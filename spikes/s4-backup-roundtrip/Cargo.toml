@@ -10,13 +10,30 @@ description = "Spike S4: rustic_core backup/restore round trip"
 
 [dependencies]
 rustic_core = { version = "0.14", features = ["clap"] }
-rustic_backend = { version = "0.8", default-features = false, features = ["opendal"] }
+# `rest` gives the worker its bridge client. The stock OpenDAL path (all ~25 services linked) is only built
+# with `--features stock-opendal`, kept for the size comparison and the stock-vs-wrapper smoke test.
+rustic_backend = { version = "0.8", default-features = false, features = ["rest"] }
+# hx Drive backend: OpenDAL with only the gdrive service, own transport and retry wrapper
+opendal = { version = "0.59", features = ["blocking", "services-gdrive", "layers-timeout"] }
+opendal-http-transport-reqwest = "0.59"
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+futures = "0.3"
+http = "1"
+bytes = "1"
+hex = "0.4"
+tiny_http = "0.12"
+base64 = "0.22"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 globset = "0.4"
 serde_json = "1"
 jiff = "0.2"
 env_logger = "0.11"
+
+[features]
+stock-opendal = ["rustic_backend/opendal"]
 
 [dev-dependencies]
 proptest = "1"

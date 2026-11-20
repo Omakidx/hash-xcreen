@@ -3,7 +3,9 @@
 //! Runs inside a worker container that has the snapshot mounted read-only. Subcommands:
 //! init, backup, restore, snapshots, check, repair-index, synth, retention, drivecheck.
 
+mod drive;
 mod rules;
+mod serve;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
@@ -28,6 +30,10 @@ struct Cli {
     /// Extra backend option key=value (repeatable), for example `root=/hash-xcreen`
     #[arg(long = "opt", global = true)]
     opts: Vec<String>,
+    /// JSON file with `client_id`, `client_secret`, `refresh_token` for the gdrive service. Read in-process
+    /// at start-up and never printed or logged.
+    #[arg(long, global = true)]
+    drive_token_file: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -91,6 +97,15 @@ enum Cmd {
         read_data: Option<String>,
     },
     RepairIndex,
+    /// Forget snapshots by (short) id and optionally prune; used to observe what deletes do on Drive
+    Forget {
+        ids: Vec<String>,
+        #[arg(long)]
+        prune: bool,
+        /// Delete pruned packs immediately instead of marking them for 23 h (rustic default)
+        #[arg(long)]
+        instant: bool,
+    },
     /// Create N small synthetic snapshots with backdated times, for retention tests
     Synth {
         #[arg(long)]
@@ -110,6 +125,16 @@ enum Cmd {
     },
     /// Construct the backend only (no I/O): proves the backend fits rustic_core's traits
     Drivecheck,
+    /// Serve the repository backend over the restic REST protocol (bridge for the credential-free worker)
+    Serve {
+        #[arg(long, default_value = "10.36.142.1:8765")]
+        listen: String,
+        /// File whose first line is the bridge password (basic auth, user `s4`)
+        #[arg(long)]
+        bridge_password_file: PathBuf,
+        #[arg(long, default_value_t = 6)]
+        threads: usize,
+    },
     /// Print the effective excludes for a tree
     Excludes {
         #[arg(long, default_value = "/src")]
@@ -126,7 +151,45 @@ fn creds(p: &Path) -> Result<Credentials> {
     Ok(Credentials::Password(pw.trim().to_string()))
 }
 
+fn hx_stats() -> &'static std::sync::Arc<drive::Stats> {
+    static S: std::sync::OnceLock<std::sync::Arc<drive::Stats>> = std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Arc::new(drive::Stats::default()))
+}
+
+fn hx_backend(cli: &Cli, root: &str) -> Result<std::sync::Arc<dyn rustic_core::WriteBackend>> {
+    let tf = cli
+        .drive_token_file
+        .as_ref()
+        .ok_or_else(|| anyhow!("hxdrive: needs --drive-token-file"))?;
+    let creds = drive::DriveCreds::from_file(tf)?;
+    let faults = match std::env::var("S4_FAULTS") {
+        Ok(spec) => drive::Faults::parse(&spec)?,
+        Err(_) => drive::Faults::default(),
+    };
+    let mut policy = drive::RetryPolicy::default();
+    if let Ok(v) = std::env::var("S4_DAILY_PAUSE_MS") {
+        policy.daily_pause = std::time::Duration::from_millis(v.parse()?);
+    }
+    if let Ok(v) = std::env::var("S4_MAX_DAILY_PAUSES") {
+        policy.max_daily_pauses = v.parse()?;
+    }
+    let be = drive::HxDrive::new(
+        &creds,
+        root,
+        policy,
+        std::sync::Arc::new(faults),
+        hx_stats().clone(),
+    )?;
+    Ok(std::sync::Arc::new(be))
+}
+
 fn backend(cli: &Cli) -> Result<rustic_core::RepositoryBackends> {
+    if let Some(root) = cli.repo.strip_prefix("hxdrive:") {
+        return Ok(rustic_core::RepositoryBackends::new(
+            hx_backend(cli, root)?,
+            None,
+        ));
+    }
     let mut b = BackendOptions::default().repository(&cli.repo);
     for kv in &cli.opts {
         let (k, v) = kv
@@ -134,11 +197,22 @@ fn backend(cli: &Cli) -> Result<rustic_core::RepositoryBackends> {
             .ok_or_else(|| anyhow!("--opt needs k=v"))?;
         b.options.insert(k.to_string(), v.to_string());
     }
+    if let Some(tf) = &cli.drive_token_file {
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(tf).context("read token file")?)?;
+        for k in ["client_id", "client_secret", "refresh_token"] {
+            let val = v[k]
+                .as_str()
+                .ok_or_else(|| anyhow!("token file lacks {k}"))?;
+            b.options.insert(k.to_string(), val.to_string());
+        }
+    }
     b.to_backends().map_err(|e| anyhow!("{e}"))
 }
 
 fn repo_opts() -> RepositoryOptions {
-    RepositoryOptions::default().cache_dir("/var/cache/s4-rustic")
+    RepositoryOptions::default()
+        .cache_dir(std::env::var("S4_CACHE_DIR").unwrap_or_else(|_| "/var/cache/s4-rustic".into()))
 }
 
 fn cpu_secs() -> (f64, f64) {
@@ -173,6 +247,27 @@ fn main() -> Result<()> {
                 .init(&c, &KeyOptions::default(), &cfg)
                 .map_err(e)?;
             println!("{{\"init\":true,\"compression\":{compression}}}");
+        }
+        Cmd::Serve {
+            listen,
+            bridge_password_file,
+            threads,
+        } => {
+            let pw = std::fs::read_to_string(bridge_password_file)?;
+            let root = cli
+                .repo
+                .strip_prefix("hxdrive:")
+                .ok_or_else(|| anyhow!("serve needs --repo hxdrive:<root>"))?;
+            let be = hx_backend(&cli, root)?;
+            let st = hx_stats().clone();
+            serve::serve(
+                listen,
+                "s4",
+                pw.trim(),
+                be,
+                std::sync::Arc::new(move || st.snapshot()),
+                *threads,
+            )?;
         }
         Cmd::Drivecheck => {
             // `be` was built above from `--repo opendal:gdrive --opt ...`; building does no network I/O.
@@ -374,6 +469,40 @@ fn main() -> Result<()> {
                     "wall_s": t0.elapsed().as_secs_f64(), "loadavg": loadavg()})
             );
         }
+        Cmd::Forget {
+            ids,
+            prune,
+            instant,
+        } => {
+            let repo = Repository::new(&ropts, &be)
+                .map_err(e)?
+                .open(&c)
+                .map_err(e)?;
+            let snaps = repo.get_all_snapshots().map_err(e)?;
+            let drop: Vec<_> = snaps
+                .iter()
+                .filter(|s| ids.iter().any(|i| s.id.to_string().starts_with(i.as_str())))
+                .map(|s| s.id)
+                .collect();
+            anyhow::ensure!(
+                drop.len() == ids.len(),
+                "every id must match exactly one snapshot"
+            );
+            repo.delete_snapshots(&drop).map_err(e)?;
+            let mut removed = serde_json::Value::Null;
+            if *prune {
+                let mut po = PruneOptions::default();
+                po.instant_delete = *instant;
+                let plan = repo.prune_plan(&po).map_err(e)?;
+                let st = plan.stats.size_sum();
+                removed = serde_json::json!({"plan_remove": st.remove, "plan_repack": st.repack, "plan_unused": st.unused});
+                repo.prune(&po, plan).map_err(e)?;
+            }
+            println!(
+                "{}",
+                serde_json::json!({"forgot": drop.len(), "prune": removed, "wall_s": t0.elapsed().as_secs_f64()})
+            );
+        }
         Cmd::RepairIndex => {
             let repo = Repository::new(&ropts, &be)
                 .map_err(e)?
@@ -482,6 +611,12 @@ fn main() -> Result<()> {
                 );
             }
         }
+    }
+    if cli.repo.starts_with("hxdrive:") {
+        println!(
+            "{}",
+            serde_json::json!({ "drive_stats": hx_stats().snapshot() })
+        );
     }
     Ok(())
 }
