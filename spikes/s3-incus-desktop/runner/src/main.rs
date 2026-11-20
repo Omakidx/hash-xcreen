@@ -248,6 +248,13 @@ fn sq(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Bounded apt network behaviour: a hung mirror connection must fail and retry, not block for minutes.
+const APT_OPTS: &str = "-o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Acquire::Retries=3";
+
+/// `apt-get update` with a hard 120 s cap per try: on the spike host an IPv6 transfer occasionally stalled
+/// for minutes without tripping apt's own timeouts.
+const APT_UPDATE: &str = "for i in 1 2 3 4; do timeout 120 apt-get -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Acquire::Retries=3 update -qq && break; [ $i = 4 ] && exit 1; done";
+
 const WAIT_NET: &str = "for i in $(seq 1 60); do getent hosts deb.debian.org >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1";
 
 fn apply(r: &Recipe, c: &Incus, install: bool) -> Result<(), String> {
@@ -270,7 +277,7 @@ fn apply(r: &Recipe, c: &Incus, install: bool) -> Result<(), String> {
     stage("wait-network", || c.run(WAIT_NET, None, None))?;
     if install {
         stage("apt-bootstrap", || {
-            c.run("apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates curl gnupg", None, None)
+            c.run(&format!("{APT_UPDATE} && apt-get {APT_OPTS} install -y -qq --no-install-recommends ca-certificates curl gnupg"), None, None)
         })?;
         stage("apt-repos", || {
             for repo in &r.apt_repo {
@@ -303,7 +310,7 @@ fn apply(r: &Recipe, c: &Incus, install: bool) -> Result<(), String> {
             }
             let pk: Vec<String> = r.apt.packages.iter().map(|p| sq(p)).collect();
             c.run(
-                &format!("apt-get update -qq && apt-get install -y -qq --no-install-recommends {}", pk.join(" ")),
+                &format!("{APT_UPDATE} && apt-get {APT_OPTS} install -y -qq --no-install-recommends {}", pk.join(" ")),
                 None,
                 None,
             )
@@ -375,7 +382,7 @@ fn post(r: &Recipe, c: &Incus) -> Result<(), String> {
         Ok(())
     })?;
     stage("security-updates", || {
-        c.run("apt-get update -qq && apt-get -y -qq -o Dpkg::Options::=--force-confold upgrade", None, None)
+        c.run(&format!("{APT_UPDATE} && apt-get {APT_OPTS} -y -qq -o Dpkg::Options::=--force-confold upgrade"), None, None)
     })?;
     stage("post-steps", || run_steps(&r.post_step, r, c))?;
     eprintln!("TOTAL post {:.1}s", total.elapsed().as_secs_f64());
