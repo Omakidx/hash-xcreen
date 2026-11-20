@@ -297,6 +297,7 @@ async fn violations_after_the_handshake_close_the_connection() {
             .await
             .expect("in time")
             .expect("join");
+        srv.authorize(common::all_features()).expect("authorize");
         breaker(&conn).await;
         assert_eq!(closed_code(&conn).await, CloseCode::ProtocolError, "{name}");
         let info = tokio::time::timeout(WAIT, srv.closed())
@@ -416,5 +417,73 @@ async fn pre_auth_slots_are_bounded() {
     assert!(
         second.is_err(),
         "a second pre-auth connection must be refused while the slot is taken"
+    );
+}
+
+/// Reviewer scenario: many peers that never send a Hello must not be able to open streams.
+#[tokio::test]
+async fn no_unidirectional_streams_before_hello_or_authorization() {
+    let opts = ServerOptions {
+        max_pending_per_ip: 64,
+        ..Default::default()
+    };
+    let server = start_server(opts).await;
+    let wait = Duration::from_millis(300);
+    let mut peers = Vec::new();
+    for _ in 0..8 {
+        let (ep, conn) = raw_quic(server.quic_addr().expect("quic"), b"hx/1")
+            .await
+            .expect("connect");
+        // No uni stream is granted before the Hello (credit 0), so opening one never completes.
+        assert!(tokio::time::timeout(wait, conn.open_uni()).await.is_err());
+        peers.push((ep, conn));
+    }
+    // One peer completes the hello and is accepted but not authorized: still no uni stream.
+    let s2 = server.clone();
+    let accepted = tokio::spawn(async move {
+        s2.accept()
+            .await
+            .expect("pending")
+            .accept(server_hello())
+            .await
+            .expect("accept")
+    });
+    let (_ep, conn) = raw_quic(server.quic_addr().expect("quic"), b"hx/1")
+        .await
+        .expect("connect");
+    let body = message::encode(&hello_message(1, 0)).expect("encode");
+    let (_s, mut r) = open_control(&conn, &body).await;
+    assert!(matches!(
+        read_reply(&mut r).await.message,
+        Some(Ctl::HelloAck(_))
+    ));
+    let srv = tokio::time::timeout(WAIT, accepted)
+        .await
+        .expect("in time")
+        .expect("join");
+    assert!(tokio::time::timeout(wait, conn.open_uni()).await.is_err());
+    // Authorization grants them.
+    srv.authorize(common::all_features()).expect("authorize");
+    let mut s = tokio::time::timeout(WAIT, conn.open_uni())
+        .await
+        .expect("granted")
+        .expect("opens");
+    s.write_all(&[0x02]).await.expect("write");
+    drop(peers);
+}
+
+#[tokio::test]
+async fn a_second_bidirectional_stream_is_refused() {
+    let server = start_server(ServerOptions::default()).await;
+    let (_ep, conn) = raw_quic(server.quic_addr().expect("quic"), b"hx/1")
+        .await
+        .expect("connect");
+    let body = message::encode(&hello_message(1, 0)).expect("encode");
+    let (_s, _r) = open_control(&conn, &body).await;
+    // The control stream used the only bidirectional credit.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), conn.open_bi())
+            .await
+            .is_err()
     );
 }

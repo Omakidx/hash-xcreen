@@ -80,12 +80,15 @@ async fn expect_close(ws: &mut RawWs) -> CloseCode {
 async fn established(server: &Arc<Server>) -> (RawWs, hx_transport::Connection) {
     let s2 = server.clone();
     let accepted = tokio::spawn(async move {
-        s2.accept()
+        let c = s2
+            .accept()
             .await
             .expect("pending")
             .accept(server_hello())
             .await
-            .expect("accept")
+            .expect("accept");
+        c.authorize(common::all_features()).expect("authorize");
+        c
     });
     let mut ws = raw_ws(server, "/hx/1").await.expect("connect");
     send_control(&mut ws, &hello_message(1, 0)).await;

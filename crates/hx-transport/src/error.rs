@@ -72,6 +72,9 @@ pub enum Error {
     /// The operation is not allowed for this side of the connection.
     #[error("{0} is not allowed for this role")]
     WrongRole(&'static str),
+    /// The connection is not authorized yet (see `Connection::authorize`).
+    #[error("the connection is not authorized")]
+    NotAuthorized,
     /// The feature behind the operation was not negotiated.
     #[error("feature {0} was not negotiated")]
     FeatureDisabled(&'static str),
@@ -86,6 +89,9 @@ pub enum Error {
         /// Current maximum.
         max: usize,
     },
+    /// TLS verification of the peer failed (certificate or key rejected).
+    #[error("peer verification failed: {0}")]
+    PeerRejected(String),
     /// Invalid configuration passed by the caller.
     #[error("invalid configuration: {0}")]
     Config(String),

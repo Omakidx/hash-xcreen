@@ -5,7 +5,7 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -23,7 +23,8 @@ use hx_proto::{
     media::{MAX_VIDEO_PAYLOAD, MEDIA_HEADER_LEN, MediaHeader},
     message,
     pb::{
-        ControlMessage, CursorEvent, InputEvent, TransferHeader, control_message::Message as Ctl,
+        ControlMessage, CursorEvent, InputEvent, RefuseReason, TransferHeader,
+        control_message::Message as Ctl,
     },
     version::{ALPN_WEBSOCKET, Features, WEBSOCKET_PATH},
 };
@@ -55,7 +56,10 @@ use crate::{
         wait_closed,
     },
     error::{CloseInfo, Error, Result, transport},
-    server::{HelloCheck, PendingInner, PendingSession, ServerCtx, check_hello, refuse_message},
+    server::{
+        HelloCheck, PendingInner, PendingSession, PreAuthSlot, ServerCtx, check_hello,
+        refuse_message,
+    },
     transfer::{
         IncomingBody, IncomingTransfer, SenderBody, TransferKind, TransferSender, WsReceiver,
     },
@@ -101,7 +105,13 @@ pub(crate) enum WsChunk {
 
 struct IncomingState {
     tx: mpsc::Sender<WsChunk>,
+    /// Bytes of this transfer queued and not yet read by the application.
+    queued: Arc<AtomicUsize>,
 }
+
+/// Queued incoming transfer data allowed per transfer and per connection (protocol §3.1).
+const TRANSFER_BUDGET: usize = 1024 * 1024;
+const CONNECTION_TRANSFER_BUDGET: usize = 4 * 1024 * 1024;
 
 #[derive(Default)]
 struct AckBook {
@@ -595,6 +605,7 @@ async fn handle_transfer(inner: &Arc<Inner>, ch: ChannelId, body: &[u8]) -> Resu
                 header.validate_clipboard()?;
             }
             let (tx, rx) = mpsc::channel(256);
+            let queued = Arc::new(AtomicUsize::new(0));
             {
                 let mut m = w.incoming.lock().map_err(|_| Error::ChannelClosed)?;
                 if m.contains_key(&id) {
@@ -605,9 +616,23 @@ async fn handle_transfer(inner: &Arc<Inner>, ch: ChannelId, body: &[u8]) -> Resu
                     let _ = w.hi.try_send(abort_msg());
                     return Ok(());
                 }
-                m.insert(id, IncomingState { tx });
+                m.insert(
+                    id,
+                    IncomingState {
+                        tx,
+                        queued: queued.clone(),
+                    },
+                );
             }
-            let t = IncomingTransfer::new(kind, header, IncomingBody::Ws(WsReceiver { rx }));
+            let t = IncomingTransfer::new(
+                kind,
+                header,
+                IncomingBody::Ws(WsReceiver {
+                    rx,
+                    queued,
+                    conn_queued: inner.transfer_budget.clone(),
+                }),
+            );
             if inner.router.transfers.try_send(t).is_err() {
                 if let Ok(mut m) = w.incoming.lock() {
                     m.remove(&id);
@@ -623,26 +648,40 @@ async fn handle_transfer(inner: &Arc<Inner>, ch: ChannelId, body: &[u8]) -> Resu
             if msg_type == 3 && !payload.is_empty() {
                 return Err(Error::Violation("transfer end carries a body".into()));
             }
-            let chunk = match msg_type {
-                2 => WsChunk::Data(Bytes::copy_from_slice(payload)),
-                3 => WsChunk::End,
-                _ => WsChunk::Aborted,
-            };
             let finished = msg_type != 2;
-            let tx = {
+            let entry = {
                 let mut m = w.incoming.lock().map_err(|_| Error::ChannelClosed)?;
                 if finished {
-                    m.remove(&id).map(|s| s.tx)
+                    m.remove(&id).map(|s| (s.tx, s.queued))
                 } else {
-                    m.get(&id).map(|s| s.tx.clone())
+                    m.get(&id).map(|s| (s.tx.clone(), s.queued.clone()))
                 }
             };
             // Unknown ids are transfers we already dropped or aborted: ignore the rest of them.
-            if let Some(tx) = tx
-                && tx.try_send(chunk).is_err()
-                && !finished
+            let Some((tx, queued)) = entry else {
+                return Ok(());
+            };
+            if msg_type != 2 {
+                let _ = tx.try_send(if msg_type == 3 {
+                    WsChunk::End
+                } else {
+                    WsChunk::Aborted
+                });
+                return Ok(());
+            }
+            // Data: enforce the byte budgets before queueing anything.
+            let len = payload.len();
+            let per = queued.fetch_add(len, Ordering::SeqCst) + len;
+            let all = inner.transfer_budget.fetch_add(len, Ordering::SeqCst) + len;
+            let over = per > TRANSFER_BUDGET || all > CONNECTION_TRANSFER_BUDGET;
+            if over
+                || tx
+                    .try_send(WsChunk::Data(Bytes::copy_from_slice(payload)))
+                    .is_err()
             {
-                // Consumer too slow or gone: stop the transfer.
+                queued.fetch_sub(len, Ordering::SeqCst);
+                inner.transfer_budget.fetch_sub(len, Ordering::SeqCst);
+                // The consumer is too slow or gone: stop the transfer.
                 if let Ok(mut m) = w.incoming.lock() {
                     m.remove(&id);
                 }
@@ -670,7 +709,7 @@ pub(crate) async fn accept_loop(listener: TcpListener, ctx: Arc<ServerCtx>) {
                 continue;
             }
         };
-        let Ok(permit) = ctx.sem.clone().try_acquire_owned() else {
+        let Some(permit) = ctx.acquire(peer.ip()) else {
             drop(tcp);
             continue;
         };
@@ -709,19 +748,22 @@ async fn incoming(
     tcp: TcpStream,
     peer: std::net::SocketAddr,
     ctx: &ServerCtx,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    slot: PreAuthSlot,
 ) -> Result<()> {
-    let deadline = Instant::now() + ctx.opts.handshake_timeout;
+    let start = Instant::now();
+    let deadline = start + ctx.opts.handshake_timeout;
+    // TLS and the HTTP upgrade must finish sooner than the whole hello exchange.
+    let tls_deadline = start + ctx.opts.handshake_timeout.min(ctx.opts.transport_timeout);
     let _ = tcp.set_nodelay(true);
     let tls_cfg = ctx.ws_tls.read().map_err(|_| Error::ChannelClosed)?.clone();
-    let tls = tokio::time::timeout_at(deadline, TlsAcceptor::from(tls_cfg).accept(tcp))
+    let tls = tokio::time::timeout_at(tls_deadline, TlsAcceptor::from(tls_cfg).accept(tcp))
         .await
         .map_err(|_| Error::Timeout("TLS handshake"))?
         .map_err(|e| Error::Tls(e.to_string()))?;
     let certs = owned_certs(tls.get_ref().1.peer_certificates());
     let io: BoxIo = Box::new(tls);
     let mut ws = tokio::time::timeout_at(
-        deadline,
+        tls_deadline,
         accept_hdr_async_with_config(io, PathCheck, Some(ws_config())),
     )
     .await
@@ -750,7 +792,7 @@ async fn incoming(
         Ok(HelloCheck::Ok(h)) => h,
         Ok(HelloCheck::UpdateRequired) => {
             let body = message::encode(&refuse_message(
-                hx_proto::pb::RefuseReason::UpdateRequired,
+                RefuseReason::UpdateRequired,
                 "update required",
             ))?;
             return refuse_server(WsPending { ws }, body, CloseCode::UpdateRequired).await;
@@ -762,21 +804,18 @@ async fn incoming(
             return Err(e);
         }
     };
-    let pending = PendingSession {
+    let pending = PendingSession::new(
+        ctx,
         hello,
-        transport: TransportKind::WebSocket,
-        remote: peer,
-        peer_certs: certs,
-        inner: PendingInner::Ws(Box::new(WsPending { ws })),
-        options: ctx.opts.connection.clone(),
-        _permit: permit,
-    };
+        TransportKind::WebSocket,
+        peer,
+        certs,
+        PendingInner::Ws(Box::new(WsPending { ws })),
+        slot,
+    );
     if let Err(e) = ctx.tx.try_send(pending) {
         let (TrySendError::Full(p) | TrySendError::Closed(p)) = e;
-        if let PendingInner::Ws(w) = p.inner {
-            let mut ws = w.ws;
-            let _ = ws.send(close_frame(CloseCode::Busy, "server busy")).await;
-        }
+        let _ = p.refuse(RefuseReason::Busy, "server busy").await;
     }
     Ok(())
 }
@@ -929,6 +968,8 @@ pub(crate) async fn connect(
         peer_certs: certs,
         remote_addr: target.addr,
         options: opts.connection.clone(),
+        slot: None,
+        auth_timeout: None,
     };
     Ok(start(ws, parts))
 }

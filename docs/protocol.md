@@ -18,9 +18,9 @@ Conventions: "MUST", "SHOULD" and "MAY" are used in the RFC 2119 sense. All mult
 - One QUIC endpoint serves both ALPN values `hx/1` and `h3`. The accept loop dispatches on the negotiated ALPN: `hx/1` goes to the native handler, `h3` to a pluggable handler (absent in Phase 1: the endpoint then offers only `hx/1`). Any other ALPN is refused at the TLS handshake.
 - The major version is part of the ALPN and of the WebSocket path (`hx/1`, `/hx/1`). A future major `2` is a new ALPN (`hx/2`), which lets one server support the current and previous major side by side (architecture §7.5). The `Hello` also carries the version and the two MUST agree (§4).
 - Congestion control: BBR on QUIC.
-- QUIC keep-alive 5 s, idle timeout 30 s. Each side limits the streams its peer may open: the server allows the client 4 bidirectional (only one is ever used, §3) and 64 unidirectional streams; the client allows the server 0 bidirectional and 1024 unidirectional streams (one per in-flight video frame).
+- QUIC keep-alive 5 s, idle timeout 30 s. Each side limits what its peer may make it buffer. A **server** starts restricted (§2.1): the client may open 1 bidirectional stream (the control stream; a second one is refused by the transport) and **0 unidirectional streams**, the connection receive window is 256 KiB and the datagram receive buffer 16 KiB. When the application authorizes the connection the limit becomes 64 unidirectional streams (input and transfers) and a 64 MiB connection receive window (the steady-state cap). A **client** allows the server 0 bidirectional streams, 1024 unidirectional streams (one per in-flight video frame), a 64 MiB connection receive window and 8 MiB per stream.
 - The server MAY require QUIC address validation (a Retry) before spending handshake state on an unvalidated source address; `hx-transport` does by default.
-- Pre-authentication resource bounds: at most 64 concurrent connections that have not finished the hello exchange (excess is refused at the transport), and 10 s from transport accept to a valid `Hello` (`HELLO_TIMEOUT`, §8). Until the hello exchange succeeds, nothing but the control stream (WebSocket: control messages) is processed.
+- Pre-authentication resource bounds. A connection is *unauthenticated* from transport accept until the application authorizes it (§2.1), is refused, or closes. At most 64 connections may be unauthenticated at once and at most 4 per source address (IPv6: per /64); excess connections are refused at the transport. TLS plus the HTTP upgrade must finish within 5 s and a valid `Hello` within 10 s of transport accept (`HELLO_TIMEOUT`, §8). The application must accept or refuse a pending session within 10 s or the transport refuses it with `BUSY`. An accepted connection that is not authorized within 30 s is closed with `UNAUTHORIZED`. All of these are configurable server options. Until the hello exchange succeeds, nothing but the control stream (WebSocket: control messages) is processed.
 
 ## 2. Roles and the session lifecycle
 
@@ -39,8 +39,20 @@ client                                          server
 
 1. The client opens the transport and the **control channel** and sends `Hello` as the first message.
 2. The server validates it and answers `HelloAck` (success) or `Refuse` followed by closing the connection with the matching code (§8).
-3. After `HelloAck`, both sides open their long-lived channels and may use the channels permitted by the negotiated features (§4.3).
+3. After `HelloAck` the connection is **restricted** on the server (§2.1) until the application authorizes the peer; the client may use every channel the negotiated features allow, but the server processes only what §2.1 lists until then.
 4. Either side ends the session with `Goodbye` (optional, informational) and a connection close with a code from §8.
+
+### 2.1 Restricted (unauthorized) state
+
+After `HelloAck` the server side of a connection is **restricted** until the server application has authenticated the peer (pinned key, PIN, pairing; §11) and authorizes the connection. While restricted:
+
+- Only control messages are processed, and only `pairing`, `auth`, `goodbye`, `ping` and `pong`. Any other control message is a protocol error.
+- Input events and mouse datagrams are dropped without being queued (counted for diagnostics).
+- QUIC: the peer cannot open unidirectional streams at all (§1), so transfers and input cannot start. WebSocket: a transfer, audio or video message is a protocol error.
+- The server sends nothing but control messages (no video, cursor, audio, transfers).
+- The negotiated features (§4.3) are not yet in effect.
+
+Authorizing makes the negotiated features effective (optionally narrowed by the application, for example clipboard off for one device), raises the QUIC limits of §1 and releases the connection's pre-authentication slot. A client may assume nothing about its own authorization until the server says so in an application-level message (for example the result of the `auth` exchange); a client MUST NOT start input, transfers or other channels before that. The restricted state exists only on the server; a client is never restricted.
 
 ## 3. Channels
 
@@ -64,7 +76,7 @@ Rules:
 
 - The sender writes the channel id as the first byte of a stream or datagram, immediately after opening it.
 - The control stream is opened by the client and MUST be the first stream; its first byte is `0x01`. A second control stream is a protocol error (`PROTOCOL_ERROR`).
-- The Input stream (client) and the Cursor stream (server) are opened right after the hello exchange. At most one of each per connection; a duplicate is a protocol error.
+- The Cursor stream (server) is opened right after the hello exchange; the Input stream (client) is opened when first needed, which can only succeed after the server has authorized the client (§2.1). At most one of each per connection; a duplicate is a protocol error.
 - A unidirectional stream with an unknown channel id, a channel id that the peer's role must not send (for example the client opening `0x05`), or a channel whose feature was not negotiated (§4.3) is a protocol error.
 - An unknown datagram channel id, or a malformed datagram, is **dropped** (datagrams are unreliable by nature; they never close the connection). Implementations count drops for diagnostics.
 - Streams carrying length-prefixed messages (control, input, cursor) use the framing in §5.1.
@@ -83,6 +95,8 @@ Rules:
 | File name in `TransferHeader` | 255 bytes; also rejected: `/`, `\`, `:`, C0/C1/DEL control characters, bidi controls (U+202A–202E, U+2066–2069, U+200E/F, U+061C), `.` and `..`, a trailing `.` or space, and the Windows device names CON, PRN, AUX, NUL, COM1–9, LPT1–9 (with or without extension) |
 | Clipboard transfer total | 67108864 (64 MiB) |
 | WebSocket transfer chunk | 65536 |
+| Queued, unread incoming transfer data (WebSocket) | 1 MiB per transfer and 4 MiB per connection; a transfer that exceeds either is aborted (`abort`, §9.4). On QUIC the same bound comes from stream and connection flow control (§1) |
+| Unread input or cursor messages queued (WebSocket) | 256 each; a peer that outpaces the application beyond this is closed with `PROTOCOL_ERROR` (QUIC: per-stream flow control instead) |
 
 A receiver that sees a value above its limit treats it as a protocol error (reliable channels) or drops the datagram. Limits are checked **before** allocating.
 
@@ -128,10 +142,13 @@ A receiver that sees a value above its limit treats it as a protocol error (reli
 - The version is `major.minor`; this document defines `1.0`.
 - **Different major** (the `Hello` major differs from the ALPN/path major or from the server's): the server answers `Refuse{reason: UPDATE_REQUIRED, version: <server version>}` and closes with `UPDATE_REQUIRED` (§8). The client shows an "update required" message. No other message is processed. The `Hello` of a different major is parsed only as far as `version` (field 1); every other field of it is ignored.
 - **Same major, different minor**: accepted. The negotiated minor is `min(client.minor, server.minor)`. Both sides then use only features available at the negotiated minor and present in both capability sets (§4.3). Unknown protobuf fields are ignored (standard protobuf behaviour), so a newer minor can add fields and messages that an older peer skips; a newer minor MUST NOT send a new message type on a channel to a peer whose negotiated minor predates it.
+- Security properties (authentication, authorization, size limits, the restricted state) are never gated by a minor version or a feature bit: every peer enforces them regardless of what was negotiated.
 - A change that an older peer cannot safely ignore (removed field, changed meaning, changed byte layout) requires a new major.
 - The agent supports the current major and the previous one, by serving both ALPN values. The web client always matches its agent.
 
 ### 4.3 Capabilities and features
+
+Capabilities advertised in `HelloAck` are an *offer*: negotiated features take effect only when the server authorizes the connection (§2.1). For an `INTENT_PAIR` hello the server advertises no features and no codecs, so a pairing connection can never carry anything but control messages.
 
 `features` is a bitmask. Both sides compute `negotiated = client.features & server.features & mask(negotiated_minor)` and `codecs = client.video_codecs ∩ server.video_codecs`, in the server's order of preference. Bits unknown to a side are ignored by that side.
 
@@ -397,6 +414,11 @@ There are none on the wire. The sender SHOULD interleave: control, input, mouse 
 | Unknown channel id on a stream | Close, `PROTOCOL_ERROR` |
 | Duplicate control, input or cursor stream | Close, `PROTOCOL_ERROR` |
 | Channel sent by the wrong role or without its feature | Close, `PROTOCOL_ERROR` |
+| Control message other than `pairing`, `auth`, `goodbye`, `ping`, `pong` while restricted; transfer, audio or video message while restricted (WebSocket) | Close, `PROTOCOL_ERROR` |
+| Input or cursor queue overflow (WebSocket) | Close, `PROTOCOL_ERROR` |
+| Input or mouse data while restricted | Drop, count, continue |
+| Not authorized within the authorization deadline | Close, `UNAUTHORIZED` |
+| Pending session not decided within the decision window | `Refuse(BUSY)`, close `BUSY` |
 | Invalid media header | Close, `PROTOCOL_ERROR` |
 | Video stream reset with `STALE_FRAME` | Drop the frame, continue |
 | Video frame not newer than `last_released` | Drop the frame, count it, continue |
@@ -416,7 +438,7 @@ This document only reserves the places where pairing slots into the protocol; th
 - **TLS layer.** Authentication of an already paired device is **mutual TLS 1.3 with pinned keys**; the verifiers are injected into `hx-transport` as ordinary rustls configs. A device that is not paired yet has no pinned key, so the server's client-certificate verifier (supplied by 1B) accepts an unknown client key **only while a pairing token is valid**; the connection is then restricted to pairing.
 - **Handshake placement.** `Hello.intent` declares the purpose. With `INTENT_PAIR` the server (after the version check and after consulting its policy through `hx-transport`'s pending-session hook, which exposes the peer's certificates and the `Hello`) answers `HelloAck` and the only messages processed afterwards are `ControlMessage.pairing` (field 100) until pairing finishes, then the connection is closed with `NO_ERROR`; the device then reconnects with `INTENT_SESSION` using its now pinned key. If pairing is not open the server answers `Refuse{PAIRING_CLOSED}` and closes with `PAIRING_CLOSED`. With `INTENT_SESSION` the server rejects an unknown or revoked key with `Refuse{UNAUTHORIZED}`; the PIN step (architecture §8.3) uses `ControlMessage.auth` (field 101) between `HelloAck` and the first `ViewConfig`, and until it succeeds the server accepts nothing else but `auth` and `goodbye`.
 - **Envelope.** Both `pairing` and `auth` carry `Opaque { bytes data = 1; }` (at most 4096 bytes). 1B defines what the bytes contain (its own protobuf messages inside the envelope) and the state machine. The transport only delivers them; it does not interpret them.
-- **Application hook.** `hx-transport` hands the server application a `PendingSession` after the version check. The application (1B/1C) decides `accept` or `refuse` and may enforce that only `pairing`/`auth` are processed until it has authenticated the peer; `hx-transport` itself does not gate messages on authentication.
+- **Application hook.** `hx-transport` hands the server application a `PendingSession` after the version check; the application calls `accept` (returning a restricted `Connection`) or `refuse`, and later `Connection::authorize` once the peer is authenticated (§2.1). The application MUST re-check the peer's key against its **current** pinned and revoked set on **every** `PendingSession` (TLS session resumption is disabled by the transport, but revocation can happen at any time), MUST close live sessions of a device when it is revoked, and MUST treat `Hello.software` and `Hello.device_name` as untrusted text (sanitize before showing or logging).
 
 ## 12. Schema location
 

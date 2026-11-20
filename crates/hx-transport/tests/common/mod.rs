@@ -156,17 +156,24 @@ pub struct Pair {
     pub srv: Connection,
 }
 
-/// Bring up a server and one connected client over `pref`, accepting with the default replies.
-pub async fn pair_with(
+/// Bring up a server and one connected client over `pref`. The server accepts with the given
+/// reply and, if `authorize` is set, authorizes the connection with every feature.
+pub async fn pair_full(
     pref: TransportPreference,
+    opts: ServerOptions,
     server_hello: ServerHello,
     client_hello: ClientHello,
+    authorize: bool,
 ) -> Pair {
-    let server = start_server(ServerOptions::default()).await;
+    let server = start_server(opts).await;
     let s2 = server.clone();
     let accept = tokio::spawn(async move {
         let pending = s2.accept().await.expect("pending session");
-        pending.accept(server_hello).await
+        let c = pending.accept(server_hello).await?;
+        if authorize {
+            c.authorize(all_features())?;
+        }
+        Ok::<_, hx_transport::Error>(c)
     });
     let c = client(pref)
         .connect(&target(&server, pref), &client_hello)
@@ -182,6 +189,21 @@ pub async fn pair_with(
         client: c,
         srv,
     }
+}
+
+pub async fn pair_with(
+    pref: TransportPreference,
+    server_hello: ServerHello,
+    client_hello: ClientHello,
+) -> Pair {
+    pair_full(
+        pref,
+        ServerOptions::default(),
+        server_hello,
+        client_hello,
+        true,
+    )
+    .await
 }
 
 pub async fn pair(pref: TransportPreference) -> Pair {

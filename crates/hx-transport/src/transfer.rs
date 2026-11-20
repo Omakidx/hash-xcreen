@@ -35,9 +35,31 @@ pub(crate) enum IncomingBody {
     Ws(WsReceiver),
 }
 
-/// Receiving half of a WebSocket transfer.
+/// Receiving half of a WebSocket transfer. Queued bytes are counted against a per-transfer
+/// and a per-connection budget until the application reads (or drops) them.
 pub(crate) struct WsReceiver {
     pub rx: tokio::sync::mpsc::Receiver<WsChunk>,
+    pub queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub conn_queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl WsReceiver {
+    fn release(&self, len: usize) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.queued.fetch_sub(len, SeqCst);
+        self.conn_queued.fetch_sub(len, SeqCst);
+    }
+}
+
+impl Drop for WsReceiver {
+    fn drop(&mut self) {
+        self.rx.close();
+        while let Ok(chunk) = self.rx.try_recv() {
+            if let WsChunk::Data(b) = chunk {
+                self.release(b.len());
+            }
+        }
+    }
 }
 
 /// A transfer started by the peer. Read it with [`next_chunk`](Self::next_chunk) or
@@ -93,6 +115,7 @@ impl IncomingTransfer {
             },
             IncomingBody::Ws(w) => match w.rx.recv().await {
                 Some(WsChunk::Data(b)) => {
+                    w.release(b.len());
                     if b.len() as u64 > self.remaining {
                         return Err(Error::TransferSize);
                     }

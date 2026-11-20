@@ -240,6 +240,8 @@ impl Client {
                 .map(|b| *b),
             remote_addr: conn.remote_address(),
             options: self.options.connection.clone(),
+            slot: None,
+            auth_timeout: None,
         };
         quic::establish(conn, send, recv, Some(endpoint), parts).await
     }

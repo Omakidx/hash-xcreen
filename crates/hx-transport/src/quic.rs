@@ -27,20 +27,38 @@ use crate::{
 /// How long a freshly accepted unidirectional stream may take to send its channel byte.
 const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Receive window of a server connection before authorization (protocol §1).
+const PREAUTH_RECEIVE_WINDOW: u32 = 256 * 1024;
+/// Steady-state connection receive window cap (both sides).
+const STEADY_RECEIVE_WINDOW: u32 = 64 * 1024 * 1024;
+/// Unidirectional streams a client may open after authorization (input + transfers).
+const AUTHORIZED_CLIENT_UNI_STREAMS: u32 = 64;
+
 /// QUIC transport parameters for one side (protocol §1).
+///
+/// A server starts **restricted**: one bidirectional stream (control), no unidirectional
+/// streams, a small connection receive window and datagram buffer, so a peer that never
+/// authenticates cannot make it buffer anything significant. `lift_restrictions` raises the
+/// limits once the application authorizes the connection.
 pub(crate) fn transport_config(role: Role) -> Result<quinn::TransportConfig> {
     let mut t = quinn::TransportConfig::default();
     // Streams the *peer* may open towards us.
     match role {
         Role::Server => {
-            // Client opens: the control stream, its input stream and transfers.
-            t.max_concurrent_bidi_streams(4u32.into());
-            t.max_concurrent_uni_streams(64u32.into());
+            t.max_concurrent_bidi_streams(1u32.into());
+            t.max_concurrent_uni_streams(0u32.into());
+            t.receive_window(PREAUTH_RECEIVE_WINDOW.into());
+            // Only 14-byte mouse datagrams are ever expected.
+            t.datagram_receive_buffer_size(Some(16 * 1024));
         }
         Role::Client => {
             // Server opens: cursor stream, one stream per video frame, transfers.
             t.max_concurrent_bidi_streams(0u32.into());
             t.max_concurrent_uni_streams(1024u32.into());
+            // A malicious server (before any pinning) cannot make the client buffer more.
+            t.receive_window(STEADY_RECEIVE_WINDOW.into());
+            t.stream_receive_window((8u32 * 1024 * 1024).into());
+            t.datagram_receive_buffer_size(Some(256 * 1024));
         }
     }
     t.keep_alive_interval(Some(Duration::from_secs(5)));
@@ -56,8 +74,9 @@ pub(crate) fn transport_config(role: Role) -> Result<quinn::TransportConfig> {
 pub(crate) struct QuicBackend {
     pub conn: quinn::Connection,
     control: tokio::sync::Mutex<SendStream>,
-    /// Client: the input stream. Server: the cursor stream.
-    uni: tokio::sync::Mutex<SendStream>,
+    /// Client: the input stream (opened on first use, which waits for authorization).
+    /// Server: the cursor stream.
+    uni: tokio::sync::Mutex<Option<SendStream>>,
     /// Client endpoints must outlive their connection.
     endpoint: Option<quinn::Endpoint>,
 }
@@ -132,7 +151,7 @@ impl QuicBackend {
     pub(crate) fn new(
         conn: quinn::Connection,
         control: SendStream,
-        uni: SendStream,
+        uni: Option<SendStream>,
         endpoint: Option<quinn::Endpoint>,
     ) -> Self {
         Self {
@@ -157,14 +176,38 @@ impl QuicBackend {
         }
     }
 
+    /// Raise the limits that were kept minimal until the application authorized the peer.
+    pub(crate) fn lift_restrictions(&self) {
+        self.conn
+            .set_max_concurrent_uni_streams(AUTHORIZED_CLIENT_UNI_STREAMS.into());
+        self.conn.set_receive_window(STEADY_RECEIVE_WINDOW.into());
+    }
+
     pub(crate) async fn send_reliable(&self, ch: ChannelId, body: Bytes) -> Result<()> {
-        let stream = match ch {
-            ChannelId::Control => &self.control,
-            ChannelId::Input | ChannelId::Cursor => &self.uni,
-            _ => return Err(Error::Violation("not a message channel".into())),
-        };
-        let mut s = stream.lock().await;
-        write_message(&mut s, &body).await
+        if ch == ChannelId::Control {
+            let mut s = self.control.lock().await;
+            return write_message(&mut s, &body).await;
+        }
+        if !matches!(ch, ChannelId::Input | ChannelId::Cursor) {
+            return Err(Error::Violation("not a message channel".into()));
+        }
+        let mut guard = self.uni.lock().await;
+        if guard.is_none() {
+            // The peer only grants unidirectional streams once it has authorized us, so
+            // this waits for that.
+            let mut s = self.conn.open_uni().await.map_err(transport)?;
+            let _ = s.set_priority(if ch == ChannelId::Input {
+                priority::INPUT
+            } else {
+                priority::CURSOR
+            });
+            s.write_all(&[ch as u8]).await.map_err(transport)?;
+            *guard = Some(s);
+        }
+        match guard.as_mut() {
+            Some(s) => write_message(s, &body).await,
+            None => Err(Error::ChannelClosed),
+        }
     }
 
     pub(crate) fn send_datagram(&self, dg: Bytes) -> Result<()> {
@@ -310,6 +353,12 @@ async fn handle_uni(inner: &Arc<Inner>, mut rs: RecvStream) -> Result<()> {
         .await
         .map_err(|_| Error::Violation("stream did not start with a channel byte".into()))??;
     let ch = ChannelId::from_u8(b[0])?;
+    if inner.role == Role::Server && !inner.is_authorized() {
+        // Unreachable with the pre-authorization stream limit of 0; enforced anyway.
+        return Err(Error::Violation(
+            "unidirectional stream before authorization".into(),
+        ));
+    }
     match (inner.role, ch) {
         (Role::Server, ChannelId::Input) => {
             if inner.claimed_input.swap(true, Ordering::SeqCst) {
@@ -425,9 +474,7 @@ async fn datagram_reader(inner: Arc<Inner>) {
 pub(crate) fn handle_datagram(inner: &Inner, d: &[u8]) {
     match (inner.role, decode_datagram(d)) {
         (Role::Server, Ok(Datagram::MouseMove(m))) => inner.deliver_mouse(m),
-        (Role::Client, Ok(Datagram::Audio(a)))
-            if inner.negotiated.features.contains(Features::AUDIO) =>
-        {
+        (Role::Client, Ok(Datagram::Audio(a))) if inner.features().contains(Features::AUDIO) => {
             inner.deliver_audio(a);
         }
         _ => {
@@ -451,21 +498,20 @@ pub(crate) async fn establish(
     parts: crate::conn::Parts,
 ) -> Result<Connection> {
     let _ = control_send.set_priority(priority::CONTROL);
-    let mut uni = conn.open_uni().await.map_err(transport)?;
-    match parts.role {
-        Role::Client => {
-            let _ = uni.set_priority(priority::INPUT);
-            uni.write_all(&[ChannelId::Input as u8])
-                .await
-                .map_err(transport)?;
-        }
+    // The server opens its cursor stream now (the client's limit allows it); the client opens
+    // its input stream lazily, because the server grants unidirectional streams only after
+    // authorizing it.
+    let uni = match parts.role {
         Role::Server => {
-            let _ = uni.set_priority(priority::CURSOR);
-            uni.write_all(&[ChannelId::Cursor as u8])
+            let mut s = conn.open_uni().await.map_err(transport)?;
+            let _ = s.set_priority(priority::CURSOR);
+            s.write_all(&[ChannelId::Cursor as u8])
                 .await
                 .map_err(transport)?;
+            Some(s)
         }
-    }
+        Role::Client => None,
+    };
     let backend = Backend::Quic(QuicBackend::new(conn, control_send, uni, endpoint));
     let inner = Inner::new(parts, backend);
     spawn_tasks(&inner, control_recv);

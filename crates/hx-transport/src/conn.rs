@@ -5,7 +5,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -30,6 +30,7 @@ use crate::{
     ack::{AckHandler, AckOutcome, CancelFlag, FrameAck, FrameTicket},
     error::{CloseInfo, Error, Result},
     quic::QuicBackend,
+    server::PreAuthSlot,
     transfer::{IncomingTransfer, TransferKind, TransferSender},
     ws::WsBackend,
 };
@@ -109,6 +110,11 @@ pub struct ConnectionStats {
     pub mouse_dropped_stale: u64,
     /// Audio packets dropped because the application was not consuming them.
     pub audio_dropped: u64,
+    /// Input events dropped because the connection was not authorized yet.
+    pub input_dropped_unauthorized: u64,
+    /// Bytes of incoming transfer data queued and not yet read by the application
+    /// (WebSocket; bounded per transfer and per connection).
+    pub queued_transfer_bytes: u64,
     /// Round-trip estimate (QUIC only).
     pub rtt: Option<Duration>,
 }
@@ -122,6 +128,7 @@ pub(crate) struct Counters {
     pub frames_reset_by_peer: AtomicU64,
     pub datagrams_dropped: AtomicU64,
     pub audio_dropped: AtomicU64,
+    pub input_dropped: AtomicU64,
 }
 
 pub(crate) enum Backend {
@@ -178,6 +185,15 @@ pub(crate) struct Inner {
     ping_nonce: AtomicU64,
     pub claimed_input: AtomicBool,
     pub claimed_cursor: AtomicBool,
+    /// Server side: false until the application calls `Connection::authorize`.
+    authorized: AtomicBool,
+    /// Features usable now: all negotiated ones for a client, none until `authorize` for a server.
+    effective_features: AtomicU64,
+    /// Pre-authentication slot, released on authorize or close.
+    slot: StdMutex<Option<PreAuthSlot>>,
+    auth_timeout: Option<Duration>,
+    /// Bytes of incoming transfer data queued (shared with the WebSocket receivers).
+    pub transfer_budget: Arc<AtomicUsize>,
 }
 
 /// Everything needed to build a [`Connection`] once the hello exchange is done.
@@ -190,6 +206,10 @@ pub(crate) struct Parts {
     pub peer_certs: Option<Vec<CertificateDer<'static>>>,
     pub remote_addr: SocketAddr,
     pub options: ConnectionOptions,
+    /// Server only: the pre-authentication slot to hold until `authorize`.
+    pub slot: Option<PreAuthSlot>,
+    /// Server only: close with `UNAUTHORIZED` if not authorized within this time.
+    pub auth_timeout: Option<Duration>,
 }
 
 impl Inner {
@@ -201,6 +221,12 @@ impl Inner {
         let (audio_tx, audio_rx) = mpsc::channel(64);
         let (transfer_tx, transfer_rx) = mpsc::channel(16);
         let (closed, _) = watch::channel(None);
+        let is_client = p.role == Role::Client;
+        let effective = if is_client {
+            p.negotiated.features.0
+        } else {
+            0
+        };
         Arc::new(Self {
             role: p.role,
             kind: p.kind,
@@ -243,6 +269,11 @@ impl Inner {
             ping_nonce: AtomicU64::new(1),
             claimed_input: AtomicBool::new(false),
             claimed_cursor: AtomicBool::new(false),
+            authorized: AtomicBool::new(is_client),
+            effective_features: AtomicU64::new(effective),
+            slot: StdMutex::new(p.slot),
+            auth_timeout: p.auth_timeout,
+            transfer_budget: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -256,6 +287,9 @@ impl Inner {
 
     /// Record how the connection ended; the first call wins. Returns true if this call recorded it.
     pub(crate) fn record_close(&self, info: CloseInfo) -> bool {
+        if let Ok(mut s) = self.slot.lock() {
+            s.take();
+        }
         self.closed.send_if_modified(|slot| {
             if slot.is_none() {
                 *slot = Some(info);
@@ -378,6 +412,14 @@ impl Inner {
             }
             _ => {}
         }
+        if self.role == Role::Server
+            && !self.is_authorized()
+            && !matches!(variant, Ctl::Pairing(_) | Ctl::Auth(_) | Ctl::Goodbye(_))
+        {
+            return Err(Error::Violation(
+                "only pairing, auth and goodbye are accepted before authorization".into(),
+            ));
+        }
         self.router
             .control
             .send(m)
@@ -386,19 +428,32 @@ impl Inner {
     }
 
     pub(crate) async fn deliver_input(&self, e: InputEvent) -> Result<()> {
-        self.router
-            .input
-            .send(e)
-            .await
-            .map_err(|_| Error::ChannelClosed)
+        if !self.is_authorized() {
+            // Never queue input from a peer that has not been authorized.
+            self.counters.input_dropped.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        self.deliver_bounded(&self.router.input, e, "input").await
     }
 
     pub(crate) async fn deliver_cursor(&self, e: CursorEvent) -> Result<()> {
-        self.router
-            .cursor
-            .send(e)
-            .await
-            .map_err(|_| Error::ChannelClosed)
+        self.deliver_bounded(&self.router.cursor, e, "cursor").await
+    }
+
+    /// QUIC: await space (per-stream flow control is the backpressure). WebSocket: one reader
+    /// serves every channel, so a full queue must not stall control; the peer outpacing the
+    /// application is a protocol violation.
+    async fn deliver_bounded<T>(&self, tx: &mpsc::Sender<T>, v: T, what: &str) -> Result<()> {
+        match &self.backend {
+            Backend::Quic(_) => tx.send(v).await.map_err(|_| Error::ChannelClosed),
+            Backend::Ws(_) => match tx.try_send(v) {
+                Ok(()) => Ok(()),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    Err(Error::Violation(format!("{what} queue overflow")))
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => Err(Error::ChannelClosed),
+            },
+        }
     }
 
     pub(crate) async fn deliver_video(&self, f: VideoFrame) -> Result<()> {
@@ -413,6 +468,12 @@ impl Inner {
     }
 
     pub(crate) fn deliver_mouse(&self, m: MouseMove) {
+        if !self.is_authorized() {
+            self.counters
+                .datagrams_dropped
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let accepted = self
             .router
             .mouse
@@ -430,11 +491,28 @@ impl Inner {
         }
     }
 
+    pub(crate) fn is_authorized(&self) -> bool {
+        self.authorized.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn features(&self) -> Features {
+        Features(self.effective_features.load(Ordering::SeqCst))
+    }
+
     pub(crate) fn require_feature(&self, f: Features, name: &'static str) -> Result<()> {
-        if self.negotiated.features.contains(f) {
+        if self.features().contains(f) {
             Ok(())
         } else {
             Err(Error::FeatureDisabled(name))
+        }
+    }
+
+    /// Server-initiated channels need authorization first.
+    pub(crate) fn require_authorized(&self) -> Result<()> {
+        if self.is_authorized() {
+            Ok(())
+        } else {
+            Err(Error::NotAuthorized)
         }
     }
 
@@ -491,7 +569,64 @@ impl std::fmt::Debug for Connection {
 
 impl Connection {
     pub(crate) fn from_inner(inner: Arc<Inner>) -> Self {
+        if inner.role == Role::Server
+            && let Some(limit) = inner.auth_timeout
+        {
+            let i = inner.clone();
+            tokio::spawn(async move {
+                let mut closed = i.subscribe_closed();
+                tokio::select! {
+                    () = tokio::time::sleep(limit) => {
+                        if !i.is_authorized() {
+                            i.close(CloseCode::Unauthorized, "authorization timed out");
+                        }
+                    }
+                    _ = wait_closed(&mut closed) => {}
+                }
+            });
+        }
         Self(Arc::new(Handle { inner }))
+    }
+
+    /// Server side: declare the peer authenticated (the application has verified its pinned
+    /// key, PIN or pairing) and enable the channels. `allowed` is intersected with the
+    /// negotiated features (for example to switch the clipboard off for one device).
+    ///
+    /// Until this is called the connection is **restricted**: only control messages
+    /// (`pairing`, `auth`, `goodbye`, `ping`/`pong`) are processed. Input and mouse data are
+    /// dropped without queueing, and QUIC peers cannot open unidirectional streams at all.
+    /// A connection that is never authorized is closed with `UNAUTHORIZED` after
+    /// [`ServerOptions::auth_timeout`](crate::ServerOptions). Authorizing releases the
+    /// connection's pre-authentication slot. Calling it twice, or on a client, is an error.
+    pub fn authorize(&self, allowed: Features) -> Result<()> {
+        let i = self.inner();
+        self.require_role(Role::Server, "authorize")?;
+        if let Some(c) = i.closed_info() {
+            return Err(Error::Closed(c));
+        }
+        let effective = i.negotiated.features.intersect(allowed);
+        i.effective_features.store(effective.0, Ordering::SeqCst);
+        if i.authorized.swap(true, Ordering::SeqCst) {
+            return Err(Error::Violation("already authorized".into()));
+        }
+        if let Backend::Quic(q) = &i.backend {
+            q.lift_restrictions();
+        }
+        if let Ok(mut s) = i.slot.lock() {
+            s.take();
+        }
+        Ok(())
+    }
+
+    /// True once the connection may use every negotiated channel (always for a client).
+    pub fn is_authorized(&self) -> bool {
+        self.inner().is_authorized()
+    }
+
+    /// Features usable now: the negotiated set after authorization (restricted by the
+    /// `allowed` argument of [`authorize`](Self::authorize)), none before it on a server.
+    pub fn enabled_features(&self) -> Features {
+        self.inner().features()
     }
 
     fn inner(&self) -> &Arc<Inner> {
@@ -592,6 +727,8 @@ impl Connection {
             datagrams_dropped: c.datagrams_dropped.load(Ordering::Relaxed),
             mouse_dropped_stale,
             audio_dropped: c.audio_dropped.load(Ordering::Relaxed),
+            input_dropped_unauthorized: c.input_dropped.load(Ordering::Relaxed),
+            queued_transfer_bytes: i.transfer_budget.load(Ordering::Relaxed) as u64,
             rtt: match &i.backend {
                 Backend::Quic(q) => Some(q.rtt()),
                 Backend::Ws(_) => None,
@@ -719,6 +856,7 @@ impl Connection {
     /// Send a cursor shape or position on the reliable cursor channel.
     pub async fn send_cursor(&self, e: &CursorEvent) -> Result<()> {
         self.require_role(Role::Server, "send_cursor")?;
+        self.inner().require_authorized()?;
         let body = message::encode(e)?;
         self.inner()
             .send_reliable(hx_proto::channel::ChannelId::Cursor, body)
@@ -745,6 +883,7 @@ impl Connection {
         payload: Bytes,
     ) -> Result<FrameTicket> {
         self.require_role(Role::Server, "send_video_frame")?;
+        self.inner().require_authorized()?;
         if header.payload_len as usize != payload.len() {
             return Err(Error::Violation(
                 "payload_len does not match the payload".into(),
@@ -837,6 +976,7 @@ impl Connection {
     /// Send one Opus packet as a datagram (`timestamp` is the 48 kHz sample clock).
     pub async fn send_audio(&self, timestamp: u32, payload: Bytes) -> Result<()> {
         self.require_role(Role::Server, "send_audio")?;
+        self.inner().require_authorized()?;
         self.inner().require_feature(Features::AUDIO, "audio")?;
         let seq = self.inner().audio_seq.fetch_add(1, Ordering::Relaxed);
         let dg = AudioPacket {
@@ -876,6 +1016,9 @@ impl Connection {
         header: TransferHeader,
     ) -> Result<TransferSender> {
         let i = self.inner();
+        if i.role == Role::Server {
+            i.require_authorized()?;
+        }
         match kind {
             TransferKind::Clipboard => {
                 i.require_feature(Features::CLIPBOARD, "clipboard")?;

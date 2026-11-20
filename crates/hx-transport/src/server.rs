@@ -2,10 +2,11 @@
 //! [`PendingSession`] hook where the application decides accept or refuse.
 
 use std::{
+    collections::HashMap,
     future::Future,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex as StdMutex, RwLock},
     time::Duration,
 };
 
@@ -14,7 +15,10 @@ use hx_proto::{
     channel::{ChannelId, CloseCode, MAX_CONTROL_MESSAGE},
     message,
     pb::{self, ControlMessage, RefuseReason, control_message::Message as Ctl},
-    version::{ALPN, ALPN_H3, PROTOCOL_MAJOR, ProtocolVersion, negotiate, peek_hello_version},
+    version::{
+        ALPN, ALPN_H3, Features, PROTOCOL_MAJOR, ProtocolVersion, capabilities, negotiate,
+        peek_hello_version,
+    },
 };
 use quinn::crypto::rustls::{HandshakeData, QuicServerConfig};
 use rustls::pki_types::CertificateDer;
@@ -47,8 +51,20 @@ pub struct ServerOptions {
     pub websocket: bool,
     /// Time allowed from transport accept to a valid `Hello` (protocol §1: 10 s).
     pub handshake_timeout: Duration,
-    /// Connections that may be in the pre-`HelloAck` state at once (protocol §1: 64).
+    /// Time allowed for TLS and (WebSocket) the HTTP upgrade, counted from the transport
+    /// accept; must not exceed `handshake_timeout` (default 5 s).
+    pub transport_timeout: Duration,
+    /// Connections that may be unauthenticated at once: from transport accept until
+    /// `Connection::authorize` (or refusal/close). Protocol §1: 64.
     pub max_pending: usize,
+    /// The same limit per source address (IPv6: per /64). Default 4.
+    pub max_pending_per_ip: usize,
+    /// How long the application may take to accept or refuse a [`PendingSession`] before the
+    /// transport refuses it with `BUSY` (default 10 s).
+    pub decision_timeout: Duration,
+    /// Close an accepted connection that is still not authorized after this long with
+    /// `UNAUTHORIZED` (default 30 s). `None` disables the deadline.
+    pub auth_timeout: Option<Duration>,
     /// Require QUIC address validation (a Retry round trip) before spending handshake state.
     pub require_retry: bool,
     /// Per-connection tunables.
@@ -63,7 +79,11 @@ impl Default for ServerOptions {
             quic: true,
             websocket: true,
             handshake_timeout: Duration::from_secs(10),
+            transport_timeout: Duration::from_secs(5),
             max_pending: 64,
+            max_pending_per_ip: 4,
+            decision_timeout: Duration::from_secs(10),
+            auth_timeout: Some(Duration::from_secs(30)),
             require_retry: true,
             connection: ConnectionOptions::default(),
             h3: None,
@@ -83,6 +103,7 @@ pub struct ServerHello {
 pub(crate) struct ServerCtx {
     pub opts: ServerOptions,
     pub sem: Arc<Semaphore>,
+    pub ips: Arc<StdMutex<HashMap<IpKey, usize>>>,
     pub tx: mpsc::Sender<PendingSession>,
     pub ws_tls: RwLock<Arc<rustls::ServerConfig>>,
 }
@@ -131,6 +152,7 @@ impl Server {
         let (tx, rx) = mpsc::channel(16);
         let ctx = Arc::new(ServerCtx {
             sem: Arc::new(Semaphore::new(opts.max_pending.max(1))),
+            ips: Arc::new(StdMutex::new(HashMap::new())),
             tx,
             ws_tls: RwLock::new(Arc::new(alpn_config(
                 &tls,
@@ -247,17 +269,83 @@ pub(crate) enum PendingInner {
     Ws(Box<WsPending>),
 }
 
+/// Pre-authentication resources held by one connection: a global slot and a per-source slot.
+/// Released when the connection is authorized, refused, closed or dropped.
+pub(crate) struct PreAuthSlot {
+    _permit: OwnedSemaphorePermit,
+    _ip: IpGuard,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct IpKey(u128);
+
+/// IPv4 addresses count individually, IPv6 addresses per /64.
+fn ip_key(ip: IpAddr) -> IpKey {
+    match ip.to_canonical() {
+        IpAddr::V4(a) => IpKey(u128::from(u32::from(a))),
+        IpAddr::V6(a) => IpKey((u128::from(a) >> 64) | (1 << 64)),
+    }
+}
+
+struct IpGuard {
+    map: Arc<StdMutex<HashMap<IpKey, usize>>>,
+    key: IpKey,
+}
+
+impl Drop for IpGuard {
+    fn drop(&mut self) {
+        if let Ok(mut m) = self.map.lock()
+            && let Some(c) = m.get_mut(&self.key)
+        {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                m.remove(&self.key);
+            }
+        }
+    }
+}
+
+impl ServerCtx {
+    /// Take a pre-authentication slot for a new connection from `ip`, or `None` if the global
+    /// or the per-source limit is reached.
+    pub(crate) fn acquire(&self, ip: IpAddr) -> Option<PreAuthSlot> {
+        let key = ip_key(ip);
+        {
+            let mut m = self.ips.lock().ok()?;
+            let c = m.entry(key).or_insert(0);
+            if *c >= self.opts.max_pending_per_ip.max(1) {
+                return None;
+            }
+            *c += 1;
+        }
+        let guard = IpGuard {
+            map: self.ips.clone(),
+            key,
+        };
+        let permit = self.sem.clone().try_acquire_owned().ok()?;
+        Some(PreAuthSlot {
+            _permit: permit,
+            _ip: guard,
+        })
+    }
+}
+
+struct PendingState {
+    inner: PendingInner,
+    slot: PreAuthSlot,
+}
+
 /// A client that passed the transport and version checks and waits for the application's
-/// decision. Holds one of the bounded pre-authentication slots until accepted, refused or
-/// dropped.
+/// decision. It holds a pre-authentication slot and must be answered within
+/// [`ServerOptions::decision_timeout`], after which it is refused with `BUSY` automatically.
 pub struct PendingSession {
     pub(crate) hello: pb::Hello,
     pub(crate) transport: TransportKind,
     pub(crate) remote: SocketAddr,
     pub(crate) peer_certs: Option<Vec<CertificateDer<'static>>>,
-    pub(crate) inner: PendingInner,
     pub(crate) options: ConnectionOptions,
-    pub(crate) _permit: OwnedSemaphorePermit,
+    auth_timeout: Option<Duration>,
+    state: Arc<StdMutex<Option<PendingState>>>,
 }
 
 /// Outcome of looking at a first control message.
@@ -282,21 +370,37 @@ pub(crate) fn check_hello(buf: &[u8]) -> Result<HelloCheck> {
     }
 }
 
+/// Longest prefix of `s` that fits in `max` bytes without splitting a character.
+fn truncate_bytes(s: &str, max: usize) -> &str {
+    let mut end = s.len().min(max);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 pub(crate) fn refuse_message(reason: RefuseReason, text: &str) -> ControlMessage {
     ControlMessage::new(Ctl::Refuse(pb::Refuse {
-        reason: reason as i32,
-        message: text.chars().take(200).collect(),
+        reason: effective_reason(reason) as i32,
+        message: truncate_bytes(text, 256).to_string(),
         version: Some(ProtocolVersion::CURRENT.into()),
     }))
 }
 
-pub(crate) fn close_code_for(reason: RefuseReason) -> CloseCode {
+/// `Unspecified` is not a valid wire value: refusing without a reason means "not authorized".
+fn effective_reason(reason: RefuseReason) -> RefuseReason {
     match reason {
+        RefuseReason::Unspecified => RefuseReason::Unauthorized,
+        other => other,
+    }
+}
+
+pub(crate) fn close_code_for(reason: RefuseReason) -> CloseCode {
+    match effective_reason(reason) {
         RefuseReason::UpdateRequired => CloseCode::UpdateRequired,
-        RefuseReason::Unauthorized => CloseCode::Unauthorized,
         RefuseReason::Busy => CloseCode::Busy,
         RefuseReason::PairingClosed => CloseCode::PairingClosed,
-        RefuseReason::Unspecified => CloseCode::InternalError,
+        _ => CloseCode::Unauthorized,
     }
 }
 
@@ -310,6 +414,46 @@ fn random_session_id() -> Result<[u8; 16]> {
 }
 
 impl PendingSession {
+    pub(crate) fn new(
+        ctx: &ServerCtx,
+        hello: pb::Hello,
+        transport: TransportKind,
+        remote: SocketAddr,
+        peer_certs: Option<Vec<CertificateDer<'static>>>,
+        inner: PendingInner,
+        slot: PreAuthSlot,
+    ) -> Self {
+        let state = Arc::new(StdMutex::new(Some(PendingState { inner, slot })));
+        // Automatic BUSY refusal if the application never decides.
+        let watch = state.clone();
+        let wait = ctx.opts.decision_timeout;
+        tokio::spawn(async move {
+            tokio::time::sleep(wait).await;
+            let st = watch.lock().ok().and_then(|mut s| s.take());
+            if let Some(st) = st {
+                let _ = refuse_inner(st.inner, RefuseReason::Busy, "no decision in time").await;
+                drop(st.slot);
+            }
+        });
+        Self {
+            hello,
+            transport,
+            remote,
+            peer_certs,
+            options: ctx.opts.connection.clone(),
+            auth_timeout: ctx.opts.auth_timeout,
+            state,
+        }
+    }
+
+    fn take_state(&self) -> Result<PendingState> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|mut s| s.take())
+            .ok_or(Error::Timeout("decision window expired"))
+    }
+
     /// The client's `Hello` (validated, same major version).
     pub fn hello(&self) -> &pb::Hello {
         &self.hello
@@ -325,14 +469,19 @@ impl PendingSession {
         self.transport
     }
 
-    /// The certificate chain the client presented during TLS (empty for no client auth).
-    /// The identity decision itself belongs to the injected TLS verifier (workstream 1B).
+    /// The certificate chain the client presented during TLS (`None` without client auth).
+    /// The application MUST re-check the peer key against its current pinned and revoked
+    /// set on every `PendingSession` (TLS resumption is disabled, but revocation can happen
+    /// at any time).
     pub fn peer_certificates(&self) -> Option<&[CertificateDer<'static>]> {
         self.peer_certs.as_deref()
     }
 
-    /// Accept: answer `HelloAck` and return the established [`Connection`].
+    /// Accept: answer `HelloAck` and return the established [`Connection`], which is
+    /// **restricted** until [`Connection::authorize`] is called (see there). For an
+    /// `INTENT_PAIR` hello the advertised features and codecs are empty.
     pub async fn accept(self, reply: ServerHello) -> Result<Connection> {
+        let st = self.take_state()?;
         let client_version = self
             .hello
             .version
@@ -340,16 +489,21 @@ impl PendingSession {
             .map(ProtocolVersion::from)
             .unwrap_or(ProtocolVersion { major: 0, minor: 0 });
         let client_caps = self.hello.capabilities.clone().unwrap_or_default();
+        let capabilities = if self.hello.intent == pb::Intent::Pair as i32 {
+            capabilities(&[], Features::NONE)
+        } else {
+            reply.capabilities
+        };
         let negotiated = negotiate(
             ProtocolVersion::CURRENT,
-            &reply.capabilities,
+            &capabilities,
             client_version,
             &client_caps,
         )?;
         let session_id = random_session_id()?;
         let ack = ControlMessage::new(Ctl::HelloAck(pb::HelloAck {
             version: Some(ProtocolVersion::CURRENT.into()),
-            capabilities: Some(reply.capabilities),
+            capabilities: Some(capabilities),
             session_id: Bytes::copy_from_slice(&session_id),
             software: reply.software,
         }));
@@ -366,8 +520,10 @@ impl PendingSession {
             peer_certs: self.peer_certs.clone(),
             remote_addr: self.remote,
             options: self.options.clone(),
+            slot: Some(st.slot),
+            auth_timeout: self.auth_timeout,
         };
-        match self.inner {
+        match st.inner {
             PendingInner::Quic {
                 conn,
                 mut send,
@@ -380,15 +536,23 @@ impl PendingSession {
         }
     }
 
-    /// Refuse: send `Refuse` with `reason` and `message` (safe to show to the user), then close
-    /// the connection with the matching close code.
+    /// Refuse: send `Refuse` with `reason` and `message` (safe to show to the user; cut to 256
+    /// bytes on a character boundary), then close the connection with the matching close code.
+    /// `RefuseReason::Unspecified` is sent as `Unauthorized`.
     pub async fn refuse(self, reason: RefuseReason, message_text: &str) -> Result<()> {
-        let body = message::encode(&refuse_message(reason, message_text))?;
-        let code = close_code_for(reason);
-        match self.inner {
-            PendingInner::Quic { conn, send, .. } => refuse_quic(&conn, send, &body, code).await,
-            PendingInner::Ws(w) => ws::refuse_server(*w, body, code).await,
-        }
+        let st = self.take_state()?;
+        let r = refuse_inner(st.inner, reason, message_text).await;
+        drop(st.slot);
+        r
+    }
+}
+
+async fn refuse_inner(inner: PendingInner, reason: RefuseReason, text: &str) -> Result<()> {
+    let body = message::encode(&refuse_message(reason, text))?;
+    let code = close_code_for(reason);
+    match inner {
+        PendingInner::Quic { conn, send, .. } => refuse_quic(&conn, send, &body, code).await,
+        PendingInner::Ws(w) => ws::refuse_server(*w, body, code).await,
     }
 }
 
@@ -418,13 +582,13 @@ async fn quic_accept_loop(endpoint: quinn::Endpoint, ctx: Arc<ServerCtx>) {
             let _ = incoming.retry();
             continue;
         }
-        let Ok(permit) = ctx.sem.clone().try_acquire_owned() else {
+        let Some(slot) = ctx.acquire(incoming.remote_address().ip()) else {
             incoming.refuse();
             continue;
         };
         let ctx = ctx.clone();
         tokio::spawn(async move {
-            if let Err(e) = quic_incoming(incoming, &ctx, permit).await {
+            if let Err(e) = quic_incoming(incoming, &ctx, slot).await {
                 tracing::debug!(error = %e, "incoming QUIC connection dropped");
             }
         });
@@ -434,11 +598,14 @@ async fn quic_accept_loop(endpoint: quinn::Endpoint, ctx: Arc<ServerCtx>) {
 async fn quic_incoming(
     incoming: quinn::Incoming,
     ctx: &ServerCtx,
-    permit: OwnedSemaphorePermit,
+    slot: PreAuthSlot,
 ) -> Result<()> {
-    let deadline = Instant::now() + ctx.opts.handshake_timeout;
+    let start = Instant::now();
+    let deadline = start + ctx.opts.handshake_timeout;
+    // TLS must complete sooner than the whole hello exchange.
+    let tls_deadline = start + ctx.opts.handshake_timeout.min(ctx.opts.transport_timeout);
     let mut connecting = incoming.accept().map_err(transport)?;
-    let hd = tokio::time::timeout_at(deadline, connecting.handshake_data())
+    let hd = tokio::time::timeout_at(tls_deadline, connecting.handshake_data())
         .await
         .map_err(|_| Error::Timeout("TLS handshake"))?
         .map_err(transport)?;
@@ -463,7 +630,7 @@ async fn quic_incoming(
         return Err(Error::Violation("unexpected ALPN".into()));
     }
 
-    let conn = tokio::time::timeout_at(deadline, connecting)
+    let conn = tokio::time::timeout_at(tls_deadline, connecting)
         .await
         .map_err(|_| Error::Timeout("QUIC handshake"))?
         .map_err(transport)?;
@@ -519,21 +686,22 @@ async fn quic_incoming(
         }
     };
 
-    let pending = PendingSession {
+    let pending = PendingSession::new(
+        ctx,
         hello,
-        transport: TransportKind::Quic,
+        TransportKind::Quic,
         remote,
         peer_certs,
-        inner: PendingInner::Quic {
+        PendingInner::Quic {
             conn: conn.clone(),
             send,
             recv,
         },
-        options: ctx.opts.connection.clone(),
-        _permit: permit,
-    };
-    if ctx.tx.try_send(pending).is_err() {
-        conn.close(quic_code(CloseCode::Busy), b"server busy");
+        slot,
+    );
+    if let Err(e) = ctx.tx.try_send(pending) {
+        let (mpsc::error::TrySendError::Full(p) | mpsc::error::TrySendError::Closed(p)) = e;
+        let _ = p.refuse(RefuseReason::Busy, "server busy").await;
     }
     Ok(())
 }
