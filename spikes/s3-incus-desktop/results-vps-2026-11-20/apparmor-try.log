@@ -1,0 +1,13 @@
+# Debian 13 container, security.nesting=false, Incus 6.0.5, kernel 7.0.0, Ubuntu 26.04 host.
+# Result of `incus exec <c> -- systemctl is-system-running` 20 s after start, per raw.apparmor snippet
+# (copied from the terminal output of apparmor-try.sh, two rounds; default profile alone: "initializing" and no network)
+pivot_root: initializing
+mount: initializing
+pivot+mount: initializing
+pivot+mount+ptrace+signal: running
+userns+all (userns, pivot_root, mount, ptrace, signal): running
+ptrace: initializing
+signal: running
+ptrace+signal: running
+# security.nesting=true alone: running
+# raw.apparmor "userns,": initializing

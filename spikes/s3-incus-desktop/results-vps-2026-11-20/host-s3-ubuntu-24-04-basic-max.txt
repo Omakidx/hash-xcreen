@@ -1,0 +1,6 @@
+host[s3-ubuntu-24-04-basic-max-before-start] used_mib=813 available_mib=7122 loadavg=0.26 0.86 0.83 incusd_rss_mib=86 steal=0
+host[s3-ubuntu-24-04-basic-max-after-settle] used_mib=1046 available_mib=6889 loadavg=0.11 0.56 0.72 incusd_rss_mib=104 steal=0
+host-cgroup memory.current of s3-ubuntu-24-04-basic: 320 MiB (limit 6400MiB)
+               total        used        free      shared  buff/cache   available
+Mem:            7936        1040        1396           4        5809        6895
+Swap:              0           0           0

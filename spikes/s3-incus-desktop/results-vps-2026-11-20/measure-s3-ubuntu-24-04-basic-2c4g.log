@@ -1,0 +1,35 @@
+container=s3-ubuntu-24-04-basic
+loadavg_host 0.50 1.31 0.93
+Failed to connect to bus: No such file or directory
+desktop_up=yes
+W: https://ppa.launchpadcontent.net/mozillateam/ppa/ubuntu/dists/noble/InRelease: Signature by key 0AB215679C571D1C8325275B9BDB3D89CE49EC21 uses weak algorithm (rsa1024)
+settling 90s
+version number:    11.0
+  dimensions:    1920x1080 pixels (508x285 millimeters)
+cpu_avg_cores=.0002
+mem_limit_mib=4096
+mem_current_mib=628
+mem_anon_mib=153
+mem_file_cache_mib=454
+mem_shmem_mib=0
+mem_kernel_mib=20
+free_strict_mib=3467
+free_reclaimable_mib=3921
+--- free -m (lxcfs view)
+               total        used        free      shared  buff/cache   available
+Mem:            4096         166        3466           0         463        3929
+Swap:              0           0           0
+--- top RSS
+  RSS COMMAND
+108976 Xorg
+80104 xfce4-session
+40284 xfdesktop
+32384 xfce4-panel
+29956 xfwm4
+27356 panel-10-notifi
+26660 panel-14-action
+26184 xfsettingsd
+24276 panel-6-systray
+23716 xfce4-notifyd
+23412 Thunar
+--- procs: 37

@@ -1,0 +1,52 @@
+crw-rw---- 1 root kvm 10, 232 Nov 20 11:41 /dev/kvm
+vm_launch_cmd_s=10.5
+vm_boot_to_agent_s=34.8  (launch command + first boot + incus-agent ready)
+STAGE wait-network 0.1s ok
+STAGE apt-bootstrap 14.5s ok
+STAGE apt-repos 0.5s ok
+STAGE pre-steps 0.0s ok
+STAGE apt-install 192.5s ok
+STAGE user 0.8s ok
+STAGE files 0.4s ok
+STAGE services 2.0s ok
+STAGE steps 0.3s ok
+TOTAL apply 211.1s
+vm_apply_s=211.0
+vm_reboot_to_agent_s=27.2
+vm_desktop_up_s=30.8 (reboot to XFCE panel)
+  dimensions:    1920x1080 pixels (508x285 millimeters)
+bash: line 1: scrot: command not found
+
+X.Org X Server 1.21.1.11
+404 /usr/lib/xorg/Xorg :0 -config /etc/hx/xorg-dummy.conf -auth /run/hx-xorg/Xauthority -noreset -nolisten tcp -novtswitch -sharevts -logfile /var/log/hx-xorg.log
+vm_cpu_busy_ticks_over_60s: busy=13 idle=11991 busy_pct=0.11
+               total        used        free      shared  buff/cache   available
+Mem:            3848         539        3174          22         367        3308
+Swap:              0           0           0
+
+  RSS COMMAND
+106196 Xorg
+92124 dockerd
+76964 xfce4-session
+44464 containerd
+39540 xfdesktop
+31128 xfce4-panel
+29252 xfwm4
+procs: 148
+host view (QEMU for s3-vm):
+qemu_rss_mib=1049 qemu_pcpu_avg_since_start=35.3
+Mem:            7936        1931        1467         989        5830        6004
+## docker in the VM (default bridge)
+Unable to find image 'hello-world:latest' locally
+latest: Pulling from library/hello-world
+4f55086f7dd0: Pulling fs layer
+4f55086f7dd0: Download complete
+4f55086f7dd0: Pull complete
+d5e71e642bf5: Download complete
+Digest: sha256:1e4c05b897a751332ce85c7e9449da2d93514ea2dea6dbb0e2753c9e949b2bfa
+Status: Downloaded newer image for hello-world:latest
+
+Hello from Docker!
+This message shows that your installation appears to be working correctly.
+
+driver=overlayfs cgroup=systemd

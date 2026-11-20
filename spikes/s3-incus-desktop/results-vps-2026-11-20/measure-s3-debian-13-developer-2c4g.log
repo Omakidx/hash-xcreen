@@ -1,0 +1,34 @@
+container=s3-debian-13-developer
+loadavg_host 2.11 1.35 0.82
+Failed to connect to system scope bus via local transport: No such file or directory
+desktop_up=yes
+settling 90s
+version number:    11.0
+  dimensions:    1920x1080 pixels (509x286 millimeters)
+cpu_avg_cores=.0002
+mem_limit_mib=4096
+mem_current_mib=480
+mem_anon_mib=139
+mem_file_cache_mib=321
+mem_shmem_mib=8
+mem_kernel_mib=20
+free_strict_mib=3615
+free_reclaimable_mib=3928
+--- free -m (lxcfs view)
+               total        used        free      shared  buff/cache   available
+Mem:            4096         159        3614           8         329        3936
+Swap:              0           0           0
+--- top RSS
+  RSS COMMAND
+104820 Xorg
+78548 xfce4-session
+49104 xfdesktop
+32728 xfce4-panel
+29356 xfwm4
+27052 wrapper-2.0
+24428 wrapper-2.0
+24128 xfsettingsd
+23908 xfce4-notifyd
+23476 Thunar
+17284 systemd-journal
+--- procs: 33
