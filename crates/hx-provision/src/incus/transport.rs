@@ -57,6 +57,8 @@ pub struct Response {
     pub status: u16,
     /// Whole body.
     pub body: Bytes,
+    /// Response headers, names lower-cased.
+    pub headers: std::collections::BTreeMap<String, String>,
 }
 
 /// Something that can carry a [`Request`] to Incus. The real implementation is [`UnixTransport`];
@@ -122,6 +124,15 @@ impl UnixTransport {
                 .await
                 .map_err(|e| IncusError::Http(e.to_string()))?;
             let status = resp.status().as_u16();
+            let headers = resp
+                .headers()
+                .iter()
+                .filter_map(|(k, v)| {
+                    v.to_str()
+                        .ok()
+                        .map(|v| (k.as_str().to_ascii_lowercase(), v.to_string()))
+                })
+                .collect();
             let body = Limited::new(resp.into_body(), limit)
                 .collect()
                 .await
@@ -135,7 +146,11 @@ impl UnixTransport {
                     }
                 })?
                 .to_bytes();
-            Ok(Response { status, body })
+            Ok(Response {
+                status,
+                body,
+                headers,
+            })
         }
         .await;
         driver.abort();

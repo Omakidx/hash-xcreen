@@ -106,6 +106,10 @@ pub struct HostSpec {
     /// Every address of the host (public IPv4/IPv6, private addresses of other interfaces,
     /// Docker bridge gateways). Desktops cannot reach any of them.
     pub host_addresses: Vec<IpAddr>,
+    /// Let desktops reach private networks behind the host (LAN, VPN/tailnet, VPC ranges, host
+    /// Docker bridges). Default `false`: the generated ruleset drops forwarding to them. Offer it
+    /// to the user only as an explicit, warned opt-in (installer option).
+    pub allow_private_networks: bool,
 }
 
 impl HostSpec {
@@ -258,19 +262,54 @@ pub fn acl_attachment(acl: &str) -> BTreeMap<String, String> {
     ])
 }
 
-/// nftables ruleset that stops anything arriving from the desktop bridge from reaching host
-/// listeners: the ACL only knows the host's unicast addresses, but a service bound to `0.0.0.0`
-/// is also reachable via broadcast, multicast, link-local and addresses added later.
+/// Inputs of [`nft_host_protection`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostFirewall {
+    /// The desktop bridge (Linux interface name).
+    pub bridge: String,
+    /// The bridge's own IPv4 address (the gateway desktops use for DNS and DHCP).
+    pub gateway: Option<Ipv4Addr>,
+    /// The bridge's IPv4 subnet as `a.b.c.d/nn` (network address), kept reachable in forwarding.
+    pub subnet: Option<String>,
+    /// Skip dropping forwarding to private networks (see [`HostSpec::allow_private_networks`]).
+    pub allow_private_networks: bool,
+}
+
+/// The network address form of `a.b.c.d/nn` (`10.77.3.1/24` -> `10.77.3.0/24`).
+pub fn network_of(cidr: &str) -> Option<String> {
+    let (addr, bits) = cidr.split_once('/')?;
+    let a: Ipv4Addr = addr.parse().ok()?;
+    let bits: u32 = bits.parse().ok().filter(|b| *b <= 32)?;
+    let mask = if bits == 0 {
+        0
+    } else {
+        u32::MAX << (32 - bits)
+    };
+    Some(format!("{}/{bits}", Ipv4Addr::from(u32::from(a) & mask)))
+}
+
+/// nftables ruleset that keeps desktops away from the host and from networks behind it.
 ///
-/// The `input` chain (traffic *to* the host; forwarding to the internet is a different hook and
-/// untouched) accepts, for packets that enter on `bridge`: established/related traffic, DHCP
-/// (udp 67-68), and DNS (udp and tcp 53) addressed to the gateway; everything else is dropped, for
-/// IPv4 and IPv6 alike (`inet` family). The text starts with a declaration and `delete table`, so
-/// loading it with `nft -f` replaces any earlier version.
+/// Why it exists: the ACL on the bridge only knows the host's unicast addresses. A service bound
+/// to `0.0.0.0` is also reachable via broadcast, multicast, link-local and addresses added later,
+/// and traffic the host *forwards* (masqueraded as the host) could reach host Docker bridges, other
+/// Incus bridges, VPN/tailnet interfaces, VPC private ranges and DNAT'd host ports.
+///
+/// Both chains only look at packets that enter on `bridge`:
+/// - `input` (to the host): accept established/related, DHCP (udp 67-68) and DNS (udp and tcp 53)
+///   to the gateway; drop everything else, IPv4 and IPv6 alike (`inet` family).
+/// - `forward` (through the host): accept established/related; drop connections that were
+///   DNAT'd (published host ports); keep the bridge's own subnet; drop destinations in
+///   10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16, fc00::/7 and
+///   fe80::/10 unless `allow_private_networks`. Everything else (the internet, via NAT) passes.
+///
+/// The text starts with a declaration and `delete table`, so `nft -f` replaces any earlier
+/// version, and it parses with `nft -c -f` (check mode, no changes).
 ///
 /// **The caller installs it** (`hx-privd` / the installer, workstream 1C/1E) and must persist it
 /// across reboots, for example with an `nftables.service` include or a unit ordered after Incus.
-pub fn nft_host_protection(bridge: &str, gateway: Option<Ipv4Addr>) -> Result<String, IncusError> {
+pub fn nft_host_protection(fw: &HostFirewall) -> Result<String, IncusError> {
+    let bridge = fw.bridge.as_str();
     let ok = !bridge.is_empty()
         && bridge.len() <= 15
         && bridge
@@ -279,6 +318,13 @@ pub fn nft_host_protection(bridge: &str, gateway: Option<Ipv4Addr>) -> Result<St
     if !ok {
         return Err(IncusError::InvalidArgument(format!(
             "`{bridge}` is not a safe interface name"
+        )));
+    }
+    if let Some(s) = &fw.subnet
+        && network_of(s).as_deref() != Some(s.as_str())
+    {
+        return Err(IncusError::InvalidArgument(format!(
+            "`{s}` is not an IPv4 network address in a.b.c.d/nn form"
         )));
     }
     let mut out = String::new();
@@ -291,11 +337,24 @@ pub fn nft_host_protection(bridge: &str, gateway: Option<Ipv4Addr>) -> Result<St
     out.push_str(&format!("    iifname != \"{bridge}\" return\n"));
     out.push_str("    ct state established,related accept\n");
     out.push_str("    ip protocol udp udp dport { 67, 68 } accept\n");
-    if let Some(g) = gateway {
+    if let Some(g) = fw.gateway {
         out.push_str(&format!("    ip daddr {g} udp dport 53 accept\n"));
         out.push_str(&format!("    ip daddr {g} tcp dport 53 accept\n"));
     }
-    out.push_str("    counter drop\n  }\n}\n");
+    out.push_str("    counter drop\n  }\n");
+    out.push_str("  chain forward {\n");
+    out.push_str("    type filter hook forward priority -10; policy accept;\n");
+    out.push_str(&format!("    iifname != \"{bridge}\" return\n"));
+    out.push_str("    ct state established,related accept\n");
+    out.push_str("    ct status dnat drop\n");
+    if let Some(s) = &fw.subnet {
+        out.push_str(&format!("    ip daddr {s} accept\n"));
+    }
+    if !fw.allow_private_networks {
+        out.push_str("    ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16 } counter drop\n");
+        out.push_str("    ip6 daddr { fc00::/7, fe80::/10 } counter drop\n");
+    }
+    out.push_str("  }\n}\n");
     Ok(out)
 }
 
@@ -463,10 +522,18 @@ pub async fn ensure_host<T: Transport>(
     let desktop = ensure_profile(desktop_profile(n)).await?;
     let compat = ensure_profile(compat_profile(n)).await?;
 
-    let host_firewall = match gateway {
-        Some(IpAddr::V4(g)) => nft_host_protection(&n.bridge, Some(g))?,
-        _ => nft_host_protection(&n.bridge, None)?,
-    };
+    let host_firewall = nft_host_protection(&HostFirewall {
+        bridge: n.bridge.clone(),
+        gateway: match gateway {
+            Some(IpAddr::V4(g)) => Some(g),
+            _ => None,
+        },
+        subnet: existing
+            .config
+            .get("ipv4.address")
+            .and_then(|a| network_of(a)),
+        allow_private_networks: spec.allow_private_networks,
+    })?;
     Ok(HostReport {
         host_firewall,
         pool,

@@ -180,6 +180,7 @@ async fn lifecycle(c: Client<UnixTransport>) {
         pool: PoolSource::LoopFile { size_gib: 5 },
         ipv4: "auto".into(),
         host_addresses: vec!["203.0.113.7".parse::<IpAddr>().unwrap()],
+        allow_private_networks: false,
     };
     let r1 = ensure_host(&c, &spec).await.unwrap();
     eprintln!("ensure_host #1: {r1:?}");
@@ -473,6 +474,124 @@ async fn lifecycle(c: Client<UnixTransport>) {
         "internet egress from the container (informational): {}",
         net.trim()
     );
+
+    // --- ingress default drop: the host (gateway address) may connect in, other bridge members may not -------------
+    let (_, perl, _) = sh(&c, "hx1d-test-c1", "command -v perl || true").await;
+    assert!(
+        !perl.trim().is_empty(),
+        "this check needs perl in the image to run a listener"
+    );
+    let in_port = 18080;
+    let listener = format!(
+        "(perl -MIO::Socket::INET -e 'alarm 150; $l = IO::Socket::INET->new(Listen => 5, LocalPort => {in_port}, ReuseAddr => 1) or die; while ($c = $l->accept) {{ print $c \"HELLO\\n\"; close $c }}' </dev/null >/dev/null 2>&1 &); sleep 1; echo started"
+    );
+    let (_, started, _) = sh(&c, "hx1d-test-c1", &listener).await;
+    assert_eq!(started.trim(), "started");
+    let c1_ip = c.instance_state("hx1d-test-c1").await.unwrap().ipv4["eth0"][0].clone();
+    // (a) a connection whose source is the bridge gateway (what the agent on the host uses) succeeds.
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.bind(std::net::SocketAddr::new(gateway, 0)).unwrap();
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        sock.connect(format!("{c1_ip}:{in_port}").parse().unwrap()),
+    )
+    .await
+    .expect("connect from the gateway address timed out: ingress must admit the gateway")
+    .expect("connect from the gateway address failed");
+    let mut hello = String::new();
+    tokio::io::AsyncReadExt::read_to_string(&mut stream, &mut hello)
+        .await
+        .unwrap();
+    assert_eq!(
+        hello.trim(),
+        "HELLO",
+        "host-initiated connection into the desktop works under default-drop ingress"
+    );
+    eprintln!("host -> desktop from {gateway}: ok");
+    // (b) another member of the bridge is refused (ACLs apply between bridge members).
+    let c2_spec = DesktopSpec::for_plan("hx1d-test-c2", n.clone(), &plan, Limits::default())
+        .with_image(dspec.image.clone());
+    c.create_instance(&c2_spec.to_create().unwrap(), Duration::from_secs(900))
+        .await
+        .unwrap();
+    c.set_state(
+        "hx1d-test-c2",
+        hx_provision::incus::StateAction::Start,
+        false,
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    wait_system_running(
+        &c,
+        "hx1d-test-c2",
+        ReadyOptions {
+            timeout: Duration::from_secs(120),
+            allow_degraded: false,
+        },
+    )
+    .await
+    .expect("second container must boot");
+    let peer = format!(
+        "timeout 4 bash -c 'echo > /dev/tcp/{c1_ip}/{in_port}' && echo REACHED || echo BLOCKED"
+    );
+    let (_, from_c2, _) = sh(&c, "hx1d-test-c2", &peer).await;
+    eprintln!("second container -> desktop: {}", from_c2.trim());
+    eprintln!(
+        "INFO second container -> desktop (same bridge, L2): {}",
+        from_c2.trim()
+    );
+    // Host connections from an address that is not the gateway (a Docker bridge or public address)
+    // are dropped by default-drop ingress; with the ACL detached the same connection works.
+    let addrs = std::process::Command::new("ip")
+        .args(["-o", "-4", "addr", "show"])
+        .output()
+        .unwrap();
+    let other_src = String::from_utf8_lossy(&addrs.stdout)
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(3).map(str::to_string))
+        .filter_map(|cidr| {
+            cidr.split('/')
+                .next()
+                .and_then(|a| a.parse::<std::net::Ipv4Addr>().ok())
+        })
+        .find(|a| {
+            !a.is_loopback() && IpAddr::V4(*a) != gateway && !a.to_string().starts_with("10.36.")
+        });
+    let other_src = other_src.expect("the host has another IPv4 address to originate from");
+    let try_from = |src: std::net::Ipv4Addr| {
+        let target = format!("{c1_ip}:{in_port}");
+        async move {
+            let sock = tokio::net::TcpSocket::new_v4().unwrap();
+            sock.bind(std::net::SocketAddr::new(IpAddr::V4(src), 0))
+                .unwrap();
+            matches!(
+                tokio::time::timeout(
+                    Duration::from_secs(4),
+                    sock.connect(target.parse().unwrap())
+                )
+                .await,
+                Ok(Ok(_))
+            )
+        }
+    };
+    let blocked = !try_from(other_src).await;
+    eprintln!(
+        "host source {other_src} -> desktop with the ACL: {}",
+        if blocked { "BLOCKED" } else { "REACHED" }
+    );
+    c.patch_network_config(&n.bridge, &detach).await.unwrap();
+    let open = try_from(other_src).await;
+    eprintln!(
+        "host source {other_src} -> desktop, ACL detached: {}",
+        if open { "REACHED" } else { "BLOCKED" }
+    );
+    c.patch_network_config(&n.bridge, &hx_provision::host::acl_attachment(&n.acl))
+        .await
+        .unwrap();
+    assert!(open, "control: reachable without the ACL");
+    assert!(blocked, "ingress admits only the gateway address");
+    destroy_instance(&c, "hx1d-test-c2").await.unwrap();
 
     // --- Docker gate: Incus older than 6.0.5 is refused without touching the container ----------------------
     let docker_plan = Catalog::embedded()

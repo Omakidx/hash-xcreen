@@ -20,6 +20,8 @@ use super::types::{
 
 /// Default timeout of a plain request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long reading one file out of an instance may take.
+const READ_FILE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Longest single `/wait` poll; the client loops until its own deadline.
 const WAIT_SLICE: Duration = Duration::from_secs(30);
 
@@ -650,7 +652,9 @@ impl<T: Transport> Client<T> {
                 body: Bytes::new(),
                 content_type: None,
                 max_response: Some(max_bytes),
-                timeout: Duration::from_secs(60),
+                // Short: a FIFO or similar planted by the container makes the daemon's read block
+                // (the headers arrive only after it opens the file), and must not hold us for long.
+                timeout: READ_FILE_TIMEOUT,
             })
             .await?;
         if r.status >= 400 {
@@ -662,7 +666,14 @@ impl<T: Transport> Client<T> {
                 )),
             };
         }
-        Ok(Some(r.body.to_vec()))
+        // Only regular files: directories and symlinks come back with another X-Incus-Type.
+        match r.headers.get("x-incus-type").map(String::as_str) {
+            Some("file") => Ok(Some(r.body.to_vec())),
+            other => Err(IncusError::Protocol(format!(
+                "`{path}` is not a regular file (type {})",
+                other.unwrap_or("missing")
+            ))),
+        }
     }
 
     /// Delete a file in an instance (a missing file is not an error).

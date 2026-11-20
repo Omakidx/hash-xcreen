@@ -71,6 +71,10 @@ pub struct State {
     pub fail_stdin_push_after_store: bool,
     /// Answer the second `PATCH /1.0/instances/<n>` with an error.
     pub fail_second_instance_patch: bool,
+    /// `X-Incus-Type` answered for GET files of these paths (default `file`).
+    pub file_types: HashMap<String, String>,
+    /// Type answered for any other path, when set.
+    pub default_file_type: Option<String>,
     pub instance_patches: u32,
     /// Waits that answer `Running` before an operation completes.
     pub pending_waits: HashMap<String, u32>,
@@ -98,6 +102,8 @@ impl State {
             files: HashMap::new(),
             fail_stdin_push_after_store: false,
             fail_second_instance_patch: false,
+            file_types: HashMap::new(),
+            default_file_type: None,
             instance_patches: 0,
             pending_waits: HashMap::new(),
             next: 0,
@@ -117,14 +123,13 @@ mod tempdir {
     pub struct Dir(pub std::path::PathBuf);
     impl Dir {
         pub fn new() -> Self {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let p = std::env::temp_dir().join(format!(
                 "hx-fake-incus-{}-{}",
                 std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0)
+                N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
+            let _ = std::fs::remove_dir_all(&p);
             std::fs::create_dir_all(&p).unwrap();
             Dir(p)
         }
@@ -455,14 +460,24 @@ impl Fake {
                                 headers,
                                 body,
                             };
-                            let (status, text) = {
+                            let (status, text, ftype) = {
                                 let mut s = st.lock().unwrap();
                                 s.log.push(rec.clone());
-                                s.handle(&rec)
+                                let ft = (rec.method == "GET" && rec.path.contains("/files?path="))
+                                    .then(|| {
+                                        s.file_types
+                                            .get(&query_path(&rec.path))
+                                            .cloned()
+                                            .or_else(|| s.default_file_type.clone())
+                                            .unwrap_or_else(|| "file".to_string())
+                                    });
+                                let (status, text) = s.handle(&rec);
+                                (status, text, ft)
                             };
                             Ok::<_, std::convert::Infallible>(
                                 Response::builder()
                                     .status(status)
+                                    .header("X-Incus-Type", ftype.unwrap_or_default())
                                     .header("Content-Type", "application/json")
                                     .body(Full::new(Bytes::from(text)))
                                     .unwrap(),

@@ -694,3 +694,28 @@ fn request_debug_never_prints_the_body() {
     );
     assert!(dbg.contains("<25 bytes>"), "{dbg}");
 }
+
+#[tokio::test]
+async fn read_file_refuses_anything_but_a_regular_file() {
+    let fake = Fake::start().await;
+    fake.with(|s| {
+        for p in ["/run/dir", "/run/link", "/run/fifo", "/run/file"] {
+            s.files.insert(p.into(), b"data".to_vec());
+        }
+        s.file_types.insert("/run/dir".into(), "directory".into());
+        s.file_types.insert("/run/link".into(), "symlink".into());
+        s.file_types.insert("/run/fifo".into(), "".into());
+    });
+    let c = fake.client();
+    assert_eq!(
+        c.read_file("c1", "/run/file", 100).await.unwrap().unwrap(),
+        b"data"
+    );
+    for p in ["/run/dir", "/run/link", "/run/fifo"] {
+        let e = c.read_file("c1", p, 100).await.unwrap_err();
+        assert!(
+            matches!(e, IncusError::Protocol(ref m) if m.contains("not a regular file")),
+            "{p}: {e}"
+        );
+    }
+}
