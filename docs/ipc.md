@@ -364,3 +364,334 @@ privd is the deputy; gatewayd is the less-privileged caller. These hold regardle
 ## 9. Admin socket of gatewayd (sketch)
 
 The CLI needs the device registry, which gatewayd owns (§2). gatewayd listens on `/run/hx/gatewayd-admin.sock` (root:root 0600; `SO_PEERCRED` uid 0 only; same framing, `Hello`, error model and limits as §4, with its own command set). Commands: `Status` (listener state, connected clients, link state), `ListDevices`, `RevokeDevice` {`device_id`} (also closes that device's live sessions, as protocol.md §11 requires), `CloseSessions`. Detailed messages belong to 1B/1C. If gatewayd is down, `hx-agent devices` may edit the registry file offline as root under a lock file. `hx-agent logs` reads the journal directly; `hx-agent status` combines `GetHostInfo`/`GetDesktop` with the admin `Status`.
+
+---
+
+# Part 2: the session link
+
+## 10. Purpose, topology and trust
+
+`hx-gatewayd` relays media and input between a client (protocol.md) and `hx-session`, the process inside the desktop container that captures, encodes and injects. The session link is the unix-socket connection between the two. It carries:
+
+- encoded video frames with what the gateway needs to build the media header (§15), and the cursor (§14);
+- input events from the client, including a coalesced mouse-motion stream (§14);
+- clipboard and file transfers in both directions (§16);
+- per-frame delivery feedback and cancel signals from the gateway to the session's congestion controller, and cancel requests the other way (§14, §15);
+- control: start and stop streaming, reconfigure (bitrate cap, frame rate, resize to the client window, policies), request an IDR, statistics, goodbye (§14);
+- audio, reserved (§15.4).
+
+**Trust.** `hx-session` runs as the desktop user in a container whose software the user controls and which may be compromised; malware there has the same uid as `hx-session`. Everything arriving on the link is **untrusted input** to the internet-facing gatewayd, parsed with explicit limits before allocation (§13, §19). Nothing secret ever goes over the link: no PIN, device key, token, password, client address or device name. The gateway sends only what the desktop needs to render and act: input, display and policy settings, feedback counters.
+
+What malware in the container can do with the link, and why that is acceptable:
+
+| Action | Result |
+|---|---|
+| Replace or impersonate `hx-session` (listen on the socket path first, or kill it) | It can show the client any picture and cursor, send any clipboard, and observe the input sent to the desktop. All of that is already within its power (it controls the screen and receives the keystrokes anyway); the client treats remote clipboard and links as untrusted (architecture §8.7). |
+| Send malformed or oversized data, or flood | Bounded by the §13 limits, the §19 validation and rate limits; a violation drops the link and does not affect gatewayd's other duties. |
+| Send decodable-but-malicious video or cursor data | Reaches the client's decoder. Out of scope for the link; noted as a risk (§22, question 8). |
+| Reach anything else through the socket | Nothing: the socket is a byte pipe to one gatewayd connection (§11); there is no descriptor passing, and the link carries no authority (no secrets, no path to privd). |
+
+## 11. Transport and socket placement
+
+**Decision: an Incus proxy device, with gatewayd dialling out and `hx-session` listening.**
+
+```
+ host                                                    container (unprivileged, isolated idmap)
+ hx-gatewayd ──connect──► /run/hx/link/main.sock  ⇄  forkproxy  ⇄  /run/user/1000/hx-session.sock ◄── listen: hx-session
+   (uid hx-gatewayd)       (listening socket made by the                 (0600, owned by the desktop user)
+                            proxy device, owner hx-gatewayd 0600)
+```
+
+- **Container side**: `hx-session` creates and listens on `/run/user/<uid>/hx-session.sock` (the `XDG_RUNTIME_DIR` of the lingering desktop user, which exists on a systemd desktop), mode `0600`, owned by the desktop user. No other account in the container can connect (root in the container can; root there is part of the container's trust domain).
+- **Host side**: `hx-privd` adds one proxy device per desktop (`ProvisionSessionLink`, §6.11): `bind=host`, `listen=unix:/run/hx/link/<desktop_id>.sock`, `connect=unix:/run/user/<uid>/hx-session.sock`, host-side socket owned by the gatewayd uid and gid, mode `0600`. `/run/hx/link/` is root:`hx-gatewayd` 0750, so gatewayd can connect but cannot create, rename, replace or delete entries; no other host user can reach it.
+- **Direction**: gatewayd connects when it needs the desktop (first authorized client) and `hx-session` accepts. Reasons: (1) the gateway fully controls how many connections exist, which keeps its attack surface at a fixed number of connections per desktop instead of an accept loop that malware can hammer; (2) a gatewayd restart needs no cleanup in the container; (3) `hx-session` idles at about zero cost with no link, and streams only while one exists. When no `hx-session` is listening, the proxy closes the connection at once and gatewayd retries with backoff (§19.2).
+- **Why a proxy device, not a shared directory or a socket bind-mounted from the host.** The proxy copies bytes between two sockets it owns, so the container never obtains a kernel-level handle to a host-created socket: no `SCM_RIGHTS` descriptor passing into gatewayd, no peer-credential games, no dependency on how the isolated idmap shows host owners. A bind-mounted directory would also give the container a path on the host filesystem. S3 used a proxy device for its network tests, but nobody has measured its throughput at the media rate (a 20 Mbps ceiling with frames up to 16 MiB), which is one of the items to verify below.
+- **Peer identity.** There is none to authenticate on the container side: `SO_PEERCRED` of an accepted connection shows the proxy process, not the gateway, and anything running as the desktop user could connect too, which gives it nothing beyond what it already has (§10). gatewayd does not authenticate `hx-session` either: the host socket path proves "this is the proxy device privd created for this desktop", and the handshake (§12) proves nothing beyond the protocol version. Neither side's decisions rely on the identity of the other. gatewayd reads the link with plain `read`/`recv` and never receives ancillary data; a control message is a violation.
+- **To verify during implementation** (1C integration test on a real Incus 6.0.x with an isolated idmap): the exact semantics of the proxy device's `uid`, `gid`, `mode`, `security.uid` and `security.gid` for a unix-to-unix proxy; that connections work after the container is stopped and started; throughput at 20 Mbps with 16 MiB frames. Fallback if `security.uid` does not behave: the container side connects as the container's root (which bypasses the `0600` file mode inside the container's user namespace), with no loss of host-side protection.
+- **Rejected alternatives**: a TCP port on the bridge (the bridge's nftables rules and ACL deliberately forbid desktop-to-host traffic; opening a hole for this would weaken the isolation both layers exist to provide); `/dev/incus` or the guest API (`security.guestapi=false` on every desktop); vsock (containers have none; only VMs).
+
+## 12. Connection lifecycle
+
+### 12.1 Lanes
+
+One link is **three** unix connections (lanes) to the same socket path, so that large or slow data never blocks small urgent data. Each lane is a separate byte stream through the proxy.
+
+| Lane | Id | Direction of bulk traffic | Carries |
+|---|---|---|---|
+| `ctl` | 1 | both, small messages | handshake, control, input, mouse motion, cursor, frame feedback, cancels, statistics, events |
+| `media` | 2 | session → gateway | video frames, audio (reserved) |
+| `bulk` | 3 | both | clipboard and file transfers |
+
+The gateway to session direction of `media` is unused; a byte received there is a violation.
+
+### 12.2 Preamble and versioning
+
+Each lane starts with an 8-byte preamble from the connecting side (the gateway), followed by a 16-byte `link_id` (random, chosen by the gateway per link, identical on the three lanes). The session answers with the same 8 bytes:
+
+```
+ 0       4        5        6      7
++--------+--------+--------+------+------+----------------+
+| "HXLK" | major  | minor  | lane | 0x00 | link_id (16 B) |   gateway → session
++--------+--------+--------+------+------+----------------+
+```
+
+The answer has the first 8 bytes only, with `minor` lowered to the session's if that is lower. Rules:
+
+- The link version is `1.0`. Same major, different minor is accepted; the negotiated minor is the lower one, and a newer minor never sends a message to a peer whose negotiated minor predates it (the rule of protocol.md §4.2). A different major is refused by closing the connection; gatewayd then records `session_outdated` for the desktop and asks privd for `InstallSession` (an update replaced the agent but not the in-container binary).
+- `hx-session` accepts at most **one link** (one `link_id`) at a time with at most one connection per lane. A new `link_id` on a `ctl` lane **supersedes** the old link: the old lanes are closed and the session behaves as for link loss (§12.4). A duplicate lane of the current link is closed.
+- The gateway opens `ctl` first and waits for the session's `info` (§14.2); it opens `media` and `bulk` after that. If the session does not see both extra lanes within 5 s of `ctl` it drops the link. Preamble and `info` must complete within 5 s of connect, else the gateway closes.
+- A malformed preamble, wrong magic, a `lane` outside 1 to 3 or a non-zero reserved byte closes the connection (on the gateway: a violation, §19.2).
+
+### 12.3 Liveness
+
+- The gateway sends `ping` {`nonce`} on `ctl` every 2 s while a link exists; the session answers `pong` within 1 s from its control thread (never from the media path). 10 s without a `pong` and no other `ctl` traffic: the gateway closes the link (a fault, §19.2).
+- While streaming, the session also sends `stats` about once per second, which doubles as a heartbeat. An idle desktop produces no frames by design (architecture §6.1), so frame silence is not a liveness signal.
+- The session closes the link and stops streaming if it receives nothing from the gateway for 15 s.
+
+### 12.4 Link loss and restart
+
+When the link closes for any reason the session, within 1 s: stops capture and encoding (idle cost about zero), injects **`release_all`** (every held key and button up), aborts transfers, discards queued output, and returns to listening for a new link. It never exits because the link ended. The gateway treats a lost link while a client is connected as `INTERNAL_ERROR`: it sends the client `Goodbye`, then redials with backoff, and the client reconnects to a fresh stream (video restarts from an IDR regardless).
+
+## 13. Framing and limits
+
+After the preamble every lane carries frames:
+
+```
++----------------+---------+------------------------+
+| length (u32 LE)| kind u8 | body (length - 1 bytes)|
++----------------+---------+------------------------+
+```
+
+The same shape as §4, so one reader implementation serves privd and the link. `length` counts the kind byte and body and is checked against the table **before** allocating. An unknown `kind`, a `kind` not valid on that lane or in that direction, a zero or oversize `length`, a frame truncated by a close, or a protobuf body that fails to decode is a **violation** (§19.2). An unknown *protobuf variant or field* inside a valid message is ignored and counted (forward compatibility).
+
+| Lane | Kind | Direction | Body | Max `length` |
+|---|---|---|---|---|
+| `ctl` | `0x01` `SessionToGateway` | S → G | protobuf (§14) | 327 685 (the 327 680-byte cursor limit of protocol.md §3.1: a 256 × 256 RGBA shape is 262 144 bytes plus protobuf overhead; plus the kind byte) |
+| `ctl` | `0x02` `GatewayToSession` | G → S | protobuf (§14) | 16 384 |
+| `media` | `0x10` Video | S → G | media header (20) + payload (§15) | 16 777 237 (16 MiB payload + 20 + kind) |
+| `media` | `0x11` Audio | S → G | `seq` u32, `timestamp` u32, Opus packet 1 to 1 100 | 1 110 (reserved, §15.4) |
+| `bulk` | `0x20` TransferOpen | both | protobuf `TransferOpen` {`id` u32, `channel` (CLIPBOARD or FILE), `header` = protocol `TransferHeader`} | 4 200 |
+| `bulk` | `0x21` TransferData | both | `id` u32 + raw bytes (1 to 65 536) | 65 541 |
+| `bulk` | `0x22` TransferEnd | both | `id` u32 | 5 |
+| `bulk` | `0x23` TransferAbort | both | `id` u32 + `code` u32 (protocol.md §8 transfer codes) | 9 |
+
+Message-level limits (checked by the **gateway** for S → G and by the session for G → S):
+
+| Item | Limit |
+|---|---|
+| Strings (`software`, event `message`, `goodbye` `message`) | 128, 256, 256 bytes; control and ANSI characters removed before display or logging |
+| `stats` | 4 per second; every counter a bounded integer |
+| Cursor shape | at most 256 × 256, `rgba.len == width * height * 4`, hotspot inside the image (protocol.md §5.4); at most 20 shapes per second and 4 MiB of shape data per second |
+| Cursor position | coalesced by the gateway to at most one per 1 ms (latest wins); never queued unboundedly |
+| `event` | 10 per second |
+| Video frame payload | at most 16 MiB; at most 2 × the negotiated `max_fps` frames in any one-second window; at most 4 IDR frames per second |
+| Transfers | at most 4 concurrent per direction; one clipboard transfer per direction at a time (a new one aborts the previous); clipboard at most 64 MiB; file at most 4 GiB in v1 (question 7); chunks at most 64 KiB; unread data at most 1 MiB per transfer and 4 MiB per link |
+| Input G → S | `InputEvent` at most 1 024 (protocol.md §3.1); input queue 4 096 events |
+| Memory per link on the gateway | at most 40 MiB for the lanes combined (a video window of up to 4 frames or 12 MiB, whichever comes first, plus bulk and ctl buffers) |
+
+## 14. Control lane (`ctl`)
+
+Messages are protobuf. They reuse the `hx.v1` types of protocol.md wherever the content is the same (`InputEvent`, `CursorEvent`, `ClientStats`, `TransferHeader`, `VideoCodec`), so field semantics are not defined twice. The new messages below belong to a package `hx.link.v1` (schema location: question 9).
+
+### 14.1 Gateway to session: `GatewayToSession` (`oneof`)
+
+| Variant | Fields | Meaning |
+|---|---|---|
+| `start` | `epoch` u32, `config` (`StreamConfig`) | Begin streaming for a client. The session creates or resumes the pipeline, replies `stream_format`, and its first frame is an IDR flagged `RESYNC`. `epoch` identifies the client (§18); the controller resets on `start`. |
+| `stop` | `epoch` | Stop capturing and encoding within 1 s (the last client left). Keeps listening; clears held keys. |
+| `reconfigure` | `config` (`StreamConfig`) | Apply new settings while streaming (client window resize, bitrate cap, frame rate, policies). Zero (unset) fields keep their value, as `ViewConfig` does. |
+| `request_idr` | `epoch`, `last_decoded_frame` u32 | The client lost sync (protocol `RequestKeyframe`) or the gateway dropped frames. The session's next frame is an IDR flagged `RESYNC`. The gateway sends at most 2 per second; the session coalesces repeats. |
+| `input` | `event` (`hx.v1.InputEvent`) | One validated key, button, scroll or `release_all` event, in client order. |
+| `mouse` | `seq` u32, `relative` bool, `x` sint32, `y` sint32 | Latest-wins pointer motion, already coalesced by the gateway (§17). Absolute values are clamped to the current display; relative deltas to ±32 768. |
+| `frame_feedback` | `results` (repeated, at most 64) of `FrameResult` | Outcome per video frame (§15.3), sent as soon as known. |
+| `transport_stats` | `rtt_us` u32, `delivery_rate_kbps` u32 | The gateway's view of the path to the client, about 4 per second while streaming; an optional extra input for the congestion controller. |
+| `client_stats` | `hx.v1.ClientStats` | Forwarded client decode statistics (about 1 per second). |
+| `ping` / `goodbye` | `nonce` u64 / `code` u32, `message` | Liveness; orderly end. `code` is a protocol.md §8 close code. |
+
+`StreamConfig`:
+
+| Field | Type | Validation (gateway before sending; session again on receipt) | Meaning |
+|---|---|---|---|
+| `codec` | `VideoCodec` | `H264` in v1; anything else is ignored and answered with `event` `CAPTURE_ERROR` | Codec to produce |
+| `max_fps` | u32 | 0 (keep or default) or 1 to 240 | Frame ceiling (`Control::set_max_fps`, 60 in v1) |
+| `bitrate_cap_kbps` | u32 | 0 = auto; otherwise 100 to 100 000 | Ceiling for the session's own controller (the ladder tops out at 20 000). The gateway has already applied the per-device bandwidth cap (architecture §7.4). |
+| `width`, `height` | u32 | both 0 (keep) or each 1 to 16 384; the session rounds down to even | Desired remote size from the client window (`Control::request_resize`) |
+| `scale_percent` | u32 | 0 (= 100) or 50 to 400 | HiDPI scale |
+| `audio_enabled` | bool | requires the `AUDIO` feature | Reserved |
+| `clipboard_enabled` | bool | | When false the session neither reads nor sends clipboard data |
+| `file_transfer_enabled` | bool | | When false the session refuses file transfers |
+
+### 14.2 Session to gateway: `SessionToGateway` (`oneof`)
+
+| Variant | Fields | Meaning |
+|---|---|---|
+| `info` | `software` (at most 128), `features` u64, `codecs` (repeated `VideoCodec`, at most 4), `display` {`width`, `height`}, `max_fps` u32 | First message on `ctl`. `features` bits: 0 `AUDIO`, 1 `CLIPBOARD`, 2 `FILE_TRANSFER` (the protocol.md §4.3 bits), 8 `INPUT` (XTest available), 9 `RESIZE` (RandR resize available). The gateway intersects them with the client's capabilities and with policy. |
+| `stream_format` | `epoch`, `codec`, `width`, `height`, `fps`, `first_frame` u32 | The format from `first_frame` on (becomes the client's `StreamInfo`, protocol.md §5.2). Sent after `start`, after a resize and whenever the picture size changes. The video lane races this message, which is why `first_frame` exists. |
+| `cursor` | `event` (`hx.v1.CursorEvent`) | Shape (RGBA, straight alpha, content-hash `id`) or position. The session converts from `hx-capture`'s premultiplied ARGB and clamps cursors larger than 256 × 256. On `start` and `request_idr` it re-sends the current shape (`Control::request_idr` already does). |
+| `cancel_frames` | `up_to_frame` u32 | The session wants every not-yet-delivered frame numbered up to this one (serial arithmetic) cancelled in transit. |
+| `stats` | `SessionStats` | About 1 per second while streaming. |
+| `event` | `kind` (`FATAL`, `DISPLAY_CHANGED`, `CAPTURE_ERROR`, `CLIPBOARD_ERROR`, `RESIZE_REFUSED`), `message` (at most 256) | Something the gateway should log or tell the client. `FATAL` means the pipeline stopped (`Control::fatal_error`). |
+| `pong` / `goodbye` | `nonce` / `code`, `message` | As above. |
+
+`SessionStats` (interval values, derived from `hx_session::stats::StatsSnapshot` by subtraction): `interval_ms`, `captures`, `frames`, `keyframes`, `idr_frames`, `bytes`, `max_frame_bytes`, `errors`, `capture_buffer_waits`, `encode_p50_us`, `encode_p95_us`, `total_p95_us`, `cpu_ms`, `target_bitrate_kbps`, `fps_ceiling`, `queue_depth_max`. The gateway uses it for logs, metrics and the admin `Status`; the client protocol has no server-to-client statistics message yet (question 5).
+
+## 15. Media lane (`media`)
+
+### 15.1 Video frame
+
+One `kind 0x10` frame per encoded frame. The body is **exactly** protocol.md §6's 20-byte media header followed by the encoded payload, so the gateway validates the header and then forwards header and payload unchanged as the body of the client's frame stream (channel byte `0x05` first on QUIC; the identical bytes inside a `0x05` message on WebSocket). That keeps the path zero-copy friendly: the gateway reads each frame into one pooled buffer (`bytes::Bytes`) and slices it; it never re-encodes or concatenates.
+
+How the session fills the header:
+
+| Header field | Source |
+|---|---|
+| `version` | `1` |
+| `codec` | `EncodedFrame.codec` mapped to the `VideoCodec` number (H.264 = 1) |
+| `flags` | bit 0 `KEY` = `EncodedFrame.idr` (an IDR; a gradual-intra-refresh recovery point does **not** set `KEY`, because `KEY` means "decodes without earlier frames"); bit 1 `RESYNC` = this IDR answers a `start`, a `request_idr`, a `cancel_frames` or a gateway cancel. Other bits 0. |
+| `frame_number` | a `u32` counter owned by the link layer, incremented for **every** `EncodedFrame` taken from `Pipeline::frames`, including one dropped before it is written, so a gap means "skipped". It does not follow `EncodedFrame::frame_no` (a `u64` that restarts when the encoder is recreated). Wraps modulo 2^32. |
+| `capture_timestamp_us` | the frame's capture time on the container's monotonic clock in microseconds (from `EncodedFrame.timing`, `hx_capture::mono_ns` / 1000); the client only uses differences |
+| `payload_len` | `EncodedFrame::bytes().len()` |
+
+Width, height and fps are **not** in the header; they travel in `stream_format` (§14.2).
+
+Gateway validation per frame, before the payload is accepted: `length` within the limit; header present; `version == 1`; `codec` equals the negotiated codec; no reserved flag bits; `payload_len == length - 21`; `frame_number` strictly newer (serial arithmetic) than the last accepted on this link, else drop and count; rate limits of §13. A structural failure is a link violation (§19.2); a rate overage drops the frame. The gateway does **not** decode the payload and does not alter the header (which is why the header is validated, not rewritten).
+
+### 15.2 Backpressure and no unbounded queues
+
+- The gateway **always drains the media lane**: it reads each frame promptly into a pool of at most 4 frames or 12 MiB (§13). It never stops reading because the client is slow, so the session's writer never blocks behind a slow client, and `Pipeline::frames` is never stalled by the network.
+- Toward the client, the gateway limits frames in flight to what the transport window allows. When a frame cannot be sent within the window or a budget of about 100 ms, it is **not queued**: the oldest not-yet-delivered frame streams are reset with `STALE_FRAME` (protocol.md §6.2) and reported as `CANCELLED`, and frames never started are reported as `DROPPED`.
+- Because H.264 P-frames depend on earlier frames, any cancel or drop breaks the chain. After one, the gateway discards every frame that is not `KEY` until the next `KEY | RESYNC` frame and sends `request_idr` (limited to 2 per second). This is the "cancel queued frame streams and send a fresh full image" rule of architecture §7.4, with the gateway doing the stream resets and the session producing the fresh image.
+- The session's own writer must complete each frame it starts (a half-written frame would desynchronise the lane). A write that makes no progress for 2 s closes the lane (a fault).
+
+### 15.3 Acks and cancels (feedback to the congestion controller)
+
+`frame_feedback.results`: one `FrameResult` per frame with `frame_number` u32, `outcome`, `bytes` u32, `elapsed_us` u32 (from the first write to the client until its ack: `FrameAck.elapsed`) and `queued_us` u32 (time the frame waited in the gateway before its first write).
+
+| `outcome` | From `hx_transport::AckOutcome` | Meaning |
+|---|---|---|
+| `DELIVERED` | `Delivered` | The client received the whole frame (stream completion on QUIC, `0x09` ack on WebSocket) |
+| `CANCELLED` | `Cancelled` | The gateway reset the stream (`STALE_FRAME`), by its own decision or on `cancel_frames` |
+| `REJECTED` | `Rejected(code)` | The client stopped the stream |
+| `DROPPED` | (gateway only) | The gateway discarded the frame without starting to send it (window full, no client, resync discard) |
+
+`ConnectionLost` is not sent; the client connection ending is followed by `stop`. Feedback arrives on `ctl`, so a congestion signal is never stuck behind video. The session's controller (1F) uses `elapsed_us`, `queued_us`, the `DELIVERED` rate and the `CANCELLED`/`DROPPED` counts to step its bitrate ladder (S2: settled near 3.5 Mbps at 150 ms RTT, 10 Mbps and 1% loss) and to decide when to send `cancel_frames` and force a `RESYNC` IDR. Feedback for one frame is sent at most once; a result for an unknown frame number is ignored by the session.
+
+### 15.4 Audio (reserved)
+
+`kind 0x11` is the protocol.md §7.2 datagram body (`seq`, `timestamp`, one Opus packet, 10 ms frames) as a media-lane frame. It is not produced in Phase 1: the `AUDIO` feature bit is 0 in `info`, and a `0x11` frame while the feature was not negotiated is a violation. Audio is loss tolerant: the gateway forwards it as a datagram and drops it rather than queueing it.
+
+## 16. Bulk lane (`bulk`)
+
+Clipboard and files use the transfer shape of protocol.md §9.4 (header, data chunks, end, abort) on one lane, so many transfers share one low-priority connection and cannot delay anything else.
+
+- **IDs**: the gateway allocates odd ids and the session even ids; an id already in use is a violation. `TransferOpen.channel` is `CLIPBOARD` (protocol channel `0x07`) or `FILE` (`0x08`); its `header` is the protocol `TransferHeader` (`mime`, `name`, `size`) under the same validation (printable-ASCII `mime`, the file-name rules of protocol.md §3.1, empty `name` for the clipboard). The gateway applies those rules to every header the session sends **before** it opens a client stream.
+- **Size**: the receiver counts bytes; fewer or more than `size`, or a clipboard over 64 MiB, aborts that transfer (`TRANSFER_ERROR`) and the lane continues. File limit 4 GiB in v1 (the protocol sets none yet; question 7).
+- **Flow control**: a byte stream gives per-lane, not per-transfer, flow control. The gateway reads a transfer's data only while it holds less than 1 MiB unread for it and 4 MiB for the link, so a stalled client stream pauses the bulk lane and never `ctl` or `media`. One slow transfer can delay other transfers; accepted.
+- **Policy**: the gateway enforces the device's clipboard and file settings in both directions (drops the data and aborts), and also tells the session through `StreamConfig` so that it does not read the selection at all. Clipboard transfers from the session are limited to 4 per second.
+- **Names are hints.** The session writes received files into a directory of its own choosing (`~/Downloads/hx-received/`), picks its own file name, never overwrites (`O_EXCL`), never follows symlinks (`O_NOFOLLOW`), and creates the file with mode `0600`. The gateway never treats a name as a path, and forwards the session's names to the client only as display hints, after the protocol.md name validation.
+
+## 17. Priorities and backpressure
+
+The requirement: **input never waits behind video**, and video is dropped or cancelled, never queued without bound.
+
+1. **Lanes separate sizes.** Video (up to 16 MiB), cursor shapes and transfers each have their own connection or direction; `ctl` G → S carries only messages of at most 16 KiB.
+2. **The gateway's writer for `ctl` G → S** is a single task with queues drained in strict order: **P0** `input` events (ordered, bounded at 4 096; overflow means the client is abusing the channel and it is closed with `PROTOCOL_ERROR`), then the single-slot **`mouse`** (latest wins: a newer motion replaces an unsent one, absolute and relative merged as in protocol.md §7.1, `MouseCoalescer`); **P1** `frame_feedback`, `request_idr`, `reconfigure`, `start`/`stop`, `ping`; **P2** `transport_stats`, `client_stats`, `goodbye`. A key or button always goes out before pending motion that arrived after it. Button events carry absolute coordinates, so a coalesced motion cannot misplace a click.
+3. **The session's reader for `ctl` G → S** runs on its own thread, independent of the encode pipeline, and injects input with the XTest backend straight from it. The encoder threads cannot delay input.
+4. **The gateway's reader for `ctl` S → G** parses cursor, `stream_format`, `cancel_frames` and `stats` in a task separate from the media reader and the bulk reader. Cursor positions coalesce to the newest within 1 ms; a shape is never overtaken by a later position (the protocol.md ordering rule).
+5. **Video**: drained promptly, bounded window, cancel or drop with feedback, resync by IDR (§15.2). **Bulk**: lowest priority; the gateway yields after every 256 KiB so it cannot monopolise the runtime.
+
+## 18. One active client per desktop and takeover
+
+v1 has one active client per desktop. The session link knows clients only through `epoch` (§14.1); all policy sits in gatewayd.
+
+- A second client that authenticates (pinned key and PIN passed) while another is active **takes over**, subject to a per-server policy `takeover` ∈ `allow` (default) or `deny` (the newcomer is answered `BUSY`). The default is `allow` because a user switching devices must not be locked out by their own stale session; both clients have passed authentication, and the displaced one is told.
+- Takeover sequence in gatewayd, in this order: (1) stop forwarding the old client's input and send `input{release_all}` to the session; (2) cancel the old client's in-flight frames (`CANCELLED`) and abort its transfers (`TransferAbort`); (3) tell the old client it was displaced: `Goodbye` with code `BUSY` and a message naming the new device (sanitized), until a dedicated `TAKEN_OVER` close code exists in protocol.md §8 (question 4); (4) increment `epoch` and send `start{epoch, config}` for the new client, then expect `stream_format` with the same `epoch` and an IDR `RESYNC` frame. Frame numbers keep counting, so the new client's reorder window starts clean.
+- The session resets its congestion controller on `start`, discards feedback tagged for earlier frames and re-sends the cursor shape. Clipboard and transfers are per client and are not carried across.
+- Only the current `epoch` may send input to the session: gatewayd forwards nothing from a client that is not the active one.
+- When the last client leaves, gatewayd sends `stop`, keeps the link for 30 s (so a reconnect is instant), then closes `bulk`, `media` and `ctl`. The next authorized client redials.
+
+## 19. Untrusted input and fault handling
+
+### 19.1 Rules gatewayd follows for every session-supplied byte
+
+1. Lengths are checked against §13 **before** any allocation; buffers come from fixed pools; no allocation is sized by a session-supplied value beyond those limits.
+2. All integers are range-checked (frame numbers, sizes, `payload_len == length - 21`, coordinates, counters); statistics use saturating arithmetic.
+3. Strings are length limited and sanitized (control and ANSI characters removed) before they reach a log, the admin API or a client; session-supplied text is never used as a path, command or URL.
+4. Cursor, transfer-header and file-name content gets the same validation as when a client sends it (protocol.md §3.1, §5.4, §5.5), before any of it is forwarded to a client.
+5. Unknown protobuf fields and `oneof` variants are ignored and counted; undecodable bodies are violations.
+6. Rates are enforced per message class (§13); the gateway never spends unbounded CPU or memory because the session is chatty.
+7. The gateway never sends anything secret to the session, and never derives behaviour from where the session says it is, who it says it is, or what version string it claims, beyond the protocol version already negotiated.
+8. No descriptors, no ancillary data; the lanes are read with plain `read`.
+9. Fuzz targets for 1H: the lane framer, `SessionToGateway` decoding, media-header validation, `TransferOpen` validation, cursor-shape validation.
+
+### 19.2 Faults and recovery
+
+A **violation** (malformed frame or preamble, forbidden kind, oversize length, structural media-header error, a byte on an unused direction) or a sustained rate overage (3 consecutive seconds) closes all three lanes, increments a per-link fault counter, logs a rate-limited warning with the sanitized reason, sends the client `Goodbye(INTERNAL_ERROR)` if one is connected, and leaves gatewayd otherwise unaffected. Redialling uses exponential backoff 1, 2, 4, … up to 30 s. After 5 faults within 10 minutes gatewayd asks privd for `RestartSession` (class A, so rate limited by privd); after 3 restarts in an hour it stops redialling and reports the desktop as `session_unavailable` in status, so the app can say so (a bad session package or malware, the user's call). A violation never crashes gatewayd: parse errors are values.
+
+## 20. Mapping
+
+### 20.1 To the client protocol (protocol.md)
+
+| Client protocol (protocol.md) | Session link |
+|---|---|
+| Control: `Hello`, `HelloAck`, `Refuse`, `pairing`, `auth`, `Ping`/`Pong` | Terminate at the gateway; the session sees none of it |
+| `ViewConfig` (§5.2) | The gateway validates, applies device policy (bandwidth cap, clipboard, files) and sends `start` or `reconfigure` with a `StreamConfig` |
+| `StreamInfo` | Built from `stream_format`, with its `first_frame` unchanged |
+| `RequestKeyframe` | `request_idr` |
+| `ClientStats` | `client_stats` (forwarded) |
+| `Goodbye` | `goodbye` / `stop` |
+| Input `0x02` (§5.3) | `input` (validated, coordinates clamped to the current display, scancode at most `0xE7`, valid buttons) |
+| Mouse `0x03` (§7.1) | `mouse` (coalesced) |
+| Cursor `0x04` (§5.4) | `cursor`, validated, positions coalesced |
+| Video `0x05` (§6) | `media` kind `0x10`, header forwarded unchanged |
+| Frame acks and `STALE_FRAME` (§6.2) | `frame_feedback` (G → S), `cancel_frames` (S → G) |
+| Audio `0x06` (§7.2) | `media` kind `0x11` (reserved) |
+| Clipboard `0x07`, Files `0x08` (§5.5, §9.4) | `bulk` lane |
+
+### 20.2 To the capture and encode pipeline (what 1F implements)
+
+`apps/hx-session` currently exposes the protocol-independent media path in `hx_session::pipeline`. The link layer sits on top of it and uses only this API:
+
+| Link | `hx_session` API |
+|---|---|
+| `start` | `Pipeline::start_x11(PipelineConfig { encoder.bitrate_kbps / fps, max_fps, .. })`, or resume a warm pipeline; the first frame follows `Control::request_idr()` |
+| `stop` | `Pipeline::shutdown()` (or park it; CPU must reach about zero within 1 s) |
+| `reconfigure.bitrate_cap_kbps` | The 1F congestion controller's ceiling; the rate it picks goes to `Control::set_bitrate_kbps` (100 to 100 000, no encoder reopen) |
+| `reconfigure.max_fps` | `Control::set_max_fps` (1 to 240) |
+| `reconfigure.width/height/scale` | `Control::request_resize(Size)`; a refusal appears in `StatsSnapshot::errors` and becomes `event RESIZE_REFUSED`; the resulting size is announced by `stream_format` |
+| `request_idr` | `Control::request_idr()` |
+| `frame_feedback`, `transport_stats` | Inputs of the controller (1F), not of the pipeline |
+| `cancel_frames` (S → G) | Produced by the controller; followed by an IDR request to itself |
+| video | `Pipeline::frames()` (`EncodedFrame`: `codec`, `keyframe`, `idr`, `timing`, `data`), turned into the §15.1 header by the link layer; the pooled buffer returns to the encoder when the frame has been written |
+| `cursor` | `Pipeline::cursor_events()` (`CursorEvent::Shape(Arc<CursorShape>)`, `Position`), converted from premultiplied ARGB `u32` to straight RGBA bytes |
+| `stats` | `Control::stats()` → `StatsSnapshot`, differenced into intervals |
+| `event FATAL` | `Control::fatal_error()` |
+| `input`, `mouse` | The XTest injector of 1F; not part of the pipeline |
+| clipboard, files | The clipboard and file components of 1F |
+
+## 21. Implementation notes and gaps
+
+Not part of the contract; for the people implementing it.
+
+1. **Schema location.** Both IPC contracts are internal to one release, so their protobuf need not live in the public client schema. Proposal: a new workspace crate `hx-ipc` holding the framing (§4, §13), the `hx.privd.v1` and `hx.link.v1` messages and helpers, shared by `hx-gatewayd`, `hx-privd`, the CLI and `hx-session` (it must not pull in `quinn`). That adds a crate to architecture §3 and dependencies to tech-stack.md (`zeroize`, an HPKE implementation, `rustix` for `SO_PEERCRED` and `mlock`); both documents change in the branch that adds the crate.
+2. **`hx-provision` gaps** (1D): (a) a device-add call on the Incus client for the proxy device (§6.11); (b) a standalone password-change entry point built on the post stage's stdin-file mechanism (§6.9); (c) setting limits on a live instance, including the root disk size (§6.8); (d) recipe vars for `settings`: hostname, timezone, locale, keyboard (§6.5); (e) the Docker disable path (§6.9) and the host-network-only fallback; (f) teardown helpers that delete only marked objects (§6.13). Until they exist the matching commands return `UNIMPLEMENTED`, or privd uses `Client` methods directly.
+3. **Unit naming.** The recipe's `hx-session.service` currently runs `xfce4-session`. The streaming daemon needs another unit name (for example `hx-stream.service`), enabled with `systemctl --global enable`; `InstallSession` and `RestartSession` use that name.
+4. **Resumed installs.** The installer's resume (architecture §5.3) re-calls idempotent commands; the app resends the password after a gatewayd restart.
+5. **Version coupling.** gatewayd, privd, the CLI and the in-container `hx-session` ship from one release. The link tolerates a minor mismatch only; after an update gatewayd calls `InstallSession` for any desktop reporting an older major.
+
+## 22. Open questions for review
+
+Decisions the reviewer should challenge.
+
+1. **Device registry in gatewayd, not privd** (§2). It keeps pre-auth data out of root and lets revocation close live sessions, but a compromised gatewayd can add its own device. The alternative (registry in privd, gatewayd asks on every connection) adds a round trip and a root-side parser for no real gain against a compromised gatewayd, which relays the desktop anyway. Is that argument convincing?
+2. **Keeping the Drive token and backup key out of gatewayd needs sealing to a privd key** (§5.2), and the client must learn privd's public key through an authenticated path. That needs a change in 1B's pairing exchange (for example the key included in the SPAKE2-confirmed transcript). Until then the architecture claim "gatewayd never sees the Drive token" (§8.6) cannot be met, because the paired channel terminates at gatewayd. It is a Phase 2 blocker; in Phase 1 the password is plain, so gatewayd sees it in transit. Accept, or require sealing of the password too?
+3. **Setup window** (§5.1): the gateway may create the host and desktop only while an Admin-opened window is open, up to 24 hours. Is a window the right control, or should the installer perform stages 4 to 8 itself as root, with the app only displaying progress? The latter removes gatewayd's setup power entirely but means the installer needs the wizard's secrets, which the architecture says arrive over the paired channel.
+4. **Takeover policy** (§18): default `allow`, last authenticated wins, the displaced client told with `Goodbye(BUSY)`. protocol.md needs a `TAKEN_OVER` close code (note for its owner; not edited here). Is `allow` the right default?
+5. **No server-to-client statistics message in protocol.md**: the stats overlay of architecture §11.1 needs one (the gateway has `SessionStats` and `transport_stats`). Note for the protocol owner.
+6. **Docker enable from the Gateway role** (§6.9): it reduces container isolation, and a compromised gatewayd could trigger it (with the acknowledgement flag) to make a later container escape easier. Mitigations are the flag, logging, a 3 per hour rate and the roll-back; the alternative is Admin-only plus a CLI step. Acceptable for v1?
+7. **File size limit** of 4 GiB (§13, §16): protocol.md sets a limit only for the clipboard (64 MiB). Needs agreement; the transfer UI and the gateway's per-link bounds assume it.
+8. **A hostile session can feed the client's video decoder** (§10): the gateway does not decode, so a crafted H.264 stream or cursor reaches libavcodec in the client. Should the gateway at least check NAL structure (Annex B framing), accepting the CPU cost? A fuzz-and-sandbox answer in the client (1G/1H) may be better.
+9. **Where the schemas live**: a new `hx-ipc` crate (§21, note 1) versus `crates/hx-proto/proto`. Affects who owns the contract and the crate dependency graph.
+10. **Proxy device semantics** (§11): the `uid`, `gid`, `mode` and `security.*` behaviour of unix-to-unix proxies on Incus 6.0 with isolated idmaps, and their throughput at the media rate, are assumed from the documentation and must be verified before implementation; the fallback is stated.
+11. **Several desktops**: with one desktop per server (v1) a single gateway-side socket suffices. Per-desktop listen paths already exist (§11), but the missing isolation between desktops on one bridge (architecture §4.2, "Known limit") is separate and unsolved.
+12. **Network access by the update fetcher and image fetcher** (§6.5, §6.12) is specified as a sandboxed child so that root never makes HTTP requests; the sandbox profile and the exact signature scheme for prebuilt images belong to 1C and 1D and are not specified here.
