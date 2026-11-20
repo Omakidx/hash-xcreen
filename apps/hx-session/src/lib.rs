@@ -9,6 +9,9 @@
 //! that needs both: `hx-codec` is also the client's decoder crate and must not pull in X11,
 //! and `hx-capture` must not know about video codecs.
 
+pub mod clipboard;
+pub mod congestion;
+pub mod input;
 pub mod pacing;
 pub mod pipeline;
 pub mod stats;

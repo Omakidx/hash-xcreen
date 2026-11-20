@@ -118,6 +118,14 @@ impl Shared {
         }
     }
 
+    fn snapshot(&self) -> StatsSnapshot {
+        StatsSnapshot {
+            target_kbps: self.bitrate_kbps.load(Relaxed),
+            max_fps: self.max_fps.load(Relaxed),
+            ..self.stats.snapshot()
+        }
+    }
+
     fn fail(&self, what: String) {
         if let Ok(mut g) = self.fatal.lock() {
             g.get_or_insert(what);
@@ -181,7 +189,7 @@ impl Control {
 
     /// Statistics so far.
     pub fn stats(&self) -> StatsSnapshot {
-        self.shared.stats.snapshot()
+        self.shared.snapshot()
     }
 
     /// The most recent recoverable error message, if any.
@@ -325,7 +333,7 @@ impl Pipeline {
 
     /// Statistics so far.
     pub fn stats(&self) -> StatsSnapshot {
-        self.shared.stats.snapshot()
+        self.shared.snapshot()
     }
 
     fn stop_and_join(&mut self) {
@@ -341,7 +349,7 @@ impl Pipeline {
     /// thread had already stopped on an unrecoverable error (or panicked).
     pub fn shutdown(mut self) -> Result<StatsSnapshot, PipelineError> {
         self.stop_and_join();
-        let stats = self.shared.stats.snapshot();
+        let stats = self.shared.snapshot();
         let fatal = self.shared.fatal.lock().ok().and_then(|g| g.clone());
         match fatal {
             Some(msg) => Err(PipelineError::Failed(msg)),

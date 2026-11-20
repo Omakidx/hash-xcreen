@@ -33,7 +33,8 @@ Every language, library, tool and external service hash-xcreen uses, and why. It
 | Area | Choice | Why |
 |---|---|---|
 | X11 capture | **XDamage**, **XShm**, **XFixes** (cursor), **RandR** (resize), via `x11rb` | Change-driven, copy-free capture; pure-Rust X11 bindings |
-| Input injection | **XTest** (X11); **libei** later for Wayland desktops | Standard injection APIs per display stack |
+| Input injection | **XTest** (X11) via `x11rb`, keys as USB HID usage → evdev → X keycode; **libei** later for Wayland desktops | Standard injection APIs per display stack; layout-independent physical keys |
+| Clipboard | X11 selections (CLIPBOARD; PRIMARY opt-in) via `x11rb` with **XFixes** owner notifications and ICCCM `INCR`; worker woken by `rustix` `eventfd` | No extra dependency; text, PNG images and `text/uri-list` files both ways |
 | Colour conversion | `yuvutils-rs` (SIMD) | Fast RGB→YUV without a C dependency |
 | Codec framework | **libavcodec** (FFmpeg) via `ffmpeg-next` / `ffmpeg-sys-next` (7.1 against Ubuntu 24.04's FFmpeg 6.1; newer FFmpeg needs a newer `ffmpeg-next`) | One API for every encoder and decoder, software and hardware |
 | Software encoder | **x264** (`ultrafast`, `zerolatency`, `crf=23`, VBV of a few frames, bitrate ladder ≤ 20 Mbps, sliced threads, intra refresh, BT.709 limited-range VUI tags) | Best low-latency software H.264 (4–8 ms encode, 11–17 ms p95 end to end on a quiet VPS in S2); GPL is fine because we are AGPL |

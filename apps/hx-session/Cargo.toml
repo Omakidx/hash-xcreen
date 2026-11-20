@@ -23,7 +23,8 @@ path = "src/bin/bench/main.rs"
 crossbeam-channel.workspace = true
 hx-capture.workspace = true
 hx-codec.workspace = true
-rustix = { workspace = true, features = ["time"] }
+hx-proto.workspace = true
+rustix = { workspace = true, features = ["fs", "time"] }
 thiserror.workspace = true
 x11rb.workspace = true
 

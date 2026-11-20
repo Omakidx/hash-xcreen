@@ -119,6 +119,10 @@ pub struct StatsSnapshot {
     pub queues: [QueueDepth; 3],
     /// Process CPU time (all threads) since the pipeline started.
     pub cpu: Duration,
+    /// The encoder rate cap in force now (set by the congestion controller), kbit/s.
+    pub target_kbps: u32,
+    /// The frame-rate ceiling in force now.
+    pub max_fps: u32,
 }
 
 impl StatsSnapshot {
@@ -290,6 +294,9 @@ impl Stats {
             },
             queues,
             cpu: process_cpu().saturating_sub(self.cpu_start),
+            // Filled in by the pipeline, which owns the encoder settings.
+            target_kbps: 0,
+            max_fps: 0,
         }
     }
 }
