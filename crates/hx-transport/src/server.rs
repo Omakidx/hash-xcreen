@@ -118,9 +118,38 @@ pub struct Server {
     tasks: Vec<JoinHandle<()>>,
 }
 
+/// A ticket producer that never produces tickets, so stateless resumption stays off even if
+/// the injected configuration enables it.
+#[derive(Debug)]
+struct NoTickets;
+
+impl rustls::server::ProducesTickets for NoTickets {
+    fn enabled(&self) -> bool {
+        false
+    }
+    fn lifetime(&self) -> u32 {
+        0
+    }
+    fn encrypt(&self, _plain: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+    fn decrypt(&self, _cipher: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+/// Prepare an injected TLS configuration for serving: set the ALPN values and switch off every
+/// form of session resumption and early data. A resumed handshake skips the client-certificate
+/// verifier (and the session cache would be shared between QUIC and WebSocket), so a revoked
+/// or unpinned key could otherwise reconnect on a cached session. Applications still must
+/// re-check the peer key on every `PendingSession` (protocol §11).
 fn alpn_config(tls: &rustls::ServerConfig, alpn: &[&[u8]]) -> rustls::ServerConfig {
     let mut c = tls.clone();
     c.alpn_protocols = alpn.iter().map(|a| a.to_vec()).collect();
+    c.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    c.ticketer = Arc::new(NoTickets);
+    c.send_tls13_tickets = 0;
+    c.max_early_data_size = 0;
     c
 }
 
@@ -138,7 +167,8 @@ impl Server {
     /// ephemeral port is chosen for UDP and TCP uses the same number.
     ///
     /// `tls` is injected by the caller (identity, client-certificate verification); it must
-    /// allow TLS 1.3. ALPN values are set by this crate.
+    /// allow TLS 1.3 and should allow nothing else (TLS 1.2 handshakes are dropped). ALPN
+    /// values are set by this crate, and session resumption and early data are forced off.
     pub async fn bind(
         addr: SocketAddr,
         tls: Arc<rustls::ServerConfig>,
@@ -221,14 +251,19 @@ impl Server {
     }
 
     /// Replace the TLS configuration for new connections (certificate hot reload). Existing
-    /// connections are untouched.
+    /// connections are untouched: **revoking a device must also close its live sessions**,
+    /// because neither a reload nor a changed verifier affects connections already
+    /// established. Only TLS 1.3 sessions are served (anything else is dropped at the handshake).
     pub fn reload_tls(&self, tls: Arc<rustls::ServerConfig>) -> Result<()> {
         if let Some(ep) = &self.endpoint {
             ep.set_server_config(Some(quic_server_config(&tls, self.ctx.opts.h3.is_some())?));
         }
-        if let Ok(mut w) = self.ctx.ws_tls.write() {
-            *w = Arc::new(alpn_config(&tls, &[hx_proto::version::ALPN_WEBSOCKET]));
-        }
+        let mut w = self
+            .ctx
+            .ws_tls
+            .write()
+            .map_err(|_| Error::Config("TLS configuration lock is poisoned".into()))?;
+        *w = Arc::new(alpn_config(&tls, &[hx_proto::version::ALPN_WEBSOCKET]));
         Ok(())
     }
 
@@ -635,10 +670,7 @@ async fn quic_incoming(
         .map_err(|_| Error::Timeout("QUIC handshake"))?
         .map_err(transport)?;
     let remote = conn.remote_address();
-    let peer_certs = conn
-        .peer_identity()
-        .and_then(|i| i.downcast::<Vec<CertificateDer<'static>>>().ok())
-        .map(|b| *b);
+    let peer_certs = quic::peer_certs(&conn)?;
 
     let hello_phase = async {
         let (send, mut recv) = conn.accept_bi().await.map_err(transport)?;

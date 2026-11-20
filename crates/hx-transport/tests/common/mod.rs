@@ -229,3 +229,161 @@ pub async fn raw_quic(
         .map_err(|e| e.to_string())?;
     Ok((ep, conn))
 }
+
+// ---------------------------------------------------------------- mutual TLS fixtures
+
+/// Test-only client-certificate verifier: accepts any certificate and counts how often it is
+/// consulted (a resumed handshake would skip it).
+#[derive(Debug)]
+pub struct CountingClientVerifier {
+    pub count: Arc<std::sync::atomic::AtomicUsize>,
+    provider: Arc<CryptoProvider>,
+}
+
+impl rustls::server::danger::ClientCertVerifier for CountingClientVerifier {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(rustls::server::danger::ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        m: &[u8],
+        c: &CertificateDer<'_>,
+        d: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            m,
+            c,
+            d,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        m: &[u8],
+        c: &CertificateDer<'_>,
+        d: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            m,
+            c,
+            d,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// A server that requires a client certificate. Session resumption settings are left at the
+/// rustls defaults on purpose: the transport must switch them off.
+pub fn mtls_server_tls() -> (
+    Arc<rustls::ServerConfig>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let (cert, key) = self_signed();
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let p = provider();
+    let verifier = CountingClientVerifier {
+        count: count.clone(),
+        provider: p.clone(),
+    };
+    let cfg = rustls::ServerConfig::builder_with_provider(p)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3")
+        .with_client_cert_verifier(Arc::new(verifier))
+        .with_single_cert(vec![cert], key.into())
+        .expect("server certificate");
+    (Arc::new(cfg), count)
+}
+
+/// A client config presenting a fresh self-signed client certificate (default resumption
+/// settings, so tests can check that the server never resumes).
+pub fn client_tls_with_cert() -> (Arc<rustls::ClientConfig>, CertificateDer<'static>) {
+    let (cert, key) = self_signed();
+    let p = provider();
+    let cfg = rustls::ClientConfig::builder_with_provider(p.clone())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyServer(p)))
+        .with_client_auth_cert(vec![cert.clone()], key.into())
+        .expect("client certificate");
+    (Arc::new(cfg), cert)
+}
+
+/// Test-only verifier that rejects every server certificate.
+#[derive(Debug)]
+pub struct RejectAllServers(Arc<CryptoProvider>);
+
+impl ServerCertVerifier for RejectAllServers {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::UnknownIssuer,
+        ))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        m: &[u8],
+        c: &CertificateDer<'_>,
+        d: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        m: &[u8],
+        c: &CertificateDer<'_>,
+        d: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+pub fn rejecting_client_tls() -> Arc<rustls::ClientConfig> {
+    let p = provider();
+    Arc::new(
+        rustls::ClientConfig::builder_with_provider(p.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(RejectAllServers(p)))
+            .with_no_client_auth(),
+    )
+}
+
+pub async fn start_server_with(tls: Arc<rustls::ServerConfig>, opts: ServerOptions) -> Arc<Server> {
+    Arc::new(
+        Server::bind("127.0.0.1:0".parse().expect("addr"), tls, opts)
+            .await
+            .expect("bind"),
+    )
+}

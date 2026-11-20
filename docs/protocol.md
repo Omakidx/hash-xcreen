@@ -14,7 +14,7 @@ Conventions: "MUST", "SHOULD" and "MAY" are used in the RFC 2119 sense. All mult
 | WebSocket over TLS (fallback) | UDP is blocked or QUIC fails | TCP `<port>` (same port number) | `http/1.1` | `wss://<host>:<port>/hx/1`, binary messages as in §9 |
 | WebTransport over HTTP/3 | Browser client (Phase 3, **not implemented in Phase 1**) | UDP `<port>` | `h3` | Not specified yet |
 
-- TLS is TLS 1.3 only (rustls). Certificates and verification are injected by the caller (§11): the protocol layer never decides who is trusted.
+- TLS is TLS 1.3 only (rustls); a TLS 1.2 handshake is dropped even if the injected configuration allows it. **Session resumption and early data are disabled** on the server (no session cache, no tickets, no 0-RTT) and clients do not resume: every connection runs the full handshake, so the injected certificate verifiers are consulted every time. The server-side QUIC and WebSocket entry points never share TLS session state. Certificates and verification are injected by the caller (§11): the protocol layer never decides who is trusted.
 - One QUIC endpoint serves both ALPN values `hx/1` and `h3`. The accept loop dispatches on the negotiated ALPN: `hx/1` goes to the native handler, `h3` to a pluggable handler (absent in Phase 1: the endpoint then offers only `hx/1`). Any other ALPN is refused at the TLS handshake.
 - The major version is part of the ALPN and of the WebSocket path (`hx/1`, `/hx/1`). A future major `2` is a new ALPN (`hx/2`), which lets one server support the current and previous major side by side (architecture §7.5). The `Hello` also carries the version and the two MUST agree (§4).
 - Congestion control: BBR on QUIC.
@@ -127,8 +127,8 @@ A receiver that sees a value above its limit treats it as a protocol error (reli
 
 | Field | # | Type | Meaning |
 |---|---|---|---|
-| `reason` | 1 | `RefuseReason` | `UPDATE_REQUIRED` (1), `UNAUTHORIZED` (2), `BUSY` (3), `PAIRING_CLOSED` (4); `UNSPECIFIED` (0) is invalid |
-| `message` | 2 | string | Human-readable, at most 256 bytes, safe to show |
+| `reason` | 1 | `RefuseReason` (a refusal without a reason is sent as `UNAUTHORIZED`, so the close code is never 0) | `UPDATE_REQUIRED` (1), `UNAUTHORIZED` (2), `BUSY` (3), `PAIRING_CLOSED` (4); `UNSPECIFIED` (0) is invalid |
+| `message` | 2 | string | Human-readable, at most 256 bytes (longer text is cut on a character boundary), safe to show |
 | `version` | 3 | `Version` | Server version, so the client can say what to update |
 
 `Version`: `major` (1, uint32), `minor` (2, uint32).
@@ -440,6 +440,16 @@ This document only reserves the places where pairing slots into the protocol; th
 - **Envelope.** Both `pairing` and `auth` carry `Opaque { bytes data = 1; }` (at most 4096 bytes). 1B defines what the bytes contain (its own protobuf messages inside the envelope) and the state machine. The transport only delivers them; it does not interpret them.
 - **Application hook.** `hx-transport` hands the server application a `PendingSession` after the version check; the application calls `accept` (returning a restricted `Connection`) or `refuse`, and later `Connection::authorize` once the peer is authenticated (§2.1). The application MUST re-check the peer's key against its **current** pinned and revoked set on **every** `PendingSession` (TLS session resumption is disabled by the transport, but revocation can happen at any time), MUST close live sessions of a device when it is revoked, and MUST treat `Hello.software` and `Hello.device_name` as untrusted text (sanitize before showing or logging).
 
-## 12. Schema location
+## 12. Client behaviour on security failures
+
+A TLS or certificate verification failure while connecting (QUIC TLS alert, rejected server key or certificate) is reported to the application as a distinct error and is **final**: a client that tries QUIC first and falls back to WebSocket does so only when QUIC could not be established (no answer in time, UDP blocked), never after a failed security check, and never after a `Refuse`. The same rule applies to any future fallback.
+
+## 13. Known follow-ups (not specified here)
+
+- A future `h3` handler (Phase 3) must account for the pre-authentication slot of the connections it takes over; today the slot is held only by `hx/1` connections.
+- Application-layer policy owned by 1B/1C: re-check pinned/revoked keys on every `PendingSession`, close live sessions on revocation, sanitize `Hello.software` and `Hello.device_name` before display or logging, clamp input coordinates in the injector, and treat transfer file names as hints.
+- Fuzz targets for 1H: `MediaHeader::decode`, `decode_datagram`, `message::decode::<ControlMessage | InputEvent | CursorEvent | TransferHeader>`, `message::decode_framed`, `version::peek_hello_version`, `file_name_problem`, and the WebSocket message router.
+
+## 14. Schema location
 
 The protobuf schema is `crates/hx-proto/proto/hx.proto` (package `hx.v1`); field numbers there are the numbers in this document. Field numbers are never reused. Adding fields or messages is a minor-version change (§4.2).

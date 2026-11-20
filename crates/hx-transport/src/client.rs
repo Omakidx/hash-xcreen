@@ -9,7 +9,7 @@ use hx_proto::{
     version::{ALPN, ProtocolVersion, negotiate},
 };
 use quinn::crypto::rustls::QuicClientConfig;
-use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::pki_types::ServerName;
 
 use crate::{
     conn::{Connection, ConnectionOptions, Parts, PeerInfo, Role, TransportKind},
@@ -151,9 +151,15 @@ impl Client {
                 match attempt.await {
                     Ok(Ok(c)) => Ok(c),
                     // The server answered: do not second-guess it over another transport.
-                    Ok(Err(e @ (Error::Refused { .. } | Error::Closed(_) | Error::Version(_)))) => {
-                        Err(e)
-                    }
+                    // Nor over a transport that would skip a failed security check: a TLS or
+                    // certificate error must surface, not be papered over (protocol §4.2).
+                    Ok(Err(
+                        e @ (Error::Refused { .. }
+                        | Error::Closed(_)
+                        | Error::Version(_)
+                        | Error::PeerRejected(_)
+                        | Error::Tls(_)),
+                    )) => Err(e),
                     Ok(Err(e)) => {
                         tracing::debug!(error = %e, "QUIC failed, falling back to WebSocket");
                         self.connect_websocket(target, hello).await
@@ -171,6 +177,8 @@ impl Client {
     pub async fn connect_quic(&self, target: &Target, hello: &ClientHello) -> Result<Connection> {
         let mut tls = (*self.tls).clone();
         tls.alpn_protocols = vec![ALPN.to_vec()];
+        // Every connection verifies the server afresh (pinning must not be skipped by resumption).
+        tls.resumption = rustls::client::Resumption::disabled();
         let quic_tls = QuicClientConfig::try_from(tls).map_err(|e| Error::Tls(e.to_string()))?;
         let mut cfg = quinn::ClientConfig::new(Arc::new(quic_tls));
         cfg.transport_config(Arc::new(quic::transport_config(Role::Client)?));
@@ -188,7 +196,7 @@ impl Client {
         let conn = tokio::time::timeout(self.options.connect_timeout, connecting)
             .await
             .map_err(|_| Error::Timeout("QUIC connect"))?
-            .map_err(transport)?;
+            .map_err(quic_connect_error)?;
 
         let hello_msg = build_hello(hello);
         let body = message::encode(&ControlMessage::new(Ctl::Hello(hello_msg.clone())))?;
@@ -234,10 +242,7 @@ impl Client {
                 device_name: String::new(),
             },
             session_id,
-            peer_certs: conn
-                .peer_identity()
-                .and_then(|i| i.downcast::<Vec<CertificateDer<'static>>>().ok())
-                .map(|b| *b),
+            peer_certs: quic::peer_certs(&conn)?,
             remote_addr: conn.remote_address(),
             options: self.options.connection.clone(),
             slot: None,
@@ -254,6 +259,18 @@ impl Client {
     ) -> Result<Connection> {
         ws::connect(&self.tls, &self.options, target, hello).await
     }
+}
+
+/// QUIC connection errors in the TLS alert range mean the handshake was rejected (certificate
+/// or key verification); they are reported as [`Error::PeerRejected`], not as a generic
+/// transport failure.
+fn quic_connect_error(e: quinn::ConnectionError) -> Error {
+    if let quinn::ConnectionError::TransportError(te) = &e
+        && (0x100..0x200).contains(&u64::from(te.code))
+    {
+        return Error::PeerRejected(te.to_string());
+    }
+    transport(e)
 }
 
 fn quinn_code(code: CloseCode) -> quinn::VarInt {

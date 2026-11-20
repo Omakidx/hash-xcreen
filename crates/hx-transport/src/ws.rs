@@ -751,6 +751,32 @@ impl tokio_tungstenite::tungstenite::handshake::server::Callback for PathCheck {
     }
 }
 
+/// A TLS handshake failure; a rejected certificate or alert is a [`Error::PeerRejected`].
+fn tls_error(e: std::io::Error) -> Error {
+    let rejected = matches!(
+        e.get_ref().and_then(|i| i.downcast_ref::<rustls::Error>()),
+        Some(
+            rustls::Error::InvalidCertificate(_)
+                | rustls::Error::AlertReceived(_)
+                | rustls::Error::PeerIncompatible(_)
+        )
+    );
+    if rejected {
+        Error::PeerRejected(e.to_string())
+    } else {
+        Error::Tls(e.to_string())
+    }
+}
+
+/// The protocol is TLS 1.3 only; a configuration that also allows 1.2 is not honoured.
+fn require_tls13(v: Option<rustls::ProtocolVersion>) -> Result<()> {
+    if v == Some(rustls::ProtocolVersion::TLSv1_3) {
+        Ok(())
+    } else {
+        Err(Error::Tls("TLS 1.3 is required".into()))
+    }
+}
+
 fn owned_certs(c: Option<&[CertificateDer<'_>]>) -> Option<Vec<CertificateDer<'static>>> {
     c.map(|c| c.iter().map(|d| d.clone().into_owned()).collect())
 }
@@ -770,7 +796,8 @@ async fn incoming(
     let tls = tokio::time::timeout_at(tls_deadline, TlsAcceptor::from(tls_cfg).accept(tcp))
         .await
         .map_err(|_| Error::Timeout("TLS handshake"))?
-        .map_err(|e| Error::Tls(e.to_string()))?;
+        .map_err(tls_error)?;
+    require_tls13(tls.get_ref().1.protocol_version())?;
     let certs = owned_certs(tls.get_ref().1.peer_certificates());
     let io: BoxIo = Box::new(tls);
     let mut ws = tokio::time::timeout_at(
@@ -887,6 +914,8 @@ pub(crate) async fn connect(
 ) -> Result<Connection> {
     let mut cfg = (**tls).clone();
     cfg.alpn_protocols = vec![ALPN_WEBSOCKET.to_vec()];
+    // Every connection verifies the server afresh (pinning must not be skipped by resumption).
+    cfg.resumption = rustls::client::Resumption::disabled();
     let tcp = tokio::time::timeout(opts.connect_timeout, TcpStream::connect(target.addr))
         .await
         .map_err(|_| Error::Timeout("TCP connect"))??;
@@ -897,7 +926,8 @@ pub(crate) async fn connect(
     )
     .await
     .map_err(|_| Error::Timeout("TLS handshake"))?
-    .map_err(|e| Error::Tls(e.to_string()))?;
+    .map_err(tls_error)?;
+    require_tls13(tls_stream.get_ref().1.protocol_version())?;
     let certs = owned_certs(tls_stream.get_ref().1.peer_certificates());
     let io: BoxIo = Box::new(tls_stream);
 

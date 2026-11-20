@@ -81,6 +81,20 @@ pub(crate) struct QuicBackend {
     endpoint: Option<quinn::Endpoint>,
 }
 
+/// The certificate chain the peer presented. An identity of an unexpected type is an error,
+/// never a silent `None` (which would read as "no client certificate").
+pub(crate) fn peer_certs(
+    conn: &quinn::Connection,
+) -> Result<Option<Vec<rustls::pki_types::CertificateDer<'static>>>> {
+    match conn.peer_identity() {
+        None => Ok(None),
+        Some(id) => id
+            .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+            .map(|b| Some(*b))
+            .map_err(|_| Error::Tls("peer identity has an unexpected type".into())),
+    }
+}
+
 // ---------------------------------------------------------------- stream I/O helpers
 
 fn quic_code(code: CloseCode) -> VarInt {
