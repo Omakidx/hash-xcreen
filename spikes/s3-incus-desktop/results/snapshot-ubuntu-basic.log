@@ -1,0 +1,26 @@
+pool_driver=btrfs
+pool_source=/var/lib/incus/disks/default.img
+pool_used_before_mib=6397
+snapshot_create_s=.28
+pool_used_after_snap0_mib=6402 delta=4
+writing 1 GiB of incompressible data in the container
+pool_used_after_write_mib=7433 delta=1030
+snapshot_create_with_1GiB_s=.46
+pool_used_after_snap1_mib=7435 delta=1
+modify 100 MiB inside the blob (CoW divergence), then delete the file
+pool_used_after_modify_mib=7535 delta=100
+pool_used_after_rm_mib=7435 delta=-100  (space is held by snap1)
+snapshots:
+Snapshots:
++----------+----------------------+------------+----------+
+|   NAME   |       TAKEN AT       | EXPIRES AT | STATEFUL |
++----------+----------------------+------------+----------+
+| s3-snap0 | 2026/11/20 09:50 CET |            | NO       |
++----------+----------------------+------------+----------+
+| s3-snap1 | 2026/11/20 09:50 CET |            | NO       |
++----------+----------------------+------------+----------+
+snapshot_restore_s=2.86
+-rw-r--r-- 1 root root 1073741824 Nov 20 08:50 /home/desk/blob
+restored-blob-present
+snapshot_delete_both_s=.41
+pool_used_final_mib=7435

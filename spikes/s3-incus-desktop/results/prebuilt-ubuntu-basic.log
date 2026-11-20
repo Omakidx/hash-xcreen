@@ -1,0 +1,15 @@
+loadavg_start 19.64 26.20 21.94
+publish_s=146.3
+image_compression=default (server default: )
+export_s=4.7
+export_file s3-img-s3-ub-basic.tar.gz 740888601 bytes
+image_bytes=740888601 image_mib=706
+download_estimate_100mbps_s=59.2  (ESTIMATE, size / line rate, no protocol overhead)
+download_estimate_1000mbps_s=5.9  (ESTIMATE, size / line rate, no protocol overhead)
+import_s=4.0
+launch_s=45.6
+STAGE wait-network 0.4s FAILED
+error: exit status exit status: 255
+post_steps_s=.4
+PREBUILT_LOCAL_TOTAL_s=50.2  (import+launch+post, excludes download)
+loadavg_end 19.77 23.05 21.51

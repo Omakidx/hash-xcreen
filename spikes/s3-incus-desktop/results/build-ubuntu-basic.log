@@ -1,0 +1,14 @@
+loadavg_start 25.51 18.96 10.32
+LAUNCH base=images:ubuntu/24.04 1.100704176s (includes image download if not cached)
+STAGE wait-network 2.2s ok
+STAGE apt-bootstrap 50.3s ok
+STAGE apt-repos 0.8s ok
+STAGE pre-steps 0.0s ok
+STAGE apt-install 459.1s ok
+STAGE user 2.9s ok
+STAGE files 1.9s ok
+STAGE services 1.5s ok
+STAGE steps 0.0s ok
+TOTAL apply 518.6s
+TOTAL_BUILD_INCL_LAUNCH 519.721302354s
+loadavg_end 34.16 30.73 20.71

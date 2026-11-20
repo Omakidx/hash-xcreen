@@ -1,0 +1,19 @@
+loadavg_start 9.65 8.85 8.87
+publish_s=216.9
+image_compression=default (server default: )
+export_s=2.4
+export_file s3-img-s3-ub-dev.tar.gz 1049920262 bytes
+image_bytes=1049920262 image_mib=1001
+download_estimate_100mbps_s=83.9  (ESTIMATE, size / line rate, no protocol overhead)
+download_estimate_1000mbps_s=8.3  (ESTIMATE, size / line rate, no protocol overhead)
+import_s=3.1
+launch_s=51.5
+STAGE wait-network 2.3s ok
+STAGE user 0.4s ok
+STAGE password 0.2s ok
+STAGE security-updates 9.4s ok
+STAGE post-steps 0.0s ok
+TOTAL post 12.4s
+post_steps_s=12.3
+PREBUILT_LOCAL_TOTAL_s=67.0  (import+launch+post, excludes download)
+loadavg_end 9.17 10.25 9.59

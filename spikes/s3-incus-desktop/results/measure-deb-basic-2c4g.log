@@ -1,0 +1,34 @@
+container=s3-deb-basic
+loadavg_host 4.92 7.57 12.37
+Failed to connect to system scope bus via local transport: No such file or directory
+desktop_up=yes
+settling 90s
+version number:    11.0
+  dimensions:    1920x1080 pixels (509x286 millimeters)
+cpu_avg_cores=.0003
+mem_limit_mib=4096
+mem_current_mib=476
+mem_anon_mib=138
+mem_file_cache_mib=315
+mem_shmem_mib=8
+mem_kernel_mib=21
+free_strict_mib=3619
+free_reclaimable_mib=3926
+--- free -m (lxcfs view)
+               total        used        free      shared  buff/cache   available
+Mem:            4096         160        3619           8         315        3935
+Swap:              0           0           0
+--- top RSS
+  RSS COMMAND
+104920 Xorg
+78664 xfce4-session
+49208 xfdesktop
+32660 xfce4-panel
+29288 xfwm4
+27064 wrapper-2.0
+24476 wrapper-2.0
+24224 xfsettingsd
+23844 xfce4-notifyd
+23376 Thunar
+17600 systemd-journal
+--- procs: 33

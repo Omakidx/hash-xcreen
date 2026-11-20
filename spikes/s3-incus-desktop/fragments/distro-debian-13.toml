@@ -1,0 +1,10 @@
+# Debian 13 (trixie) specifics.
+[recipe]
+base_image = "images:debian/13"
+
+[vars]
+distro = "debian"
+codename = "trixie"
+
+[apt]
+packages = ["firefox-esr"]

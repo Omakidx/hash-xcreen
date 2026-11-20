@@ -1,0 +1,19 @@
+loadavg_start 11.16 10.20 9.40
+publish_s=186.5
+image_compression=default (server default: )
+export_s=3.2
+export_file s3-img-s3-deb-dev.tar.gz 966783858 bytes
+image_bytes=966783858 image_mib=921
+download_estimate_100mbps_s=77.3  (ESTIMATE, size / line rate, no protocol overhead)
+download_estimate_1000mbps_s=7.7  (ESTIMATE, size / line rate, no protocol overhead)
+import_s=2.6
+launch_s=42.3
+STAGE wait-network 2.3s ok
+STAGE user 0.5s ok
+STAGE password 0.2s ok
+STAGE security-updates 27.9s ok
+STAGE post-steps 0.0s ok
+TOTAL post 30.9s
+post_steps_s=30.8
+PREBUILT_LOCAL_TOTAL_s=75.9  (import+launch+post, excludes download)
+loadavg_end 6.58 9.20 9.23

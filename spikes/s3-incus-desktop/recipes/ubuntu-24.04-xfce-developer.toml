@@ -1,0 +1,9 @@
+# Recipe: ubuntu-24.04 x xfce x developer. Order matters only for array concatenation and scalar overrides.
+include = [
+  "../fragments/xfce-desktop.toml",
+  "../fragments/distro-ubuntu-24.04.toml",
+  "../fragments/preset-developer.toml",
+]
+
+[recipe]
+name = "ubuntu-24.04-xfce-developer"

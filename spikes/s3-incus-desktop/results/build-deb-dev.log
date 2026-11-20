@@ -1,0 +1,16 @@
+loadavg_start 8.59 10.12 9.55
+LAUNCH base=images:debian/13 1.087696853s (includes image download if not cached)
+STAGE wait-network 2.3s ok
+STAGE apt-bootstrap 42.1s ok
+STAGE apt-repos 0.3s ok
+  step 'vscode-debconf'
+STAGE pre-steps 5.2s ok
+STAGE apt-install 254.5s ok
+STAGE user 0.6s ok
+STAGE files 0.8s ok
+STAGE services 1.0s ok
+  step 'apt-cleanup'
+STAGE steps 0.3s ok
+TOTAL apply 307.2s
+TOTAL_BUILD_INCL_LAUNCH 308.278788474s
+loadavg_end 7.30 7.64 8.60
