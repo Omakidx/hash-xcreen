@@ -1,0 +1,134 @@
+// Spike S1 UI: video surface + live stats overlay + responsiveness probe.
+
+export struct Bar { h: length, label: string, hot: bool }
+
+export component App inherits Window {
+    title: "hash-xcreen S1 - Slint video presentation";
+    background: #101418;
+    preferred-width: 1280px;
+    preferred-height: 720px;
+
+    in property <image> video-frame;
+    in property <string> path-label;
+    in property <string> stats-text;
+    in property <[Bar]> bars;
+    in property <int> probe-count;
+    in property <string> probe-text;
+    in property <bool> show-overlay: true;
+    // Bumped by Rust; lets the probe animation prove the UI thread is alive.
+    in property <duration> spin-period: 2s;
+
+    out property <length> probe-x: probe-btn.absolute-position.x + 20px;
+    out property <length> probe-y: probe-btn.absolute-position.y + 10px;
+
+    callback probe-clicked();
+    callback toggle-overlay();
+
+    // The video, letterboxed.
+    Image {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        source: root.video-frame;
+        image-fit: contain;
+        accessible-role: image;
+        accessible-label: "Decoded video";
+    }
+
+    Rectangle {
+        visible: root.show-overlay;
+        x: 12px;
+        y: 12px;
+        width: 520px;
+        height: panel.preferred-height + 24px;
+        background: #000000b0;
+        border-radius: 8px;
+
+        panel := VerticalLayout {
+            padding: 12px;
+            spacing: 6px;
+            Text {
+                text: root.path-label;
+                color: #7fd1ff;
+                font-size: 15px;
+                font-weight: 700;
+            }
+            Text {
+                text: root.stats-text;
+                color: white;
+                font-size: 13px;
+                wrap: word-wrap;
+            }
+            // Frame-interval histogram (ms buckets).
+            HorizontalLayout {
+                height: 72px;
+                spacing: 4px;
+                for b in root.bars: Rectangle {
+                    VerticalLayout {
+                        alignment: end;
+                        Rectangle {
+                            height: max(1px, b.h);
+                            background: b.hot ? #ff7a59 : #5ad17a;
+                        }
+                        Text {
+                            text: b.label;
+                            font-size: 9px;
+                            color: #cccccc;
+                            horizontal-alignment: center;
+                        }
+                    }
+                }
+            }
+            HorizontalLayout {
+                spacing: 12px;
+                alignment: start;
+                // Responsiveness probe: a button plus a spinner driven by the animation clock.
+                probe-btn := Rectangle {
+                    width: 150px;
+                    height: 34px;
+                    border-radius: 6px;
+                    background: probe-ta.pressed ? #2f6fed : #3b82f6;
+                    accessible-role: button;
+                    accessible-label: "Responsiveness probe";
+                    accessible-action-default => { root.probe-clicked(); }
+                    Text {
+                        text: "Probe click (" + root.probe-count + ")";
+                        color: white;
+                        font-size: 13px;
+                    }
+                    probe-ta := TouchArea {
+                        clicked => { root.probe-clicked(); }
+                    }
+                }
+                // Bouncing marker driven by the animation clock: stutters if the UI thread stalls.
+                Rectangle {
+                    width: 120px;
+                    height: 34px;
+                    background: #ffffff20;
+                    Rectangle {
+                        x: (parent.width - self.width) * (0.5 + 0.5 * sin(360deg * animation-tick() / root.spin-period));
+                        y: 4px;
+                        width: 8px;
+                        height: parent.height - 8px;
+                        background: #ffd24a;
+                    }
+                }
+                Text {
+                    text: root.probe-text;
+                    color: #ffd24a;
+                    font-size: 13px;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+
+    // F1 or Tab-less toggle: keep the overlay optional so the pure video cost can be seen.
+    FocusScope {
+        key-pressed(e) => {
+            if (e.text == "o") { root.toggle-overlay(); return accept; }
+            reject
+        }
+    }
+}

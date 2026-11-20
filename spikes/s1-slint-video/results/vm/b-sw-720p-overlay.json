@@ -1,0 +1,182 @@
+{
+  "convert_ms_cpu_swscale": {
+    "max": 0.0,
+    "mean": 0.0,
+    "n": 0,
+    "p50": 0.0,
+    "p95": 0.0,
+    "p99": 0.0
+  },
+  "cpu": {
+    "per_thread_cores": {
+      "decoder": 0.241,
+      "llvmpipe-0": 0.209,
+      "llvmpipe-1": 0.214,
+      "llvmpipe-10": 0.207,
+      "llvmpipe-11": 0.181,
+      "llvmpipe-12": 0.21,
+      "llvmpipe-13": 0.195,
+      "llvmpipe-14": 0.183,
+      "llvmpipe-15": 0.19,
+      "llvmpipe-2": 0.206,
+      "llvmpipe-3": 0.197,
+      "llvmpipe-4": 0.225,
+      "llvmpipe-5": 0.192,
+      "llvmpipe-6": 0.214,
+      "llvmpipe-7": 0.207,
+      "llvmpipe-8": 0.207,
+      "llvmpipe-9": 0.19,
+      "s1-slint-video": 0.661
+    },
+    "process_cores": 4.127,
+    "system_s": 5.54,
+    "user_s": 56.39
+  },
+  "decode_ms": {
+    "max": 44.412867,
+    "mean": 13.276509817477878,
+    "n": 904,
+    "p50": 12.092699999999999,
+    "p95": 23.901986,
+    "p99": 33.086949999999995
+  },
+  "decode_to_render_ms": {
+    "max": 71.99616999999999,
+    "mean": 31.988044182561296,
+    "n": 367,
+    "p50": 30.041932,
+    "p95": 52.195152,
+    "p99": 64.487906
+  },
+  "environment": {
+    "bench_seconds": 15.0,
+    "clip": "clip-1080p60.mp4",
+    "cpus": 16,
+    "decoder": "libavcodec h264 software (4 slice threads)",
+    "display": ":82",
+    "hw_decode_active": false,
+    "loadavg_end": "22.38 24.38 21.77",
+    "loadavg_start": "19.84 24.05 21.62",
+    "measured_wall_s": 15.006,
+    "overlay": true,
+    "presenter": "GL OpenGL ES 3.2 Mesa 25.2.8-0ubuntu0.24.04.5 / llvmpipe (LLVM 20.1.2, 256 bits); DMA-BUF import unavailable: Slint's OpenGL context is not an EGL context (it is GLX on X11); EGL_EXT_image_dma_buf_import needs an EGL context: run under a Wayland session (or an EGL-based Slint platform)",
+    "slint": "1.19.0",
+    "sync_gpu": false,
+    "wayland_display": null,
+    "window": "1280x720",
+    "zero_copy_dmabuf": false
+  },
+  "handoff_decode_to_handed_ms": {
+    "max": 45.858587,
+    "mean": 15.514100100817448,
+    "n": 367,
+    "p50": 14.511988,
+    "p95": 29.897074,
+    "p99": 37.652307
+  },
+  "path": "b",
+  "prepare_upload_ms": {
+    "max": 28.564722,
+    "mean": 7.352038866485008,
+    "n": 367,
+    "p50": 6.63928,
+    "p95": 13.3801,
+    "p99": 18.014213
+  },
+  "present_interval_ms": {
+    "dist": {
+      "max": 90.852946,
+      "mean": 40.91398134059943,
+      "n": 367,
+      "p50": 38.480374999999995,
+      "p95": 64.757359,
+      "p99": 74.755371
+    },
+    "histogram_counts": [
+      0,
+      0,
+      0,
+      0,
+      9,
+      95,
+      191,
+      72
+    ],
+    "histogram_edges_ms": [
+      14.0,
+      15.5,
+      17.5,
+      20.0,
+      25.0,
+      33.4,
+      50.0
+    ],
+    "pct_within_13.3_20.0ms": 0.0,
+    "stddev": 11.441
+  },
+  "render_interval_ms": {
+    "max": 90.852946,
+    "mean": 40.80280204347824,
+    "n": 368,
+    "p50": 38.480374999999995,
+    "p95": 64.757359,
+    "p99": 74.755371
+  },
+  "render_ms": {
+    "max": 56.636511,
+    "mean": 23.82797041416895,
+    "n": 367,
+    "p50": 22.02588,
+    "p95": 40.432559,
+    "p99": 46.469534
+  },
+  "representative_of_gpu_hardware": false,
+  "s1_criteria": {
+    "decode_to_present_caveat": "measured decode-complete -> end of Slint render (AfterRendering); swap/scanout latency is not observable from the rendering notifier",
+    "decode_to_present_le_8ms": "fails threshold on software rendering (NOT representative)",
+    "even_frame_pacing": "fails threshold on software rendering (NOT representative)",
+    "sustained_60fps": "fails threshold on software rendering (NOT representative)",
+    "thresholds": {
+      "decode_to_render_p95_ms_max": 8.0,
+      "dropped_pct_max": 1.0,
+      "event_loop_lag_p99_ms_max": 20.0,
+      "event_to_render_p95_ms_max": 33.4,
+      "pacing_pct_within_13.3_20.0ms_min": 98.0,
+      "presented_fps_min": 59.0
+    },
+    "ui_responsive": "fails threshold on software rendering (NOT representative)"
+  },
+  "spike": "s1",
+  "status": "ok",
+  "ui_responsiveness": {
+    "event_loop_lag_ms": {
+      "max": 81.124565,
+      "mean": 35.01403878666663,
+      "n": 375,
+      "p50": 32.917462,
+      "p95": 58.526836,
+      "p99": 70.112631
+    },
+    "event_to_render_ms": {
+      "max": 48.372702,
+      "mean": 26.85583063636363,
+      "n": 55,
+      "p50": 25.547978,
+      "p95": 39.129385,
+      "p99": 47.159096999999996
+    },
+    "note": "event = synthetic Slint pointer click dispatched by a timer; excludes OS/compositor input latency",
+    "probe_clicks": 64
+  },
+  "video": {
+    "decoded_fps": 60.244,
+    "decoder_late_frames": 219,
+    "dropped_pct": 59.292,
+    "frames_decoded": 904,
+    "frames_dropped": 536,
+    "frames_presented": 367,
+    "presented_fps": 24.458,
+    "source_fps": 60.0
+  },
+  "warning": "SOFTWARE RENDERING / no GPU: these numbers are NOT representative of GPU hardware"
+}
