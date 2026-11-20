@@ -59,6 +59,9 @@ pub struct ServerOptions {
     pub max_pending: usize,
     /// The same limit per source address (IPv6: per /64). Default 4.
     pub max_pending_per_ip: usize,
+    /// The same limit per IPv6 /48 (a site), so one network cannot hold every slot with many
+    /// /64s. Default 16. IPv4 is limited per address only.
+    pub max_pending_per_v6_48: usize,
     /// How long the application may take to accept or refuse a [`PendingSession`] before the
     /// transport refuses it with `BUSY` (default 10 s).
     pub decision_timeout: Duration,
@@ -82,6 +85,7 @@ impl Default for ServerOptions {
             transport_timeout: Duration::from_secs(5),
             max_pending: 64,
             max_pending_per_ip: 4,
+            max_pending_per_v6_48: 16,
             decision_timeout: Duration::from_secs(10),
             auth_timeout: Some(Duration::from_secs(30)),
             require_retry: true,
@@ -314,27 +318,36 @@ pub(crate) struct PreAuthSlot {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct IpKey(u128);
 
-/// IPv4 addresses count individually, IPv6 addresses per /64.
-fn ip_key(ip: IpAddr) -> IpKey {
+/// The counters a source address is charged to, with each one's limit: an IPv4 address
+/// individually; an IPv6 address per /64 and per /48 (one site must not hold every slot).
+fn ip_keys(ip: IpAddr, per_64: usize, per_48: usize) -> Vec<(IpKey, usize)> {
     match ip.to_canonical() {
-        IpAddr::V4(a) => IpKey(u128::from(u32::from(a))),
-        IpAddr::V6(a) => IpKey((u128::from(a) >> 64) | (1 << 64)),
+        IpAddr::V4(a) => vec![(IpKey(u128::from(u32::from(a))), per_64)],
+        IpAddr::V6(a) => {
+            let bits = u128::from(a);
+            vec![
+                (IpKey((bits >> 64) | (1 << 64)), per_64),
+                (IpKey((bits >> 80) | (1 << 65)), per_48),
+            ]
+        }
     }
 }
 
 struct IpGuard {
     map: Arc<StdMutex<HashMap<IpKey, usize>>>,
-    key: IpKey,
+    keys: Vec<IpKey>,
 }
 
 impl Drop for IpGuard {
     fn drop(&mut self) {
-        if let Ok(mut m) = self.map.lock()
-            && let Some(c) = m.get_mut(&self.key)
-        {
-            *c = c.saturating_sub(1);
-            if *c == 0 {
-                m.remove(&self.key);
+        if let Ok(mut m) = self.map.lock() {
+            for key in &self.keys {
+                if let Some(c) = m.get_mut(key) {
+                    *c = c.saturating_sub(1);
+                    if *c == 0 {
+                        m.remove(key);
+                    }
+                }
             }
         }
     }
@@ -344,18 +357,26 @@ impl ServerCtx {
     /// Take a pre-authentication slot for a new connection from `ip`, or `None` if the global
     /// or the per-source limit is reached.
     pub(crate) fn acquire(&self, ip: IpAddr) -> Option<PreAuthSlot> {
-        let key = ip_key(ip);
+        let limits = ip_keys(
+            ip,
+            self.opts.max_pending_per_ip.max(1),
+            self.opts.max_pending_per_v6_48.max(1),
+        );
         {
             let mut m = self.ips.lock().ok()?;
-            let c = m.entry(key).or_insert(0);
-            if *c >= self.opts.max_pending_per_ip.max(1) {
+            if limits
+                .iter()
+                .any(|(k, cap)| m.get(k).copied().unwrap_or(0) >= *cap)
+            {
                 return None;
             }
-            *c += 1;
+            for (k, _) in &limits {
+                *m.entry(*k).or_insert(0) += 1;
+            }
         }
         let guard = IpGuard {
             map: self.ips.clone(),
-            key,
+            keys: limits.iter().map(|(k, _)| *k).collect(),
         };
         let permit = self.sem.clone().try_acquire_owned().ok()?;
         Some(PreAuthSlot {
@@ -786,4 +807,63 @@ async fn quic_incoming(
         let _ = p.refuse(RefuseReason::Busy, "server busy").await;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx() -> ServerCtx {
+        let (tx, _rx) = mpsc::channel(1);
+        let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3")
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(rustls::server::ResolvesServerCertUsingSni::new()));
+        ServerCtx {
+            opts: ServerOptions::default(),
+            sem: Arc::new(Semaphore::new(64)),
+            ips: Arc::new(StdMutex::new(HashMap::new())),
+            tx,
+            ws_tls: RwLock::new(Arc::new(tls)),
+        }
+    }
+
+    fn v6(site: u16, subnet: u16) -> IpAddr {
+        format!("2001:db8:{site:x}:{subnet:x}::1")
+            .parse()
+            .expect("address")
+    }
+
+    #[test]
+    fn one_ipv6_site_cannot_hold_all_slots() {
+        let ctx = ctx();
+        // One /48 may hold 16 slots spread over different /64s, not more.
+        let held: Vec<_> = (0..16)
+            .map(|n| ctx.acquire(v6(1, n)).expect("within the /48 cap"))
+            .collect();
+        assert!(ctx.acquire(v6(1, 99)).is_none(), "the /48 is full");
+        // Another site is unaffected, and so is IPv4.
+        assert!(ctx.acquire(v6(2, 0)).is_some());
+        assert!(ctx.acquire("192.0.2.1".parse().expect("v4")).is_some());
+        // Releasing one frees a place.
+        drop(held);
+        assert!(ctx.acquire(v6(1, 99)).is_some());
+    }
+
+    #[test]
+    fn per_64_and_per_ipv4_address_caps_apply() {
+        let ctx = ctx();
+        let _a: Vec<_> = (0..4)
+            .map(|_| ctx.acquire(v6(3, 0)).expect("within the /64 cap"))
+            .collect();
+        assert!(ctx.acquire(v6(3, 0)).is_none());
+        let v4: IpAddr = "192.0.2.7".parse().expect("v4");
+        let _b: Vec<_> = (0..4)
+            .map(|_| ctx.acquire(v4).expect("within the address cap"))
+            .collect();
+        assert!(ctx.acquire(v4).is_none());
+    }
 }
