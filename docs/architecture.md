@@ -1,6 +1,6 @@
 # hash-xcreen architecture
 
-Status: draft v0.2 (2026-11-20), updated with the Phase 0 spike results; items still marked **provisional** wait for the follow-up runs in execution-phase.md §0.4. Libraries and tools are in [tech-stack.md](tech-stack.md), the user experience in [userflow.md](userflow.md), and the phased plan we follow, including the Phase 0 spikes, in [execution-phase.md](execution-phase.md).
+Status: draft v0.3 (2026-11-20), updated with the Phase 0 spike results and their follow-up runs on a real server and real Google Drive; the only item still marked **provisional** is the desktop client's video path, which waits for the S1 GPU run (execution-phase.md §0.4). Libraries and tools are in [tech-stack.md](tech-stack.md), the user experience in [userflow.md](userflow.md), and the phased plan we follow, including the Phase 0 spikes, in [execution-phase.md](execution-phase.md).
 
 ## 1. What hash-xcreen is
 
@@ -96,9 +96,10 @@ One Cargo workspace; one semver version for every component.
 - Storage pool on btrfs by default (ZFS when the host already uses it), on a spare disk (`--storage-device`) or a sparse loop file sized at about 60% of free disk, bounded to 12–200 GiB. Copy-on-write snapshots are what make backups consistent and cheap: S3 measured 0.2–0.5 s per snapshot, with space growing only by data that changes afterwards.
 - The desktop is an **unprivileged** system container. Privileged containers are never used.
 - Resource limits on CPU, memory and disk from the setup wizard.
-- Container networking: the desktop joins a dedicated hash-xcreen bridge network. Incus network ACLs on that bridge allow internet access but drop the host's agent ports and `169.254.169.254` (cloud metadata). Incus 6.0 rejects ACLs on the container's own network interface, which is why the bridge is ours; an nftables rule set is the fallback where ACLs can't cover every host address. Blocking the host was verified in S3; the metadata rule still needs a VPS test.
-- **Host kernel limits:** all unprivileged containers on a host share one inotify budget (default 128 instances), and one idle XFCE desktop uses about 23. The installer writes `/etc/sysctl.d/90-hx-incus.conf` (`fs.inotify.max_queued_events`, `max_user_instances` and `max_user_watches` = 1048576; `vm.max_map_count` = 262144) and preflight checks it. Without it, new containers failed to boot in S3 with "Too many open files".
-- **Docker on the host:** Docker's firewall rules can block forwarding from the Incus bridge (S3 saw containers lose IPv4; inferred, not verified). The installer detects a host Docker and adds `DOCKER-USER` accept rules for our bridge.
+- Container networking: the desktop joins a dedicated hash-xcreen bridge network. Incus network ACLs on that bridge allow internet access but drop the host's agent ports and `169.254.169.254` (cloud metadata). Incus 6.0 rejects ACLs on the container's own network interface, which is why the bridge is ours; an nftables rule set is the fallback where ACLs can't cover every host address. Both rules were verified on a real VPS in S3, where the metadata address was live: the desktop, and Docker containers inside it, could reach neither the host's address nor `169.254.169.254`, while internet and DNS kept working.
+- **Host kernel limits:** all unprivileged containers on a host share one inotify budget (default 128 instances), and one idle XFCE desktop uses about 23. The installer writes `/etc/sysctl.d/90-hx-incus.conf` (`fs.inotify.max_queued_events`, `max_user_instances` and `max_user_watches` = 1048576; `vm.max_map_count` = 262144) and preflight checks it. Without it, new containers failed to boot in S3 with "Too many open files" (on the VPS, the sixth desktop failed with the default limit; eight ran with ours).
+- **Docker on the host:** Docker's firewall rules block forwarding from the Incus bridge, so containers lose IPv4 (confirmed on the VPS in S3). The installer detects a host Docker and adds two `DOCKER-USER` accept rules for our bridge (in on the bridge; out to it when related or established), **made persistent across reboots** (Docker recreates the chain on start, so the rules are re-applied by a unit ordered after `docker.service`). Reboot persistence is still to be tested.
+- **Guest compatibility rules:** on the VPS kernel (7.0, Incus 6.0.5), Debian 13 desktops hang at boot unless the container's AppArmor profile allows `signal` (`raw.apparmor "signal,"`); Ubuntu guests don't need it. The rule lives in a hash-xcreen Incus profile (prebuilt images carry no instance config), and the installer checks that every new desktop reaches `systemctl is-system-running` = `running` before going on.
 
 ### 4.3 Desktop provisioning
 
@@ -120,7 +121,7 @@ CI builds the desktop both ways and compares package lists, config files and ena
 
 **Recipe format** (from S3): TOML fragments combined with `include`, `[vars]` for per-distro values, add-ons such as Docker, apt repositories pinned by key fingerprint, and a separate `post` stage that runs after a prebuilt import (user creation, security updates). Secrets come from the environment at run time, never from recipes. Every apt operation runs with a timeout and retries: in S3, `apt-get update` hung for over 9 minutes twice.
 
-S3 timings (local, indicative): prebuilt import, launch and post-steps took 56–76 s, plus an estimated 34–84 s of download at 100 Mbps; building on the server took 213–308 s. Both are well inside the 5-minute and 20-minute targets.
+S3 timings: on a real 4 vCPU VPS, prebuilt import, launch and post-steps took 16–29 s, plus an estimated 1–2 minutes of download at 100 Mbps, and building on the server took 86–206 s (locally 56–76 s and 213–308 s). Both are well inside the 5-minute and 20-minute targets. Incus plus one idle desktop cost the host 0.1–0.35 GB of RAM, leaving 3.45–3.93 GB free at 2 vCPU / 4 GB.
 
 **Presets**
 
@@ -129,9 +130,17 @@ S3 timings (local, indicative): prebuilt import, launch and post-steps took 56�
 | basic | XFCE, browser, file manager, text editor |
 | developer | basic + VS Code, git, build tools, Claude Code, Codex CLI (vendors' native installers; they self-update) |
 
-**Docker (opt-in)**: enables `security.nesting` and syscall interception for `mknod` and `setxattr` on the container, installs Docker Engine from Docker's apt repository, adds the user to the `docker` group, and restarts the desktop. The app warns that nesting enlarges the attack surface for container escapes. Later option: run the desktop as an Incus VM for full isolation, where the VPS supports nested virtualisation.
+**Docker (opt-in)**: enables `security.nesting` and syscall interception for `mknod` and `setxattr` on the container, installs Docker Engine from Docker's apt repository, adds the user to the `docker` group, and restarts the desktop. Requires **Incus 6.0.5 or newer**.
 
-**Status (S3): not working as specified.** On Incus 6.0.0 with Ubuntu 24.04 and Debian 13 guests, image pulls work, but starting any container on Docker's default bridge fails: runc can't set `net.ipv4.ip_unprivileged_port_start` under the container's AppArmor profile. `--network host` works, and so does unconfining AppArmor, which is not acceptable as a default. Docker 29 also uses the containerd image store (overlayfs snapshotter) rather than classic overlay2. Next step: re-test on a VPS with newer Incus (Zabbly) and classic overlay2. If it still fails, choose between host-network-only Docker, running the desktop as an Incus VM when Docker is on, or a targeted AppArmor change. Tracked in execution-phase.md §0.4.
+- **Warning shown when the user turns it on:** with nesting, Incus drops the container's AppArmor denials for `/proc/sys` and `/sys` and allows `mount`, `pivot_root`, `ptrace` and `signal`, which enlarges the attack surface for container escapes. That is why Docker is opt-in.
+- **Self-test:** the version number isn't trusted. After enabling Docker, the installer runs `docker run --rm hello-world` (with a pull) on Docker's default bridge.
+- **If the self-test fails** (as on Incus 6.0.0, where runc can't set `net.ipv4.ip_unprivileged_port_start`), the app says so and offers, in order:
+  1. upgrade Incus from the Zabbly repository;
+  2. **host-network-only Docker**, which worked on every version tested, with no port isolation inside the desktop and `network_mode: host` needed in Compose files;
+  3. run the desktop as an Incus VM, where the server has `/dev/kvm`. Not for v1: it boots in about 31 s instead of 2 s, uses 1–1.8 GB of RAM instead of about 0.2 GB, and S4's file-level backups don't apply to VM disks.
+- A custom AppArmor profile or `unconfined` is not used: it was never needed on a good Incus version and would need maintenance against every Incus update.
+
+S3 evidence: on the VPS (Ubuntu 26.04 host, Incus 6.0.5), `hello-world` and a Compose app with a volume ran on Docker's default bridge in Ubuntu 24.04 and Debian 13 desktops, for about 85 MiB and no boot penalty, keeping btrfs snapshots. On Incus 6.0.0 (local) the same setup failed. Which release between them fixed it is unknown, hence the self-test.
 
 ## 5. Install and setup
 
@@ -185,6 +194,8 @@ Every stage is idempotent; re-running the command resumes a failed install. `hx-
 
 The app performs Google OAuth for installed apps (PKCE, loopback redirect) in the user's normal browser, requesting only `drive.file`, and sends the refresh token to the agent over the paired channel. It can be skipped and connected later. The OAuth client must be **published to production** before release: tokens issued by an app in "Testing" status expire after 7 days.
 
+hash-xcreen ships **one fixed OAuth client** for every install. With `drive.file`, an app sees only the files its own OAuth client created (S4), so "restore onto a new server" works only when the new install uses the same client as the backup; per-user client IDs would break it.
+
 ### 5.5 Updates
 
 - Agent: self-update from signed releases on the stable or beta channel, with automatic rollback when the new version fails its health check.
@@ -206,8 +217,10 @@ No damage means no capture, no encode and no traffic.
 ### 6.2 Encode (`hx-codec`)
 
 - All encoders through libavcodec, so one code path covers them.
-- Software default: **x264** with `ultrafast`, `zerolatency`, `crf=23`, a one-frame VBV, a bitrate ladder up to 20 Mbps, sliced threads equal to the number of encode cores, `keyint=120`, gradual intra refresh, and IDR frames only on connect and resync. In S2 this encoded in 4–8 ms (p50) and used 0.5–0.6 cores while typing or scrolling at 1080p. Intra refresh cost 15–25% more bitrate with no latency gain on a LAN; it stays on until it is measured on a lossy link. x264 is allowed because the project is AGPL.
-- **Pacing:** capture as soon as the pipeline is free after damage arrives; 60 fps is a ceiling, not a clock. Holding damage to a fixed 60 fps grid added 5–13 ms at p95 in S2.
+- Software default: **x264** with `ultrafast`, `zerolatency`, `crf=23`, a VBV of a few frames (a tunable; S2 used one frame, and 2–4 is the provisional default until a worst-frame test settles it), a bitrate ladder up to 20 Mbps, sliced threads equal to the number of encode cores (4 on a 4 vCPU server; one thread added 3.5–7 ms at p95), `keyint=120`, gradual intra refresh, and IDR frames only on connect and resync. In S2 this encoded in 4–8 ms (p50) and used 0.45–0.75 cores at 1080p. Intra refresh had no latency cost on the VPS and saved bitrate in scrolling but cost it elsewhere; it stays on until it is measured on a lossy link. x264 is allowed because the project is AGPL.
+- **Colour tags:** the stream always carries BT.709 limited-range VUI tags (`colorprim`, `transfer`, `colormatrix` = bt709, `fullrange=off`). Untagged, a client has to guess, and in S2 reading the same frames as BT.601 cost 10 dB and as full range 10–25 dB.
+- **Pacing:** capture as soon as the pipeline is free after damage arrives; 60 fps is a ceiling, not a clock. Holding damage to a fixed 60 fps grid added 5–13 ms at p95 in S2 locally and 7–14 ms on the VPS, so relaxed pacing is required.
+- **Known quality gap:** the first frame after a large change (scroll reversal, window drag) can be visibly blocky (15–24 dB) because it hits the VBV budget; a larger VBV did not fix it. Sharp-text refinement (below) and per-frame QP control are the planned fixes.
 - Changing bitrate currently reopens the encoder and forces an IDR (12–17 reopens in S2's lossy runs); production should reconfigure the rate without reopening.
 - **SVT-AV1** real-time presets where CPU and client allow (later phase); AV1 has screen-content coding tools.
 - Hardware when present: VAAPI (Intel/AMD), NVENC (NVIDIA).
@@ -311,7 +324,12 @@ Out of scope: the VPS provider, or anyone with root on the host.
 - First login: password + PIN, then register a passkey; afterwards passkey + PIN.
 - Rate limiting with exponential backoff and IP lockouts; short-lived sessions bound to the browser.
 - Certificate from Let's Encrypt for `--domain`.
-- With no domain **(provisional: not yet issued for real)**: a Let's Encrypt short-lived certificate for the server's IP address (`shortlived` profile, about 160 hours, validated by `http-01` or `tls-alpn-01`), renewed automatically. `instant-acme` supports IP identifiers and ACME profiles.
+- With no domain: a Let's Encrypt short-lived certificate for the server's IP addresses (`shortlived` profile, 160 hours, validated by `http-01` on TCP 80), issued with `instant-acme`. S5 issued and renewed real ones for IPv4 and IPv6 in 6.5–7.4 s, and Chrome and Firefox used them for WebTransport over the internet.
+  - The CSR has an empty subject (Let's Encrypt rejects a common name for IP certificates).
+  - Renewal follows ACME Renewal Information (about half the lifetime, so roughly every 3 days) with `replaces`, backs off on errors, and keeps the previous certificate until the new one is live. A fallback timer renews well inside 160 hours. Let's Encrypt's duplicate-certificate limits make a retry loop dangerous.
+  - The certificate is **hot-reloaded** into the QUIC endpoint, HTTPS and WebSocket listeners without dropping sessions.
+  - Port 80 must be reachable from several vantage points; where the provider blocks it, the self-signed fallback below is used.
+  - Chrome rejects WebTransport to an **IPv6 address literal** with a CA certificate that it accepts over TCP (Chrome 158; cause unknown). IPv6-only servers therefore use the WebSocket fallback in Chrome.
 - Fallback: a self-signed ECDSA P-256 certificate valid for under 14 days, pinned by the page through WebTransport's `serverCertificateHashes` (works in Chrome and Firefox, S5). Rotation needs an overlap window offering two hashes. Because the browser won't trust that certificate for loading the page itself, this fallback needs the web client served from a trusted HTTPS origin (for example the project's GitHub Pages), which then connects to the server by IP and pins the hash it got from the desktop app.
 
 ### 8.5 Privilege separation
@@ -322,7 +340,7 @@ Out of scope: the VPS provider, or anyone with root on the host.
 
 ### 8.6 Secrets on the server
 
-- Drive refresh token, backup repository key and agent identity key are stored root-only, outside the container, sealed with `systemd-creds` (TPM-backed where available).
+- Drive refresh token, backup repository key, agent identity key and the ACME account key are stored root-only, outside the container, sealed with `systemd-creds` (TPM-backed where available).
 - `hx-gatewayd` never sees the Drive token or backup key.
 - Because unattended backups need the backup key, root on the server can read the backups. The **recovery key** is shown once at setup and is the only way to restore if the server is lost.
 - Root on the server could delete backups using the Drive token; the desktop app checks regularly that recent backups exist and warns if they disappear.
@@ -357,7 +375,9 @@ Everything on disk in the desktop container: system, installed apps, configurati
 1. Take an Incus snapshot (crash-consistent; SQLite, LevelDB and database containers recover from it as from a power cut; S4 confirmed `PRAGMA integrity_check` = ok on a database written to during the snapshot).
 2. Attach the snapshot read-only to the backup worker with ownership mapped (an idmapped mount, as S4 did with an Incus disk device and `shift=true`) and run the worker: `rustic_core`, **zstd level 3**, content-defined chunking, encryption and authentication, Google Drive backend. Level 9 cost about 70% more CPU for 4% smaller output.
 
-S4 sizes (synthetic data): a 2.24 GB desktop became a 906 MB repository; a simulated day of use added 98 MB.
+S4 sizes (synthetic data): a 2.24 GB desktop became a 906 MB repository locally; on real Google Drive a 2.44 GB desktop became 1.0 GB, uploaded in 125 s, and a simulated day of use added 98 MB in 28 s.
+
+The Drive backend is hash-xcreen's own wrapper over OpenDAL's `gdrive` service (S4's `HxDrive`). It owns every retry decision (OpenDAL's retry layer is off), passes listing errors up instead of dropping them, bounds every request with a timeout (60 s plus 4 s per MiB), and creates the repository's 256 `data/xx` folders lazily, when a pack is first written to them, instead of at `init` (534 API calls). The worker never holds Google credentials: `hx-privd` gives it a repository handle, as S4's REST bridge did.
 3. Record a manifest: distro, desktop, preset, container configuration, agent version, backup format version.
 4. Delete the snapshot.
 
@@ -372,8 +392,9 @@ S4 sizes (synthetic data): a 2.24 GB desktop became a 906 MB repository; a simul
 
 | Failure | Handling |
 |---|---|
-| Network errors, Google 5xx, rate limiting | Retry with exponential backoff and jitter; content addressing means only missing data is uploaded on retry. OpenDAL's `gdrive` backend retries only 5xx, 405 and one specific message, so hash-xcreen's wrapper must handle HTTP 429 and 403 `rateLimitExceeded`. Each pack is one multipart upload, so an interrupted upload resumes per pack, not mid-pack. |
-| Daily upload limit (750 GB per account) | Pause and resume the next day. |
+| Network errors, Google 5xx, 408, 405, rate limiting (429, 403 `rateLimitExceeded` / `userRateLimitExceeded`) | Retry with exponential backoff (1 s doubling to 64 s, equal jitter, `Retry-After` honoured), at most 8 retries, then fail the run and reschedule. Content addressing means only missing data is uploaded on retry. Each pack is one multipart upload, so an interrupted upload resumes per pack, not mid-pack (a killed upload leaves no partial object on Drive). Tested by fault injection on real Drive; real rate-limit replies have not been seen yet, so the nightly Drive test records every non-2xx reply to confirm the classifier. |
+| Daily upload limit (750 GB per account), 403 `dailyLimitExceeded` | A gate shared by all upload threads pauses for an hour and probes again, for up to about a day. |
+| Drive storage quota exceeded | No retry; "Drive full" handling (9.7). |
 | Token revoked or expired | Stop; mark "Action needed: reconnect Google Drive". |
 | Server disk too full for a snapshot | Do not start; notify. |
 | Agent crash mid-run | On start-up, remove tagged leftover snapshots and stale repository locks; retry. |
@@ -382,7 +403,9 @@ S4 sizes (synthetic data): a 2.24 GB desktop became a 906 MB repository; a simul
 ### 9.7 Quota, retention and verification
 
 - Free Google storage (15 GB) is shared with Gmail and Photos. The wizard estimates the first backup and typical increments before enabling backups.
-- Before each run, compare free Drive space with the estimated new data. Warnings at 80% and 95%.
+- Before each run, compare free Drive space with the estimated new data. Free space comes from Drive's `about.storageQuota`, which counts the trash, not from the sum of the repository's pack sizes. Warnings at 80% and 95%.
+- **Deleting on Drive is permanent.** A Drive delete through OpenDAL only moves the file to the trash, which still counts against the quota (S4: 2.8 GB pruned, quota unchanged). hash-xcreen's backend therefore ends every removal with `DELETE files/{id}` on its own files, which `drive.file` allows. It never calls `files.emptyTrash`, which would delete the user's other trashed files. Folders are deleted leaves first: Drive refuses a recursive delete of a folder with children (403 `appNotAuthorizedToChild`).
+- Pruning uses `--instant`; otherwise rustic keeps removed packs for 23 hours.
 - **Drive full**: prune oldest backups automatically, never below the two most recent successful ones; if still short, stop and notify.
 - Retention defaults: every 12h keeps the latest 14 + 4 weekly + 6 monthly; every 24h keeps 7 daily + 4 weekly + 6 monthly. Editable per server.
 - Pruning runs weekly.
@@ -395,7 +418,7 @@ S4 sizes (synthetic data): a 2.24 GB desktop became a 906 MB repository; a simul
 3. The restored desktop must boot and start `hx-session` before it replaces the old one.
 4. The old desktop is kept as a pre-restore snapshot until the user confirms, or for 7 days.
 5. Restoring onto a newer agent is supported; the manifest records versions.
-6. Restore details found in S4: keep numeric owner IDs; restore sparse files as sparse; recreate the mount-point directories that backups skip (`/proc`, `/sys`, `/dev`, `/run`, `/tmp`); on a new server, generate a new hostname and `/etc/machine-id`, which otherwise stay identical to the original's. S4 restored 81,065 entries with 0 differences in contents, owners, permissions, extended attributes or hard links, and an interrupted restore resumed by restoring only the missing files.
+6. Restore details found in S4: keep numeric owner IDs; restore sparse files as sparse; recreate the mount-point directories that backups skip (`/proc`, `/sys`, `/dev`, `/run`, `/tmp`); on a new server, generate a new hostname and `/etc/machine-id`, which otherwise stay identical to the original's. S4 restored 81,065 entries locally and 81,070 from real Google Drive with 0 differences in contents, owners, permissions, extended attributes or hard links, and an interrupted restore resumed by restoring only the missing files. The same 1.06 GB restore from Drive took 367 s once and 19 s the next time, with no error or retry logged, so the app shows restore progress by bytes and never promises a duration.
 7. **Restore onto a new server**: the app signs in to Drive, the user picks a backup and enters the recovery key, and the installer restores instead of creating a fresh desktop.
 
 ### 9.9 Alerts
@@ -412,7 +435,17 @@ In-app badges and desktop notifications, plus optional server-side alerts in v1:
 
 Latency budget: capture ≤ 2 ms, colour conversion 1–2 ms, encode 4–8 ms, send < 1 ms, hardware decode 2–4 ms, present 0–8 ms.
 
-S2 measured (damage to decode complete, p95, LAN, 4 pinned cores, presentation excluded): typing 24.6 ms, scrolling 34.6 ms, window drag 30.2 ms, video 40.5 ms (28.6 ms with lower pacing). The server used 0.48–0.60 cores while typing or scrolling, and 0.01 cores with 0 bytes sent while idle. The 40 ms target holds only with CPU headroom: under heavy shared-host load, scrolling and dragging reached 37–61 ms at p95.
+S2 measured on a quiet 4 vCPU VPS (damage to decode complete, p95, presentation excluded, 3 repeats, relaxed pacing):
+
+| Scenario | Same host (LAN) | Over the internet (14 ms RTT) | Server cores |
+|---|---|---|---|
+| Typing | 10.7 ms | 24.8 ms | 0.45–0.49 |
+| Scrolling | 13.9 ms | 21.6 ms | 0.47–0.49 |
+| Window drag | 11.7 ms | 20.4 ms | 0.69–0.75 |
+| Video | 16.5 ms | 23.8 ms | 0.54–0.64 |
+| Idle | 0 frames | 1–2 tiny frames per 30 s | 0.01–0.02 |
+
+Over the internet, about 8 ms of the total is the network (half the round trip). Decoded frames matched the source at 47 dB PSNR while typing (text fully legible), 34–44 dB in the moving scenarios. The 40 ms target needs CPU headroom: in the first local run on a heavily shared host, scrolling and dragging reached 37–61 ms at p95. Not yet measured on a lossy real link: on the VPS, `tc netem` had no effect through the Incus proxy device used.
 
 Hot path rules: encode only on damage; buffer pools, no per-frame allocation; dedicated threads joined by lock-free queues for capture, conversion and encode; the async runtime is used only for networking.
 
@@ -475,11 +508,13 @@ Status after the Phase 0 spikes (details in `docs/spikes/`; follow-up runs in ex
 | Item | Status |
 |---|---|
 | Slint can display GPU-decoded frames without CPU copies | Open: code built, untested without a GPU (S1 GPU run) |
-| x264 1080p60 within the CPU and latency budget on 4 vCPU | Confirmed locally (S2); re-measure on a quiet VPS |
-| XFCE fits the 2 vCPU / 4 GB minimum | Confirmed locally (S3); VPS overhead still to measure |
-| Docker nested in the desktop | **Failing** on Incus 6.0 (S3); decision pending |
-| Full-desktop backup and restore with `rustic_core` | Confirmed with a local repository (S4) |
-| OpenDAL's Google Drive backend, `drive.file` scope, rate limits | Open: compiles and fits, untested against Drive (S4 Drive run) |
-| WebTransport and native QUIC on one port | Confirmed (S5) |
-| Let's Encrypt IP-address certificates; Safari support | Open (S5 public-server run) |
+| x264 1080p60 within the CPU and latency budget on 4 vCPU | Confirmed on a quiet VPS, same host and over the internet (S2); behaviour on a lossy real link still to measure |
+| XFCE fits the 2 vCPU / 4 GB minimum | Confirmed on a VPS (S3); a real 4 GB server and Ubuntu 24.04 / Debian 13 hosts still untested |
+| Docker nested in the desktop | Works on Incus 6.0.5 (S3 VPS), fails on 6.0.0; installer self-test with fallbacks (4.3) |
+| Full-desktop backup and restore with `rustic_core` | Confirmed locally and on real Google Drive (S4) |
+| OpenDAL's Google Drive backend, `drive.file` scope, rate limits | `drive.file` confirmed on real Drive; wrapper tested by fault injection; real rate-limit replies, packs ≥ 128 MB, slow uplinks and token revocation still unseen (S4) |
+| WebTransport and native QUIC on one port | Confirmed, including over the internet (S5) |
+| Let's Encrypt IP-address certificates | Confirmed: issued and renewed in production (S5); Chrome fails to IPv6 literals |
+| Safari WebTransport | Open: needs a Mac (Phase 3); WebSocket fallback meanwhile |
+| Process control inside the desktop | On the VPS kernel, processes started by one `incus exec` could not be signalled from another (AppArmor). `hx-session` must own the processes it manages (S2) |
 | Google OAuth app verification for `drive.file` stays light | Release checklist |
