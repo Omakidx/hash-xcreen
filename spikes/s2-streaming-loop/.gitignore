@@ -1,2 +1,5 @@
 target/
 results/*/client-frames.csv
+results/vps/*/client-frames.csv
+results/vps/*/client-clock.csv
+results/vps/*/*.tgz

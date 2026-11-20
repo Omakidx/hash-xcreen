@@ -1,0 +1,99 @@
+== FID 13:38:03
+Error: Can't unset key 'limits.cpu', it's not currently set
+Error: Can't unset key 'limits.cpu', it's not currently set
+FID_typing_fps120_r1 rc 0 vps busy 24.6 steal 0.48 load 0.48
+FID_typing_fps120-vui_r1 rc 0 vps busy 25.3 steal 0.6 load 0.70
+FID_scroll_fps120_r1 rc 0 vps busy 35.8 steal 0.84 load 1.28
+FID_scroll_fps120-vui_r1 rc 0 vps busy 39.2 steal 1.48 load 1.08
+FID_drag_fps120_r1 rc 0 vps busy 34.3 steal 0.62 load 2.00
+FID_drag_fps120-vui_r1 rc 0 vps busy 33.3 steal 0.68 load 2.06
+FID_video_fps120_r1 rc 0 vps busy 48.0 steal 0.45 load 1.77
+FID_video_fps120-vui_r1 rc 0 vps busy 47.6 steal 0.83 load 2.00
+== A1 13:43:47
+Error: Can't unset key 'limits.cpu', it's not currently set
+Error: Can't unset key 'limits.cpu', it's not currently set
+A1_typing_fps120_r1 rc 0 vps busy 26.1 steal 0.79 load 2.66
+A1_typing_base_r1 rc 0 vps busy 23.3 steal 0.59 load 1.56
+A1_scroll_fps120_r1 rc 0 vps busy 36.0 steal 1.34 load 0.93
+A1_scroll_base_r1 rc 0 vps busy 36.9 steal 0.95 load 1.78
+A1_drag_fps120_r1 rc 0 vps busy 34.6 steal 0.79 load 1.74
+A1_drag_base_r1 rc 0 vps busy 32.8 steal 0.63 load 1.76
+A1_video_fps120_r1 rc 0 vps busy 52.2 steal 0.79 load 1.65
+A1_video_base_r1 rc 0 vps busy 48.0 steal 0.83 load 3.16
+A1_idle_base_r1 rc 0 vps busy 1.1 steal 0.13 load 3.28
+A1_typing_fps120_r2 rc 0 vps busy 26.3 steal 0.71 load 2.18
+A1_typing_base_r2 rc 0 vps busy 23.9 steal 0.53 load 1.47
+A1_scroll_fps120_r2 rc 0 vps busy 36.0 steal 0.67 load 1.27
+A1_scroll_base_r2 rc 0 vps busy 36.0 steal 0.83 load 1.26
+A1_drag_fps120_r2 rc 0 vps busy 33.7 steal 0.5 load 1.94
+A1_drag_base_r2 rc 0 vps busy 31.5 steal 0.55 load 1.71
+A1_video_fps120_r2 rc 0 vps busy 49.0 steal 0.5 load 2.18
+A1_video_base_r2 rc 0 vps busy 40.5 steal 0.19 load 3.27
+A1_idle_base_r2 rc 0 vps busy 1.5 steal 0.12 load 3.25
+A1_typing_fps120_r3 rc 0 vps busy 21.7 steal 0.45 load 1.53
+A1_typing_base_r3 rc 0 vps busy 21.8 steal 0.15 load 1.13
+A1_scroll_fps120_r3 rc 0 vps busy 31.5 steal 0.11 load 1.54
+A1_scroll_base_r3 rc 0 vps busy 32.2 steal 0.14 load 1.45
+A1_drag_fps120_r3 rc 0 vps busy 31.0 steal 0.25 load 1.27
+A1_drag_base_r3 rc 0 vps busy 28.0 steal 0.2 load 1.09
+A1_video_fps120_r3 rc 0 vps busy 44.7 steal 0.55 load 2.14
+A1_video_base_r3 rc 0 vps busy 43.6 steal 0.69 load 2.56
+A1_idle_base_r3 rc 0 vps busy 0.9 steal 0.05 load 2.21
+== A2 14:01:38
+Error: Invalid config: Invalid cpuset value: 0
+A2_typing_fps120_r1 rc 0 vps busy 21.1 steal 0.14 load 1.26
+A2_scroll_fps120_r1 rc 0 vps busy 30.8 steal 0.13 load 1.57
+A2_drag_fps120_r1 rc 0 vps busy 28.5 steal 0.13 load 2.08
+A2_video_fps120_r1 rc 0 vps busy 42.2 steal 0.27 load 2.09
+A2_idle_fps120_r1 rc 0 vps busy 0.9 steal 0.01 load 1.99
+A2_typing_fps120_r2 rc 0 vps busy 24.1 steal 0.96 load 1.18
+A2_scroll_fps120_r2 rc 0 vps busy 35.1 steal 0.65 load 1.08
+A2_drag_fps120_r2 rc 0 vps busy 31.8 steal 0.56 load 1.11
+A2_video_fps120_r2 rc 0 vps busy 46.6 steal 0.24 load 1.51
+A2_idle_fps120_r2 rc 0 vps busy 1.7 steal 0.18 load 1.16
+A2_typing_fps120_r3 rc 0 vps busy 24.1 steal 0.28 load 0.85
+A2_scroll_fps120_r3 rc 0 vps busy 35.2 steal 0.52 load 1.94
+A2_drag_fps120_r3 rc 0 vps busy 34.5 steal 0.71 load 1.78
+A2_video_fps120_r3 rc 0 vps busy 45.8 steal 0.44 load 2.19
+A2_idle_fps120_r3 rc 0 vps busy 1.0 steal 0.07 load 1.76
+Error: Can't unset key 'limits.cpu', it's not currently set
+== X 14:11:40
+Error: Can't unset key 'limits.cpu', it's not currently set
+Error: Can't unset key 'limits.cpu', it's not currently set
+X_typing_fps120-noir_r1 rc 0 vps busy 26.1 steal 0.29 load 0.84
+X_typing_fps120-t1_r1 rc 0 vps busy 23.8 steal 0.31 load 0.96
+X_typing_fps120-t2_r1 rc 0 vps busy 23.5 steal 0.48 load 0.99
+X_scroll_fps120-noir_r1 rc 0 vps busy 33.0 steal 0.21 load 1.03
+X_scroll_fps120-t1_r1 rc 0 vps busy 35.0 steal 0.28 load 1.48
+X_scroll_fps120-t2_r1 rc 0 vps busy 34.6 steal 0.68 load 1.15
+X_drag_fps120-noir_r1 rc 0 vps busy 35.0 steal 0.7 load 1.05
+X_drag_fps120-t1_r1 rc 0 vps busy 31.5 steal 0.5 load 2.03
+X_drag_fps120-t2_r1 rc 0 vps busy 33.2 steal 0.41 load 1.64
+X_video_fps120-noir_r1 rc 0 vps busy 49.6 steal 0.47 load 1.83
+X_video_fps120-t1_r1 rc 0 vps busy 46.9 steal 0.47 load 2.48
+X_video_fps120-t2_r1 rc 0 vps busy 43.2 steal 0.44 load 1.79
+X_typing_fps120-noir_r2 rc 0 vps busy 25.6 steal 0.89 load 1.58
+X_typing_fps120-t1_r2 rc 0 vps busy 25.0 steal 1.04 load 1.37
+X_typing_fps120-t2_r2 rc 0 vps busy 25.4 steal 0.69 load 1.07
+X_scroll_fps120-noir_r2 rc 0 vps busy 35.5 steal 0.65 load 1.11
+X_scroll_fps120-t1_r2 rc 0 vps busy 34.8 steal 0.5 load 2.12
+X_scroll_fps120-t2_r2 rc 0 vps busy 34.4 steal 0.29 load 2.22
+X_drag_fps120-noir_r2 rc 0 vps busy 33.1 steal 0.33 load 2.30
+X_drag_fps120-t1_r2 rc 0 vps busy 30.6 steal 0.35 load 1.68
+X_drag_fps120-t2_r2 rc 0 vps busy 31.7 steal 0.39 load 1.46
+X_video_fps120-noir_r2 rc 0 vps busy 42.8 steal 0.25 load 1.82
+X_video_fps120-t1_r2 rc 0 vps busy 43.0 steal 0.29 load 2.25
+X_video_fps120-t2_r2 rc 0 vps busy 41.7 steal 0.3 load 2.28
+X_typing_fps120-noir_r3 rc 0 vps busy 24.6 steal 0.26 load 1.56
+X_typing_fps120-t1_r3 rc 0 vps busy 21.6 steal 0.26 load 1.78
+X_typing_fps120-t2_r3 rc 0 vps busy 21.8 steal 0.53 load 1.17
+X_scroll_fps120-noir_r3 rc 0 vps busy 30.3 steal 0.18 load 0.67
+X_scroll_fps120-t1_r3 rc 0 vps busy 31.1 steal 0.52 load 1.41
+X_scroll_fps120-t2_r3 rc 0 vps busy 31.2 steal 0.18 load 1.33
+X_drag_fps120-noir_r3 rc 0 vps busy 29.6 steal 0.18 load 1.28
+X_drag_fps120-t1_r3 rc 0 vps busy 26.0 steal 0.11 load 1.04
+X_drag_fps120-t2_r3 rc 0 vps busy 27.6 steal 0.3 load 0.79
+X_video_fps120-noir_r3 rc 0 vps busy 39.9 steal 0.19 load 1.04
+X_video_fps120-t1_r3 rc 0 vps busy 42.4 steal 0.2 load 0.98
+X_video_fps120-t2_r3 rc 0 vps busy 43.2 steal 0.15 load 1.73
+== done 14:35:06

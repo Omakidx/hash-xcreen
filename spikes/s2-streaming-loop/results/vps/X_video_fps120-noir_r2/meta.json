@@ -1,0 +1,28 @@
+{
+ "client": "lan",
+ "profile": "lan",
+ "scenario": "video",
+ "config": "fps120-noir",
+ "extra": "",
+ "label": "A1: both containers unpinned on 4 vCPU",
+ "client_rc": 0,
+ "tag": "X_video_fps120-noir_r2",
+ "server_args": "--fps 120 --intra-refresh 0",
+ "netem": null,
+ "vps_loadavg_start": "1.72 1.71 1.61 2/386 714157",
+ "vps_loadavg_mid": "1.82 1.73 1.62 7/417 714253",
+ "vps_loadavg_end": "2.00 1.78 1.64 1/399 714311",
+ "vps_busy_all_pct": 42.8,
+ "vps_steal_pct": 0.25,
+ "vps_iowait_pct": 0.01,
+ "vps_busy_per_core_pct": [
+  44.0,
+  42.4,
+  42.5,
+  42.4
+ ],
+ "local_loadavg_start": "1.72 1.71 1.61 2/385 714157",
+ "local_loadavg_mid": "1.82 1.73 1.62 6/416 714253",
+ "local_loadavg_end": "2.00 1.78 1.64 1/398 714311",
+ "ts": "2026-11-20T14:26:03"
+}

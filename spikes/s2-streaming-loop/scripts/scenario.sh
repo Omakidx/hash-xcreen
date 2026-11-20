@@ -2,6 +2,9 @@
 # Scenario driver, runs inside the container as user `desk` (pushed to /home/desk/scenario.sh).
 #   scenario.sh prep <name>          set the desktop up (not measured)
 #   scenario.sh run  <name> <secs>   generate input for <secs> seconds
+# With HOLD=1, `prep` touches /tmp/s2-ready and then sleeps forever, so the apps it started stay in the cgroup of the
+# transient unit that runs it; `systemctl stop` of that unit then removes them. This matters on the VPS (kernel 7.0):
+# AppArmor denies signals between processes started by different `incus exec` sessions, so pkill cannot clean up.
 # Names: idle typing scroll video drag
 export DISPLAY=:10
 mode=$1; name=$2; secs=${3:-20}
@@ -24,6 +27,7 @@ if [ "$mode" = prep ]; then
   esac
   xdotool mousemove 1800 1000
   sleep 1
+  if [ "${HOLD:-0}" = 1 ]; then touch /tmp/s2-ready; exec sleep infinity; fi
   exit 0
 fi
 

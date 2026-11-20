@@ -1,0 +1,77 @@
+### FID_drag_fps120-vbv4_r1
+decoder-reported: format=YUV420P width=1920 height=1080 range=MPEG space=BT709 primaries=BT709 trc=BT709
+frames=33 psnr_rgb mean=40.48 min=21.28 | psnr_luma mean=41.88 | ssim_luma mean=0.9924 min=0.9107 | plane psnr Y=41.99 U=54.59 V=53.96 | bias RGB=0.34,-0.29,0.23 | psnr_if_bt601 mean=39.94 | psnr_if_full_range mean=24.00
+pure-white source pixels decode to mean RGB 254.19,253.94,254.13
+crop frame 160 at x=688 y=496 128x72 (psnr_rgb 41.51)
+crop frame 1320 at x=560 y=400 128x72 (psnr_rgb 21.28)
+
+### FID_drag_fps120-vui_r1
+decoder-reported: format=YUV420P width=1920 height=1080 range=MPEG space=BT709 primaries=BT709 trc=BT709
+frames=33 psnr_rgb mean=36.60 min=24.06 | psnr_luma mean=37.30 | ssim_luma mean=0.9875 min=0.9288 | plane psnr Y=37.59 U=51.07 V=51.65 | bias RGB=0.28,-0.48,0.22 | psnr_if_bt601 mean=36.31 | psnr_if_full_range mean=23.90
+pure-white source pixels decode to mean RGB 253.87,253.44,253.89
+crop frame 800 at x=512 y=512 128x72 (psnr_rgb 37.68)
+crop frame 680 at x=592 y=480 128x72 (psnr_rgb 24.06)
+
+### FID_drag_fps120_r1
+decoder-reported: format=YUV420P width=1920 height=1080 range=Unspecified space=Unspecified primaries=Unspecified trc=Unspecified
+frames=33 psnr_rgb mean=36.16 min=17.98 | psnr_luma mean=36.89 | ssim_luma mean=0.9846 min=0.8602 | plane psnr Y=37.27 U=50.92 V=51.49 | bias RGB=0.33,-0.42,0.30 | psnr_if_bt601 mean=35.88 | psnr_if_full_range mean=23.70
+pure-white source pixels decode to mean RGB 253.78,253.35,253.83
+crop frame 520 at x=624 y=80 128x72 (psnr_rgb 37.75)
+crop frame 1080 at x=768 y=688 128x72 (psnr_rgb 17.98)
+
+### FID_scroll_fps120-vbv4_r1
+decoder-reported: format=YUV420P width=1920 height=1080 range=MPEG space=BT709 primaries=BT709 trc=BT709
+frames=25 psnr_rgb mean=39.27 min=14.82 | psnr_luma mean=45.35 | ssim_luma mean=0.9674 min=0.8356 | plane psnr Y=48.40 U=55.74 V=57.98 | bias RGB=1.16,0.28,1.30 | psnr_if_bt601 mean=37.80 | psnr_if_full_range mean=24.24
+pure-white source pixels decode to mean RGB 245.87,245.95,247.48
+crop frame 80 at x=1792 y=0 128x72 (psnr_rgb 45.86)
+crop frame 1000 at x=864 y=272 128x72 (psnr_rgb 14.82)
+
+### FID_scroll_fps120-vui_r1
+decoder-reported: format=YUV420P width=1920 height=1080 range=MPEG space=BT709 primaries=BT709 trc=BT709
+frames=25 psnr_rgb mean=43.74 min=19.63 | psnr_luma mean=51.68 | ssim_luma mean=0.9829 min=0.7981 | plane psnr Y=56.04 U=59.35 V=59.47 | bias RGB=0.83,0.05,1.03 | psnr_if_bt601 mean=41.91 | psnr_if_full_range mean=25.77
+pure-white source pixels decode to mean RGB 253.29,253.30,253.39
+crop frame 840 at x=160 y=0 128x72 (psnr_rgb 46.74)
+crop frame 160 at x=864 y=272 128x72 (psnr_rgb 19.63)
+
+### FID_scroll_fps120_r1
+decoder-reported: format=YUV420P width=1920 height=1080 range=Unspecified space=Unspecified primaries=Unspecified trc=Unspecified
+frames=25 psnr_rgb mean=42.97 min=17.44 | psnr_luma mean=49.75 | ssim_luma mean=0.9821 min=0.7897 | plane psnr Y=53.30 U=57.79 V=58.31 | bias RGB=0.84,-0.02,1.07 | psnr_if_bt601 mean=41.31 | psnr_if_full_range mean=25.68
+pure-white source pixels decode to mean RGB 244.80,246.95,249.76
+crop frame 240 at x=1792 y=0 128x72 (psnr_rgb 46.29)
+crop frame 280 at x=864 y=272 128x72 (psnr_rgb 17.44)
+
+### FID_typing_fps120-vui_r1
+decoder-reported: format=YUV420P width=1920 height=1080 range=MPEG space=BT709 primaries=BT709 trc=BT709
+frames=26 psnr_rgb mean=47.07 min=46.95 | psnr_luma mean=55.02 | ssim_luma mean=0.9995 min=0.9993 | plane psnr Y=57.07 U=59.40 V=59.68 | bias RGB=0.41,0.05,0.41 | psnr_if_bt601 mean=45.47 | psnr_if_full_range mean=23.78
+pure-white source pixels decode to mean RGB 254.99,254.99,254.98
+crop frame 840 at x=352 y=128 128x72 (psnr_rgb 47.04)
+crop frame 920 at x=752 y=128 128x72 (psnr_rgb 46.95)
+
+### FID_typing_fps120_r1
+decoder-reported: format=YUV420P width=1920 height=1080 range=Unspecified space=Unspecified primaries=Unspecified trc=Unspecified
+frames=27 psnr_rgb mean=47.11 min=46.99 | psnr_luma mean=55.08 | ssim_luma mean=0.9995 min=0.9994 | plane psnr Y=57.16 U=59.67 V=60.20 | bias RGB=0.40,0.05,0.41 | psnr_if_bt601 mean=45.48 | psnr_if_full_range mean=23.79
+pure-white source pixels decode to mean RGB 254.99,254.99,254.98
+crop frame 480 at x=256 y=128 128x72 (psnr_rgb 47.06)
+crop frame 1080 at x=208 y=128 128x72 (psnr_rgb 46.99)
+
+### FID_video_fps120-vbv4_r1
+decoder-reported: format=YUV420P width=1920 height=1080 range=MPEG space=BT709 primaries=BT709 trc=BT709
+frames=25 psnr_rgb mean=34.52 min=34.08 | psnr_luma mean=43.68 | ssim_luma mean=0.9924 min=0.9909 | plane psnr Y=45.17 U=44.77 V=43.90 | bias RGB=-0.08,0.13,0.03 | psnr_if_bt601 mean=23.15 | psnr_if_full_range mean=24.38
+pure-white source pixels decode to mean RGB 253.48,254.13,252.91
+crop frame 520 at x=1200 y=688 128x72 (psnr_rgb 34.52)
+crop frame 1000 at x=1200 y=848 128x72 (psnr_rgb 34.08)
+
+### FID_video_fps120-vui_r1
+decoder-reported: format=YUV420P width=1920 height=1080 range=MPEG space=BT709 primaries=BT709 trc=BT709
+frames=27 psnr_rgb mean=33.61 min=32.91 | psnr_luma mean=40.32 | ssim_luma mean=0.9872 min=0.9847 | plane psnr Y=41.65 U=42.79 V=41.47 | bias RGB=-0.08,0.11,0.05 | psnr_if_bt601 mean=23.09 | psnr_if_full_range mean=24.29
+pure-white source pixels decode to mean RGB 253.70,254.14,253.20
+crop frame 360 at x=1200 y=848 128x72 (psnr_rgb 33.70)
+crop frame 40 at x=1200 y=848 128x72 (psnr_rgb 32.91)
+
+### FID_video_fps120_r1
+decoder-reported: format=YUV420P width=1920 height=1080 range=Unspecified space=Unspecified primaries=Unspecified trc=Unspecified
+frames=30 psnr_rgb mean=33.68 min=33.01 | psnr_luma mean=40.48 | ssim_luma mean=0.9876 min=0.9855 | plane psnr Y=41.80 U=43.07 V=41.70 | bias RGB=-0.07,0.12,0.05 | psnr_if_bt601 mean=23.10 | psnr_if_full_range mean=24.30
+pure-white source pixels decode to mean RGB 253.63,254.17,253.14
+crop frame 240 at x=1200 y=688 128x72 (psnr_rgb 33.63)
+crop frame 1160 at x=1200 y=688 128x72 (psnr_rgb 33.01)
+

@@ -1,0 +1,28 @@
+{
+ "client": "lan",
+ "profile": "lan",
+ "scenario": "drag",
+ "config": "fps120-vui",
+ "extra": "",
+ "label": "A1: both containers unpinned on 4 vCPU",
+ "client_rc": 0,
+ "tag": "FID_drag_fps120-vui_r1",
+ "server_args": "--fps 120 --vui 1 --dump /tmp/dump --dump-every 40",
+ "netem": null,
+ "vps_loadavg_start": "2.24 1.25 0.87 2/381 644950",
+ "vps_loadavg_mid": "2.06 1.23 0.87 4/412 644993",
+ "vps_loadavg_end": "1.91 1.25 0.88 4/395 645014",
+ "vps_busy_all_pct": 33.3,
+ "vps_steal_pct": 0.68,
+ "vps_iowait_pct": 0.09,
+ "vps_busy_per_core_pct": [
+  31.8,
+  35.6,
+  33.4,
+  32.5
+ ],
+ "local_loadavg_start": "2.24 1.25 0.87 2/380 644950",
+ "local_loadavg_mid": "2.06 1.23 0.87 3/411 644993",
+ "local_loadavg_end": "1.91 1.25 0.88 3/394 645014",
+ "ts": "2026-11-20T13:42:18"
+}

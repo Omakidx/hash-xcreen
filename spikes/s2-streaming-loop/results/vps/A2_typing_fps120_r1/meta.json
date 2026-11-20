@@ -1,0 +1,28 @@
+{
+ "client": "lan",
+ "profile": "lan",
+ "scenario": "typing",
+ "config": "fps120",
+ "extra": "",
+ "label": "A2: s2-desktop pinned to cores 1-3, s2-client pinned to core 0",
+ "client_rc": 0,
+ "tag": "A2_typing_fps120_r1",
+ "server_args": "--fps 120",
+ "netem": null,
+ "vps_loadavg_start": "1.37 1.78 1.60 2/387 675463",
+ "vps_loadavg_mid": "1.26 1.75 1.59 2/418 675566",
+ "vps_loadavg_end": "1.53 1.78 1.61 1/401 675579",
+ "vps_busy_all_pct": 21.1,
+ "vps_steal_pct": 0.14,
+ "vps_iowait_pct": 0.03,
+ "vps_busy_per_core_pct": [
+  3.7,
+  26.1,
+  28.9,
+  25.8
+ ],
+ "local_loadavg_start": "1.37 1.78 1.60 2/386 675463",
+ "local_loadavg_mid": "1.26 1.75 1.59 2/417 675566",
+ "local_loadavg_end": "1.53 1.78 1.61 2/400 675579",
+ "ts": "2026-11-20T14:02:19"
+}

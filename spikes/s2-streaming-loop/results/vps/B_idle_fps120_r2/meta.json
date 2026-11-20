@@ -1,0 +1,30 @@
+{
+ "client": "local",
+ "profile": "lan",
+ "scenario": "idle",
+ "config": "fps120",
+ "extra": "",
+ "label": "B: client on the local machine over the internet (server in s2-desktop via UDP proxy)",
+ "client_rc": 0,
+ "tag": "B_idle_fps120_r2",
+ "server_args": "--fps 120",
+ "netem": null,
+ "vps_loadavg_start": "2.18 1.49 1.35 2/375 767353",
+ "vps_loadavg_mid": "2.01 1.46 1.34 1/392 767533",
+ "vps_loadavg_end": "1.22 1.32 1.30 1/391 767721",
+ "vps_busy_all_pct": 1.4,
+ "vps_steal_pct": 0.04,
+ "vps_iowait_pct": 0.03,
+ "vps_busy_per_core_pct": [
+  1.3,
+  1.3,
+  2.3,
+  0.8
+ ],
+ "local_loadavg_start": "6.59 5.02 4.22 3/3942 1579097",
+ "local_loadavg_mid": "6.14 4.95 4.20 7/3928 1579183",
+ "local_loadavg_end": "5.87 5.02 4.25 1/3995 1579944",
+ "ts": "2026-11-20T15:59:39",
+ "local_busy_all_pct": 29.0,
+ "local_ncpu": 16
+}

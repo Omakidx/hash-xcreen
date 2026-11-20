@@ -1,0 +1,28 @@
+{
+ "client": "lan",
+ "profile": "lan",
+ "scenario": "scroll",
+ "config": "fps120-vui",
+ "extra": "",
+ "label": "A1: both containers unpinned on 4 vCPU",
+ "client_rc": 0,
+ "tag": "FID_scroll_fps120-vui_r1",
+ "server_args": "--fps 120 --vui 1 --dump /tmp/dump --dump-every 40",
+ "netem": null,
+ "vps_loadavg_start": "1.09 0.77 0.69 3/376 642712",
+ "vps_loadavg_mid": "1.08 0.77 0.70 2/407 642753",
+ "vps_loadavg_end": "1.78 0.95 0.76 1/394 642889",
+ "vps_busy_all_pct": 39.2,
+ "vps_steal_pct": 1.48,
+ "vps_iowait_pct": 0.03,
+ "vps_busy_per_core_pct": [
+  36.2,
+  40.3,
+  41.3,
+  39.1
+ ],
+ "local_loadavg_start": "1.09 0.77 0.69 3/376 642713",
+ "local_loadavg_mid": "1.08 0.77 0.70 2/406 642753",
+ "local_loadavg_end": "1.78 0.95 0.76 1/393 642889",
+ "ts": "2026-11-20T13:40:50"
+}

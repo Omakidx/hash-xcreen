@@ -1,0 +1,28 @@
+{
+ "client": "lan",
+ "profile": "lan",
+ "scenario": "drag",
+ "config": "fps120",
+ "extra": "",
+ "label": "A1: both containers unpinned on 4 vCPU",
+ "client_rc": 0,
+ "tag": "A1_drag_fps120_r2",
+ "server_args": "--fps 120",
+ "netem": null,
+ "vps_loadavg_start": "1.42 1.69 1.36 5/382 661078",
+ "vps_loadavg_mid": "1.94 1.80 1.39 1/414 661123",
+ "vps_loadavg_end": "1.94 1.81 1.41 1/394 661143",
+ "vps_busy_all_pct": 33.7,
+ "vps_steal_pct": 0.5,
+ "vps_iowait_pct": 0.01,
+ "vps_busy_per_core_pct": [
+  34.4,
+  34.3,
+  32.0,
+  34.2
+ ],
+ "local_loadavg_start": "1.42 1.69 1.36 3/381 661078",
+ "local_loadavg_mid": "1.94 1.80 1.39 1/413 661123",
+ "local_loadavg_end": "1.94 1.81 1.41 1/393 661143",
+ "ts": "2026-11-20T13:53:05"
+}

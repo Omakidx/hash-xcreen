@@ -52,6 +52,37 @@ struct Counters {
     cursor_lat_max_ns: AtomicU64,
 }
 
+/// Write the decoded picture as tightly packed planar YUV (Y, then U, then V) plus a one-line sidecar
+/// with the pixel format and the colour properties the stream signalled (fidelity runs).
+fn dump_frame(dir: &str, frame_no: u32, frame: &ffmpeg::frame::Video) {
+    let (w, h) = (frame.width() as usize, frame.height() as usize);
+    let mut buf = Vec::with_capacity(w * h * 3 / 2);
+    // SAFETY: the decoder output is a planar 4:2:0 AVFrame whose three planes are valid for linesize * rows bytes.
+    unsafe {
+        let f = frame.as_ptr();
+        for p in 0..3 {
+            let (pw, ph) = if p == 0 { (w, h) } else { (w.div_ceil(2), h.div_ceil(2)) };
+            let stride = (*f).linesize[p] as usize;
+            let data = std::slice::from_raw_parts((*f).data[p], stride * ph);
+            for row in 0..ph {
+                buf.extend_from_slice(&data[row * stride..row * stride + pw]);
+            }
+        }
+    }
+    let _ = std::fs::write(format!("{dir}/dec-{frame_no:06}.yuv"), buf);
+    let meta = format!(
+        "format={:?} width={} height={} range={:?} space={:?} primaries={:?} trc={:?}\n",
+        frame.format(),
+        frame.width(),
+        frame.height(),
+        frame.color_range(),
+        frame.color_space(),
+        frame.color_primaries(),
+        frame.color_transfer_characteristic()
+    );
+    let _ = std::fs::write(format!("{dir}/dec-format.txt"), meta);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_thread(
     rx: Receiver<RxFrame>,
@@ -61,6 +92,8 @@ fn decode_thread(
     rows_path: String,
     summary_path: String,
     ctr: Arc<Counters>,
+    dump_dir: String,
+    dump_every: u32,
 ) -> Result<()> {
     let codec = ffmpeg::decoder::find(ffmpeg::codec::Id::H264).ok_or_else(|| anyhow::anyhow!("no h264 decoder"))?;
     let mut ctx = ffmpeg::codec::context::Context::new_with_codec(codec);
@@ -121,6 +154,10 @@ fn decode_thread(
             let mut got = false;
             while dec.receive_frame(&mut frame).is_ok() {
                 got = true;
+                // receive_frame unrefs the frame on the next (failing) call, so dump inside the loop.
+                if !dump_dir.is_empty() && dump_every > 0 && f.hdr.frame_no % dump_every == 0 {
+                    dump_frame(&dump_dir, f.hdr.frame_no, &frame);
+                }
             }
             let t_dec_end = now_ns();
             if !got {
@@ -241,6 +278,10 @@ fn main() -> Result<()> {
     let duration = (a.get::<f64>("duration", 20.0) * 1e9) as u64;
     let out = a.get_str("out", "/tmp/s2-client");
     let dec_threads: usize = a.get("dec-threads", 4);
+    let dump_dir = a.get_str("dump", "");
+    let dump_every: u32 = a.get("dump-every", 40);
+    let clock_path = format!("{out}-clock.csv");
+    let clock_samples: Arc<std::sync::Mutex<Vec<[u64; 4]>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     ffmpeg::init()?;
     ffmpeg::util::log::set_level(ffmpeg::util::log::Level::Warning);
 
@@ -249,7 +290,7 @@ fn main() -> Result<()> {
     let dec = {
         let ctr = ctr.clone();
         let (rp, sp) = (format!("{out}-frames.csv"), format!("{out}-summary.json"));
-        std::thread::Builder::new().name("decode".into()).spawn(move || decode_thread(rx, dec_threads, warmup, duration, rp, sp, ctr))?
+        std::thread::Builder::new().name("decode".into()).spawn(move || decode_thread(rx, dec_threads, warmup, duration, rp, sp, ctr, dump_dir, dump_every))?
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
@@ -272,6 +313,30 @@ fn main() -> Result<()> {
         ep.set_default_client_config(cc);
         let conn = ep.connect(server, "s2")?.await?;
         eprintln!("s2-client: connected to {server}");
+        // Clock probes: NTP-style exchange over QUIC datagrams every 50 ms (t1 here, t2/t3 on the server, t4 here).
+        {
+            let c = conn.clone();
+            tokio::spawn(async move {
+                let mut iv = tokio::time::interval(std::time::Duration::from_millis(50));
+                loop {
+                    iv.tick().await;
+                    if c.send_datagram(now_ns().to_le_bytes().to_vec().into()).is_err() {
+                        break;
+                    }
+                }
+            });
+            let c = conn.clone();
+            let samples = clock_samples.clone();
+            tokio::spawn(async move {
+                while let Ok(d) = c.read_datagram().await {
+                    let t4 = now_ns();
+                    if d.len() == 24 {
+                        let u = |o: usize| u64::from_le_bytes(d[o..o + 8].try_into().unwrap());
+                        samples.lock().unwrap().push([u(0), u(8), u(16), t4]);
+                    }
+                }
+            });
+        }
         loop {
             if dec.is_finished() {
                 break;
@@ -290,6 +355,13 @@ fn main() -> Result<()> {
         let _ = tokio::time::timeout(std::time::Duration::from_millis(500), ep.wait_idle()).await;
         Ok::<_, anyhow::Error>(())
     })?;
+    {
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&clock_path)?);
+        writeln!(f, "t1,t2,t3,t4")?;
+        for r in clock_samples.lock().unwrap().iter() {
+            writeln!(f, "{},{},{},{}", r[0], r[1], r[2], r[3])?;
+        }
+    }
     match dec.join() {
         Ok(r) => r,
         Err(_) => bail!("decode thread panicked"),

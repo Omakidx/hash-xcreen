@@ -1,0 +1,28 @@
+{
+ "client": "lan",
+ "profile": "lan",
+ "scenario": "idle",
+ "config": "fps120",
+ "extra": "",
+ "label": "A2: s2-desktop pinned to cores 1-3, s2-client pinned to core 0",
+ "client_rc": 0,
+ "tag": "A2_idle_fps120_r2",
+ "server_args": "--fps 120",
+ "netem": null,
+ "vps_loadavg_start": "1.26 1.57 1.58 3/373 684774",
+ "vps_loadavg_mid": "1.16 1.54 1.57 2/403 684812",
+ "vps_loadavg_end": "0.76 1.41 1.53 1/385 684878",
+ "vps_busy_all_pct": 1.7,
+ "vps_steal_pct": 0.18,
+ "vps_iowait_pct": 0.03,
+ "vps_busy_per_core_pct": [
+  0.8,
+  1.5,
+  2.8,
+  1.6
+ ],
+ "local_loadavg_start": "1.26 1.57 1.58 2/373 684775",
+ "local_loadavg_mid": "1.16 1.54 1.57 1/402 684812",
+ "local_loadavg_end": "0.76 1.41 1.53 1/384 684878",
+ "ts": "2026-11-20T14:08:22"
+}
