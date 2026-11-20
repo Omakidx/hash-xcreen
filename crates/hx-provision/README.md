@@ -64,6 +64,8 @@ follow; `hx-gatewayd` and everything else unprivileged is never allowed to influ
 - **`host_addresses` must be complete** (every address of the host, including private ones and
   Docker bridge gateways), and `ensure_host` must be re-run when they change, until the nftables
   rule above is installed everywhere.
+- **LAN access.** `HostSpec::allow_private_networks` (default `false`) lets desktops reach private
+  networks behind the host. Expose it only as an explicit, warned installer option.
 - **Post stage.** Call `orchestrate::run_post_stage` (it sweeps `/run/hx-provision` before and
   after) rather than `apply_stage` directly with a password.
 - **Docker.** Check `DockerOutcome::SelfTestFailed::isolation_restored`; when `false`, retry the
@@ -89,3 +91,28 @@ No exec sets `record-output` (that would make the host write unbounded files und
 container's 0700 `/run/hx-provision` and the client reads them back with a size cap and deletes
 them. `Client::exec` returns the exit status only. All execs in this crate (readiness,
 post stage, Docker) use the bounded path, so they are safe on a container that has run user code.
+
+## Host ruleset: installer (1E) verification checklist
+
+`hx-provision` only generates the nftables ruleset (`HostReport::host_firewall`); the installer
+loads it with `nft -f` and persists it. It parses with `nft -c -f` (checked in a throwaway
+`unshare -rn` namespace by the unit tests), but nothing in this repository loads it on a host, so
+the installer's CI must verify these at runtime on a fresh VM, from inside a desktop:
+
+1. **Input drop.** A UDP listener on the host bound to `0.0.0.0` does not receive a broadcast
+   (`255.255.255.255`) or a datagram sent to the gateway address from the desktop; TCP connections from the
+   desktop to a host listener on the gateway address or the host's public address time out.
+2. **DHCP and DNS still work.** A new desktop gets its lease, and `getent hosts example.com`
+   resolves through the gateway (udp and tcp 53).
+3. **Forward drop.** From the desktop, connections to an address in each of `10.0.0.0/8`,
+   `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`, `169.254.0.0/16` (for example a host
+   Docker bridge gateway `172.17.0.1`, a second Incus bridge, a VPN address) time out, and a
+   host port published with Docker (`-p`) or another DNAT is unreachable.
+4. **Internet via NAT still works** (HTTPS to a public address) and a `docker run` inside the
+   desktop can pull images (with the `DOCKER-USER` rules for a host Docker).
+5. **With `allow_private_networks`** the private-range probes in item 3 succeed while item 1 and the
+   DNAT drop still hold.
+6. **Persistence.** After a reboot the table `inet hx` exists before the first desktop starts.
+
+Known limit: Incus 6.0 network ACLs do not filter traffic between two instances on the same
+bridge, so with several desktops on one bridge they can reach each other (v1 has one desktop).
