@@ -56,4 +56,4 @@ Commit messages follow [Conventional Commits](https://www.conventionalcommits.or
 
 ## Licence
 
-AGPL-3.0. The `LICENSE` file is added in Phase 0.
+[AGPL-3.0-or-later](LICENSE).

@@ -8,7 +8,7 @@ The plan we follow to build hash-xcreen v1. Each phase ends at a **gate**: its e
 - **Riskiest first.** Spikes in Phase 0 settle the unknowns before code depends on them. If a spike fails, we update the architecture and tech stack before continuing.
 - **One owner per area.** Each workstream owns its crates and files; shared contracts (protocol, IPC commands, recipe format) have exactly one owner and their consumers start after the contract is merged.
 - **Contracts before consumers.** `docs/protocol.md` and the `hx-privd` command set are written and reviewed before the code that uses them.
-- **Everything through PRs** to `main` with CI green, DCO sign-off and Conventional Commits.
+- **Every change on its own branch, committed locally first.** Branch from `main` (`phase-<n>/…`, `spike/…`, `docs/…`, `fix/…`, `chore/…`), commit each logical change locally as it is completed (Conventional Commits, `git commit -s`), and merge into `main` later through a PR with CI green. Nothing is committed directly to `main`. Full rules in [AGENTS.md](../AGENTS.md).
 - **Security-sensitive changes** (pairing, auth, privilege boundaries, secrets, parsers) get an independent security review before merge.
 - **Status** is tracked with the checkboxes below; update them in the same PR that completes the work.
 
@@ -34,11 +34,11 @@ Phases 2 and 3 can run in parallel once Phase 1 passes its gate; backups come fi
 
 ### 0.1 Repository foundations (S)
 
-- [ ] Cargo workspace with the crate and app layout from architecture §3 (empty crates that compile)
-- [ ] `LICENSE` (AGPL-3.0), `SECURITY.md`, `CONTRIBUTING.md` (DCO, Conventional Commits)
-- [ ] CI: `cargo fmt --check`, `clippy -D warnings`, `cargo nextest`, `cargo-deny` (licences + advisories), `cargo-audit`, DCO check
-- [ ] Renovate configuration
-- [ ] `rust-toolchain.toml` pinning stable
+- [x] Cargo workspace with the crate and app layout from architecture §3 (empty crates that compile)
+- [x] `LICENSE` (AGPL-3.0), `SECURITY.md`, `CONTRIBUTING.md` (DCO, Conventional Commits)
+- [x] CI: `cargo fmt --check`, `clippy -D warnings`, `cargo nextest`, `cargo-deny` (licences + advisories), `cargo-audit`, DCO check
+- [x] Renovate configuration
+- [x] `rust-toolchain.toml` pinning stable
 
 ### 0.2 Spikes
 
