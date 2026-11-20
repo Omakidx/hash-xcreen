@@ -36,7 +36,7 @@ recipes root directory, may not be absolute, may not form a cycle and may nest a
 
 **Variables.** `[vars]` holds string values (`distro`, `codename`, `distro_version`, `desktop`,
 `preset`; `user` is added from `[user].name`). `{{name}}` in any string value of the merged recipe
-is replaced; an unknown name is an error that names the key. `{{` is reserved for this; `[vars]`
+is replaced; an unknown name is an error that names the key. `{{` is reserved for this; `user` and `uid` are filled from `[user]` (the validated account, see below) and cannot be defined in `[vars]`; `[vars]`
 values themselves are not expanded.
 
 **Unknown keys are errors**, everywhere, so typos fail loudly.
@@ -46,9 +46,9 @@ values themselves are not expanded.
 | `[recipe]` | `name` (required), `base_image` (required, `images:debian/13`-style alias on the Incus image server, or `local:<alias>`). |
 | `[vars]` | String variables, see above. |
 | `[incus_config]` | Instance configuration applied to the container, not content inside it. Only `security.nesting`, `security.syscalls.intercept.mknod` and `security.syscalls.intercept.setxattr` are allowed (values `true`/`false`); everything else, `security.privileged`, `raw.*` and the other intercepts included, is rejected. Used by the Docker add-on. |
-| `[[apt_repo]]` | `name`, `key_url`, `key_fingerprint` (40 hex characters), `uri`, `suite`, `components`, optional `pin` (apt preferences body). The downloaded key must contain exactly the pinned primary key fingerprint or the step fails. Written as a deb822 `.sources` file with `Signed-By`. |
+| `[[apt_repo]]` | `name`, `key_url`, `key_fingerprint` (40 hex characters), `uri`, `suite`, `components`, optional `pin` (apt preferences body). The downloaded key must contain exactly the pinned primary key fingerprint or the step fails; it is imported into a temporary keyring and only the pinned key is exported. All downloads use `curl --proto '=https' --proto-redir '=https'`, vendor installers included. Written as a deb822 `.sources` file with `Signed-By`. |
 | `[apt]` | `packages`: installed with `--no-install-recommends`; duplicates are removed, first occurrence wins. |
-| `[user]` | `name`, `uid`, `shell`, `groups`, `linger`. The desktop user is created locked (no password); the password is set in the post stage from a secret handed over at run time. An add-on may add `groups` only. |
+| `[user]` | `name`, `uid`, `shell`, `groups`, `linger`. `name` must be a valid, non-reserved login name (`^[a-z_][a-z0-9_-]{0,31}$`; not `root`, `ubuntu`, `docker`, ...). The caller may choose another name at resolve time; a prebuilt image built with `desk` is renamed in the post stage. The account step refuses to adopt an existing system account or one with another uid. The desktop user is created locked (no password); the password is set in the post stage from a secret handed over at run time. An add-on may add `groups` only. |
 | `[[file]]` | `path` (absolute), `content`, `mode` (default `0644`), `owner` (default `root:root`). A path may appear only once. |
 | `[services]` | `system_enable` (`systemctl enable`), `user_enable_global` (`systemctl --global enable`, started by the user's lingering manager). |
 | `[[pre_step]]` | Shell commands that run after apt repositories are configured and before packages are installed. |
@@ -65,7 +65,7 @@ Step fields: `name` (required, unique within its list), `run` (required, execute
 Build stage (also what the prebuilt image CI runs): wait for network, apt bootstrap, apt
 repositories, `pre_step`, apt install, user, files, services, `step`.
 
-Post stage (always runs, after a prebuilt import and after a server build): wait for network,
+Post stage (always runs, after a prebuilt import and after a server build): wait for network, rename the image user when the caller chose another name,
 ensure the user exists, set the password (secret, via stdin of `chpasswd` from a 0600 file, never
 argv), security updates, `post_step`.
 
