@@ -74,6 +74,7 @@ both!(
     authorize_cannot_be_widened_by_a_second_call,
     failed_accept_closes_with_an_explicit_code,
     cursor_position_bursts_are_coalesced,
+    dropped_pending_sessions_are_refused_at_once,
 );
 
 async fn server_sends_need_authorization(pref: TransportPreference) {
@@ -686,4 +687,33 @@ async fn cursor_position_bursts_are_coalesced(pref: TransportPreference) {
     }
     assert_eq!(last, Some(pos(2999)), "the newest position survives");
     assert!(count < 3000, "positions were coalesced ({count} delivered)");
+}
+
+async fn dropped_pending_sessions_are_refused_at_once(pref: TransportPreference) {
+    let server = start_server(ServerOptions::default()).await; // decision window: 10 s
+    let s2 = server.clone();
+    let dropper = tokio::spawn(async move {
+        let pending = s2.accept().await.expect("pending");
+        drop(pending);
+    });
+    let started = std::time::Instant::now();
+    let err = client(pref)
+        .connect(&target(&server, pref), &client_hello())
+        .await
+        .expect_err("refused");
+    assert!(
+        matches!(
+            err,
+            Error::Refused {
+                reason: RefuseReason::Busy,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "refused without waiting for the decision window"
+    );
+    within(dropper).await.expect("join");
 }

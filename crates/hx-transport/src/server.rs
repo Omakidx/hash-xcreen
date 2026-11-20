@@ -653,6 +653,23 @@ impl PendingSession {
     }
 }
 
+/// Dropping a session without deciding refuses it with `BUSY` at once (instead of waiting for
+/// the decision window), so a forgotten `PendingSession` cannot keep its slot or its peer
+/// waiting.
+impl Drop for PendingSession {
+    fn drop(&mut self) {
+        let st = self.state.lock().ok().and_then(|mut s| s.take());
+        if let Some(st) = st
+            && let Ok(rt) = tokio::runtime::Handle::try_current()
+        {
+            rt.spawn(async move {
+                let _ = refuse_inner(st.inner, RefuseReason::Busy, "session dropped").await;
+                drop(st.slot);
+            });
+        }
+    }
+}
+
 async fn refuse_inner(inner: PendingInner, reason: RefuseReason, text: &str) -> Result<()> {
     let body = message::encode(&refuse_message(reason, text))?;
     let code = close_code_for(reason);
