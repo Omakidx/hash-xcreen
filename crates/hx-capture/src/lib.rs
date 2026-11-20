@@ -21,7 +21,8 @@
 //! # }
 //! ```
 //!
-//! Input injection (XTest) is not part of this module yet.
+//! Input injection (XTest) lives in [`input`]: physical-scancode keyboard, clamped pointer,
+//! accumulated scrolling, and release-on-disconnect, behind the [`InputInjector`] trait.
 
 #![deny(unsafe_code)]
 
@@ -30,6 +31,8 @@ mod cursor;
 mod error;
 mod frame;
 mod geometry;
+mod hid;
+pub mod input;
 mod shm;
 mod x11;
 
@@ -38,6 +41,7 @@ pub use cursor::{CursorEvent, CursorPosition, CursorShape};
 pub use error::CaptureError;
 pub use frame::{Frame, PixelFormat};
 pub use geometry::{Rect, Size};
+pub use input::{Button, InputError, InputInjector, X11Input};
 pub use x11::{X11Capture, X11Config};
 
 use std::time::Duration;
