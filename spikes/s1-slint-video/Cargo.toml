@@ -1,0 +1,29 @@
+[package]
+name = "s1-slint-video"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "AGPL-3.0-or-later"
+description = "Spike S1: Slint video presentation paths (wgpu, DMA-BUF/EGL/OpenGL, CPU upload)"
+
+# Standalone: not part of the root workspace.
+[workspace]
+
+[dependencies]
+slint = { version = "=1.19.0", default-features = false, features = ["std", "backend-winit", "backend-winit-x11", "backend-winit-wayland", "renderer-femtovg", "renderer-femtovg-wgpu", "unstable-wgpu-30", "compat-1-2"] }
+ffmpeg-next = "7.1"
+ffmpeg-sys-next = "7.1"
+glow = "0.16"
+khronos-egl = { version = "6", features = ["dynamic"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+libc = "0.2"
+ash = "0.38"
+
+[build-dependencies]
+slint-build = "=1.19.0"
+
+[profile.release]
+debug = 1
