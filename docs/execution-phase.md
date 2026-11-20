@@ -138,10 +138,10 @@ flowchart LR
 ```
 
 ### 1A — Protocol and transport
-- [ ] `docs/protocol.md`: handshake, versioning, channel table, every control message, media header layout
-- [ ] Protobuf schema and generated types; media header encode/decode
-- [ ] QUIC endpoint and client with the channel layout (streams, datagrams, priorities); WebSocket fallback
-- [ ] Property tests for every message round trip
+- [x] `docs/protocol.md`: handshake, versioning, channel table, every control message, media header layout
+- [x] Protobuf schema and generated types; media header encode/decode
+- [x] QUIC endpoint and client with the channel layout (streams, datagrams, priorities); WebSocket fallback
+- [x] Property tests for every message round trip
 
 ### 1B — Crypto and pairing
 - [ ] Identity and device keys; pinned-key TLS verification in rustls
