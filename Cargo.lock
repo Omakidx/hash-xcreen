@@ -773,6 +773,7 @@ dependencies = [
  "proptest",
  "prost",
  "rcgen",
+ "rustix",
  "rustls",
  "sha2",
  "spake2",

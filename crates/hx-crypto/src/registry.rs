@@ -12,8 +12,8 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    io::{Read, Write},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -86,15 +86,6 @@ impl DeviceRecord {
     }
 }
 
-/// Result of recording a wrong PIN.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PinFailure {
-    /// Consecutive failures now.
-    pub failed_pins: u32,
-    /// True if this failure revoked the device.
-    pub revoked: bool,
-}
-
 /// Storage of paired devices. Implementations must make each method atomic and durable (a
 /// `Ok` return means the change survives a crash).
 pub trait DeviceRegistry: Send + Sync + 'static {
@@ -111,17 +102,18 @@ pub trait DeviceRegistry: Send + Sync + 'static {
     fn list(&self) -> Result<Vec<DeviceRecord>>;
 
     /// Add a device, or (if the key is already paired) update its name. An existing record
-    /// keeps its failure counter and revocation state.
+    /// keeps its failure counter. A **revoked** device is not touched and the call fails with
+    /// [`Error::Revoked`], decided inside the same atomic step as the write.
     fn upsert_paired(&self, key: &PublicKey, name: &str, now_unix: u64) -> Result<DeviceRecord>;
 
-    /// Count a wrong PIN; the `max_failures`-th consecutive one revokes the device, in the
-    /// same atomic write.
-    fn record_pin_failure(
-        &self,
-        id: &DeviceId,
-        max_failures: u32,
-        now_unix: u64,
-    ) -> Result<PinFailure>;
+    /// Count a PIN attempt **before** it is checked (so an attempt that is cut off still
+    /// counts) and return the failure counter after counting. A correct PIN resets it with
+    /// [`record_pin_success`](Self::record_pin_success).
+    fn begin_pin_attempt(&self, id: &DeviceId) -> Result<u32>;
+
+    /// After a wrong verdict: revoke the device if its counter reached `max_failures`.
+    /// Returns true if the device is revoked afterwards.
+    fn revoke_if_failed(&self, id: &DeviceId, max_failures: u32, now_unix: u64) -> Result<bool>;
 
     /// A correct PIN: reset the counter and stamp `last_seen`.
     fn record_pin_success(&self, id: &DeviceId, now_unix: u64) -> Result<()>;
@@ -145,6 +137,8 @@ type State = BTreeMap<DeviceId, DeviceRecord>;
 struct Store {
     state: Mutex<State>,
     file: Option<PathBuf>,
+    /// Exclusive lock on `<file>.lock`, held for the lifetime of the registry (file-backed only).
+    _lock: Option<fs::File>,
 }
 
 impl Store {
@@ -184,6 +178,9 @@ impl Store {
     fn upsert_paired(&self, key: &PublicKey, name: &str, now: u64) -> Result<DeviceRecord> {
         self.mutate(|s| {
             let id = key.device_id();
+            if s.get(&id).is_some_and(DeviceRecord::is_revoked) {
+                return (Err(Error::Revoked), false);
+            }
             let rec = s.entry(id).or_insert_with(|| DeviceRecord {
                 id,
                 name: name.to_owned(),
@@ -194,28 +191,33 @@ impl Store {
                 revoked: None,
             });
             rec.name = name.to_owned();
-            (rec.clone(), true)
-        })
+            (Ok(rec.clone()), true)
+        })?
     }
 
-    fn record_pin_failure(&self, id: &DeviceId, max: u32, now: u64) -> Result<PinFailure> {
+    fn begin_pin_attempt(&self, id: &DeviceId) -> Result<u32> {
         self.mutate(|s| match s.get_mut(id) {
             None => (Err(Error::UnknownDevice), false),
             Some(rec) => {
                 rec.failed_pins = rec.failed_pins.saturating_add(1);
+                (Ok(rec.failed_pins), true)
+            }
+        })?
+    }
+
+    fn revoke_if_failed(&self, id: &DeviceId, max: u32, now: u64) -> Result<bool> {
+        self.mutate(|s| match s.get_mut(id) {
+            None => (Err(Error::UnknownDevice), false),
+            Some(rec) => {
+                let mut changed = false;
                 if rec.failed_pins >= max && rec.revoked.is_none() {
                     rec.revoked = Some(Revocation {
                         at_unix: now,
                         reason: RevokeReason::TooManyPinFailures,
                     });
+                    changed = true;
                 }
-                (
-                    Ok(PinFailure {
-                        failed_pins: rec.failed_pins,
-                        revoked: rec.revoked.is_some(),
-                    }),
-                    true,
-                )
+                (Ok(rec.revoked.is_some()), changed)
             }
         })?
     }
@@ -280,13 +282,16 @@ macro_rules! delegate_registry {
             ) -> Result<DeviceRecord> {
                 self.0.upsert_paired(key, name, now_unix)
             }
-            fn record_pin_failure(
+            fn begin_pin_attempt(&self, id: &DeviceId) -> Result<u32> {
+                self.0.begin_pin_attempt(id)
+            }
+            fn revoke_if_failed(
                 &self,
                 id: &DeviceId,
                 max_failures: u32,
                 now_unix: u64,
-            ) -> Result<PinFailure> {
-                self.0.record_pin_failure(id, max_failures, now_unix)
+            ) -> Result<bool> {
+                self.0.revoke_if_failed(id, max_failures, now_unix)
             }
             fn record_pin_success(&self, id: &DeviceId, now_unix: u64) -> Result<()> {
                 self.0.record_pin_success(id, now_unix)
@@ -315,6 +320,7 @@ impl MemoryRegistry {
         Self(Store {
             state: Mutex::new(State::new()),
             file: None,
+            _lock: None,
         })
     }
 }
@@ -364,20 +370,36 @@ struct FileDevice {
 }
 
 impl FileRegistry {
-    /// Open (or start) the registry at `path`. A missing file is an empty registry. A file that
-    /// other users can read or write, that is not a regular file, or that does not parse is an
-    /// error: the registry fails closed rather than start from nothing.
+    /// Open (or start) the registry at `path`, as its **only** writer: an exclusive `flock` on
+    /// `<path>.lock` is taken here and held until the value is dropped; if another instance
+    /// (in this or another process) holds it the call fails with [`Error::Locked`]. Other tools
+    /// (CLI) must therefore revoke and reinstate through the agent, never by opening the file.
+    ///
+    /// Fails closed: the directory must not be writable by group or others; the file is opened
+    /// without following symlinks and must be a regular file owned by the effective user with
+    /// mode 0600; it must parse. A missing file is an empty registry.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
-        let state = match fs::symlink_metadata(&path) {
-            Ok(meta) => {
+        let dir = parent_dir(&path);
+        let dir_mode = fs::metadata(dir)?.permissions().mode();
+        if dir_mode & 0o022 != 0 {
+            return Err(Error::InsecurePermissions);
+        }
+        let lock = take_lock(&path)?;
+        let state = match open_nofollow(&path) {
+            Ok(mut f) => {
+                let meta = f.metadata()?;
                 if !meta.is_file() {
                     return Err(Error::Corrupt("registry path is not a regular file".into()));
                 }
-                if meta.permissions().mode() & 0o077 != 0 {
+                if meta.uid() != rustix::process::geteuid().as_raw()
+                    || meta.permissions().mode() & 0o077 != 0
+                {
                     return Err(Error::InsecurePermissions);
                 }
-                decode_file(&fs::read(&path)?)?
+                let mut bytes = Vec::new();
+                f.read_to_end(&mut bytes)?;
+                decode_file(&bytes)?
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::new(),
             Err(e) => return Err(e.into()),
@@ -385,7 +407,42 @@ impl FileRegistry {
         Ok(Self(Store {
             state: Mutex::new(state),
             file: Some(path),
+            _lock: Some(lock),
         }))
+    }
+}
+
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    }
+}
+
+fn open_nofollow(path: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(path)
+}
+
+fn take_lock(path: &Path) -> Result<fs::File> {
+    let mut name = path
+        .file_name()
+        .ok_or_else(|| Error::Corrupt("registry path has no file name".into()))?
+        .to_os_string();
+    name.push(".lock");
+    let lock = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(parent_dir(path).join(name))?;
+    match rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(lock),
+        Err(e) if e == rustix::io::Errno::WOULDBLOCK => Err(Error::Locked),
+        Err(e) => Err(std::io::Error::from(e).into()),
     }
 }
 
@@ -460,22 +517,16 @@ fn encode_file(state: &State) -> Vec<u8> {
 /// Write `state` to `path` atomically: temporary file (0600, exclusive) in the same
 /// directory, flushed, renamed over `path`, directory flushed.
 fn persist(path: &Path, state: &State) -> Result<()> {
-    let dir = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
+    let dir = parent_dir(path);
     let name = path
         .file_name()
         .ok_or_else(|| Error::Corrupt("registry path has no file name".into()))?;
     let mut tmp_name = name.to_os_string();
-    tmp_name.push(format!(".{}.tmp", std::process::id()));
+    tmp_name.push(format!(
+        ".{}.tmp",
+        crate::encoding::hex_encode(&crate::keys::random_bytes::<8>()?)
+    ));
     let tmp = dir.join(tmp_name);
-    // A leftover from a crash of an earlier process with the same pid.
-    match fs::remove_file(&tmp) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
-    }
     let result = (|| -> std::io::Result<()> {
         let mut f = fs::OpenOptions::new()
             .write(true)
@@ -512,6 +563,7 @@ mod tests {
                 .unwrap_or(0)
         ));
         fs::create_dir_all(&d).expect("tmp dir");
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).expect("chmod");
         d
     }
 
@@ -524,26 +576,29 @@ mod tests {
         assert!(r.find_by_key(&key()).unwrap().is_none());
         // Failures count and the 5th revokes, in one step.
         for n in 1..5 {
-            let f = r.record_pin_failure(&rec.id, 5, 20).unwrap();
-            assert_eq!((f.failed_pins, f.revoked), (n, false));
+            assert_eq!(r.begin_pin_attempt(&rec.id).unwrap(), n);
+            assert!(!r.revoke_if_failed(&rec.id, 5, 20).unwrap());
         }
-        let f = r.record_pin_failure(&rec.id, 5, 21).unwrap();
-        assert!(f.revoked);
+        assert_eq!(r.begin_pin_attempt(&rec.id).unwrap(), 5);
+        assert!(r.revoke_if_failed(&rec.id, 5, 21).unwrap());
         let got = r.get(&rec.id).unwrap().unwrap();
         assert_eq!(
             got.revoked.unwrap().reason,
             RevokeReason::TooManyPinFailures
         );
         assert!(!r.revoke(&rec.id, RevokeReason::User, 22).unwrap());
-        // Re-pairing keeps the counter and revocation.
-        let again = r.upsert_paired(&k, "renamed", 30).unwrap();
-        assert_eq!(again.name, "renamed");
-        assert!(again.is_revoked());
-        assert_eq!(again.created_unix, 10);
+        // A revoked device cannot be re-paired, and the record is left alone.
+        assert!(matches!(
+            r.upsert_paired(&k, "renamed", 30),
+            Err(Error::Revoked)
+        ));
+        assert_eq!(r.get(&rec.id).unwrap().unwrap().name, "laptop");
         assert!(r.reinstate(&rec.id).unwrap());
+        let again = r.upsert_paired(&k, "renamed", 31).unwrap();
+        assert_eq!((again.name.as_str(), again.created_unix), ("renamed", 10));
         let ok = r.get(&rec.id).unwrap().unwrap();
         assert!(!ok.is_revoked() && ok.failed_pins == 0);
-        r.record_pin_failure(&rec.id, 5, 40).unwrap();
+        r.begin_pin_attempt(&rec.id).unwrap();
         r.record_pin_success(&rec.id, 50).unwrap();
         let ok = r.get(&rec.id).unwrap().unwrap();
         assert_eq!((ok.failed_pins, ok.last_seen_unix), (0, 50));
@@ -562,7 +617,7 @@ mod tests {
         {
             let r = FileRegistry::open(&path).unwrap();
             r.upsert_paired(&k, "phone", 5).unwrap();
-            r.record_pin_failure(&k.device_id(), 5, 6).unwrap();
+            r.begin_pin_attempt(&k.device_id()).unwrap();
             r.revoke(&k.device_id(), RevokeReason::User, 7).unwrap();
         }
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
@@ -608,7 +663,7 @@ mod tests {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
         let denied = fs::File::create(dir.join("probe")).is_err();
         if denied {
-            assert!(r.record_pin_failure(&k.device_id(), 5, 2).is_err());
+            assert!(r.begin_pin_attempt(&k.device_id()).is_err());
             fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
             assert_eq!(r.get(&k.device_id()).unwrap().unwrap().failed_pins, 0);
         } else {
@@ -639,5 +694,85 @@ mod tests {
             decode_file(&doc.encode_to_vec()),
             Err(Error::Corrupt(_))
         ));
+    }
+
+    #[test]
+    fn a_second_instance_on_the_same_file_is_refused_until_the_first_is_dropped() {
+        let dir = tmp_dir("lock");
+        let path = dir.join("devices.pb");
+        let first = FileRegistry::open(&path).unwrap();
+        assert!(matches!(FileRegistry::open(&path), Err(Error::Locked)));
+        // Writes by the holder still work, and nobody else can undo them.
+        let k = key();
+        first.upsert_paired(&k, "a", 1).unwrap();
+        first.revoke(&k.device_id(), RevokeReason::User, 2).unwrap();
+        assert!(matches!(FileRegistry::open(&path), Err(Error::Locked)));
+        drop(first);
+        let second = FileRegistry::open(&path).unwrap();
+        assert!(second.get(&k.device_id()).unwrap().unwrap().is_revoked());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_openers_get_exactly_one_winner() {
+        let dir = tmp_dir("race");
+        let path = dir.join("devices.pb");
+        let wins: usize = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    // Keep the winner alive until every thread has tried.
+                    let r = FileRegistry::open(&path);
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    usize::from(r.is_ok())
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .sum();
+        assert_eq!(wins, 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn open_refuses_symlinks_foreign_modes_and_open_directories() {
+        let dir = tmp_dir("hard");
+        let real = dir.join("real.pb");
+        {
+            let r = FileRegistry::open(&real).unwrap();
+            r.upsert_paired(&key(), "x", 1).unwrap();
+        }
+        // A symlink at the registry path is not followed.
+        let link = dir.join("link.pb");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(FileRegistry::open(&link).is_err());
+        // A group-writable directory is refused.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(matches!(
+            FileRegistry::open(&real),
+            Err(Error::InsecurePermissions)
+        ));
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(FileRegistry::open(&real).is_ok());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn temporary_files_use_random_names() {
+        let dir = tmp_dir("tmpname");
+        let path = dir.join("devices.pb");
+        // A stale temporary file with a guessable name does not get in the way.
+        fs::write(
+            dir.join(format!("devices.pb.{}.tmp", std::process::id())),
+            b"x",
+        )
+        .unwrap();
+        let r = FileRegistry::open(&path).unwrap();
+        r.upsert_paired(&key(), "a", 1).unwrap();
+        assert!(FileRegistry::open(&path).is_err());
+        drop(r);
+        assert_eq!(FileRegistry::open(&path).unwrap().list().unwrap().len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

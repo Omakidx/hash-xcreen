@@ -962,3 +962,387 @@ async fn join_all<T, F: Future<Output = T>>(fs: Vec<F>) -> Vec<T> {
     .await;
     out.into_iter().flatten().collect()
 }
+
+// ------------------------------------------------------------------ review fixes
+
+/// An authorized session for a freshly paired device.
+async fn live_session(
+    e: &mut Env,
+    pref: TransportPreference,
+) -> (Arc<IdentityKey>, hx_transport::Connection) {
+    let device = new_key();
+    e.pair(&device, pref).await;
+    let t = target(&e.server, pref);
+    let pin = Pin::new(PIN).expect("pin");
+    let conn = within(connect_with_pin(
+        &t,
+        &device,
+        e.server_key.public(),
+        &pin,
+        &session_opts(pref),
+    ))
+    .await
+    .expect("session");
+    let Outcome::Authorized { .. } = e.next().await.expect("outcome") else {
+        panic!("expected Authorized");
+    };
+    (device, conn)
+}
+
+fn fast_watch() -> AuthenticatorConfig {
+    AuthenticatorConfig {
+        watch_interval: Duration::from_millis(100),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn every_revocation_path_closes_the_live_session() {
+    for pref in BOTH {
+        // Authenticator::revoke
+        let mut e = env_with(fast_watch()).await;
+        let (d, conn) = live_session(&mut e, pref).await;
+        assert!(
+            e.auth
+                .revoke(&d.public().device_id(), RevokeReason::User)
+                .await
+                .expect("revoke")
+        );
+        assert_eq!(
+            within(conn.closed()).await.code,
+            CloseCode::Unauthorized,
+            "{pref:?} revoke"
+        );
+
+        // Authenticator::remove
+        let mut e = env_with(fast_watch()).await;
+        let (d, conn) = live_session(&mut e, pref).await;
+        assert!(
+            e.auth
+                .remove(&d.public().device_id())
+                .await
+                .expect("remove")
+        );
+        assert_eq!(
+            within(conn.closed()).await.code,
+            CloseCode::Unauthorized,
+            "{pref:?} remove"
+        );
+
+        // A change made behind the authenticator's back (backstop re-check).
+        let mut e = env_with(fast_watch()).await;
+        let (d, conn) = live_session(&mut e, pref).await;
+        e.registry
+            .revoke(&d.public().device_id(), RevokeReason::User, 1)
+            .expect("direct revoke");
+        assert_eq!(
+            within(conn.closed()).await.code,
+            CloseCode::Unauthorized,
+            "{pref:?} direct revoke"
+        );
+        let mut e = env_with(fast_watch()).await;
+        let (d, conn) = live_session(&mut e, pref).await;
+        e.registry
+            .remove(&d.public().device_id())
+            .expect("direct remove");
+        assert_eq!(
+            within(conn.closed()).await.code,
+            CloseCode::Unauthorized,
+            "{pref:?} direct remove"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_dropped_revoke_call_still_announces() {
+    let pref = TransportPreference::Quic;
+    let mut e = env().await;
+    let (d, conn) = live_session(&mut e, pref).await;
+    let id = d.public().device_id();
+    // Start the revoke and cancel the future at once.
+    {
+        let fut = e.auth.revoke(&id, RevokeReason::User);
+        let _ = tokio::time::timeout(Duration::ZERO, fut).await;
+    }
+    assert_eq!(within(conn.closed()).await.code, CloseCode::Unauthorized);
+    assert!(e.registry.get(&id).expect("reg").expect("dev").is_revoked());
+}
+
+#[tokio::test]
+async fn reinstate_goes_through_the_authenticator_and_clears_state() {
+    let pref = TransportPreference::Quic;
+    let mut e = env().await;
+    let (d, _conn) = live_session(&mut e, pref).await;
+    let id = d.public().device_id();
+    e.auth
+        .revoke(&id, RevokeReason::User)
+        .await
+        .expect("revoke");
+    assert!(e.auth.reinstate(&id).await.expect("reinstate"));
+    assert!(
+        !e.auth
+            .registry()
+            .get(&id)
+            .expect("reg")
+            .expect("dev")
+            .is_revoked()
+    );
+    assert!(!e.auth.reinstate(&id).await.expect("again"));
+}
+
+/// Revokes the device right after it has been looked up, as a concurrent operator would.
+struct RevokeOnLookup(Arc<MemoryRegistry>);
+
+impl DeviceRegistry for RevokeOnLookup {
+    fn get(&self, id: &hx_crypto::DeviceId) -> hx_crypto::Result<Option<hx_crypto::DeviceRecord>> {
+        self.0.get(id)
+    }
+    fn find_by_key(
+        &self,
+        key: &hx_crypto::PublicKey,
+    ) -> hx_crypto::Result<Option<hx_crypto::DeviceRecord>> {
+        let found = self.0.find_by_key(key)?;
+        if found.is_some() {
+            self.0.revoke(&key.device_id(), RevokeReason::User, 1)?;
+        }
+        Ok(found)
+    }
+    fn list(&self) -> hx_crypto::Result<Vec<hx_crypto::DeviceRecord>> {
+        self.0.list()
+    }
+    fn upsert_paired(
+        &self,
+        key: &hx_crypto::PublicKey,
+        name: &str,
+        now: u64,
+    ) -> hx_crypto::Result<hx_crypto::DeviceRecord> {
+        self.0.upsert_paired(key, name, now)
+    }
+    fn begin_pin_attempt(&self, id: &hx_crypto::DeviceId) -> hx_crypto::Result<u32> {
+        self.0.begin_pin_attempt(id)
+    }
+    fn revoke_if_failed(
+        &self,
+        id: &hx_crypto::DeviceId,
+        max: u32,
+        now: u64,
+    ) -> hx_crypto::Result<bool> {
+        self.0.revoke_if_failed(id, max, now)
+    }
+    fn record_pin_success(&self, id: &hx_crypto::DeviceId, now: u64) -> hx_crypto::Result<()> {
+        self.0.record_pin_success(id, now)
+    }
+    fn revoke(
+        &self,
+        id: &hx_crypto::DeviceId,
+        r: RevokeReason,
+        now: u64,
+    ) -> hx_crypto::Result<bool> {
+        self.0.revoke(id, r, now)
+    }
+    fn reinstate(&self, id: &hx_crypto::DeviceId) -> hx_crypto::Result<bool> {
+        self.0.reinstate(id)
+    }
+    fn remove(&self, id: &hx_crypto::DeviceId) -> hx_crypto::Result<bool> {
+        self.0.remove(id)
+    }
+}
+
+#[tokio::test]
+async fn a_key_revoked_during_pairing_does_not_pair() {
+    let pref = TransportPreference::Quic;
+    let inner = Arc::new(MemoryRegistry::new());
+    let device = new_key();
+    inner
+        .upsert_paired(&device.public(), "old name", 1)
+        .expect("pre-register");
+    let server_key = new_key();
+    let auth = Authenticator::new(
+        server_key.clone(),
+        Arc::new(RevokeOnLookup(inner.clone())),
+        AuthenticatorConfig::default(),
+    );
+    let server = Arc::new(
+        Server::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            tls::server_config(&server_key).expect("tls"),
+            ServerOptions::default(),
+        )
+        .await
+        .expect("bind"),
+    );
+    let token = auth.pairing().issue_token().expect("token");
+    let cred = PairingCredential::parse(&token.to_text()).expect("parse");
+    let t = target(&server, pref);
+    let (s2, a2) = (server.clone(), auth.clone());
+    let handle = tokio::spawn(async move {
+        let p = s2.accept().await.expect("pending");
+        a2.authenticate(p).await
+    });
+    let r = within(pair_device(
+        &t,
+        &device,
+        &cred,
+        &pair_opts(pref, "new name"),
+    ))
+    .await;
+    assert!(
+        r.is_err(),
+        "the client must not be told pairing worked: {r:?}"
+    );
+    assert!(within(handle).await.expect("join").is_err());
+    let rec = inner
+        .get(&device.public().device_id())
+        .expect("reg")
+        .expect("dev");
+    assert!(rec.is_revoked());
+    assert_eq!(rec.name, "old name");
+}
+
+#[tokio::test]
+async fn refusals_do_not_say_whether_a_key_was_revoked() {
+    let pref = TransportPreference::Quic;
+    let mut e = env().await;
+    let device = new_key();
+    e.pair(&device, pref).await;
+    e.auth
+        .revoke(&device.public().device_id(), RevokeReason::User)
+        .await
+        .expect("revoke");
+    let t = target(&e.server, pref);
+    let pin = Pin::new(PIN).expect("pin");
+    let msg = |r: hx_crypto::Result<hx_transport::Connection>| match r {
+        Err(Error::Refused { reason, message }) => (reason, message),
+        other => panic!("expected a refusal: {other:?}"),
+    };
+    let revoked = msg(within(connect_with_pin(
+        &t,
+        &device,
+        e.server_key.public(),
+        &pin,
+        &session_opts(pref),
+    ))
+    .await);
+    let _ = e.next().await;
+    let stranger = msg(within(connect_with_pin(
+        &t,
+        &new_key(),
+        e.server_key.public(),
+        &pin,
+        &session_opts(pref),
+    ))
+    .await);
+    assert_eq!(revoked, stranger);
+}
+
+fn slow_pin_config(pin_timeout: Duration, min_budget: Duration) -> AuthenticatorConfig {
+    AuthenticatorConfig {
+        pin_timeout,
+        min_hash_budget: min_budget,
+        ..Default::default()
+    }
+}
+
+async fn failed_pins_settle(e: &Env, id: &hx_crypto::DeviceId) -> u32 {
+    let mut last = 0;
+    for _ in 0..300 {
+        last = e.registry.get(id).expect("reg").expect("dev").failed_pins;
+        if last > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    last
+}
+
+#[tokio::test]
+async fn a_pin_attempt_cut_off_by_the_deadline_still_counts() {
+    let pref = TransportPreference::Quic;
+    let mut e = env_with(slow_pin_config(
+        Duration::from_millis(400),
+        Duration::from_millis(10),
+    ))
+    .await;
+    let device = new_key();
+    e.pair(&device, pref).await;
+    // A hash that takes much longer than the exchange deadline.
+    e.auth.set_pin(
+        PinHash::with_params(
+            &Pin::new(PIN).expect("pin"),
+            PinParams {
+                memory_kib: 128 * 1024,
+                iterations: 4,
+                parallelism: 1,
+            },
+        )
+        .expect("hash"),
+    );
+    let t = target(&e.server, pref);
+    let mut c = within(connect_session(
+        &t,
+        &device,
+        e.server_key.public(),
+        &session_opts(pref),
+    ))
+    .await
+    .expect("connect");
+    let r = within(c.submit(&Pin::new("000000").expect("pin"))).await;
+    assert!(r.is_err(), "the exchange was cut off: {r:?}");
+    let id = device.public().device_id();
+    assert_eq!(
+        failed_pins_settle(&e, &id).await,
+        1,
+        "the cut-off attempt must count"
+    );
+}
+
+#[tokio::test]
+async fn no_attempt_is_started_without_time_to_finish_it() {
+    let pref = TransportPreference::Quic;
+    let mut e = env_with(slow_pin_config(
+        Duration::from_millis(400),
+        Duration::from_secs(5),
+    ))
+    .await;
+    let device = new_key();
+    e.pair(&device, pref).await;
+    let t = target(&e.server, pref);
+    let mut c = within(connect_session(
+        &t,
+        &device,
+        e.server_key.public(),
+        &session_opts(pref),
+    ))
+    .await
+    .expect("connect");
+    let r = within(c.submit(&Pin::new("000000").expect("pin"))).await;
+    assert!(r.is_err());
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let id = device.public().device_id();
+    assert_eq!(
+        e.registry.get(&id).expect("reg").expect("dev").failed_pins,
+        0
+    );
+}
+
+#[tokio::test]
+async fn names_a_sanitiser_would_change_still_pair() {
+    let pref = TransportPreference::Quic;
+    let mut e = env().await;
+    let token = e.auth.pairing().issue_token().expect("token");
+    let cred = PairingCredential::parse(&token.to_text()).expect("parse");
+    let t = target(&e.server, pref);
+    let device = new_key();
+    let raw = "tab\there\u{200B}\u{7}";
+    let p = within(pair_device(&t, &device, &cred, &pair_opts(pref, raw)))
+        .await
+        .expect("a name with control characters must still pair");
+    let _ = e.next().await;
+    p.finish().await;
+    let rec = e
+        .registry
+        .find_by_key(&device.public())
+        .expect("reg")
+        .expect("dev");
+    assert_eq!(rec.name, "tabhere");
+}

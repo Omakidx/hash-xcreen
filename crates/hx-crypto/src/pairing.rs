@@ -141,6 +141,8 @@ struct Entry {
     password: Zeroizing<Vec<u8>>,
     expires: Instant,
     attempts_left: u32,
+    /// Attempts begun and not yet finished.
+    in_flight: u32,
 }
 
 #[derive(Default)]
@@ -206,6 +208,7 @@ impl PairingWindow {
             password,
             expires: self.clock.now() + ttl,
             attempts_left: tries,
+            in_flight: 0,
         }
     }
 
@@ -281,11 +284,42 @@ impl PairingWindow {
             return None;
         }
         entry.attempts_left -= 1;
+        entry.in_flight += 1;
         Some(Attempt {
             slot,
             generation: entry.generation,
             password: entry.password.clone(),
         })
+    }
+
+    /// An attempt ended (any outcome). A secret whose attempts are all used is deleted as soon
+    /// as the last one has ended.
+    pub(crate) fn finish(&self, a: &Attempt) {
+        let mut s = self.lock();
+        match a.slot {
+            Slot::Token(id) => {
+                let done = s.tokens.get_mut(&id).is_some_and(|e| {
+                    e.in_flight = e
+                        .in_flight
+                        .saturating_sub(u32::from(e.generation == a.generation));
+                    e.generation == a.generation && e.attempts_left == 0 && e.in_flight == 0
+                });
+                if done {
+                    s.tokens.remove(&id);
+                }
+            }
+            Slot::Code => {
+                let done = s.code.as_mut().is_some_and(|e| {
+                    e.in_flight = e
+                        .in_flight
+                        .saturating_sub(u32::from(e.generation == a.generation));
+                    e.generation == a.generation && e.attempts_left == 0 && e.in_flight == 0
+                });
+                if done {
+                    s.code = None;
+                }
+            }
+        }
     }
 
     /// Spend the secret: succeeds for exactly one caller, and only while it is still the
@@ -373,7 +407,8 @@ pub(crate) async fn serve_pairing(
     client_key: &PublicKey,
     wait: Duration,
 ) -> Result<PairedDevice> {
-    match serve_inner(
+    let mut attempt = None;
+    let result = serve_inner(
         conn,
         window,
         registry,
@@ -382,9 +417,13 @@ pub(crate) async fn serve_pairing(
         server_name,
         client_key,
         wait,
+        &mut attempt,
     )
-    .await
-    {
+    .await;
+    if let Some(a) = &attempt {
+        window.finish(a);
+    }
+    match result {
         Ok(p) => Ok(p),
         Err(e) => {
             let reason = match e {
@@ -413,6 +452,7 @@ async fn serve_inner(
     server_name: &str,
     client_key: &PublicKey,
     wait: Duration,
+    attempt_slot: &mut Option<Attempt>,
 ) -> Result<PairedDevice> {
     let Body::Start(start) = recv_pairing(conn, wait).await? else {
         return Err(Error::Protocol("expected PairStart"));
@@ -426,13 +466,15 @@ async fn serve_inner(
     if !id_ok || start.spake.len() != SPAKE_LEN || start.device_name.len() > MAX_NAME {
         return Err(Error::Protocol("malformed PairStart"));
     }
-    let device_name = sanitize_label(&start.device_name, MAX_NAME, "unnamed device");
+    // The transcript carries the names exactly as sent; only what is stored is sanitised.
+    let stored_name = sanitize_label(&start.device_name, MAX_NAME, "unnamed device");
     let server_name = sanitize_label(server_name, MAX_NAME, "server");
 
     // A real attempt consumes one of the secret's tries now; otherwise run the exchange
     // against a random password so the failure looks the same.
-    let attempt = window.begin(mode, &start.token_id);
-    let password = match &attempt {
+    *attempt_slot = window.begin(mode, &start.token_id);
+    let attempt = &*attempt_slot;
+    let password = match attempt {
         Some(a) => a.password.clone(),
         None => Zeroizing::new(random_bytes::<32>()?.to_vec()),
     };
@@ -465,7 +507,7 @@ async fn serve_inner(
         token_id: &start.token_id,
         client_spake: &start.spake,
         server_spake: &server_spake,
-        device_name: &device_name,
+        device_name: &start.device_name,
         server_name: &server_name,
     }
     .hash();
@@ -479,7 +521,7 @@ async fn serve_inner(
     let (reg, key_copy, name, now) = (
         registry.clone(),
         *client_key,
-        device_name.clone(),
+        stored_name,
         clock.unix_secs(),
     );
     let record = tokio::task::spawn_blocking(move || reg.upsert_paired(&key_copy, &name, now))
@@ -611,7 +653,11 @@ async fn client_exchange(
         PairingCredential::Token(t) => (PairMode::Token, t.id().to_vec(), t.password()),
         PairingCredential::Code(c) => (PairMode::Code, Vec::new(), c.password()),
     };
-    let device_name = sanitize_label(&opts.device_name, MAX_NAME, "device");
+    // Sent and bound into the transcript exactly as given; the server sanitises for storage.
+    if opts.device_name.len() > MAX_NAME {
+        return Err(Error::InvalidSecret("device name longer than 64 bytes"));
+    }
+    let device_name = opts.device_name.clone();
     let (spake, client_spake) = Spake2::<Ed25519Group>::start_a(
         &Password::new(&*password),
         &Identity::new(ID_CLIENT),
@@ -701,6 +747,26 @@ mod tests {
             .sum();
         assert_eq!(granted, 3);
         assert!(!w.is_open());
+    }
+
+    #[test]
+    fn exhausted_secrets_are_deleted_when_their_last_attempt_ends() {
+        let (w, _) = window(PairingLimits::default());
+        w.issue_code().unwrap();
+        let attempts: Vec<_> = (0..3)
+            .map(|_| w.begin(PairMode::Code, &[]).unwrap())
+            .collect();
+        // Still held while the last attempts are running (one of them may yet succeed).
+        assert!(w.lock().code.is_some());
+        for a in &attempts {
+            w.finish(a);
+        }
+        assert!(w.lock().code.is_none());
+        let t = w.issue_token().unwrap();
+        let a = w.begin(PairMode::Token, &t.id()).unwrap();
+        assert!(w.lock().tokens.contains_key(&t.id()));
+        w.finish(&a);
+        assert!(w.lock().tokens.contains_key(&t.id()), "attempts remain");
     }
 
     #[test]

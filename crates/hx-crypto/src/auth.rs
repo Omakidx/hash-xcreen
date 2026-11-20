@@ -50,6 +50,12 @@ pub struct AuthenticatorConfig {
     pub max_pin_messages: u32,
     /// Pairing window limits.
     pub pairing: PairingLimits,
+    /// How often a live session re-checks the registry as a backstop for revocations that
+    /// were not announced (default 5 s; an in-memory lookup).
+    pub watch_interval: Duration,
+    /// A PIN attempt is not started (and not counted) if less than this remains of
+    /// `pin_timeout`, so a hash is not begun that the deadline would cut off (default 1 s).
+    pub min_hash_budget: Duration,
 }
 
 impl Default for AuthenticatorConfig {
@@ -64,8 +70,16 @@ impl Default for AuthenticatorConfig {
             max_pin_failures: MAX_PIN_FAILURES,
             max_pin_messages: 5,
             pairing: PairingLimits::default(),
+            watch_interval: Duration::from_secs(5),
+            min_hash_budget: Duration::from_secs(1),
         }
     }
+}
+
+struct PinVerdict {
+    right: bool,
+    failed: u32,
+    revoked: bool,
 }
 
 /// What [`Authenticator::authenticate`] did with a session.
@@ -89,6 +103,28 @@ pub enum Outcome {
     },
     /// The session was refused before `HelloAck` (the client was told); nothing is left open.
     Refused(RefuseReason),
+}
+
+/// Read-only view of the registry. Changes go through [`Authenticator`] (`revoke`, `remove`,
+/// `reinstate`), which also close live sessions and announce them.
+#[derive(Clone)]
+pub struct RegistryView(Arc<dyn DeviceRegistry>);
+
+impl RegistryView {
+    /// Look a device up by id.
+    pub fn get(&self, id: &DeviceId) -> Result<Option<DeviceRecord>> {
+        self.0.get(id)
+    }
+
+    /// Look a device up by key.
+    pub fn find_by_key(&self, key: &PublicKey) -> Result<Option<DeviceRecord>> {
+        self.0.find_by_key(key)
+    }
+
+    /// All devices.
+    pub fn list(&self) -> Result<Vec<DeviceRecord>> {
+        self.0.list()
+    }
 }
 
 struct Inner {
@@ -151,10 +187,10 @@ impl Authenticator {
         &self.inner.window
     }
 
-    /// The registry (for listing devices and, after the caller verified the password,
-    /// `reinstate`).
-    pub fn registry(&self) -> &Arc<dyn DeviceRegistry> {
-        &self.inner.registry
+    /// A read-only view of the registry (device list). Mutations go through
+    /// [`revoke`](Self::revoke), [`remove`](Self::remove) and [`reinstate`](Self::reinstate).
+    pub fn registry(&self) -> RegistryView {
+        RegistryView(self.inner.registry.clone())
     }
 
     /// This server's public identity key (what clients pin).
@@ -175,15 +211,73 @@ impl Authenticator {
 
     /// Revoke a device now: persist it, close its live sessions, and announce it on
     /// [`subscribe_revocations`](Self::subscribe_revocations). Returns false if the device is
-    /// unknown or already revoked.
+    /// unknown or already revoked. The write and the announcement run as one unit that
+    /// finishes even if the caller's future is dropped.
     pub async fn revoke(&self, id: &DeviceId, reason: RevokeReason) -> Result<bool> {
-        let (id2, now) = (*id, self.inner.clock.unix_secs());
-        let revoked = self.reg(move |r| r.revoke(&id2, reason, now)).await?;
-        if revoked {
-            // No receiver is fine: nothing is live.
-            let _ = self.inner.revocations.send(*id);
-        }
-        Ok(revoked)
+        let id = *id;
+        self.commit(move |r, tx, now| {
+            let revoked = r.revoke(&id, reason, now)?;
+            if revoked {
+                // No receiver is fine: nothing is live.
+                let _ = tx.send(id);
+            }
+            Ok(revoked)
+        })
+        .await
+    }
+
+    /// Forget a device: persist, close its live sessions (announced like a revocation) and
+    /// drop its PIN backoff state. Returns false if it was unknown.
+    pub async fn remove(&self, id: &DeviceId) -> Result<bool> {
+        let id = *id;
+        let removed = self
+            .commit(move |r, tx, _| {
+                let removed = r.remove(&id)?;
+                if removed {
+                    let _ = tx.send(id);
+                }
+                Ok(removed)
+            })
+            .await?;
+        self.inner
+            .not_before
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&id);
+        Ok(removed)
+    }
+
+    /// Lift a revocation. **The caller must have verified the Linux password first**
+    /// (architecture §8.3). The device then has to pair again. Returns false if the device
+    /// is unknown or not revoked.
+    pub async fn reinstate(&self, id: &DeviceId) -> Result<bool> {
+        let id = *id;
+        let done = self.commit(move |r, _, _| r.reinstate(&id)).await?;
+        self.inner
+            .not_before
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&id);
+        Ok(done)
+    }
+
+    /// Run a registry change and its announcement as one blocking unit: once started it
+    /// completes even if the awaiting future is cancelled, so a persisted revocation is
+    /// never left unannounced.
+    async fn commit<R: Send + 'static>(
+        &self,
+        f: impl FnOnce(&dyn DeviceRegistry, &broadcast::Sender<DeviceId>, u64) -> Result<R>
+        + Send
+        + 'static,
+    ) -> Result<R> {
+        let (r, tx, now) = (
+            self.inner.registry.clone(),
+            self.inner.revocations.clone(),
+            self.inner.clock.unix_secs(),
+        );
+        tokio::task::spawn_blocking(move || f(&*r, &tx, now))
+            .await
+            .map_err(|_| Error::Protocol("registry task failed"))?
     }
 
     /// Every revocation (by an operator or by the PIN lockout) is announced here, for
@@ -273,11 +367,7 @@ impl Authenticator {
     ) -> Result<Outcome> {
         if known.as_ref().is_some_and(DeviceRecord::is_revoked) {
             return self
-                .refuse(
-                    pending,
-                    RefuseReason::Unauthorized,
-                    "this device was revoked",
-                )
+                .refuse(pending, RefuseReason::Unauthorized, "not authorized")
                 .await;
         }
         if !self.inner.window.is_open() {
@@ -314,7 +404,7 @@ impl Authenticator {
                 })
             }
             Ok(Err(e)) => {
-                tracing::warn!(key = %key.fingerprint().short(), "pairing failed");
+                tracing::warn!(remote = %conn.remote_addr(), key = %key.fingerprint().short(), error = %e, "pairing failed");
                 close_after(&conn, CloseCode::Unauthorized, "pairing failed").await;
                 Err(e)
             }
@@ -340,11 +430,7 @@ impl Authenticator {
         };
         if device.is_revoked() {
             return self
-                .refuse(
-                    pending,
-                    RefuseReason::Unauthorized,
-                    "this device was revoked",
-                )
+                .refuse(pending, RefuseReason::Unauthorized, "not authorized")
                 .await;
         }
         if self.pin_hash().is_none() {
@@ -362,9 +448,10 @@ impl Authenticator {
                 software: self.inner.config.software.clone(),
             })
             .await?;
+        let deadline = std::time::Instant::now() + self.inner.config.pin_timeout;
         let result = tokio::time::timeout(
             self.inner.config.pin_timeout,
-            self.pin_exchange(&conn, &device),
+            self.pin_exchange(&conn, &device, deadline),
         )
         .await;
         let verdict = match result {
@@ -449,7 +536,12 @@ impl Authenticator {
 
     /// Read PIN attempts until one is right, the device is revoked, or the connection runs out
     /// of attempts. `Ok(())` means the PIN was verified (nothing is sent yet).
-    async fn pin_exchange(&self, conn: &Connection, device: &DeviceRecord) -> Result<()> {
+    async fn pin_exchange(
+        &self,
+        conn: &Connection,
+        device: &DeviceRecord,
+        deadline: std::time::Instant,
+    ) -> Result<()> {
         let cfg = &self.inner.config;
         for _ in 0..cfg.max_pin_messages {
             let m = conn.recv_control().await?;
@@ -457,9 +549,9 @@ impl Authenticator {
                 return Err(Error::Protocol("expected a PIN attempt"));
             };
 
-            // From here to the verdict nothing else may try this device's PIN.
-            let lock = self.device_lock(&device.id);
-            let _guard = lock.lock().await;
+            // From here to the verdict nothing else may try this device's PIN. The guard is
+            // owned so that the counting unit below keeps it even if this future is dropped.
+            let guard = self.device_lock(&device.id).lock_owned().await;
             let id = device.id;
             let current = self
                 .reg(move |r| r.get(&id))
@@ -486,24 +578,21 @@ impl Authenticator {
                     .await?;
                 continue;
             }
-
             let Some(hash) = self.pin_hash() else {
                 self.send_result(conn, AuthStatus::NotAvailable, left, Duration::ZERO)
                     .await?;
                 return Err(Error::PinNotAvailable);
             };
-            let right = match Pin::from_bytes(&attempt.pin) {
-                Ok(pin) => tokio::task::spawn_blocking(move || hash.verify(pin.as_bytes()))
-                    .await
-                    .map_err(|_| Error::Protocol("PIN task failed"))?,
-                Err(_) => false,
-            };
+            // Do not begin a hash the deadline would cut off.
+            if deadline.saturating_duration_since(std::time::Instant::now()) < cfg.min_hash_budget {
+                return Err(Error::Timeout("PIN exchange"));
+            }
+
+            let verdict = self
+                .check_pin(device.id, hash, attempt.pin.clone(), guard)
+                .await?;
             drop(attempt);
-            let now_unix = self.inner.clock.unix_secs();
-            if right {
-                let id = device.id;
-                self.reg(move |r| r.record_pin_success(&id, now_unix))
-                    .await?;
+            if verdict.right {
                 self.inner
                     .not_before
                     .lock()
@@ -511,21 +600,15 @@ impl Authenticator {
                     .remove(&device.id);
                 return Ok(());
             }
-
-            // Wrong: count it durably before answering.
-            let (id, max) = (device.id, cfg.max_pin_failures);
-            let f = self
-                .reg(move |r| r.record_pin_failure(&id, max, now_unix))
-                .await?;
-            if f.revoked {
+            tracing::warn!(remote = %conn.remote_addr(), device = %device.id, failed = verdict.failed, "wrong PIN");
+            if verdict.revoked {
                 tracing::warn!(device = %device.id, "device revoked after too many wrong PINs");
-                let _ = self.inner.revocations.send(device.id);
                 let _ = self
                     .send_result(conn, AuthStatus::Revoked, 0, Duration::ZERO)
                     .await;
                 return Err(Error::Revoked);
             }
-            let retry = backoff_after(f.failed_pins);
+            let retry = backoff_after(verdict.failed);
             self.inner
                 .not_before
                 .lock()
@@ -534,7 +617,7 @@ impl Authenticator {
             self.send_result(
                 conn,
                 AuthStatus::WrongPin,
-                max.saturating_sub(f.failed_pins),
+                cfg.max_pin_failures.saturating_sub(verdict.failed),
                 retry,
             )
             .await?;
@@ -542,28 +625,94 @@ impl Authenticator {
         Err(Error::Protocol("too many PIN attempts on one connection"))
     }
 
-    /// Close `conn` when its device is revoked.
+    /// Count the attempt, hash, then record the outcome, as one detached unit that owns the
+    /// per-device guard: if the caller is cancelled (deadline, disconnect) the attempt is
+    /// still counted and a wrong PIN still counts toward revocation. The attempt is counted
+    /// **before** the hash starts and cleared only by a correct PIN.
+    async fn check_pin(
+        &self,
+        id: DeviceId,
+        hash: Arc<PinHash>,
+        pin: Vec<u8>,
+        guard: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<PinVerdict> {
+        let this = self.clone();
+        let max = self.inner.config.max_pin_failures;
+        tokio::spawn(async move {
+            let _guard = guard;
+            let pin = zeroize::Zeroizing::new(pin);
+            let counted = this.reg(move |r| r.begin_pin_attempt(&id)).await?;
+            // An earlier attempt at the limit was cut off before its verdict: it counted.
+            let right = counted <= max
+                && match Pin::from_bytes(&pin) {
+                    Ok(p) => tokio::task::spawn_blocking(move || hash.verify(p.as_bytes()))
+                        .await
+                        .map_err(|_| Error::Protocol("PIN task failed"))?,
+                    Err(_) => false,
+                };
+            let now_unix = this.inner.clock.unix_secs();
+            if right {
+                this.reg(move |r| r.record_pin_success(&id, now_unix))
+                    .await?;
+                return Ok(PinVerdict {
+                    right: true,
+                    failed: 0,
+                    revoked: false,
+                });
+            }
+            let revoked = this
+                .commit(move |r, tx, now| {
+                    let revoked = r.revoke_if_failed(&id, max, now)?;
+                    if revoked {
+                        let _ = tx.send(id);
+                    }
+                    Ok(revoked)
+                })
+                .await?;
+            Ok(PinVerdict {
+                right: false,
+                failed: counted,
+                revoked,
+            })
+        })
+        .await
+        .map_err(|_| Error::Protocol("PIN task failed"))?
+    }
+
+    /// Close `conn` when its device is revoked or removed: on the announcement, and, as a
+    /// backstop for changes nobody announced, by re-reading the registry every
+    /// `watch_interval`.
     fn watch(&self, conn: Connection, id: DeviceId, mut rx: broadcast::Receiver<DeviceId>) {
         let this = self.clone();
         tokio::spawn(async move {
+            let mut tick = tokio::time::interval(this.inner.config.watch_interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await; // the first tick is immediate
             loop {
-                tokio::select! {
+                let check_registry = tokio::select! {
                     _ = conn.closed() => break,
-                    r = rx.recv() => {
-                        let hit = match r {
-                            Ok(rid) => rid == id,
-                            // Missed announcements: ask the registry instead.
-                            Err(broadcast::error::RecvError::Lagged(_)) => this
-                                .reg(move |reg| reg.get(&id))
-                                .await
-                                .map(|d| d.is_none_or(|d| d.is_revoked()))
-                                .unwrap_or(true),
-                            Err(broadcast::error::RecvError::Closed) => break,
-                        };
-                        if hit {
+                    r = rx.recv() => match r {
+                        Ok(rid) => {
+                            if rid == id {
+                                conn.close(CloseCode::Unauthorized, "device revoked").await;
+                                break;
+                            }
+                            false
+                        }
+                        // Missed announcements: ask the registry instead.
+                        Err(broadcast::error::RecvError::Lagged(_)) => true,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    },
+                    _ = tick.tick() => true,
+                };
+                if check_registry {
+                    match this.reg(move |reg| reg.get(&id)).await {
+                        Ok(d) if d.as_ref().is_none_or(DeviceRecord::is_revoked) => {
                             conn.close(CloseCode::Unauthorized, "device revoked").await;
                             break;
                         }
+                        Ok(_) => {}
+                        Err(e) => tracing::error!(error = %e, "registry re-check failed"),
                     }
                 }
             }

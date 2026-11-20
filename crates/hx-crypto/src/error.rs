@@ -26,6 +26,9 @@ pub enum Error {
     /// The registry file has permissions that expose it to other users.
     #[error("registry file permissions are too open (need 0600)")]
     InsecurePermissions,
+    /// Another registry instance already holds the single-writer lock.
+    #[error("the device registry is locked by another instance")]
+    Locked,
     /// Reading or writing the registry failed.
     #[error("registry I/O: {0}")]
     Io(#[from] std::io::Error),
