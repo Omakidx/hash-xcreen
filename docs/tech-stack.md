@@ -1,6 +1,6 @@
 # Tech stack
 
-Every language, library, tool and external service hash-xcreen uses, and why. Items marked **(spike)** are chosen but must be confirmed by the Phase 0 spike named in [execution-phase.md](execution-phase.md) before we depend on them.
+Every language, library, tool and external service hash-xcreen uses, and why. Items marked **(provisional)** were chosen in the Phase 0 spikes but still need the follow-up run listed in [execution-phase.md](execution-phase.md) §0.4 before we depend on them.
 
 ## Languages
 
@@ -19,7 +19,9 @@ Every language, library, tool and external service hash-xcreen uses, and why. It
 | Storage | **ZFS** or **btrfs** pool (spare disk or loop file) | Instant copy-on-write snapshots for consistent backups |
 | Desktop (v1) | **XFCE** on headless **Xorg** with the `dummy` driver | Lightest desktop, simplest and most efficient capture path |
 | Audio in the desktop | **PipeWire** | Standard on current Ubuntu/Debian; capture for streaming |
-| Docker (opt-in) | Docker Engine from Docker's apt repository, Incus `security.nesting` | Official packages; works inside unprivileged containers |
+| Docker (opt-in) | Docker Engine from Docker's apt repository, Incus `security.nesting` **(provisional: failing on Incus 6.0, see architecture §4.3)** | Official packages |
+| Host tuning | `/etc/sysctl.d/90-hx-incus.conf` (inotify limits, `vm.max_map_count`) | All unprivileged containers share one inotify budget; the default (128) blocks a second desktop |
+| Provisioning recipes | TOML fragments (`include`, `[vars]`, add-ons, `post` stage) applied by `hx-provision` | Same recipe drives prebuilt images and building on the server |
 | Process management | **systemd** units with sandboxing, `systemd-creds` for secrets | Hardening and TPM-sealed secrets without extra software |
 | Firewall | ufw or nftables, whichever the host uses | Avoid fighting the host's existing setup |
 | Async runtime | **tokio** (networking only) | Standard for quinn and HTTP; kept out of the media hot path |
@@ -32,8 +34,9 @@ Every language, library, tool and external service hash-xcreen uses, and why. It
 | X11 capture | **XDamage**, **XShm**, **XFixes** (cursor), **RandR** (resize), via `x11rb` | Change-driven, copy-free capture; pure-Rust X11 bindings |
 | Input injection | **XTest** (X11); **libei** later for Wayland desktops | Standard injection APIs per display stack |
 | Colour conversion | `yuvutils-rs` (SIMD) | Fast RGB→YUV without a C dependency |
-| Codec framework | **libavcodec** (FFmpeg) via `ffmpeg-next` / `ffmpeg-sys-next` | One API for every encoder and decoder, software and hardware |
-| Software encoder | **x264** (`ultrafast`, `zerolatency`, intra refresh) | Best low-latency software H.264; GPL is fine because we are AGPL |
+| Codec framework | **libavcodec** (FFmpeg) via `ffmpeg-next` / `ffmpeg-sys-next` (7.1 against Ubuntu 24.04's FFmpeg 6.1; newer FFmpeg needs a newer `ffmpeg-next`) | One API for every encoder and decoder, software and hardware |
+| Software encoder | **x264** (`ultrafast`, `zerolatency`, `crf=23`, one-frame VBV, bitrate ladder ≤ 20 Mbps, sliced threads, intra refresh) | Best low-latency software H.264 (4–8 ms encode in S2); GPL is fine because we are AGPL |
+| Media pipeline threads | Dedicated OS threads joined by bounded `crossbeam-channel` queues, pooled buffers | Keeps the hot path off the async runtime (S2) |
 | Later encoders | **SVT-AV1** (real-time presets), **VAAPI**, **NVENC** | Screen-content AV1; hardware encoding when a GPU exists |
 | Audio codec | **Opus** (10 ms frames, in-band FEC) via `audiopus` | Low latency, loss-tolerant |
 | Client hardware decode | libavcodec with **VAAPI** (Linux) | Hardware decode on Intel/AMD; NVIDIA through VAAPI drivers or NVDEC later |
@@ -43,12 +46,12 @@ Every language, library, tool and external service hash-xcreen uses, and why. It
 | Area | Choice | Why |
 |---|---|---|
 | Native transport | **QUIC** via `quinn`, BBR congestion control | Independent streams (no head-of-line blocking), datagrams, built-in TLS 1.3 |
-| Browser transport | **WebTransport** over HTTP/3 (`wtransport` or `h3` + quinn) **(spike S5)** | Same QUIC on both clients |
-| Fallback | WebSocket over TLS (`tokio-tungstenite`) | Networks that block UDP |
+| Browser transport | **WebTransport** over HTTP/3 via `wtransport` running on our own quinn endpoint, dispatched by ALPN (`h3` / `hx/1`); `h3` + `h3-webtransport` as the fallback library | Same QUIC and the same port for both clients (proven in S5) |
+| Fallback | WebSocket over TLS (`tokio-tungstenite`) on the same port number over TCP | Networks that block UDP, and Safari until it is tested |
 | TLS | `rustls` | Pure Rust, no OpenSSL; supports pinned raw keys |
 | Control messages | **Protocol Buffers** via `prost` | Schema evolution, language-neutral for future mobile clients |
 | Media framing | Fixed little-endian binary header | No parsing cost on the hot path |
-| Web certificates | Let's Encrypt via ACME (`instant-acme`); IP-address certificates when no domain **(spike S5)** | Real HTTPS for the browser without a domain |
+| Web certificates | Let's Encrypt via ACME (`instant-acme`); short-lived IP-address certificates when there is no domain **(provisional: not yet issued for real)**; fallback: self-signed ECDSA P-256 certificate from `rcgen`, pinned with `serverCertificateHashes` | Real HTTPS for the browser without a domain |
 
 ## Security
 
@@ -67,8 +70,8 @@ Every language, library, tool and external service hash-xcreen uses, and why. It
 
 | Area | Choice | Why |
 |---|---|---|
-| Backup engine | **`rustic_core`** (Rust implementation of the restic format) | Content-defined chunking, deduplication, zstd compression, authenticated encryption; restic-compatible format |
-| Google Drive access | **OpenDAL** `gdrive` service; rclone backend as fallback **(spike S4)** | Native Rust Drive backend for rustic |
+| Backup engine | **`rustic_core`** (Rust implementation of the restic format), zstd level 3; versions pinned because its API is still unstable | Content-defined chunking, deduplication, compression, authenticated encryption; restic-compatible format; full round trip proven locally in S4 |
+| Google Drive access | **OpenDAL** `gdrive` service through `rustic_backend`, with only that service enabled (all services made a 43 MB binary), wrapped by hash-xcreen for 429/403 rate limits and the daily cap; rclone backend as fallback **(provisional: untested against Drive)** | Native Rust Drive backend for rustic |
 | Google auth | OAuth 2.0 for installed apps (PKCE, loopback redirect) via `oauth2`; scope `drive.file` | Sign-in happens in the client's browser; least-privilege scope with light verification |
 | Scheduling | In-agent scheduler (wall-clock times, catch-up, no overlap) | Needs knowledge of sessions (upload cap) and quotas |
 | Alerts | **ntfy** HTTP API, generic **webhooks** (`reqwest`) | Push to phones and chat tools without a central service |
@@ -78,7 +81,7 @@ Every language, library, tool and external service hash-xcreen uses, and why. It
 | Area | Choice | Why |
 |---|---|---|
 | Desktop UI | **Slint** | Native Rust UI with a declarative language, small runtime |
-| Video presentation | Slint **wgpu** integration (GPU texture as `slint::Image`) **(spike S1)** | No CPU copy per frame; fallbacks: OpenGL underlay or CPU upload |
+| Video presentation | VAAPI → DMA-BUF → EGL image → OpenGL texture (`khronos-egl`, `glow`) → Slint `BorrowedOpenGLTextureBuilder`; fallback: CPU upload into `SharedPixelBuffer`; Slint's wgpu integration kept as an option **(provisional: awaiting the S1 GPU run)** | No CPU copy per frame using a stable Slint API; needs an EGL context (Wayland, or a custom Slint platform on X11) |
 | SSH setup from the app | `russh` | Pure-Rust SSH client with host-key verification |
 | Web client | Rust → **WASM** (`wasm-bindgen`) for protocol and logic; **WebCodecs** decode; **WebGL/WebGPU** canvas; Pointer Lock, Keyboard Lock, Clipboard API | Shared protocol code with hardware decode in the browser |
 | Web UI hosting | Served by `hx-gatewayd` (`axum`) | No separate web server |
@@ -111,3 +114,4 @@ Every language, library, tool and external service hash-xcreen uses, and why. It
 
 - Project licence: **AGPL-3.0**; contributions under the **DCO**.
 - All dependencies must be AGPL-compatible; `cargo-deny` enforces the allowed licence list. x264 (GPL-2.0+) and FFmpeg built with GPL components are allowed.
+- Slint is used under its GPL-3.0 option, which is compatible with AGPL-3.0-or-later.
