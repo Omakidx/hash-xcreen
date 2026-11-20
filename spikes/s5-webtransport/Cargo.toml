@@ -1,0 +1,26 @@
+[package]
+name = "s5-webtransport"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "AGPL-3.0-or-later"
+description = "Spike S5: WebTransport and native QUIC on one UDP port, plus certificates"
+
+# Standalone crate: deliberately NOT a member of the root workspace.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+futures-util = "0.3"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+sha2 = "0.10"
+time = "0.3"
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tokio-tungstenite = "0.30"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wtransport = { version = "0.7.2", default-features = false, features = ["quinn", "ring"] }
