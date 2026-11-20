@@ -1,0 +1,29 @@
+# Docker add-on (opt-in). Needs {{distro}} and {{codename}} from the distro fragment.
+#
+# [incus_config] keys are instance configuration, not container content: hx-provision applies
+# them with a config update and restarts the desktop. They enlarge the container's attack
+# surface (security.nesting relaxes the AppArmor profile), which is why Docker is opt-in
+# (architecture section 4.3). Requires Incus 6.0.5 or newer; the caller checks the version and
+# runs the self-test (`docker run --rm hello-world`) after applying this add-on.
+
+[incus_config]
+"security.nesting" = "true"
+"security.syscalls.intercept.mknod" = "true"
+"security.syscalls.intercept.setxattr" = "true"
+
+[[apt_repo]]
+name = "docker"
+key_url = "https://download.docker.com/linux/{{distro}}/gpg"
+key_fingerprint = "9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
+uri = "https://download.docker.com/linux/{{distro}}"
+suite = "{{codename}}"
+components = "stable"
+
+[apt]
+packages = ["docker-ce", "docker-ce-cli", "containerd.io", "docker-buildx-plugin", "docker-compose-plugin"]
+
+[user]
+groups = ["docker"]
+
+[services]
+system_enable = ["docker.service", "containerd.service"]

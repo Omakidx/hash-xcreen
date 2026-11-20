@@ -1,0 +1,48 @@
+# Preset "developer": basic + VS Code, git, build tools, Claude Code, Codex CLI.
+[vars]
+preset = "developer"
+
+[[apt_repo]]
+name = "vscode"
+key_url = "https://packages.microsoft.com/keys/microsoft.asc"
+key_fingerprint = "BC528686B50D79E339D3721CEB3E94ADBE1229CF"
+uri = "https://packages.microsoft.com/repos/code"
+suite = "stable"
+components = "main"
+
+# The `code` postinst offers to add Microsoft's repository a second time; we already did.
+[[pre_step]]
+name = "vscode-debconf"
+run = "apt-get install -y -qq debconf-utils >/dev/null; echo 'code code/add-microsoft-repo boolean false' | debconf-set-selections"
+
+[apt]
+packages = ["code", "git", "build-essential", "pkg-config", "unzip", "jq", "python3", "less", "openssh-client"]
+
+# Vendor native installers. They run as the desktop user in the post stage, so a prebuilt image
+# and a server-built desktop end in the same state, and they self-update afterwards. They fetch
+# vendor-hosted scripts and binaries, so a vendor outage must not fail the whole provisioning:
+# `optional = true` turns a failure into a warning in the result.
+[[post_step]]
+name = "claude-code"
+as_user = true
+optional = true
+timeout_secs = 600
+run = "curl -fsSL --retry 3 --connect-timeout 20 --max-time 300 https://claude.ai/install.sh | bash"
+
+# Codex CLI ships as a single static binary on GitHub releases (musl build, no runtime deps);
+# it updates itself from there. Installed into ~/.local/bin, which Debian/Ubuntu's default
+# ~/.profile adds to PATH.
+[[post_step]]
+name = "codex-cli"
+as_user = true
+optional = true
+timeout_secs = 600
+run = '''
+mkdir -p "$HOME/.local/bin"
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+curl -fsSL --retry 3 --connect-timeout 20 --max-time 300 \
+  https://github.com/openai/codex/releases/latest/download/codex-x86_64-unknown-linux-musl.tar.gz -o "$tmp/codex.tar.gz"
+tar -xzf "$tmp/codex.tar.gz" -C "$tmp"
+install -m 0755 "$tmp"/codex-x86_64-unknown-linux-musl "$HOME/.local/bin/codex"
+'''

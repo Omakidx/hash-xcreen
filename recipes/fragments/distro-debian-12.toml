@@ -1,0 +1,11 @@
+# Debian 12 (bookworm). Firefox ESR is a normal deb here.
+[recipe]
+base_image = "images:debian/12"
+
+[vars]
+distro = "debian"
+codename = "bookworm"
+distro_version = "12"
+
+[apt]
+packages = ["firefox-esr"]
