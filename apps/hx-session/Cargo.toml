@@ -10,3 +10,22 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[[bin]]
+name = "hx-session"
+path = "src/main.rs"
+
+[[bin]]
+name = "hx-session-bench"
+path = "src/bin/bench/main.rs"
+
+[dependencies]
+crossbeam-channel.workspace = true
+hx-capture = { path = "../../crates/hx-capture" }
+hx-codec = { path = "../../crates/hx-codec" }
+rustix = { workspace = true, features = ["time"] }
+thiserror.workspace = true
+x11rb.workspace = true
+
+[dev-dependencies]
+x11rb = { workspace = true, features = ["xtest"] }

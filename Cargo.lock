@@ -209,6 +209,14 @@ version = "0.1.0"
 [[package]]
 name = "hx-session"
 version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "hx-capture",
+ "hx-codec",
+ "rustix",
+ "thiserror",
+ "x11rb",
+]
 
 [[package]]
 name = "hx-transport"
