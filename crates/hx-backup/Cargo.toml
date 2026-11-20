@@ -1,0 +1,12 @@
+[package]
+name = "hx-backup"
+description = "Full-desktop backups to Google Drive with rustic_core: scheduling, retention, verification."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
