@@ -92,7 +92,7 @@ Rules:
 | Video payload | 16777216 (16 MiB) |
 | Audio payload | 1100 |
 | `TransferHeader` encoded | 4096 |
-| File name in `TransferHeader` | 255 bytes; also rejected: `/`, `\`, `:`, C0/C1/DEL control characters, bidi controls (U+202A–202E, U+2066–2069, U+200E/F, U+061C), `.` and `..`, a trailing `.` or space, and the Windows device names CON, PRN, AUX, NUL, COM1–9, LPT1–9 (with or without extension) |
+| File name in `TransferHeader` | 255 bytes; also rejected: `/`, `\`, `:`, C0/C1/DEL control characters, bidi controls (U+202A–202E, U+2066–2069, U+200E/F, U+061C), `.` and `..`, a trailing `.` or space, and the Windows device names CON, PRN, AUX, NUL, CONIN$, CONOUT$, COM1–9, LPT1–9 and the superscript forms COM¹²³, LPT¹²³ (with or without extension); also zero-width/invisible characters (U+200B–200D, U+2060, U+FEFF, U+180E) |
 | Clipboard transfer total | 67108864 (64 MiB) |
 | WebSocket transfer chunk | 65536 |
 | Queued, unread incoming transfer data (WebSocket) | 1 MiB per transfer and 4 MiB per connection; a transfer that exceeds either is aborted (`abort`, §9.4). On QUIC the same bound comes from stream and connection flow control (§1) |
@@ -260,7 +260,7 @@ The client draws the cursor itself, so pointer motion never waits for video.
 
 Each transfer is its own unidirectional QUIC stream, opened by whichever side sends it: channel id `0x07` (clipboard) or `0x08` (file), then the `TransferHeader` framed as in §5.1 (limit 4096), then exactly `size` raw bytes, then FIN.
 
-`TransferHeader`: `mime` (1, string, 1 to 255 bytes, never empty; clipboard formats such as `text/plain;charset=utf-8`, `image/png`, `text/uri-list`), `name` (2, string; files only, must be empty for clipboard, see §3.1 for constraints; **a display hint only**: a receiver writes inside a directory of its own choosing, picks its own file name and never treats `name` as a path), `size` (3, uint64, exact byte count of the body).
+`TransferHeader`: `mime` (1, string, 1 to 255 bytes, printable ASCII only, `type/subtype` of token characters followed by optional `;` parameters; clipboard formats such as `text/plain;charset=utf-8`, `image/png`, `text/uri-list`), `name` (2, string; files only, must be empty for clipboard, see §3.1 for constraints; **a display hint only**: a receiver writes inside a directory of its own choosing, picks its own file name and never treats `name` as a path), `size` (3, uint64, exact byte count of the body).
 
 The receiver enforces `size` (more or fewer bytes than announced is a protocol error for that stream, which is reset with `TRANSFER_ERROR`; the connection continues) and the clipboard limit of §3.1. A receiver MAY abort a transfer at any time with `STOP_SENDING` (`TRANSFER_REJECTED`). Progress is the bytes received so far over `size`. Transfers only occur if the matching feature was negotiated and the user has not disabled it (`clipboard_enabled`).
 

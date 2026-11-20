@@ -207,11 +207,12 @@ fn cursor() -> impl Strategy<Value = CursorEvent> {
 
 fn transfer() -> impl Strategy<Value = TransferHeader> {
     let name = "f[a-z0-9_-]{0,40}(\\.[a-z]{1,4})?";
-    ("[a-z/;=0-9-]{1,64}", name, any::<u64>()).prop_map(|(mime, name, size)| TransferHeader {
-        mime,
+    (
+        "[a-z]{1,8}/[a-z0-9.+-]{1,8}(;[a-z]+=[a-z0-9-]+)?",
         name,
-        size,
-    })
+        any::<u64>(),
+    )
+        .prop_map(|(mime, name, size)| TransferHeader { mime, name, size })
 }
 
 fn media_header() -> impl Strategy<Value = MediaHeader> {
@@ -557,6 +558,20 @@ fn malformed_messages_are_rejected() {
     ] {
         assert!(t(bad).validate().is_err(), "{bad:?} must be rejected");
     }
+    for bad in [
+        "CONIN$",
+        "conout$",
+        "COM\u{B9}",
+        "LPT\u{B2}.txt",
+        "COM\u{B3}",
+        "a\u{200B}b",
+        "a\u{200D}",
+        "\u{FEFF}a",
+        "a\u{2060}b",
+        "a\u{180E}",
+    ] {
+        assert!(t(bad).validate().is_err(), "{bad:?} must be rejected");
+    }
     for ok in [
         "a.txt",
         "...hidden",
@@ -578,6 +593,40 @@ fn malformed_messages_are_rejected() {
         size: 64 * 1024 * 1024 + 1,
     };
     assert!(clip.validate_clipboard().is_err());
+    // Media types.
+    let m = |mime: &str| TransferHeader {
+        mime: mime.into(),
+        name: String::new(),
+        size: 1,
+    };
+    for ok in [
+        "text/plain",
+        "text/plain;charset=utf-8",
+        "image/png",
+        "application/vnd.x+json",
+        "text/uri-list",
+    ] {
+        assert!(m(ok).validate().is_ok(), "{ok:?}");
+    }
+    for bad in [
+        "",
+        "text",
+        "/plain",
+        "text/",
+        "text/pl ain",
+        "a/b/c",
+        "te\nxt/plain",
+        "text/plain;\u{1}",
+        "tëxt/plain",
+        "text/plain;é",
+        "te(xt/plain",
+    ] {
+        assert!(m(bad).validate().is_err(), "{bad:?}");
+    }
+    assert!(
+        m(&"a/b;".repeat(80)).validate().is_err(),
+        "mime above 255 bytes"
+    );
     // Opaque envelope limit.
     let big = ControlMessage::new(Ctl::Pairing(pb::Opaque {
         data: Bytes::from(vec![0u8; 4097]),

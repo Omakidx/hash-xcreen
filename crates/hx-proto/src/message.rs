@@ -291,10 +291,8 @@ impl Wire for TransferHeader {
     const MAX_LEN: usize = MAX_TRANSFER_HEADER;
 
     fn validate(&self) -> Result<(), ProtoError> {
-        if self.mime.is_empty() {
-            return Err(invalid("transfer.mime", "must not be empty"));
-        }
         check_str("transfer.mime", &self.mime, 255)?;
+        mime_problem(&self.mime).map_or(Ok(()), |reason| Err(invalid("transfer.mime", reason)))?;
         check_str("transfer.name", &self.name, 255)?;
         if !self.name.is_empty() {
             file_name_problem(&self.name)
@@ -324,6 +322,9 @@ pub fn file_name_problem(name: &str) -> Option<&'static str> {
             | '\u{061C}' => {
                 return Some("contains a bidirectional control character");
             }
+            '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}' | '\u{180E}' => {
+                return Some("contains an invisible character");
+            }
             c if c.is_control() => return Some("contains a control character"),
             _ => {}
         }
@@ -333,14 +334,45 @@ pub fn file_name_problem(name: &str) -> Option<&'static str> {
     }
     let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ');
     let upper = stem.to_ascii_uppercase();
-    let reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || ((upper.starts_with("COM") || upper.starts_with("LPT"))
-            && upper.len() == 4
-            && matches!(upper.as_bytes().get(3), Some(b'1'..=b'9')));
+    let numbered = |prefix: &str| {
+        upper.strip_prefix(prefix).is_some_and(|rest| {
+            let mut it = rest.chars();
+            matches!(
+                (it.next(), it.next()),
+                (Some('1'..='9' | '\u{B9}' | '\u{B2}' | '\u{B3}'), None)
+            )
+        })
+    };
+    let reserved = matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || numbered("COM")
+        || numbered("LPT");
     if reserved {
         return Some("is a reserved device name");
     }
     None
+}
+
+/// Why `mime` is not an acceptable media type, or `None` if it is: `type/subtype` made of
+/// token characters, optionally followed by `;`-separated printable-ASCII parameters.
+pub fn mime_problem(mime: &str) -> Option<&'static str> {
+    if mime.is_empty() {
+        return Some("must not be empty");
+    }
+    if !mime.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+        return Some("contains a control or non-ASCII character");
+    }
+    let (essence, _params) = mime.split_once(';').unwrap_or((mime, ""));
+    let is_token = |t: &str| {
+        !t.is_empty()
+            && t.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$&^_.+-".contains(&b))
+    };
+    match essence.trim_end().split_once('/') {
+        Some((t, sub)) if is_token(t) && is_token(sub) => None,
+        _ => Some("is not type/subtype"),
+    }
 }
 
 impl TransferHeader {
