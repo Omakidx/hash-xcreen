@@ -1,0 +1,9 @@
+# Recipe: debian-13 x xfce x developer. Merge order: arrays concatenate, later scalars win (recipes/README.md).
+include = [
+  "fragments/xfce-desktop.toml",
+  "fragments/distro-debian-13.toml",
+  "fragments/preset-developer.toml",
+]
+
+[recipe]
+name = "debian-13-xfce-developer"

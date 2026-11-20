@@ -1,0 +1,27 @@
+# Ubuntu 26.04 (resolute). Same snap-shim problem as 24.04, same Mozilla Team PPA (the PPA,
+# Docker and VS Code repositories all publish a `resolute` suite as of 2026-11).
+# Not yet build-tested end to end (S3 only ran 26.04 as the host); the CI equivalence check
+# and the prebuilt image CI are the first full runs.
+[recipe]
+base_image = "images:ubuntu/26.04"
+
+[vars]
+distro = "ubuntu"
+codename = "resolute"
+distro_version = "26.04"
+
+[[apt_repo]]
+name = "mozillateam"
+key_url = "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x0AB215679C571D1C8325275B9BDB3D89CE49EC21"
+key_fingerprint = "0AB215679C571D1C8325275B9BDB3D89CE49EC21"
+uri = "https://ppa.launchpadcontent.net/mozillateam/ppa/ubuntu"
+suite = "{{codename}}"
+components = "main"
+pin = '''
+Package: firefox*
+Pin: release o=LP-PPA-mozillateam
+Pin-Priority: 1001
+'''
+
+[apt]
+packages = ["firefox"]

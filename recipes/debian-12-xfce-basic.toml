@@ -1,0 +1,9 @@
+# Recipe: debian-12 x xfce x basic. Merge order: arrays concatenate, later scalars win (recipes/README.md).
+include = [
+  "fragments/xfce-desktop.toml",
+  "fragments/distro-debian-12.toml",
+  "fragments/preset-basic.toml",
+]
+
+[recipe]
+name = "debian-12-xfce-basic"

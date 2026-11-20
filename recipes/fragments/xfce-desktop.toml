@@ -1,0 +1,134 @@
+# The X cookie never appears in a process list: the file is created 0600 and owned by the
+# desktop user's numeric uid ({{uid}}, so renaming the account does not touch this unit), and the
+# cookie goes to xauth on stdin.
+# Shared desktop fragment: headless Xorg (dummy) + XFCE session + PipeWire.
+# Distro-independent. Included by every recipe in the recipes/ directory.
+# See recipes/README.md for the format.
+
+[vars]
+desktop = "xfce"
+
+[apt]
+packages = [
+  # base tooling
+  "sudo", "curl", "ca-certificates", "gnupg", "xdg-utils", "locales",
+  # headless X
+  "xserver-xorg-core", "xserver-xorg-video-dummy", "xauth", "x11-xserver-utils", "x11-utils", "dbus-x11",
+  # session bus and logind integration for the user manager
+  "dbus-user-session", "libpam-systemd",
+  # XFCE (no metapackage: avoids the large Recommends set)
+  "xfce4-session", "xfwm4", "xfdesktop4", "xfce4-panel", "xfce4-settings", "xfconf",
+  "xfce4-terminal", "xfce4-notifyd", "thunar", "mousepad", "adwaita-icon-theme", "fonts-dejavu-core",
+  # audio
+  "pipewire", "pipewire-pulse", "wireplumber", "pipewire-bin", "pulseaudio-utils",
+]
+
+[user]
+name = "desk"
+uid = 1000
+shell = "/bin/bash"
+groups = ["sudo", "audio", "video"]
+linger = true
+
+[services]
+system_enable = ["hx-xorg.service"]
+# Enabled for every user manager (the desktop user's lingering manager starts them at boot).
+user_enable_global = ["hx-session.service", "pipewire.socket", "pipewire-pulse.socket", "wireplumber.service"]
+
+[[file]]
+path = "/etc/hx/xorg-dummy.conf"
+content = '''
+Section "ServerFlags"
+  Option "AutoAddDevices" "false"
+  Option "AutoEnableDevices" "false"
+  Option "AutoAddGPU" "false"
+  Option "DontVTSwitch" "true"
+  Option "BlankTime" "0"
+  Option "StandbyTime" "0"
+  Option "SuspendTime" "0"
+  Option "OffTime" "0"
+EndSection
+Section "Device"
+  Identifier "dummy0"
+  Driver "dummy"
+  VideoRam 262144
+EndSection
+Section "Monitor"
+  Identifier "monitor0"
+  HorizSync 5.0-1000.0
+  VertRefresh 5.0-200.0
+  Modeline "1920x1080" 148.50 1920 2008 2052 2200 1080 1084 1089 1125 +hsync +vsync
+EndSection
+Section "Screen"
+  Identifier "screen0"
+  Device "dummy0"
+  Monitor "monitor0"
+  DefaultDepth 24
+  SubSection "Display"
+    Depth 24
+    Virtual 1920 1080
+    Modes "1920x1080"
+  EndSubSection
+EndSection
+'''
+
+[[file]]
+path = "/etc/systemd/system/hx-xorg.service"
+content = '''
+[Unit]
+Description=Headless Xorg (dummy driver) on :0
+After=systemd-user-sessions.service
+
+[Service]
+RuntimeDirectory=hx-xorg
+RuntimeDirectoryMode=0755
+ExecStartPre=/bin/sh -c 'install -m 0600 -o {{uid}} /dev/null /run/hx-xorg/Xauthority && echo "add :0 . $(mcookie)" | xauth -f /run/hx-xorg/Xauthority source - && chown {{uid}} /run/hx-xorg/Xauthority && chmod 0600 /run/hx-xorg/Xauthority'
+ExecStart=/usr/lib/xorg/Xorg :0 -config /etc/hx/xorg-dummy.conf -auth /run/hx-xorg/Xauthority -noreset -nolisten tcp -novtswitch -sharevts -logfile /var/log/hx-xorg.log
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+'''
+
+[[file]]
+path = "/etc/systemd/user/hx-session.service"
+content = '''
+[Unit]
+Description=XFCE session on :0
+
+[Service]
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/run/hx-xorg/Xauthority
+ExecStartPre=/bin/sh -c 'for i in $(seq 100); do [ -S /tmp/.X11-unix/X0 ] && exit 0; sleep 0.2; done; exit 1'
+ExecStart=/usr/bin/xfce4-session
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+'''
+
+# Virtual output so PipeWire has a sink to capture even without sound hardware.
+[[file]]
+path = "/etc/pipewire/pipewire.conf.d/10-hx-null-sink.conf"
+content = '''
+context.objects = [
+  { factory = adapter
+    args = {
+      factory.name = support.null-audio-sink
+      node.name = "hx-sink"
+      node.description = "hash-xcreen virtual output"
+      media.class = "Audio/Sink"
+      audio.position = [ FL FR ]
+      object.linger = true
+    }
+  }
+]
+'''
+
+# Last build step: drop apt caches and lists so the published image is smaller.
+# (The post stage runs `apt-get update` itself before upgrading.)
+[[step]]
+name = "apt-cleanup"
+run = "apt-get clean && rm -rf /var/lib/apt/lists/*"

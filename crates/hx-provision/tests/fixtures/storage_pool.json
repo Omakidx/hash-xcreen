@@ -1,0 +1,1 @@
+{"type":"sync","status":"Success","status_code":200,"operation":"","error_code":0,"error":"","metadata":{"config":{"size":"60GiB","source":"/var/lib/incus/disks/default.img"},"description":"","name":"default","driver":"btrfs","used_by":["/1.0/profiles/default"],"status":"Created","locations":["none"]}}
