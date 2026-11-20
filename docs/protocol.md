@@ -243,7 +243,7 @@ The client draws the cursor itself, so pointer motion never waits for video.
 
 Each transfer is its own unidirectional QUIC stream, opened by whichever side sends it: channel id `0x07` (clipboard) or `0x08` (file), then the `TransferHeader` framed as in §5.1 (limit 4096), then exactly `size` raw bytes, then FIN.
 
-`TransferHeader`: `mime` (1, string, at most 255 bytes; clipboard formats such as `text/plain;charset=utf-8`, `image/png`, `text/uri-list`), `name` (2, string; files only, must be empty for clipboard, see §3.1 for constraints), `size` (3, uint64, exact byte count of the body).
+`TransferHeader`: `mime` (1, string, 1 to 255 bytes, never empty; clipboard formats such as `text/plain;charset=utf-8`, `image/png`, `text/uri-list`), `name` (2, string; files only, must be empty for clipboard, see §3.1 for constraints), `size` (3, uint64, exact byte count of the body).
 
 The receiver enforces `size` (more or fewer bytes than announced is a protocol error for that stream, which is reset with `TRANSFER_ERROR`; the connection continues) and the clipboard limit of §3.1. A receiver MAY abort a transfer at any time with `STOP_SENDING` (`TRANSFER_REJECTED`). Progress is the bytes received so far over `size`. Transfers only occur if the matching feature was negotiated and the user has not disabled it (`clipboard_enabled`).
 

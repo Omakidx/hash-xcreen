@@ -291,6 +291,9 @@ impl Wire for TransferHeader {
     const MAX_LEN: usize = MAX_TRANSFER_HEADER;
 
     fn validate(&self) -> Result<(), ProtoError> {
+        if self.mime.is_empty() {
+            return Err(invalid("transfer.mime", "must not be empty"));
+        }
         check_str("transfer.mime", &self.mime, 255)?;
         check_str("transfer.name", &self.name, 255)?;
         if self.name.chars().any(|c| matches!(c, '/' | '\\' | '\0')) {
