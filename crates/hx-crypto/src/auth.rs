@@ -508,6 +508,24 @@ impl Authenticator {
         })
     }
 
+    /// Set (or clear) the earliest time the device may try its PIN again. Called while the
+    /// per-device guard is held.
+    fn set_not_before(&self, id: &DeviceId, wait: Option<Duration>) {
+        let mut m = self
+            .inner
+            .not_before
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        match wait {
+            Some(w) => {
+                m.insert(*id, self.inner.clock.now() + w);
+            }
+            None => {
+                m.remove(id);
+            }
+        }
+    }
+
     fn device_lock(&self, id: &DeviceId) -> Arc<tokio::sync::Mutex<()>> {
         let mut m = self
             .inner
@@ -593,11 +611,6 @@ impl Authenticator {
                 .await?;
             drop(attempt);
             if verdict.right {
-                self.inner
-                    .not_before
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .remove(&device.id);
                 return Ok(());
             }
             tracing::warn!(remote = %conn.remote_addr(), device = %device.id, failed = verdict.failed, "wrong PIN");
@@ -609,11 +622,6 @@ impl Authenticator {
                 return Err(Error::Revoked);
             }
             let retry = backoff_after(verdict.failed);
-            self.inner
-                .not_before
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(device.id, self.inner.clock.now() + retry);
             self.send_result(
                 conn,
                 AuthStatus::WrongPin,
@@ -654,6 +662,7 @@ impl Authenticator {
             if right {
                 this.reg(move |r| r.record_pin_success(&id, now_unix))
                     .await?;
+                this.set_not_before(&id, None);
                 return Ok(PinVerdict {
                     right: true,
                     failed: 0,
@@ -669,6 +678,9 @@ impl Authenticator {
                     Ok(revoked)
                 })
                 .await?;
+            // The wait starts here, before the guard is released: another connection that
+            // takes the lock next must see it.
+            this.set_not_before(&id, Some(backoff_after(counted)));
             Ok(PinVerdict {
                 right: false,
                 failed: counted,
