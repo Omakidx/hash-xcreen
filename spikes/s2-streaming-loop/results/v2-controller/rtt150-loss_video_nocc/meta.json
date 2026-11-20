@@ -1,0 +1,19 @@
+{
+ "profile": "rtt150-loss",
+ "scenario": "video",
+ "config": "nocc",
+ "extra": "",
+ "client_rc": 0,
+ "loadavg_start": "8.64 9.37 9.07 4/4606 1122264",
+ "loadavg_mid": "9.95 9.63 9.16 13/4622 1122375",
+ "loadavg_end": "11.79 10.07 9.31 4/4618 1122753",
+ "host_busy_cores_12_15_pct": 62.7,
+ "host_busy_cores_0_3_pct": 32.8,
+ "host_busy_all_pct": 37.7,
+ "netem": "delay 150ms rate 10mbit loss 1% limit 1000",
+ "server_args": "--cc 0",
+ "tag": "rtt150-loss_video_nocc",
+ "attempt": 1,
+ "quiet_before": true,
+ "noisy": false
+}

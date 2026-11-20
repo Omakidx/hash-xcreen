@@ -1,0 +1,19 @@
+{
+ "profile": "rtt150-loss",
+ "scenario": "video",
+ "config": "base",
+ "extra": "",
+ "client_rc": 0,
+ "loadavg_start": "3.75 4.05 5.32 4/4266 1171056",
+ "loadavg_mid": "5.05 4.31 5.40 14/4269 1171209",
+ "loadavg_end": "5.16 4.46 5.40 2/4269 1172013",
+ "host_busy_cores_12_15_pct": 43.7,
+ "host_busy_cores_0_3_pct": 15.5,
+ "host_busy_all_pct": 21.2,
+ "netem": "delay 150ms rate 10mbit loss 1% limit 1000",
+ "server_args": "",
+ "tag": "recovery_rtt150-loss_video",
+ "attempt": 1,
+ "quiet_before": true,
+ "noisy": false
+}

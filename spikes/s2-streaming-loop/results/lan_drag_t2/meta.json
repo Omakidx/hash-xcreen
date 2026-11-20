@@ -1,0 +1,19 @@
+{
+ "profile": "lan",
+ "scenario": "drag",
+ "config": "t2",
+ "extra": "",
+ "client_rc": 0,
+ "loadavg_start": "18.20 18.58 19.53 11/4798 977156",
+ "loadavg_mid": "17.71 18.47 19.49 12/4817 977573",
+ "loadavg_end": "18.03 18.49 19.47 13/4832 979139",
+ "host_busy_cores_12_15_pct": 61.9,
+ "host_busy_cores_0_3_pct": 47.6,
+ "host_busy_all_pct": 50.2,
+ "netem": null,
+ "server_args": "--threads 2",
+ "tag": "lan_drag_t2",
+ "attempt": 1,
+ "quiet_before": true,
+ "noisy": false
+}

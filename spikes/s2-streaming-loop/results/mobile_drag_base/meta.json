@@ -1,0 +1,19 @@
+{
+ "profile": "mobile",
+ "scenario": "drag",
+ "config": "base",
+ "extra": "",
+ "client_rc": 0,
+ "loadavg_start": "4.61 4.27 5.49 1/4254 1169088",
+ "loadavg_mid": "4.32 4.21 5.47 4/4261 1169240",
+ "loadavg_end": "3.93 4.13 5.41 6/4247 1169652",
+ "host_busy_cores_12_15_pct": 23.1,
+ "host_busy_cores_0_3_pct": 11.2,
+ "host_busy_all_pct": 13.8,
+ "netem": "delay 40ms 30ms distribution normal loss 0.5% rate 20mbit limit 1000",
+ "server_args": "",
+ "tag": "mobile_drag_base",
+ "attempt": 1,
+ "quiet_before": true,
+ "noisy": false
+}

@@ -1,0 +1,19 @@
+{
+ "profile": "lan",
+ "scenario": "typing",
+ "config": "fps120",
+ "extra": "",
+ "client_rc": 0,
+ "loadavg_start": "8.38 5.57 8.29 5/4444 1052480",
+ "loadavg_mid": "8.43 5.63 8.30 2/4450 1052619",
+ "loadavg_end": "8.48 5.83 8.31 6/4447 1055424",
+ "host_busy_cores_12_15_pct": 35.0,
+ "host_busy_cores_0_3_pct": 29.2,
+ "host_busy_all_pct": 29.7,
+ "netem": null,
+ "server_args": "--fps 120",
+ "tag": "lan_typing_fps120",
+ "attempt": 1,
+ "quiet_before": true,
+ "noisy": false
+}

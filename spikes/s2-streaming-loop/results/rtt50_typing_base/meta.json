@@ -1,0 +1,19 @@
+{
+ "profile": "rtt50",
+ "scenario": "typing",
+ "config": "base",
+ "extra": "",
+ "client_rc": 0,
+ "loadavg_start": "3.38 4.50 6.36 2/4231 1157899",
+ "loadavg_mid": "3.19 4.44 6.33 2/4260 1157983",
+ "loadavg_end": "3.08 4.33 6.25 6/4245 1158360",
+ "host_busy_cores_12_15_pct": 29.9,
+ "host_busy_cores_0_3_pct": 15.8,
+ "host_busy_all_pct": 17.1,
+ "netem": "delay 50ms rate 50mbit limit 1000",
+ "server_args": "",
+ "tag": "rtt50_typing_base",
+ "attempt": 1,
+ "quiet_before": true,
+ "noisy": false
+}

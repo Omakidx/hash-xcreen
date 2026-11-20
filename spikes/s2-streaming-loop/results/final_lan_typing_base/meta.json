@@ -1,0 +1,19 @@
+{
+ "profile": "lan",
+ "scenario": "typing",
+ "config": "base",
+ "extra": "",
+ "client_rc": 0,
+ "loadavg_start": "2.52 3.99 5.09 2/4257 1175593",
+ "loadavg_mid": "2.48 3.96 5.07 8/4281 1175682",
+ "loadavg_end": "2.37 3.83 5.01 4/4265 1176038",
+ "host_busy_cores_12_15_pct": 26.3,
+ "host_busy_cores_0_3_pct": 13.0,
+ "host_busy_all_pct": 15.1,
+ "netem": null,
+ "server_args": "",
+ "tag": "final_lan_typing_base",
+ "attempt": 1,
+ "quiet_before": true,
+ "noisy": false
+}

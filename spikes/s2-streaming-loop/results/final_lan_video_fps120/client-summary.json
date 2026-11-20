@@ -1,0 +1,1 @@
+{"t0_ns":60805699640427,"t1_ns":60825700179469,"wall_s":20.001,"client_cpu_cores":0.2222,"rx_bytes":12783546,"rx_mbps":5.113,"frames":891,"fps":44.55,"decoded_total":1025,"streams_ok":1032,"streams_reset":0,"resync_jumps":1,"dropped_before_key":7,"max_gap_stall_ms":0.0,"cursor_msgs":1,"cursor_lat_avg_ms":3.678,"cursor_lat_max_ms":3.678}

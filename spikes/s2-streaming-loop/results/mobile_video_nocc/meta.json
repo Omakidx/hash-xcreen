@@ -1,0 +1,19 @@
+{
+ "profile": "mobile",
+ "scenario": "video",
+ "config": "nocc",
+ "extra": "",
+ "client_rc": 0,
+ "loadavg_start": "3.56 4.04 5.37 3/4262 1170125",
+ "loadavg_mid": "3.75 4.08 5.37 3/4283 1170212",
+ "loadavg_end": "4.05 4.12 5.36 3/4266 1170566",
+ "host_busy_cores_12_15_pct": 42.1,
+ "host_busy_cores_0_3_pct": 14.1,
+ "host_busy_all_pct": 20.0,
+ "netem": "delay 40ms 30ms distribution normal loss 0.5% rate 20mbit limit 1000",
+ "server_args": "--cc 0",
+ "tag": "mobile_video_nocc",
+ "attempt": 1,
+ "quiet_before": true,
+ "noisy": false
+}

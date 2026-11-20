@@ -1,0 +1,19 @@
+{
+ "profile": "lan",
+ "scenario": "idle",
+ "config": "nocursor",
+ "extra": "",
+ "client_rc": 0,
+ "loadavg_start": "9.34 6.96 8.45 4/4467 1064103",
+ "loadavg_mid": "9.16 6.96 8.44 6/4495 1064246",
+ "loadavg_end": "9.32 7.22 8.48 3/4470 1066066",
+ "host_busy_cores_12_15_pct": 24.5,
+ "host_busy_cores_0_3_pct": 31.1,
+ "host_busy_all_pct": 28.0,
+ "netem": null,
+ "server_args": "--cursor 0",
+ "tag": "lan_idle_nocursor",
+ "attempt": 1,
+ "quiet_before": true,
+ "noisy": false
+}

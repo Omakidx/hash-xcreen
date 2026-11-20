@@ -1,0 +1,19 @@
+{
+ "profile": "lan",
+ "scenario": "typing",
+ "config": "superfast",
+ "extra": "",
+ "client_rc": 0,
+ "loadavg_start": "5.95 8.71 13.35 6/4410 1017695",
+ "loadavg_mid": "5.55 8.58 13.28 8/4415 1017800",
+ "loadavg_end": "6.06 8.50 13.15 11/4414 1018714",
+ "host_busy_cores_12_15_pct": 36.2,
+ "host_busy_cores_0_3_pct": 20.0,
+ "host_busy_all_pct": 24.6,
+ "netem": null,
+ "server_args": "--preset superfast",
+ "tag": "lan_typing_superfast",
+ "attempt": 1,
+ "quiet_before": true,
+ "noisy": false
+}

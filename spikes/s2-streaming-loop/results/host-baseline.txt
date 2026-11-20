@@ -1,0 +1,2 @@
+host idle baseline (my container desktop idle, no s2 processes), 30 s:
+busy cores 12-15 21.8%, cores 0-3 31.8%, all 25.4%, loadavg 10.26 6.66 8.46 4/4386 1059383

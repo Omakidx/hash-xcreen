@@ -1,0 +1,19 @@
+{
+ "profile": "lan",
+ "scenario": "drag",
+ "config": "fps120",
+ "extra": "",
+ "client_rc": 0,
+ "loadavg_start": "8.70 9.98 9.52 15/4667 1099057",
+ "loadavg_mid": "9.20 10.06 9.55 10/4721 1099269",
+ "loadavg_end": "9.26 10.03 9.55 13/4706 1100024",
+ "host_busy_cores_12_15_pct": 49.5,
+ "host_busy_cores_0_3_pct": 33.0,
+ "host_busy_all_pct": 36.8,
+ "netem": null,
+ "server_args": "--fps 120",
+ "tag": "lan_drag_fps120_r3",
+ "attempt": 1,
+ "quiet_before": true,
+ "noisy": false
+}

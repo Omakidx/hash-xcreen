@@ -1,0 +1,19 @@
+{
+ "profile": "lan",
+ "scenario": "idle",
+ "config": "base",
+ "extra": "",
+ "client_rc": 0,
+ "loadavg_start": "14.56 19.90 20.57 15/5018 917123",
+ "loadavg_mid": "13.71 19.64 20.48 4/5012 917253",
+ "loadavg_end": "10.37 18.24 19.98 7/4998 918140",
+ "host_busy_cores_12_15_pct": 32.0,
+ "host_busy_cores_0_3_pct": 34.8,
+ "host_busy_all_pct": 33.7,
+ "netem": null,
+ "server_args": "",
+ "tag": "lan_idle_base",
+ "attempt": 1,
+ "quiet_before": true,
+ "noisy": false
+}

@@ -1,0 +1,19 @@
+{
+ "profile": "lan",
+ "scenario": "scroll",
+ "config": "t2",
+ "extra": "",
+ "client_rc": 0,
+ "loadavg_start": "15.39 18.88 19.83 21/4915 958257",
+ "loadavg_mid": "15.04 18.75 19.78 12/4880 958670",
+ "loadavg_end": "15.07 18.54 19.69 12/4931 960668",
+ "host_busy_cores_12_15_pct": 68.1,
+ "host_busy_cores_0_3_pct": 47.0,
+ "host_busy_all_pct": 52.2,
+ "netem": null,
+ "server_args": "--threads 2",
+ "tag": "lan_scroll_t2",
+ "attempt": 1,
+ "quiet_before": true,
+ "noisy": false
+}

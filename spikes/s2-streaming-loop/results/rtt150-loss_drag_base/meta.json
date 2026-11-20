@@ -1,0 +1,19 @@
+{
+ "profile": "rtt150-loss",
+ "scenario": "drag",
+ "config": "base",
+ "extra": "",
+ "client_rc": 0,
+ "loadavg_start": "3.67 4.07 5.68 9/4273 1164914",
+ "loadavg_mid": "3.67 4.07 5.68 5/4287 1165080",
+ "loadavg_end": "3.71 4.05 5.64 2/4284 1165593",
+ "host_busy_cores_12_15_pct": 28.5,
+ "host_busy_cores_0_3_pct": 12.9,
+ "host_busy_all_pct": 15.4,
+ "netem": "delay 150ms rate 10mbit loss 1% limit 1000",
+ "server_args": "",
+ "tag": "rtt150-loss_drag_base",
+ "attempt": 1,
+ "quiet_before": true,
+ "noisy": false
+}

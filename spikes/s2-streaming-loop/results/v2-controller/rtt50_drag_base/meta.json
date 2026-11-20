@@ -1,0 +1,19 @@
+{
+ "profile": "rtt50",
+ "scenario": "drag",
+ "config": "base",
+ "extra": "",
+ "client_rc": 0,
+ "loadavg_start": "9.70 8.43 8.69 6/4599 1116004",
+ "loadavg_mid": "9.65 8.44 8.70 12/4664 1116229",
+ "loadavg_end": "8.89 8.34 8.66 20/4642 1116655",
+ "host_busy_cores_12_15_pct": 51.0,
+ "host_busy_cores_0_3_pct": 35.7,
+ "host_busy_all_pct": 38.8,
+ "netem": "delay 50ms rate 50mbit limit 1000",
+ "server_args": "",
+ "tag": "rtt50_drag_base",
+ "attempt": 1,
+ "quiet_before": true,
+ "noisy": false
+}

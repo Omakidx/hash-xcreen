@@ -1,0 +1,19 @@
+{
+ "profile": "rtt50",
+ "scenario": "scroll",
+ "config": "base",
+ "extra": "",
+ "client_rc": 0,
+ "loadavg_start": "7.72 7.43 8.40 8/4615 1113829",
+ "loadavg_mid": "7.72 7.43 8.40 12/4621 1113959",
+ "loadavg_end": "10.32 8.06 8.59 4/4599 1114321",
+ "host_busy_cores_12_15_pct": 53.8,
+ "host_busy_cores_0_3_pct": 30.5,
+ "host_busy_all_pct": 35.6,
+ "netem": "delay 50ms rate 50mbit limit 1000",
+ "server_args": "",
+ "tag": "rtt50_scroll_base",
+ "attempt": 1,
+ "quiet_before": true,
+ "noisy": false
+}
