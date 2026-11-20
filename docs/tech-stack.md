@@ -64,7 +64,8 @@ Every language, library, tool and external service hash-xcreen uses, and why. It
 | Area | Choice | Why |
 |---|---|---|
 | Pairing | **SPAKE2** (`spake2` crate) | Safe with both long tokens and short human codes; resists man-in-the-middle |
-| Keys | Ed25519 identities (`ed25519-dalek`), pinned in TLS | No certificate authority needed for the native client |
+| Keys | Ed25519 identities (`ed25519-dalek`), pinned in TLS 1.3 as **raw public keys** (RFC 7250, `rustls` with `ring`) | No certificate authority and no X.509 parsing before authentication; one config for QUIC and WebSocket (protocol §11.1) |
+| Pairing and PIN primitives | `sha2`, `hmac` (transcript and confirmation MACs), `argon2` parameters in protocol §11.4, `getrandom`, `subtle` (constant-time compare), `zeroize` | Small RustCrypto building blocks; secrets are zeroized and never printed |
 | PIN hashing | **Argon2id** (`argon2`) | Memory-hard; server-side verification with lockout |
 | Linux password | System shadow hash (yescrypt) | Standard login, sudo and lock screen |
 | Web login | **WebAuthn passkeys** (`webauthn-rs`) | Phishing-resistant browser login |

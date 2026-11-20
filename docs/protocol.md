@@ -2,7 +2,7 @@
 
 The contract between hash-xcreen's session/agent side (the **server**) and its viewers (the **client**: desktop app now, browser and others later). The code in `crates/hx-proto` (messages, media header, versioning) and `crates/hx-transport` (QUIC and WebSocket transports) implements exactly what is written here. If the two disagree, that is a bug in one of them: fix it and update this file in the same branch.
 
-Design background is in [architecture.md](architecture.md) §6–§8. Pairing cryptography is **not** specified here (workstream 1B); §11 says where it plugs in.
+Design background is in [architecture.md](architecture.md) §6–§8. Pairing and authentication (workstream 1B) are specified in §11.
 
 Conventions: "MUST", "SHOULD" and "MAY" are used in the RFC 2119 sense. All multi-byte integers outside protobuf are **little-endian**. Sizes are in bytes. "Server" is the side that streams video (agent or `hx-session`); "client" is the side that views and sends input. The client always opens the connection.
 
@@ -432,14 +432,108 @@ There are none on the wire. The sender SHOULD interleave: control, input, mouse 
 
 Unknown protobuf fields are always ignored. A decoded message whose required semantic constraints (§5) fail is treated as malformed.
 
-## 11. Pairing and authentication (owned by workstream 1B)
+## 11. Pairing and authentication (workstream 1B, `crates/hx-crypto`)
 
-This document only reserves the places where pairing slots into the protocol; the cryptography (SPAKE2, token and PIN semantics, key pinning) is specified by 1B.
+### 11.1 Identity and TLS: raw public keys
 
-- **TLS layer.** Authentication of an already paired device is **mutual TLS 1.3 with pinned keys**; the verifiers are injected into `hx-transport` as ordinary rustls configs. A device that is not paired yet has no pinned key, so the server's client-certificate verifier (supplied by 1B) accepts an unknown client key **only while a pairing token is valid**; the connection is then restricted to pairing.
-- **Handshake placement.** `Hello.intent` declares the purpose. With `INTENT_PAIR` the server (after the version check and after consulting its policy through `hx-transport`'s pending-session hook, which exposes the peer's certificates and the `Hello`) answers `HelloAck` and the only messages processed afterwards are `ControlMessage.pairing` (field 100) until pairing finishes, then the connection is closed with `NO_ERROR`; the device then reconnects with `INTENT_SESSION` using its now pinned key. If pairing is not open the server answers `Refuse{PAIRING_CLOSED}` and closes with `PAIRING_CLOSED`. With `INTENT_SESSION` the server rejects an unknown or revoked key with `Refuse{UNAUTHORIZED}`; the PIN step (architecture §8.3) uses `ControlMessage.auth` (field 101) between `HelloAck` and the first `ViewConfig`, and until it succeeds the server accepts nothing else but `auth` and `goodbye`.
-- **Envelope.** Both `pairing` and `auth` carry `Opaque { bytes data = 1; }` (at most 4096 bytes). 1B defines what the bytes contain (its own protobuf messages inside the envelope) and the state machine. The transport only delivers them; it does not interpret them.
-- **Application hook.** `hx-transport` hands the server application a `PendingSession` after the version check; the application calls `accept` (returning a restricted `Connection`) or `refuse`, and later `Connection::authorize` once the peer is authenticated (§2.1). The application MUST re-check the peer's key against its **current** pinned and revoked set on **every** `PendingSession` (TLS session resumption is disabled by the transport, but revocation can happen at any time), MUST close live sessions of a device when it is revoked, and MUST treat `Hello.software` and `Hello.device_name` as untrusted text (sanitize before showing or logging).
+Every party has an **Ed25519 key pair**: the server (agent) one identity key, each client device one device key. TLS authenticates with **raw public keys (RFC 7250)**, not certificates, and there is no certificate authority:
+
+- The "certificate" in the TLS `Certificate` message is the key's `SubjectPublicKeyInfo` DER (44 bytes: the fixed Ed25519 prefix `302a300506032b6570032100` followed by the 32-byte key). The only signature scheme is `ED25519`.
+- TLS 1.3 only (the `rustls` configs built by `hx-crypto::tls` list only `TLS13`; `tls12` stays banned in `deny.toml`). Session resumption is off on both sides (also enforced by `hx-transport`).
+- **Client authentication is mandatory.** The server's verifier accepts **any** well-formed Ed25519 client key whose handshake signature verifies (a signature check proves possession of the key); it does not decide who may connect, because a not-yet-paired device must be able to reach the pairing step. The decision is the application's, made from `PendingSession::peer_certificates()` (§11.5).
+- The client's verifier has two modes. **Session**: the SPKI must equal the pinned server key byte for byte and the signature must verify; anything else fails the handshake. **Pairing** (no server key known yet): any well-formed Ed25519 key with a valid signature is accepted *provisionally*; the key is then bound into the SPAKE2 confirmation (§11.3), and a pairing that does not complete that confirmation MUST be discarded. The pairing client never stores or uses a server key before the confirmation succeeded.
+- All verifiers fail closed: a real X.509 certificate, wrong length or prefix, a key that does not decode or has small order, a signature scheme other than `ED25519`, an invalid signature, or TLS 1.2 ends the handshake.
+
+Why raw public keys rather than self-signed X.509 certificates: the pinned identity is exactly the 32-byte key, with no certificate parsing (a large attack surface on the pre-authentication path), no generated certificate with validity dates or names to keep in sync, and no `ServerName` handling. `rustls` 0.23 supports RPK for both server and client authentication with the `ring` provider, and `quinn` and the WebSocket `tokio-rustls` path both take an ordinary `rustls` config, so one code path serves QUIC and WebSocket. The browser transport (Phase 3) uses a different mechanism (architecture §8.4) and is not affected. The cost: a peer that only speaks X.509 (for example a generic TLS tool) cannot connect, which is intended.
+
+Key identifiers: the **fingerprint** of a key is the SHA-256 of its 32 raw bytes, shown as lowercase hex; the **device id** is the first 16 bytes of the fingerprint. A secret key is stored as its 32-byte Ed25519 seed (where is up to 1C on the server and 1G on the client), never logged, and wiped from memory on drop on a best-effort basis (see §11.5).
+
+### 11.2 Handshake placement and state machine
+
+`Hello.intent` declares the purpose. After the version check the server application receives a `PendingSession` and looks at the **current** registry, never at anything cached from a previous connection.
+
+| Intent | Peer key | Server answer |
+|---|---|---|
+| `PAIR` | revoked | `Refuse{UNAUTHORIZED}` |
+| `PAIR` | any, no token or code valid | `Refuse{PAIRING_CLOSED}`, close `PAIRING_CLOSED` |
+| `PAIR` | any, a token or code valid | `HelloAck` (no features, no codecs), pairing exchange (§11.3) |
+| `SESSION` | unknown or revoked | `Refuse{UNAUTHORIZED}` (the message does not say which) |
+| `SESSION` | paired, no PIN configured on the server | `Refuse{UNAUTHORIZED}` |
+| `SESSION` | paired | `HelloAck`, PIN exchange (§11.4), then `authorize()` |
+
+On the **pairing connection** only `ControlMessage.pairing` (field 100) is processed. When the exchange succeeds the server application keeps the (still restricted) connection open for as long as it needs (for example to receive the password and PIN setup of architecture §5.3, whose messages 1C/1G specify) and then closes it with `NO_ERROR`; the device reconnects with `INTENT_SESSION` using its pinned key. A failed or timed-out exchange ends with `PairFailure` (when it can be sent) and a close with `UNAUTHORIZED`. The whole exchange is bounded (default 20 s).
+
+On a **session connection** only `ControlMessage.auth` (field 101) and `goodbye`/`ping`/`pong` are processed until authorization. The server calls `Connection::authorize()` **before** sending the `AuthResult` that reports success (§13), so a client that sees success can use every channel at once.
+
+### 11.3 Pairing exchange (field 100)
+
+`Opaque.data` (at most 4096 bytes) carries a protobuf `PairingMessage { oneof body { start = 1; server_hello = 2; client_confirm = 3; server_confirm = 4; failure = 5 } }`. The schema is `crates/hx-crypto/src/wire.rs` (prost-derived; the field numbers below are final, additions are additive).
+
+| Message | Fields |
+|---|---|
+| `PairStart` (C→S) | `mode` 1 (`TOKEN` = 1, `CODE` = 2), `token_id` 2 (bytes, 8, `TOKEN` only), `spake` 3 (bytes, the SPAKE2 message, 33), `device_name` 4 (string, at most 64 bytes) |
+| `PairServerHello` (S→C) | `spake` 1 (bytes, 33), `server_name` 2 (string, at most 64 bytes) |
+| `PairClientConfirm` (C→S) | `mac` 1 (bytes, 32) |
+| `PairServerConfirm` (S→C) | `mac` 1 (bytes, 32) |
+| `PairFailure` (S→C) | `reason` 1 (`FAILED` = 1, `BUSY` = 2, `PROTOCOL` = 3) |
+
+Flow: `PairStart` → `PairServerHello` → `PairClientConfirm` → `PairServerConfirm`. Any other message, a repeat, a wrong size or an unparsable message ends the exchange with `PairFailure{PROTOCOL}`.
+
+**Secrets.** Two kinds, both used as the SPAKE2 password (Ed25519 group, identities `"hx-pair-client"` and `"hx-pair-server"`, the client is side A):
+
+- **Token** (from the one-liner and the app): an 8-byte random id plus a 32-byte random secret, written `hxt1-` plus lowercase RFC 4648 base32 without padding. The id is a public lookup label; the SPAKE2 password is `"hx-pair-token" || secret`. Valid 15 minutes by default (configurable); 5 started attempts.
+- **Code** (interactive install): 8 symbols from the 32-symbol Crockford alphabet (`0-9 A-Z` without `I L O U`), written `XXXX-XXXX`; parsing ignores case and separators and maps `O`→`0`, `I` and `L`→`1`. 40 bits of entropy. The SPAKE2 password is `"hx-pair-code" || the 8 normalised symbols`. Valid 15 minutes by default; **3 started attempts**, then invalidated. A code has no id: the server uses its active code.
+
+The server keeps secrets in memory only (SPAKE2 needs the plaintext, so hashing at rest would not help) and never persists them. Token expiry uses the monotonic clock, which on Linux does not advance while the machine is suspended: after a suspend a token can outlive its 15 wall-clock minutes by the length of the suspend. Pairing windows are short-lived and opened by an operator, so this is accepted.
+
+**Attempt budget.** Every `PairStart` that names an existing, unexpired secret consumes one attempt *when it arrives*, not when it fails, so parallel connections cannot multiply the guesses; when the budget is spent the secret is deleted as soon as its last running attempt has ended. A secret is single use: success removes it, and two concurrent attempts that both prove knowledge race for one atomic removal, the loser fails. A guessing attacker therefore gets at most 3 guesses against a code (success probability about 3·2⁻⁴⁰) and none against a token. The accepted cost: an attacker who can reach the port can burn a code's budget with junk attempts (a denial of service the user fixes by issuing a new code; a token's id is sent in clear in `PairStart`, so an on-path attacker who sees it can burn that token the same way, which is again only a denial of service: without the secret he cannot pair). If the id is unknown, or the secret expired or its budget is spent, the server does not say so: it uses a random password and fails at the confirmation like any wrong secret.
+
+**Transcript binding.** The names go into the transcript **exactly as they were sent** (`device_name` as the client sent it, `server_name` as the server sent it); only what is stored or shown is sanitised, so a name that the sanitiser would change still pairs. `cs` and `ss` are the 44-byte SPKIs of the keys each side saw in the TLS handshake (the server: the client's key; the client: the server's key, taken from the connection), `lp(x)` is a 4-byte big-endian length followed by `x`:
+
+```
+T   = SHA-256( "hx-pair-v1" || lp(cs) || lp(ss) || lp(mode byte) || lp(token_id) ||
+               lp(client spake msg) || lp(server spake msg) || lp(device_name) || lp(server_name) )
+K   = the 32-byte SPAKE2 output
+client_mac = HMAC-SHA-256(K, "hx-pair-v1 client" || T)
+server_mac = HMAC-SHA-256(K, "hx-pair-v1 server" || T)
+```
+
+The server verifies `client_mac` (constant time) and only then consumes the secret, registers the device and sends `server_mac`; the client verifies `server_mac` (constant time) and only then pins the server key. A man in the middle who terminates TLS with his own key on one or both legs makes the two ends hold different `cs` or `ss`, hence different `T`, and without the secret he cannot make `K` agree with a transcript of his choice, so a confirmation fails: the client sees `PairFailure` or a bad `server_mac`. The client must treat that as a possible attack and not only as a typo (a wrong code and an interception cannot be told apart, so the UI says "wrong or expired code, or the connection is being intercepted"). A passive observer or a relay without the secret learns nothing usable (SPAKE2).
+
+On success the server stores `{id, name = device_name (sanitised), public key = cs}` and the client stores `{server key = ss, server_name}`. Pairing an already paired, non-revoked key updates its name and keeps its PIN failure count. Pairing a **revoked** key is refused (`UNAUTHORIZED`): re-pairing a revoked device needs the Linux password (architecture §8.3), which the server application verifies before it calls the registry's `reinstate`.
+
+### 11.4 PIN exchange (field 101)
+
+The PIN is a 6 to 16 digit secret chosen by the user at setup. The server stores only an **Argon2id** hash: m = 64 MiB, t = 3, p = 1, 16-byte random salt, 32-byte output, as the string `hx-pin1$m=65536,t=3,p=1$<salt hex>$<hash hex>`. Parameters read back from storage are bounded (m ≤ 1 GiB, t ≤ 16, p ≤ 16) so a corrupted file cannot force an arbitrary cost. The hash comparison is constant time. Verification runs on a blocking thread, one at a time per device.
+
+`AuthMessage { oneof body { pin = 1; result = 2 } }`:
+
+| Message | Fields |
+|---|---|
+| `PinAttempt` (C→S) | `pin` 1 (bytes, 6 to 16 ASCII digits) |
+| `AuthResult` (S→C) | `status` 1 (`OK` = 1, `WRONG_PIN` = 2, `BACKOFF` = 3, `REVOKED` = 4, `NOT_AVAILABLE` = 5, sent if the server has no PIN verifier when the attempt arrives), `attempts_left` 2, `retry_after_ms` 3 |
+
+The channel is TLS 1.3 with both keys pinned, so the PIN travels in clear inside it. Rules, enforced on the server only:
+
+1. **An attempt is counted before it is checked.** The failure counter is incremented and persisted, then the hash is computed, then a correct PIN resets the counter to 0 and a wrong one leaves it counted (the 5th consecutive failure revokes the device: `status = REVOKED`, close `UNAUTHORIZED`). The count, the hash and the outcome run as one unit that keeps the per-device lock and finishes even if the connection or the deadline ends the exchange, so an attempt that is cut off still counts. An attempt is not started when less than a hash's time remains before the exchange deadline.
+2. After the n-th consecutive failure the device must wait `min(2^(n-1), 30)` seconds. An attempt that arrives earlier gets `BACKOFF` with `retry_after_ms` and is neither verified nor counted. The wait is held in memory (a restart clears the wait, not the counter).
+3. A connection is allowed at most 5 attempt messages (including those answered `BACKOFF`), then it is closed with `UNAUTHORIZED`; the transport's authorization deadline bounds the whole exchange.
+4. A malformed PIN (wrong length or a non-digit) is answered `WRONG_PIN` without a hash computation and counts as a failure.
+5. The registry check is repeated immediately before `authorize()`; a revocation that happened while the exchange ran ends the connection.
+
+### 11.5 Application obligations (summary of §13)
+
+On **every** `PendingSession` the application looks the peer key up in the current registry. The key comes from the connection's single raw-public-key "certificate"; more than one entry, or one that is not a 44-byte Ed25519 SPKI, is refused. `Hello.software` and `Hello.device_name` are stripped of control characters and truncated before they are logged, shown or stored. Revoking a device closes its live sessions (`UNAUTHORIZED`) and announces the revocation on a channel for other components (for example `hx-session` supervision). Secrets (tokens, codes, PINs, keys, `K`) are never written to logs, command lines or `Debug` output; their types print `[redacted]`. Wiping them from memory is **best effort**: the types hold them in zeroizing buffers, but `spake2`'s internal state, the protobuf and `Bytes` buffers, and the transport's buffers are not wiped, and a process dump of a running agent can contain secrets (hence the agent runs unprivileged with core dumps off, architecture §8.5).
+
+**Revocation reaches live sessions through the authenticator only.** `Authenticator::revoke`, `remove` and (for completeness) `reinstate` are the mutating paths; they persist and announce as one unit that finishes even if the caller is cancelled. `Authenticator::registry()` is a read-only view. A live session also re-reads the registry every few seconds and closes itself if its device is revoked or gone, as a backstop. `FileRegistry` is single-writer: it takes an exclusive `flock` on `<file>.lock` and fails if another instance holds it, so no tool may open the file next to the agent; the CLI revokes and reinstates through the agent's IPC.
+
+### 11.6 Notes for the agent (1C)
+
+- Never call `authorize()` on an `Outcome::Paired` connection: it is a pairing connection with no features.
+- Post-pairing password and PIN setup is allowed only for first-time setup, or when the request proves the current Linux password. It must finish inside the transport's authorization deadline (30 s by default; the pairing exchange itself may take up to 20 s of it).
+- CLI revoke, remove and reinstate go through the agent. `reinstate` only after the Linux password was verified by `hx-privd`'s peppered verifier (`PepperVerify`, a failure-capped yes/no check, with `PepperEnrol` for setting it up; see [ipc.md](ipc.md) §6.15).
+- Clients must sanitise `Refuse.message` (and any server text) before showing it; the server's refusal text for unknown, revoked and unsetup cases is deliberately uniform.
+- The identity seed is root-only (`systemd-creds`), the registry directory must not be writable by group or others, and the registry file is 0600 and owned by the agent user.
 
 ## 12. Client behaviour on security failures
 
@@ -453,4 +547,4 @@ A TLS or certificate verification failure while connecting (QUIC TLS alert, reje
 
 ## 14. Schema location
 
-The protobuf schema is `crates/hx-proto/proto/hx.proto` (package `hx.v1`); field numbers there are the numbers in this document. Field numbers are never reused. Adding fields or messages is a minor-version change (§4.2).
+The protobuf schema is `crates/hx-proto/proto/hx.proto` (package `hx.v1`); field numbers there are the numbers in this document. The messages inside the `pairing` and `auth` envelopes (§11) are defined by `crates/hx-crypto/src/wire.rs`. Field numbers are never reused. Adding fields or messages is a minor-version change (§4.2).

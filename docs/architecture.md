@@ -1,6 +1,6 @@
 # hash-xcreen architecture
 
-Status: draft v0.3 (2026-11-20), updated with the Phase 0 spike results and their follow-up runs on a real server and real Google Drive; the only item still marked **provisional** is the desktop client's video path, which waits for the S1 GPU run (execution-phase.md §0.4). Libraries and tools are in [tech-stack.md](tech-stack.md), the user experience in [userflow.md](userflow.md), and the phased plan we follow, including the Phase 0 spikes, in [execution-phase.md](execution-phase.md).
+Status: draft v0.3 (2026-11-20), updated with the Phase 0 spike results and their follow-up runs on a real server and real Google Drive; the only item still marked **provisional** is the desktop client's video path, which waits for the S1 GPU run (execution-phase.md §0.4). Libraries and tools are in [tech-stack.md](tech-stack.md), the user experience in [userflow.md](userflow.md), the internal IPC contracts between the server processes in [ipc.md](ipc.md), and the phased plan we follow, including the Phase 0 spikes, in [execution-phase.md](execution-phase.md).
 
 ## 1. What hash-xcreen is
 
@@ -43,16 +43,16 @@ Everything is written in Rust. The desktop client uses Slint.
                                        │          │ XFCE on headless Xorg            │  │
                                        │          │ hx-session (runs as the user):   │  │
                                        │          │  capture, encode, audio, input   │  │
-                                       │          └── unix socket to hx-gatewayd ────┘  │
+                                       │          └── unix socket (Incus proxy) ─────┘  │
                                        └──────────────────────────────────────────────┘
 ```
 
 | Component | Runs as | Responsibility |
 |---|---|---|
 | `hx-gatewayd` | Dedicated unprivileged user, systemd-sandboxed | The only internet-facing process. TLS/QUIC, pairing, login (PIN, password, passkeys), protocol parsing, web client hosting, relaying media between client and `hx-session`. |
-| `hx-privd` | root | A narrow, typed command set: create/start/stop container, snapshot, mount snapshot read-only, restore, resource limits, Docker toggle. Owns the Incus socket. |
+| `hx-privd` | root | A narrow, typed command set: create/start/stop container, snapshot, mount snapshot read-only, restore, resource limits, Docker toggle. Owns the Incus socket. Command set and authorization in [ipc.md](ipc.md) Part 1. |
 | backup worker | Spawned by `hx-privd`, sandboxed | Reads a mounted snapshot read-only and uploads to Google Drive with `rustic_core`. Holds the Drive token and backup key only while running. |
-| `hx-session` | The desktop user, inside the container | Screen capture, encoding, cursor, audio, clipboard, input injection. Holds no secrets. |
+| `hx-session` | The desktop user, inside the container | Screen capture, encoding, cursor, audio, clipboard, input injection. Holds no secrets. Talks only to `hx-gatewayd`, over the session link ([ipc.md](ipc.md) Part 2). |
 | `hx-agent` CLI | root, on demand | Local administration: status, devices list/revoke, uninstall, logs. |
 | `hx-desktop` | User, client machine | Slint app: servers, setup wizard over SSH, streaming view, backups, security. |
 | `hx-web` | Browser | Served by `hx-gatewayd`; login plus streaming and server settings for that one server. |
@@ -198,7 +198,7 @@ Every stage is idempotent; re-running the command resumes a failed install. `hx-
 
 ### 5.4 Google Drive during setup
 
-The app performs Google OAuth for installed apps (PKCE, loopback redirect) in the user's normal browser, requesting only `drive.file`, and sends the refresh token to the agent over the paired channel. It can be skipped and connected later. The OAuth client must be **published to production** before release: tokens issued by an app in "Testing" status expire after 7 days.
+The app performs Google OAuth for installed apps (PKCE, loopback redirect) in the user's normal browser, requesting only `drive.file`, and sends the refresh token to the agent over the paired channel, sealed to a key only `hx-privd` holds so that `hx-gatewayd` only relays ciphertext ([ipc.md](ipc.md) §5.2). It can be skipped and connected later. The OAuth client must be **published to production** before release: tokens issued by an app in "Testing" status expire after 7 days.
 
 hash-xcreen ships **one fixed OAuth client** for every install. With `drive.file`, an app sees only the files its own OAuth client created (S4), so "restore onto a new server" works only when the new install uses the same client as the backup; per-user client IDs would break it.
 
@@ -304,7 +304,7 @@ Sent separately as shape (cached by hash) and position, and drawn by the client,
 
 | Attacker | Defence |
 |---|---|
-| Internet scanners, network attackers | Unpaired peers can only attempt pairing while a token is valid; all else is refused at the TLS handshake. Pre-auth parsers are fuzzed. |
+| Internet scanners, network attackers | Unpaired peers can only attempt pairing while a token or code is valid. An unknown key still completes the TLS 1.3 handshake (the server accepts any well-formed Ed25519 client key, protocol §11.1) and is refused at the application's `PendingSession` step, after the `Hello` and a registry lookup. That keeps the refusal reasons precise but widens the pre-authentication surface to TLS, the `Hello` parser and the registry lookup, all bounded by the transport's per-address and global limits and all targets for the 1H fuzzers. Pre-auth parsers are fuzzed. |
 | Someone who sees the one-liner | Token is single-use and expires after 15 minutes. |
 | Stolen client device | Device key alone is not enough: the server checks the PIN, revoking the device after 5 failures. Devices can be revoked from any other device or the CLI. |
 | Malware inside the desktop | Unprivileged container; `hx-session` holds no secrets; the agent treats all container input as untrusted; metadata endpoint and agent ports blocked. |
@@ -342,13 +342,16 @@ Out of scope: the VPS provider, or anyone with root on the host.
 ### 8.5 Privilege separation
 
 - `hx-gatewayd` runs unprivileged with systemd hardening (`NoNewPrivileges`, `ProtectSystem=strict`, private tmp, capability bounding) and a seccomp allowlist.
-- `hx-privd` accepts only a fixed set of typed commands over a unix socket.
+- `hx-privd` accepts only a fixed set of typed commands over a unix socket (`/run/hx/privd.sock`, root:`hx-gatewayd` 0660). The peer is authenticated with `SO_PEERCRED`: only the `hx-gatewayd` uid and root are served, and the role follows from the uid. Every instance, path, device and URL is chosen by privd, never by the caller; desktop and host setup from `hx-gatewayd` is accepted only while a root-opened setup window is open; privileged options (a pool device, private-network access, offline images, uninstall, enabling Docker after setup, updates to an unverified version) are root-only. privd and root tools never open paths inside a directory that `hx-gatewayd` can write. The full command set, the refusal rules and the limits are in [ipc.md](ipc.md) Part 1, and they implement the caller obligations in `crates/hx-provision/README.md`.
+- `hx-gatewayd` reaches `hx-session` through one Incus proxy device per desktop that privd adds: a unix socket on the host that only `hx-gatewayd` can use, connected to a systemd-created socket in a root-owned directory inside the container that only the desktop user can use. It is a byte pipe: no descriptor passing, no secrets, and everything `hx-session` sends is parsed by `hx-gatewayd` as untrusted input with explicit limits ([ipc.md](ipc.md) Part 2).
+- The device registry (paired devices, revocation state, PIN and password verifiers and failure counters) belongs to `hx-gatewayd` and is administered by the CLI through gatewayd's admin socket; it holds nothing that grants root, and the verifiers are peppered with a key only `hx-privd` holds, so they can only be guessed online, through failure-capped verification in privd ([ipc.md](ipc.md) §5.3).
 - The host reads container files only through the Incus API, never by following paths into the container filesystem.
 
 ### 8.6 Secrets on the server
 
 - Drive refresh token, backup repository key, agent identity key and the ACME account key are stored root-only, outside the container, sealed with `systemd-creds` (TPM-backed where available).
-- `hx-gatewayd` never sees the Drive token or backup key.
+- `hx-gatewayd` cannot read the Drive token or backup key. Where a client must hand one to the server, it is sealed to `hx-privd`'s key and authenticated by an owner key that privd enrols outside gatewayd's control, so gatewayd relays only ciphertext and cannot substitute its own ([ipc.md](ipc.md) §5.2; in the SSH install path the secrets go to the root installer directly).
+- A gatewayd compromise that stays in memory can add devices to the registry; the identity-key rotation and re-pinning procedure is in [ipc.md](ipc.md) §2.1.
 - Because unattended backups need the backup key, root on the server can read the backups. The **recovery key** is shown once at setup and is the only way to restore if the server is lost.
 - Root on the server could delete backups using the Drive token; the desktop app checks regularly that recent backups exist and warns if they disappear.
 

@@ -8,6 +8,7 @@ Instructions for everyone working in this repository, human or agent.
 - [docs/architecture.md](docs/architecture.md): design decisions. Change the design there first, then the code.
 - [docs/tech-stack.md](docs/tech-stack.md): approved languages, libraries and tools. Adding a dependency outside it needs a doc update in the same branch.
 - [docs/userflow.md](docs/userflow.md): what the user sees.
+- [docs/ipc.md](docs/ipc.md): the internal IPC contracts (`hx-privd` command set, gateway-to-session link). Change the contract there first, then the code.
 
 ## Git workflow
 
