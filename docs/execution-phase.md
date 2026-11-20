@@ -34,11 +34,11 @@ Phases 2 and 3 can run in parallel once Phase 1 passes its gate; backups come fi
 
 ### 0.1 Repository foundations (S)
 
-- [ ] Cargo workspace with the crate and app layout from architecture §3 (empty crates that compile)
-- [ ] `LICENSE` (AGPL-3.0), `SECURITY.md`, `CONTRIBUTING.md` (DCO, Conventional Commits)
-- [ ] CI: `cargo fmt --check`, `clippy -D warnings`, `cargo nextest`, `cargo-deny` (licences + advisories), `cargo-audit`, DCO check
-- [ ] Renovate configuration
-- [ ] `rust-toolchain.toml` pinning stable
+- [x] Cargo workspace with the crate and app layout from architecture §3 (empty crates that compile)
+- [x] `LICENSE` (AGPL-3.0), `SECURITY.md`, `CONTRIBUTING.md` (DCO, Conventional Commits)
+- [x] CI: `cargo fmt --check`, `clippy -D warnings`, `cargo nextest`, `cargo-deny` (licences + advisories), `cargo-audit`, DCO check
+- [x] Renovate configuration
+- [x] `rust-toolchain.toml` pinning stable
 
 ### 0.2 Spikes
 

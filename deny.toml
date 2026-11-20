@@ -29,6 +29,8 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.9
+# The allowlist is policy for future dependencies; do not warn about entries not yet in use.
+unused-allowed-license = "allow"
 
 [licenses.private]
 # Our own crates are unpublished (publish = false).
