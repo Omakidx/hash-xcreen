@@ -71,6 +71,8 @@ both!(
     pair_intent_gets_no_features,
     unauthorized_connections_hold_their_slot,
     undecided_sessions_are_refused_busy,
+    authorize_cannot_be_widened_by_a_second_call,
+    failed_accept_closes_with_an_explicit_code,
 );
 
 async fn server_sends_need_authorization(pref: TransportPreference) {
@@ -462,4 +464,169 @@ async fn one_source_cannot_exhaust_the_pre_auth_slots() {
         .expect("a client from another address still connects");
     within(accepted).await.expect("join");
     drop((c, hogs));
+}
+
+async fn authorize_cannot_be_widened_by_a_second_call(pref: TransportPreference) {
+    let p = unauthorized_pair(pref).await;
+    p.srv
+        .authorize(Features::FILE_TRANSFER)
+        .expect("first authorize narrows");
+    assert!(p.srv.authorize(all_features()).is_err());
+    assert_eq!(
+        p.srv.enabled_features(),
+        Features::FILE_TRANSFER,
+        "a failed second call changes nothing"
+    );
+}
+
+async fn failed_accept_closes_with_an_explicit_code(pref: TransportPreference) {
+    let opts = ServerOptions {
+        max_pending: 1,
+        ..Default::default()
+    };
+    let server = start_server(opts).await;
+    let s2 = server.clone();
+    let failing = tokio::spawn(async move {
+        let mut hello = server_hello();
+        hello.software = "x".repeat(200); // above the 128-byte limit: cannot be encoded
+        s2.accept().await.expect("pending").accept(hello).await
+    });
+    let err = client(pref)
+        .connect(&target(&server, pref), &client_hello())
+        .await
+        .expect_err("the accept failed");
+    assert!(
+        matches!(&err, Error::Closed(c) if c.code == CloseCode::InternalError),
+        "{err}"
+    );
+    assert!(matches!(
+        within(failing).await.expect("join"),
+        Err(Error::Protocol(_))
+    ));
+    // The slot was released: the next client gets through.
+    let s3 = server.clone();
+    let ok = tokio::spawn(async move {
+        s3.accept()
+            .await
+            .expect("pending")
+            .accept(server_hello())
+            .await
+    });
+    client(pref)
+        .connect(&target(&server, pref), &client_hello())
+        .await
+        .expect("connects");
+    within(ok).await.expect("join").expect("accepted");
+}
+
+// ---------------------------------------------------------------- accept cannot be stalled
+
+fn hello_frame() -> Vec<u8> {
+    let hello = ControlMessage::new(Ctl::Hello(pb::Hello {
+        version: Some(pb::Version { major: 1, minor: 0 }),
+        capabilities: Some(hx_proto::version::capabilities(
+            &[hx_proto::VideoCodec::H264],
+            all_features(),
+        )),
+        intent: Intent::Session as i32,
+        software: "raw".into(),
+        device_name: String::new(),
+    }));
+    let body = hx_proto::message::encode(&hello).expect("encode");
+    let mut v = vec![0x01];
+    v.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    v.extend_from_slice(&body);
+    v
+}
+
+async fn raw_with_windows(
+    addr: std::net::SocketAddr,
+    uni: u32,
+    stream_window: u32,
+) -> (quinn::Endpoint, quinn::Connection) {
+    let mut tls = (*common::client_tls()).clone();
+    tls.alpn_protocols = vec![b"hx/1".to_vec()];
+    let q = quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("quic tls");
+    let mut cfg = quinn::ClientConfig::new(std::sync::Arc::new(q));
+    let mut t = quinn::TransportConfig::default();
+    t.max_concurrent_uni_streams(uni.into());
+    t.stream_receive_window(stream_window.into());
+    cfg.transport_config(std::sync::Arc::new(t));
+    let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().expect("addr")).expect("endpoint");
+    ep.set_default_client_config(cfg);
+    let conn = ep
+        .connect(addr, "localhost")
+        .expect("connect")
+        .await
+        .expect("handshake");
+    (ep, conn)
+}
+
+/// A peer that grants no unidirectional streams cannot stall `accept` (the server no longer
+/// opens a stream to the peer there), and one that grants no flow-control window is bounded.
+#[tokio::test]
+async fn a_peer_that_grants_no_credit_cannot_stall_accept() {
+    let opts = ServerOptions {
+        max_pending: 1,
+        decision_timeout: Duration::from_millis(700),
+        ..Default::default()
+    };
+    let server = start_server(opts).await;
+    let addr = server.quic_addr().expect("quic");
+
+    // 1. No unidirectional streams granted: accept completes promptly.
+    let s2 = server.clone();
+    let accepted = tokio::spawn(async move {
+        s2.accept()
+            .await
+            .expect("pending")
+            .accept(server_hello())
+            .await
+    });
+    let (_ep, conn) = raw_with_windows(addr, 0, 1_250_000).await;
+    let (mut send, _recv) = conn.open_bi().await.expect("bi");
+    send.write_all(&hello_frame()).await.expect("hello");
+    let srv = within(accepted)
+        .await
+        .expect("join")
+        .expect("accept is not stalled");
+    srv.authorize(all_features()).expect("authorize");
+    drop(srv);
+    drop((_ep, conn));
+
+    // 2. No stream window: the HelloAck cannot be written, so accept fails within its bound
+    // and the slot is freed.
+    let s2 = server.clone();
+    let accepted = tokio::spawn(async move {
+        s2.accept()
+            .await
+            .expect("pending")
+            .accept(server_hello())
+            .await
+    });
+    let (_ep2, conn2) = raw_with_windows(addr, 0, 0).await;
+    let (mut send, _recv) = conn2.open_bi().await.expect("bi");
+    send.write_all(&hello_frame()).await.expect("hello");
+    let started = std::time::Instant::now();
+    let r = tokio::time::timeout(Duration::from_secs(5), accepted)
+        .await
+        .expect("accept returns")
+        .expect("join");
+    assert!(matches!(r, Err(Error::Timeout(_))), "{r:?}");
+    assert!(started.elapsed() < Duration::from_secs(3));
+
+    // 3. The only slot is free again.
+    let s3 = server.clone();
+    let ok = tokio::spawn(async move {
+        s3.accept()
+            .await
+            .expect("pending")
+            .accept(server_hello())
+            .await
+    });
+    client(TransportPreference::Quic)
+        .connect(&target(&server, TransportPreference::Quic), &client_hello())
+        .await
+        .expect("a new client connects");
+    within(ok).await.expect("join").expect("accepted");
 }

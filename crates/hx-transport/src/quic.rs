@@ -512,20 +512,10 @@ pub(crate) async fn establish(
     parts: crate::conn::Parts,
 ) -> Result<Connection> {
     let _ = control_send.set_priority(priority::CONTROL);
-    // The server opens its cursor stream now (the client's limit allows it); the client opens
-    // its input stream lazily, because the server grants unidirectional streams only after
-    // authorizing it.
-    let uni = match parts.role {
-        Role::Server => {
-            let mut s = conn.open_uni().await.map_err(transport)?;
-            let _ = s.set_priority(priority::CURSOR);
-            s.write_all(&[ChannelId::Cursor as u8])
-                .await
-                .map_err(transport)?;
-            Some(s)
-        }
-        Role::Client => None,
-    };
+    // Both sides open their long-lived unidirectional stream (the client's input stream, the
+    // server's cursor stream) lazily on first use. Nothing here waits on the peer's stream
+    // credit, so a peer that grants none cannot stall `accept`.
+    let uni = None;
     let backend = Backend::Quic(QuicBackend::new(conn, control_send, uni, endpoint));
     let inner = Inner::new(parts, backend);
     spawn_tasks(&inner, control_recv);

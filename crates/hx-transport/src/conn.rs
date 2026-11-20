@@ -187,6 +187,8 @@ pub(crate) struct Inner {
     pub claimed_cursor: AtomicBool,
     /// Server side: false until the application calls `Connection::authorize`.
     authorized: AtomicBool,
+    /// Set by the first `authorize` call, before the features are stored.
+    auth_claimed: AtomicBool,
     /// Features usable now: all negotiated ones for a client, none until `authorize` for a server.
     effective_features: AtomicU64,
     /// Pre-authentication slot, released on authorize or close.
@@ -270,6 +272,7 @@ impl Inner {
             claimed_input: AtomicBool::new(false),
             claimed_cursor: AtomicBool::new(false),
             authorized: AtomicBool::new(is_client),
+            auth_claimed: AtomicBool::new(is_client),
             effective_features: AtomicU64::new(effective),
             slot: StdMutex::new(p.slot),
             auth_timeout: p.auth_timeout,
@@ -604,11 +607,16 @@ impl Connection {
         if let Some(c) = i.closed_info() {
             return Err(Error::Closed(c));
         }
-        let effective = i.negotiated.features.intersect(allowed);
-        i.effective_features.store(effective.0, Ordering::SeqCst);
-        if i.authorized.swap(true, Ordering::SeqCst) {
+        // Claim first, so a second call can neither widen nor replace the features.
+        if i.auth_claimed
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
             return Err(Error::Violation("already authorized".into()));
         }
+        let effective = i.negotiated.features.intersect(allowed);
+        i.effective_features.store(effective.0, Ordering::SeqCst);
+        i.authorized.store(true, Ordering::SeqCst);
         if let Backend::Quic(q) = &i.backend {
             q.lift_restrictions();
         }

@@ -16,8 +16,8 @@ use hx_proto::{
     message,
     pb::{self, ControlMessage, RefuseReason, control_message::Message as Ctl},
     version::{
-        ALPN, ALPN_H3, Features, PROTOCOL_MAJOR, ProtocolVersion, capabilities, negotiate,
-        peek_hello_version,
+        ALPN, ALPN_H3, Features, Negotiated, PROTOCOL_MAJOR, ProtocolVersion, capabilities,
+        negotiate, peek_hello_version,
     },
 };
 use quinn::crypto::rustls::{HandshakeData, QuicServerConfig};
@@ -380,6 +380,7 @@ pub struct PendingSession {
     pub(crate) peer_certs: Option<Vec<CertificateDer<'static>>>,
     pub(crate) options: ConnectionOptions,
     auth_timeout: Option<Duration>,
+    accept_timeout: Duration,
     state: Arc<StdMutex<Option<PendingState>>>,
 }
 
@@ -477,6 +478,7 @@ impl PendingSession {
             peer_certs,
             options: ctx.opts.connection.clone(),
             auth_timeout: ctx.opts.auth_timeout,
+            accept_timeout: ctx.opts.decision_timeout,
             state,
         }
     }
@@ -516,7 +518,69 @@ impl PendingSession {
     /// **restricted** until [`Connection::authorize`] is called (see there). For an
     /// `INTENT_PAIR` hello the advertised features and codecs are empty.
     pub async fn accept(self, reply: ServerHello) -> Result<Connection> {
+        // Everything that can fail locally is checked before the transport is touched, and a
+        // failure closes the connection with an explicit code (never 0).
+        let (negotiated, session_id, body) = match self.prepare(reply) {
+            Ok(p) => p,
+            Err(e) => {
+                self.abort(CloseCode::InternalError).await;
+                return Err(e);
+            }
+        };
         let st = self.take_state()?;
+        let parts = Parts {
+            role: Role::Server,
+            kind: self.transport,
+            negotiated,
+            peer: PeerInfo {
+                software: self.hello.software.clone(),
+                device_name: self.hello.device_name.clone(),
+            },
+            session_id,
+            peer_certs: self.peer_certs.clone(),
+            remote_addr: self.remote,
+            options: self.options.clone(),
+            slot: Some(st.slot),
+            auth_timeout: self.auth_timeout,
+        };
+        let quic_conn = match &st.inner {
+            PendingInner::Quic { conn, .. } => Some(conn.clone()),
+            PendingInner::Ws(_) => None,
+        };
+        // A peer that never reads (zero flow-control window) must not hold the slot, and the
+        // caller's accept loop, forever: the whole answer is bounded.
+        let establish = async move {
+            match st.inner {
+                PendingInner::Quic {
+                    conn,
+                    mut send,
+                    recv,
+                } => {
+                    write_message(&mut send, &body).await?;
+                    quic::establish(conn, send, recv, None, parts).await
+                }
+                PendingInner::Ws(w) => ws::establish_server(*w, body, parts).await,
+            }
+        };
+        match tokio::time::timeout(self.accept_timeout, establish).await {
+            Ok(Ok(c)) => Ok(c),
+            Ok(Err(e)) => {
+                if let Some(c) = quic_conn {
+                    c.close(quic_code(CloseCode::InternalError), b"accept failed");
+                }
+                Err(e)
+            }
+            Err(_) => {
+                if let Some(c) = quic_conn {
+                    c.close(quic_code(CloseCode::Busy), b"accept timed out");
+                }
+                Err(Error::Timeout("HelloAck"))
+            }
+        }
+    }
+
+    /// Negotiate and encode the `HelloAck`; fails before anything is sent.
+    fn prepare(&self, reply: ServerHello) -> Result<(Negotiated, [u8; 16], Bytes)> {
         let client_version = self
             .hello
             .version
@@ -542,32 +606,18 @@ impl PendingSession {
             session_id: Bytes::copy_from_slice(&session_id),
             software: reply.software,
         }));
+        // Validates `ServerHello` (software length, codec list) up front.
         let body = message::encode(&ack)?;
-        let parts = Parts {
-            role: Role::Server,
-            kind: self.transport,
-            negotiated,
-            peer: PeerInfo {
-                software: self.hello.software.clone(),
-                device_name: self.hello.device_name.clone(),
-            },
-            session_id,
-            peer_certs: self.peer_certs.clone(),
-            remote_addr: self.remote,
-            options: self.options.clone(),
-            slot: Some(st.slot),
-            auth_timeout: self.auth_timeout,
-        };
-        match st.inner {
-            PendingInner::Quic {
-                conn,
-                mut send,
-                recv,
-            } => {
-                write_message(&mut send, &body).await?;
-                quic::establish(conn, send, recv, None, parts).await
+        Ok((negotiated, session_id, body))
+    }
+
+    /// Close an undecided session with an explicit code (no `Refuse`), releasing its slot.
+    async fn abort(&self, code: CloseCode) {
+        if let Ok(st) = self.take_state() {
+            match st.inner {
+                PendingInner::Quic { conn, .. } => conn.close(quic_code(code), b"accept failed"),
+                PendingInner::Ws(w) => ws::close_server(*w, code).await,
             }
-            PendingInner::Ws(w) => ws::establish_server(*w, body, parts).await,
         }
     }
 

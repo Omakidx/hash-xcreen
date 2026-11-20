@@ -890,6 +890,16 @@ pub(crate) async fn establish_server(w: WsPending, ack: Bytes, parts: Parts) -> 
     Ok(start(ws, parts))
 }
 
+/// Close an undecided socket with an explicit close code and no `Refuse`.
+pub(crate) async fn close_server(w: WsPending, code: CloseCode) {
+    let mut ws = w.ws;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(1),
+        ws.send(close_frame(code, "accept failed")),
+    )
+    .await;
+}
+
 pub(crate) async fn refuse_server(w: WsPending, body: Bytes, code: CloseCode) -> Result<()> {
     let mut ws = w.ws;
     let _ = tokio::time::timeout(Duration::from_secs(2), async {
