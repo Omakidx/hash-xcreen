@@ -144,9 +144,9 @@ flowchart LR
 - [x] Property tests for every message round trip
 
 ### 1B — Crypto and pairing
-- [ ] Identity and device keys; pinned-key TLS verification in rustls
-- [ ] SPAKE2 pairing for long tokens and short codes; token expiry and single use
-- [ ] PIN verification (Argon2id) with lockout and device revocation
+- [x] Identity and device keys; pinned-key TLS verification in rustls
+- [x] SPAKE2 pairing for long tokens and short codes; token expiry and single use
+- [x] PIN verification (Argon2id) with lockout and device revocation
 
 ### 1C — Agent core
 - [x] `hx-privd` command set specified and reviewed before implementation ([ipc.md](ipc.md) v0.3; the session link too)

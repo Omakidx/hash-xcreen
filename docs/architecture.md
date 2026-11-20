@@ -303,7 +303,7 @@ Sent separately as shape (cached by hash) and position, and drawn by the client,
 
 | Attacker | Defence |
 |---|---|
-| Internet scanners, network attackers | Unpaired peers can only attempt pairing while a token is valid; all else is refused at the TLS handshake. Pre-auth parsers are fuzzed. |
+| Internet scanners, network attackers | Unpaired peers can only attempt pairing while a token or code is valid. An unknown key still completes the TLS 1.3 handshake (the server accepts any well-formed Ed25519 client key, protocol §11.1) and is refused at the application's `PendingSession` step, after the `Hello` and a registry lookup. That keeps the refusal reasons precise but widens the pre-authentication surface to TLS, the `Hello` parser and the registry lookup, all bounded by the transport's per-address and global limits and all targets for the 1H fuzzers. Pre-auth parsers are fuzzed. |
 | Someone who sees the one-liner | Token is single-use and expires after 15 minutes. |
 | Stolen client device | Device key alone is not enough: the server checks the PIN, revoking the device after 5 failures. Devices can be revoked from any other device or the CLI. |
 | Malware inside the desktop | Unprivileged container; `hx-session` holds no secrets; the agent treats all container input as untrusted; metadata endpoint and agent ports blocked. |
