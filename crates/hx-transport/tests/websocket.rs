@@ -377,3 +377,55 @@ async fn auto_does_not_retry_a_refusal_over_the_other_transport() {
             .is_err()
     );
 }
+
+/// Reviewer scenario: a pre-Hello peer announcing a huge frame must be cut off at the header.
+#[tokio::test]
+async fn oversized_messages_are_closed_before_being_buffered() {
+    let server = start_server(ServerOptions::default()).await;
+    // Before the Hello: far above the 64 KiB client-to-server limit.
+    let mut ws = raw_ws(&server, "/hx/1").await.expect("connect");
+    let mut big = vec![0x01];
+    big.extend(std::iter::repeat_n(0u8, 200 * 1024));
+    let _ = ws.send(Message::Binary(Bytes::from(big))).await;
+    assert_eq!(expect_close(&mut ws).await, CloseCode::ProtocolError);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), server.accept())
+            .await
+            .is_err()
+    );
+    // After the Hello: the same limit applies to an established connection.
+    let (mut ws, srv) = established(&server).await;
+    let mut big = vec![0x07, 1, 0, 0, 0, 2];
+    big.extend(std::iter::repeat_n(0u8, 100 * 1024));
+    let _ = ws.send(Message::Binary(Bytes::from(big))).await;
+    assert_eq!(expect_close(&mut ws).await, CloseCode::ProtocolError);
+    let info = tokio::time::timeout(WAIT, srv.closed())
+        .await
+        .expect("server closes");
+    assert_eq!(info.code, CloseCode::ProtocolError);
+}
+
+/// The frame ack book keeps metadata for at most 256 frames, never their payloads.
+#[tokio::test]
+async fn unacknowledged_frames_are_capped() {
+    let server = start_server(ServerOptions::default()).await;
+    let (_ws, srv) = established(&server).await; // never reads, so never acks
+    let mut sent = 0;
+    for n in 0..400u32 {
+        let header = hx_proto::media::MediaHeader {
+            codec: VideoCodec::H264,
+            flags: 0,
+            frame_number: n,
+            capture_timestamp_us: 0,
+            payload_len: 4,
+        };
+        match srv
+            .send_video_frame(header, Bytes::from_static(b"data"))
+            .await
+        {
+            Ok(_) => sent += 1,
+            Err(_) => break,
+        }
+    }
+    assert_eq!(sent, 256);
+}

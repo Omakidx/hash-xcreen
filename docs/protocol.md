@@ -368,7 +368,7 @@ Stream reset / stop codes (application error codes on a single stream; the conne
 
 ## 9. WebSocket fallback
 
-Same port number over TCP. TLS 1.3 with ALPN `http/1.1`, then an HTTP/1.1 WebSocket upgrade at path `/hx/1`; any other path is answered `404`. All messages are **binary**; text messages are a protocol error. The maximum WebSocket message size is `16 MiB + 64`.
+Same port number over TCP. TLS 1.3 with ALPN `http/1.1`, then an HTTP/1.1 WebSocket upgrade at path `/hx/1`; any other path is answered `404`. All messages are **binary**; text messages are a protocol error. The maximum WebSocket message size depends on the direction: **client to server `64 KiB + 64`** (the largest legitimate message is a control message or a transfer chunk), **server to client `16 MiB + 64`** (a video frame). A larger message is a protocol error, detected from the frame header before the payload is buffered (WebSocket close `PROTOCOL_ERROR`). The sender of unacknowledged video keeps only per-frame metadata, for at most 256 frames in flight.
 
 Every message is `channel id (1 byte)` followed by the body. Channels `0x01`–`0x09` of §3 keep their meaning; there are no streams or datagrams, everything is multiplexed on the one ordered connection (head-of-line blocking is inherent and accepted for a fallback).
 

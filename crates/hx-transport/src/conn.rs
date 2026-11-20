@@ -1059,15 +1059,40 @@ pub(crate) struct VideoJob {
     pub started: Instant,
 }
 
-impl VideoJob {
+/// What is kept of a frame once its bytes are on the wire: enough to report its outcome,
+/// none of the payload.
+pub(crate) struct VideoMeta {
+    frame_number: u32,
+    bytes: usize,
+    started: Instant,
+    done: oneshot::Sender<FrameAck>,
+}
+
+impl VideoMeta {
     pub(crate) fn finish(self, inner: &Inner, outcome: AckOutcome) {
         let ack = FrameAck {
             frame_number: self.frame_number,
-            bytes: self.payload_len,
+            bytes: self.bytes,
             elapsed: self.started.elapsed(),
             outcome,
         };
         inner.resolve_ack(ack);
         let _ = self.done.send(ack);
+    }
+}
+
+impl VideoJob {
+    /// Drop the payload and keep only the outcome bookkeeping.
+    pub(crate) fn into_meta(self) -> VideoMeta {
+        VideoMeta {
+            frame_number: self.frame_number,
+            bytes: self.payload_len,
+            started: self.started,
+            done: self.done,
+        }
+    }
+
+    pub(crate) fn finish(self, inner: &Inner, outcome: AckOutcome) {
+        self.into_meta().finish(inner, outcome);
     }
 }

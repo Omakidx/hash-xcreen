@@ -53,7 +53,7 @@ use crate::{
     client::{ClientHello, ClientOptions, Target, build_hello, process_reply},
     conn::{
         Backend, Connection, Inner, Parts, PeerInfo, Role, TransportKind, VideoFrame, VideoJob,
-        wait_closed,
+        VideoMeta, wait_closed,
     },
     error::{CloseInfo, Error, Result, transport},
     server::{
@@ -73,11 +73,22 @@ type Ws = WebSocketStream<BoxIo>;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const KEEPALIVE: Duration = Duration::from_secs(5);
 const CLOSE_GRACE: Duration = Duration::from_secs(1);
-const MAX_UNACKED_FRAMES: usize = 8192;
+/// Frames written but not yet acknowledged (metadata only, no payloads).
+const MAX_UNACKED_FRAMES: usize = 256;
 const MAX_INCOMING_TRANSFERS: usize = 16;
 
-fn ws_config() -> WebSocketConfig {
-    let max = MAX_VIDEO_PAYLOAD as usize + 64;
+/// Largest legitimate client-to-server message: a control message (64 KiB) or a transfer
+/// chunk (64 KiB plus 6 bytes of tagging), with a little slack for framing.
+const CLIENT_TO_SERVER_MAX: usize = 64 * 1024 + 64;
+
+/// WebSocket limits for the side that **receives**: a server only ever receives small
+/// messages (so an unauthenticated peer cannot make it buffer megabytes), a client receives
+/// video frames up to 16 MiB.
+fn ws_config(receiver: Role) -> WebSocketConfig {
+    let max = match receiver {
+        Role::Server => CLIENT_TO_SERVER_MAX,
+        Role::Client => MAX_VIDEO_PAYLOAD as usize + 64,
+    };
     WebSocketConfig::default()
         .max_message_size(Some(max))
         .max_frame_size(Some(max))
@@ -115,7 +126,7 @@ const CONNECTION_TRANSFER_BUDGET: usize = 4 * 1024 * 1024;
 
 #[derive(Default)]
 struct AckBook {
-    by_frame: HashMap<u32, VecDeque<VideoJob>>,
+    by_frame: HashMap<u32, VecDeque<VideoMeta>>,
     total: usize,
 }
 
@@ -182,7 +193,7 @@ impl WsBackend {
             book.by_frame
                 .entry(frame_number)
                 .or_default()
-                .push_back(job);
+                .push_back(job.into_meta());
         }
         self.lo
             .send(Out::Video {
@@ -222,7 +233,7 @@ impl WsBackend {
     }
 
     fn drain_pending(&self, inner: &Inner) {
-        let jobs: Vec<VideoJob> = match self.acks.lock() {
+        let jobs: Vec<VideoMeta> = match self.acks.lock() {
             Ok(mut book) => {
                 book.total = 0;
                 book.by_frame.drain().flat_map(|(_, q)| q).collect()
@@ -764,7 +775,7 @@ async fn incoming(
     let io: BoxIo = Box::new(tls);
     let mut ws = tokio::time::timeout_at(
         tls_deadline,
-        accept_hdr_async_with_config(io, PathCheck, Some(ws_config())),
+        accept_hdr_async_with_config(io, PathCheck, Some(ws_config(Role::Server))),
     )
     .await
     .map_err(|_| Error::Timeout("WebSocket upgrade"))?
@@ -899,7 +910,7 @@ pub(crate) async fn connect(
     let url = format!("wss://{host}:{}{WEBSOCKET_PATH}", target.addr.port());
     let (mut ws, _) = tokio::time::timeout(
         opts.connect_timeout,
-        client_async_with_config(url, io, Some(ws_config())),
+        client_async_with_config(url, io, Some(ws_config(Role::Client))),
     )
     .await
     .map_err(|_| Error::Timeout("WebSocket upgrade"))?
