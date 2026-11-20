@@ -88,9 +88,14 @@ async function main() {
   let wt;
   const t0 = performance.now();
   try {
-    wt = new WebTransport(`https://127.0.0.1:${info.udpPort}/wt`, {
-      serverCertificateHashes: [{ algorithm: "sha-256", value: hash }],
-    });
+    // Public mode (CA certificate): no pinning, connect to the host the page came from.
+    // Local mode: pin the self-signed certificate hash.
+    report.public = !!info.public; report.origin = location.origin; report.ua = navigator.userAgent;
+    wt = info.public
+      ? new WebTransport(`https://${location.hostname}:${info.udpPort}/wt`)
+      : new WebTransport(`https://127.0.0.1:${info.udpPort}/wt`, {
+          serverCertificateHashes: [{ algorithm: "sha-256", value: hash }],
+        });
     await wt.ready;
   } catch (e) { report.steps.connect = { ok: false, error: String(e) }; report.error = "connect: " + e; return finish(); }
   report.steps.connect = { ok: true, ms: +(performance.now() - t0).toFixed(1), reliability: wt.reliability, congestionControl: wt.congestionControl, maxDatagramSize: wt.datagrams.maxDatagramSize };
