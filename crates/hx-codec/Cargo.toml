@@ -10,3 +10,10 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+crossbeam-channel.workspace = true
+ffmpeg-next.workspace = true
+rustix = { workspace = true, features = ["time"] }
+thiserror.workspace = true
+yuvutils-rs.workspace = true
