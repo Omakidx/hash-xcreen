@@ -511,7 +511,7 @@ The PIN is a 6 to 16 digit secret chosen by the user at setup. The server stores
 | Message | Fields |
 |---|---|
 | `PinAttempt` (C→S) | `pin` 1 (bytes, 6 to 16 ASCII digits) |
-| `AuthResult` (S→C) | `status` 1 (`OK` = 1, `WRONG_PIN` = 2, `BACKOFF` = 3, `REVOKED` = 4, `NOT_AVAILABLE` = 5), `attempts_left` 2, `retry_after_ms` 3 |
+| `AuthResult` (S→C) | `status` 1 (`OK` = 1, `WRONG_PIN` = 2, `BACKOFF` = 3, `REVOKED` = 4, `NOT_AVAILABLE` = 5, sent if the server has no PIN verifier when the attempt arrives), `attempts_left` 2, `retry_after_ms` 3 |
 
 The channel is TLS 1.3 with both keys pinned, so the PIN travels in clear inside it. Rules, enforced on the server only:
 
