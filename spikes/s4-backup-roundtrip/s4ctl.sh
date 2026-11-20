@@ -13,15 +13,18 @@ WORKER=${S4_WORKER:-s4-worker}
 POOL=/var/lib/incus/storage-pools/default
 S4_REPOS=${S4_REPOS:-/tmp/claude-1000/-home-z11-desktop--claude-spares-spare-UB6ukz/edb16c05-ab51-4f18-98dc-0c91687db632/scratchpad/repos}
 inc() { sg incus-admin -c "incus $*"; }
+# S4_REPO_URL (for example rest:http://s4:<bridge-password>@10.36.142.1:8765/) replaces the local /repos/<name>
+# repository: the worker then talks to the host-side Drive bridge (`s4 serve`) and never holds Google credentials.
+repo_arg() { if [ -n "${S4_REPO_URL:-}" ]; then printf %s "--repo $S4_REPO_URL"; else printf %s "--repo /repos/$1"; fi; }
 
 cmd=${1:?}; shift
 case "$cmd" in
   init)
     repo=$1; lvl=$2
-    inc "exec $WORKER -- s4 --repo /repos/$repo init --compression $lvl" ;;
+    inc "exec $WORKER -- s4 $(repo_arg $repo) init --compression $lvl" ;;
   w)
     repo=$1; shift
-    inc "exec $WORKER -- s4 --repo /repos/$repo $*" ;;
+    inc "exec $WORKER -- s4 $(repo_arg $repo) $*" ;;
   backup)
     repo=$1; shift
     snap=s4-bk-$(date +%s)
@@ -42,15 +45,15 @@ case "$cmd" in
     # $repo may be a comma-separated list: every repository is backed up from the SAME snapshot
     for r in ${repo//,/ }; do
       echo "== repo $r"
-      inc "exec $WORKER -- nice -n 19 ionice -c3 s4 --repo /repos/$r backup --source /src/rootfs --description-file /tmp/manifest.json $*"
-      du -sb "$S4_REPOS/$r" 2>/dev/null | awk '{print "{\"repo_bytes_after\":" $1 "}"}'
+      inc "exec $WORKER -- nice -n 19 ionice -c3 s4 $(repo_arg $r) backup --source /src/rootfs --description-file /tmp/manifest.json $*"
+      [ -z "${S4_REPO_URL:-}" ] && du -sb "$S4_REPOS/$r" 2>/dev/null | awk '{print "{\"repo_bytes_after\":" $1 "}"}'
     done
     ;;
   restore)
     repo=$1; ct=$2; snap=${3:-latest}
     inc "config device add $WORKER target disk source=$POOL/containers/$ct path=/target shift=true" >/dev/null
     trap 'inc "config device remove $WORKER target" >/dev/null 2>&1 || true' EXIT
-    inc "exec $WORKER -- s4 --repo /repos/$repo restore --snapshot $snap --dest /target/rootfs"
+    inc "exec $WORKER -- s4 $(repo_arg $repo) restore --snapshot $snap --dest /target/rootfs --sparse"
     ;;
   *) echo "unknown $cmd"; exit 2 ;;
 esac
