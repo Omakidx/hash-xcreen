@@ -273,6 +273,9 @@ fn main() -> Result<()> {
         let conn = ep.connect(server, "s2")?.await?;
         eprintln!("s2-client: connected to {server}");
         loop {
+            if dec.is_finished() {
+                break;
+            }
             tokio::select! {
                 s = conn.accept_uni() => {
                     let Ok(s) = s else { break };
@@ -284,7 +287,7 @@ fn main() -> Result<()> {
             }
         }
         conn.close(0u32.into(), b"done");
-        ep.wait_idle().await;
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), ep.wait_idle()).await;
         Ok::<_, anyhow::Error>(())
     })?;
     match dec.join() {

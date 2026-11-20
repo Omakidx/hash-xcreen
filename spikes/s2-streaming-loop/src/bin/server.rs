@@ -394,6 +394,7 @@ struct Inflight {
     cancel: tokio::sync::oneshot::Sender<()>,
 }
 
+type AckLog = Arc<Mutex<(u64, std::collections::VecDeque<u64>)>>;
 type InflightMap = Arc<Mutex<BTreeMap<u32, Inflight>>>;
 
 async fn serve_connection(
@@ -405,6 +406,8 @@ async fn serve_connection(
     pool_tx: &Sender<Vec<u8>>,
 ) {
     let inflight: InflightMap = Arc::new(Mutex::new(BTreeMap::new()));
+    // (time of last ack, ack delays in ns of the most recent frames)
+    let acks: AckLog = Arc::new(Mutex::new((0, std::collections::VecDeque::new())));
     // Drop anything stale from before this connection and start with a fresh image.
     while frame_rx.try_recv().is_ok() {}
     while cursor_rx.try_recv().is_ok() {}
@@ -468,8 +471,18 @@ async fn serve_connection(
     let mut rtt_min = u64::MAX;
     let mut last_change = now_ns();
     let mut good_since = now_ns();
+    let mut tick_active = true;
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(4));
-    let mut kbps = cfg.max_kbps;
+    // Bitrate ladder (kbit/s): one step per controller decision, so the encoder is reopened rarely.
+    let ladder: Vec<u32> = [500u32, 1000, 1500, 2000, 3000, 4000, 6000, 8000, 10_000, 15_000, 20_000, 30_000, 50_000]
+        .into_iter()
+        .filter(|k| *k < cfg.max_kbps)
+        .chain(std::iter::once(cfg.max_kbps))
+        .collect();
+    let mut level = ladder.len() - 1;
+    let mut block_until = vec![0u64; ladder.len()];
+    let mut backoff_ns = 2_000_000_000u64;
+    let mut kbps;
     let mut cursor_done = false;
 
     loop {
@@ -488,8 +501,28 @@ async fn serve_connection(
                     (m.values().map(|i| i.t_send).min(), m.len())
                 };
                 sh.inflight.store(n as u32, Relaxed);
+                // Idle: slow the controller tick down so an idle desktop costs ~0 CPU.
+                if (n > 0) != tick_active {
+                    tick_active = n > 0;
+                    tick = tokio::time::interval(std::time::Duration::from_millis(if tick_active { 4 } else { 100 }));
+                }
                 let base = if rtt_min == u64::MAX { 0 } else { rtt_min };
-                let lag_ms = oldest.map(|t| (now - t) / 1_000_000).unwrap_or(0).saturating_sub(base);
+                // Queueing estimate that ignores single-packet loss recovery: median ack delay of the
+                // last frames (minus the base RTT), or the time since anything was acked if all stalled.
+                let (med, last_ack) = {
+                    let a = acks.lock().unwrap();
+                    let mut v: Vec<u64> = a.1.iter().copied().collect();
+                    v.sort_unstable();
+                    (v.get(v.len() / 2).copied().unwrap_or(0), a.0)
+                };
+                let med = if n == 0 && now - last_ack > 500_000_000 { 0 } else { med };
+                let q_med = med.saturating_sub(base * 1_000_000) / 1_000_000;
+                let stall = match oldest {
+                    Some(t) => (now - t.max(last_ack)) / 1_000_000,
+                    None => 0,
+                }
+                .saturating_sub(base);
+                let lag_ms = q_med.max(stall);
                 sh.lag_ms.store(lag_ms as u32, Relaxed);
                 if !cfg.congestion { continue; }
                 if lag_ms > 100 && now - last_change > 150_000_000 {
@@ -503,19 +536,25 @@ async fn serve_connection(
                     sh.cancels.fetch_add(1, Relaxed);
                     sh.force_idr.store(true, Relaxed);
                     sh.resync_flag.store(true, Relaxed);
-                    kbps = (kbps / 2).max(500);
+                    ladder_down(&mut level, 2, &mut block_until, &mut backoff_ns, now);
+                    kbps = ladder[level];
                     apply_rate(cfg, sh, kbps);
                     last_change = now;
                     good_since = now;
                 } else if lag_ms > 40 && now - last_change > 250_000_000 {
-                    kbps = (kbps * 3 / 4).max(500);
+                    ladder_down(&mut level, 1, &mut block_until, &mut backoff_ns, now);
+                    kbps = ladder[level];
                     apply_rate(cfg, sh, kbps);
                     last_change = now;
                     good_since = now;
                 } else if lag_ms > 15 {
                     good_since = now;
-                } else if now - good_since > 700_000_000 && now - last_change > 700_000_000 && kbps < cfg.max_kbps {
-                    kbps = (kbps * 6 / 5).min(cfg.max_kbps);
+                } else if now - good_since > 700_000_000 && now - last_change > 700_000_000 && level + 1 < ladder.len() && now >= block_until[level + 1] {
+                    level += 1;
+                    if level + 1 == ladder.len() {
+                        backoff_ns = 2_000_000_000;
+                    }
+                    kbps = ladder[level];
                     apply_rate(cfg, sh, kbps);
                     last_change = now;
                 }
@@ -528,6 +567,8 @@ async fn serve_connection(
                 let inf = inflight.clone();
                 let sh2 = sh.clone();
                 let pool = pool_tx.clone();
+                let acks2 = acks.clone();
+                let t_sent = f.hdr.t_send;
                 tokio::spawn(async move {
                     let hdr = f.hdr.encode();
                     let n = f.hdr.frame_no;
@@ -539,6 +580,13 @@ async fn serve_connection(
                         sh2.bytes_sent.fetch_add(total, Relaxed);
                         sh2.frames_sent.fetch_add(1, Relaxed);
                         let _ = s.stopped().await;
+                        let t = now_ns();
+                        let mut a = acks2.lock().unwrap();
+                        a.0 = t;
+                        a.1.push_back(t - t_sent);
+                        if a.1.len() > 8 {
+                            a.1.pop_front();
+                        }
                         Some(())
                     };
                     tokio::select! {
@@ -556,6 +604,14 @@ async fn serve_connection(
     for (_, i) in std::mem::take(&mut *inflight.lock().unwrap()) {
         let _ = i.cancel.send(());
     }
+}
+
+/// Step down `n` levels and forbid probing back up to the failed level for `backoff` (doubles on repeats).
+fn ladder_down(level: &mut usize, n: usize, block_until: &mut [u64], backoff_ns: &mut u64, now: u64) {
+    let failed = *level;
+    block_until[failed] = now + *backoff_ns;
+    *backoff_ns = (*backoff_ns * 2).min(8_000_000_000);
+    *level = level.saturating_sub(n);
 }
 
 fn apply_rate(cfg: &Cfg, sh: &Shared, kbps: u32) {
