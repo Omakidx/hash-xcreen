@@ -25,7 +25,8 @@ Every language, library, tool and external service hash-xcreen uses, and why. It
 | Process management | **systemd** units with sandboxing, `systemd-creds` for secrets | Hardening and TPM-sealed secrets without extra software |
 | Firewall | ufw or nftables, whichever the host uses | Avoid fighting the host's existing setup |
 | Async runtime | **tokio** (networking only) | Standard for quinn and HTTP; kept out of the media hot path |
-| Incus API client | Incus REST API over its unix socket (`hyper` + `serde`) | No CLI scraping; typed requests from `hx-privd` |
+| Incus API client | Incus REST API over its unix socket (`hyper` 1.x with `hyper-util`, `http-body-util` and `bytes`; `serde` + `serde_json`; `tokio` for the socket and timeouts) | No CLI scraping; typed requests from `hx-privd` |
+| Recipe engine | `toml` 0.8 + `serde` (unknown keys rejected), `sha2` (file hashes in the equivalence manifest), `thiserror` (typed errors) | Pure, deterministic parsing and resolution in `hx-provision` |
 
 ## Streaming
 

@@ -20,8 +20,11 @@
 pub mod catalog;
 pub mod error;
 pub mod exec;
+pub mod host;
+pub mod incus;
 pub mod lower;
 pub mod manifest;
+pub mod orchestrate;
 pub mod plan;
 pub mod recipe;
 
@@ -31,6 +34,11 @@ pub use exec::{
     Action, ApplyError, ExecError, ExecOutput, ExecRequest, Executor, FilePush, Progress, Secret,
     SecretError, Secrets, StageReport, StepFailure, StepWarning, apply_stage,
 };
+pub use host::{HostReport, HostSpec, Naming, PoolSource, ensure_host};
 pub use manifest::Manifest;
+pub use orchestrate::{
+    DesktopSpec, IncusExecutor, Limits, ProvisionError, ProvisionReport, build_on_server,
+    destroy_instance, finish_prebuilt, wait_system_running,
+};
 pub use plan::{ImageRef, Plan, Stage, Step};
 pub use recipe::{DirSource, MemSource, RecipeSource};

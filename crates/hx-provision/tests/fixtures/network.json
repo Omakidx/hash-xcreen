@@ -1,0 +1,1 @@
+{"type":"sync","status":"Success","status_code":200,"operation":"","error_code":0,"error":"","metadata":{"config":{"ipv4.address":"10.36.142.1/24","ipv4.nat":"true","ipv6.address":"fd42:194:286a:39f0::1/64","ipv6.nat":"true"},"description":"","name":"incusbr0","type":"bridge","used_by":["/1.0/profiles/default"],"managed":true,"status":"Created","locations":["none"]}}
