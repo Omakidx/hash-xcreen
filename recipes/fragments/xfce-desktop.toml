@@ -1,3 +1,6 @@
+# The X cookie never appears in a process list: the file is created 0600 and owned by the
+# desktop user's numeric uid ({{uid}}, so renaming the account does not touch this unit), and the
+# cookie goes to xauth on stdin.
 # Shared desktop fragment: headless Xorg (dummy) + XFCE session + PipeWire.
 # Distro-independent. Included by every recipe in the recipes/ directory.
 # See recipes/README.md for the format.
@@ -79,7 +82,7 @@ After=systemd-user-sessions.service
 [Service]
 RuntimeDirectory=hx-xorg
 RuntimeDirectoryMode=0755
-ExecStartPre=/bin/sh -c 'touch /run/hx-xorg/Xauthority && xauth -f /run/hx-xorg/Xauthority add :0 . $(mcookie) && chown {{user}} /run/hx-xorg/Xauthority'
+ExecStartPre=/bin/sh -c 'install -m 0600 -o {{uid}} /dev/null /run/hx-xorg/Xauthority && echo "add :0 . $(mcookie)" | xauth -f /run/hx-xorg/Xauthority source - && chown {{uid}} /run/hx-xorg/Xauthority && chmod 0600 /run/hx-xorg/Xauthority'
 ExecStart=/usr/lib/xorg/Xorg :0 -config /etc/hx/xorg-dummy.conf -auth /run/hx-xorg/Xauthority -noreset -nolisten tcp -novtswitch -sharevts -logfile /var/log/hx-xorg.log
 Restart=on-failure
 RestartSec=2

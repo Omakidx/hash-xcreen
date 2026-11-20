@@ -79,7 +79,7 @@
       "path": "/etc/systemd/system/hx-xorg.service",
       "mode": "0644",
       "owner": "root:root",
-      "sha256": "270bbd4ee8dae241040c0dc7fa05ee658d8d72de9e87c8fa6a8996ee8d18f9e3"
+      "sha256": "0caac8be5bb8177bafdf5cdd717441d5b2ea264fc46416ff801f27dc5aebfd39"
     },
     {
       "path": "/etc/systemd/user/hx-session.service",

@@ -379,7 +379,10 @@ fn file_and_user_steps_lower_to_quoted_commands() {
         .unwrap();
     let s = script_of(&lower(user, &Secrets::none()).unwrap()[0]).to_string();
     assert!(
-        s.contains("--uid 1000") && s.contains("passwd -l 'desk'") && s.contains("'docker'"),
+        s.contains("--uid 1000")
+            && s.contains("n='desk'")
+            && s.contains("passwd -l")
+            && s.contains("'docker'"),
         "{s}"
     );
     assert!(s.contains("userdel -r ubuntu"));

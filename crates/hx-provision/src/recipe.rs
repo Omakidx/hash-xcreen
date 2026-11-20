@@ -14,6 +14,7 @@ use toml::{Table, Value};
 
 use crate::error::RecipeError;
 use crate::plan::{AptRepo, CommandSpec, FileSpec, ImageRef, Plan, ServiceSpec, Step, UserSpec};
+use crate::user::Username;
 
 /// Deepest allowed `include` nesting.
 pub const MAX_INCLUDE_DEPTH: usize = 8;
@@ -551,7 +552,7 @@ fn dedup(v: Vec<String>) -> Vec<String> {
 }
 
 /// Expand variables in a merged table and turn it into a validated plan.
-fn table_to_plan(mut t: Table) -> Result<Plan, RecipeError> {
+fn table_to_plan(mut t: Table, base_user: Option<String>) -> Result<Plan, RecipeError> {
     // Variables: [vars] plus `user` from [user].name. [vars] values are not themselves expanded.
     let raw_vars: BTreeMap<String, String> = match t.get("vars") {
         Some(v) => v
@@ -568,9 +569,23 @@ fn table_to_plan(mut t: Table) -> Result<Plan, RecipeError> {
             ));
         }
     }
+    // `user` and `uid` come only from [user] (the validated account), never from [vars].
+    for reserved in ["user", "uid"] {
+        if raw_vars.contains_key(reserved) {
+            return Err(RecipeError::invalid(
+                format!("vars.{reserved}"),
+                "is derived from [user] (and the caller's chosen username); remove it from [vars]",
+            ));
+        }
+    }
     let mut vars = raw_vars;
     if let Some(Value::String(n)) = t.get("user").and_then(|u| u.get("name")) {
-        vars.entry("user".to_string()).or_insert_with(|| n.clone());
+        // Validated before substitution: a username is user input.
+        Username::new(n).map_err(|e| RecipeError::invalid("user.name", e.to_string()))?;
+        vars.insert("user".to_string(), n.clone());
+    }
+    if let Some(Value::Integer(i)) = t.get("user").and_then(|u| u.get("uid")) {
+        vars.insert("uid".to_string(), i.to_string());
     }
     let vars_table = t.remove("vars");
     let mut tv = Value::Table(t);
@@ -616,12 +631,7 @@ fn table_to_plan(mut t: Table) -> Result<Plan, RecipeError> {
         }
         None
     } else {
-        if !ident_ok(&u.name) {
-            return Err(RecipeError::invalid(
-                "user.name",
-                "lower-case letters, digits, `_`, `-`; at most 32 characters",
-            ));
-        }
+        Username::new(&u.name).map_err(|e| RecipeError::invalid("user.name", e.to_string()))?;
         if let Some(uid) = u.uid
             && !(1000..60000).contains(&uid)
         {
@@ -820,6 +830,14 @@ fn table_to_plan(mut t: Table) -> Result<Plan, RecipeError> {
 
     // Assemble the post stage.
     let mut post = vec![Step::WaitNetwork];
+    if let (Some(u), Some(from)) = (&user, &base_user)
+        && &u.name != from
+    {
+        post.push(Step::RenameUser {
+            from: from.clone(),
+            to: u.name.clone(),
+        });
+    }
     if let Some(u) = &user {
         post.push(Step::EnsureUser(u.clone()));
         post.push(Step::SetPassword {
@@ -845,7 +863,8 @@ fn table_to_plan(mut t: Table) -> Result<Plan, RecipeError> {
 // Public entry points
 // ---------------------------------------------------------------------------------------------
 
-/// Resolve `recipe_path` with the given add-on files (merged in order) into a [`Plan`].
+/// Resolve `recipe_path` with the given add-on files (merged in order) into a [`Plan`], with the
+/// recipe's own user (`desk`).
 ///
 /// Paths are relative to the root of `src`.
 pub fn resolve(
@@ -853,13 +872,42 @@ pub fn resolve(
     recipe_path: &str,
     addon_paths: &[&str],
 ) -> Result<Plan, RecipeError> {
+    resolve_as(src, recipe_path, addon_paths, None)
+}
+
+/// Like [`resolve`], but the desktop user is `username` (validated user input). The recipe's own
+/// user name is the account baked into a prebuilt image; when it differs from `username`, the post
+/// stage renames it ([`Step::RenameUser`]).
+pub fn resolve_as(
+    src: &dyn RecipeSource,
+    recipe_path: &str,
+    addon_paths: &[&str],
+    username: Option<&Username>,
+) -> Result<Plan, RecipeError> {
     let mut t = load_file(src, recipe_path, &mut Vec::new())?;
     for a in addon_paths {
         let at = load_file(src, a, &mut Vec::new())?;
         check_addon(a, &at)?;
         merge(&mut t, at);
     }
-    table_to_plan(t)
+    let base_user = t
+        .get("user")
+        .and_then(|u| u.get("name"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if let Some(u) = username {
+        set_user_name(&mut t, u);
+    }
+    table_to_plan(t, base_user)
+}
+
+fn set_user_name(t: &mut Table, u: &Username) {
+    let mut user = match t.remove("user") {
+        Some(Value::Table(x)) => x,
+        _ => Table::new(),
+    };
+    user.insert("name".into(), Value::String(u.as_str().to_string()));
+    t.insert("user".into(), Value::Table(user));
 }
 
 /// The steps of one add-on only, to apply it to a desktop that already exists (for example one
@@ -869,6 +917,16 @@ pub fn resolve_addon_only(
     src: &dyn RecipeSource,
     recipe_path: &str,
     addon_path: &str,
+) -> Result<Plan, RecipeError> {
+    resolve_addon_only_as(src, recipe_path, addon_path, None)
+}
+
+/// Like [`resolve_addon_only`] for a desktop whose user is `username`.
+pub fn resolve_addon_only_as(
+    src: &dyn RecipeSource,
+    recipe_path: &str,
+    addon_path: &str,
+    username: Option<&Username>,
 ) -> Result<Plan, RecipeError> {
     let base = load_file(src, recipe_path, &mut Vec::new())?;
     let mut addon = load_file(src, addon_path, &mut Vec::new())?;
@@ -892,7 +950,10 @@ pub fn resolve_addon_only(
         }
         addon.insert("user".into(), Value::Table(u));
     }
-    let mut plan = table_to_plan(addon)?;
+    if let Some(u) = username {
+        set_user_name(&mut addon, u);
+    }
+    let mut plan = table_to_plan(addon, None)?;
     plan.post.clear();
     Ok(plan)
 }

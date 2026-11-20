@@ -139,6 +139,14 @@ pub enum Step {
         /// User to enable lingering for.
         linger_user: Option<String>,
     },
+    /// Rename the image's build user to the account the caller chose (post stage; a no-op when
+    /// `from` does not exist or `to` already does). Home directory and primary group move too.
+    RenameUser {
+        /// The user baked into the image.
+        from: String,
+        /// The chosen login name.
+        to: String,
+    },
     /// Set the user's password from the run-time secret (post stage only).
     SetPassword {
         /// Login name.
@@ -187,6 +195,7 @@ impl Step {
                 services.user_enable_global.join(","),
                 linger_user.as_deref().unwrap_or("-")
             ),
+            Self::RenameUser { from, to } => format!("rename-user {from} -> {to}"),
             Self::SetPassword { user } => format!("set-password {user}"),
             Self::SecurityUpdates => "security-updates".into(),
         }

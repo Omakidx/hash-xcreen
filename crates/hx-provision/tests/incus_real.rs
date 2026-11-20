@@ -352,6 +352,52 @@ async fn lifecycle(c: Client<UnixTransport>) {
     let (_, who, _) = sh(&c, "hx1d-test-c1", "runuser -u desk -- id -un").await;
     assert_eq!(who.trim(), "desk");
 
+    // --- username contract: ensure-user refuses bad accounts; rename moves a lingering user -----------------------
+    let spec_for = |name: &str, uid: Option<u32>| hx_provision::plan::UserSpec {
+        name: name.into(),
+        uid,
+        shell: "/bin/bash".into(),
+        groups: vec![],
+        linger: false,
+    };
+    for (name, uid, why) in [
+        ("desk", Some(1001), "uid mismatch"),
+        ("daemon", None, "system account"),
+    ] {
+        let mut p = plan.clone();
+        p.post = vec![hx_provision::Step::EnsureUser(spec_for(name, uid))];
+        let e = apply_stage(&exec, &p, Stage::Post, &Secrets::none(), &mut |_| {})
+            .await
+            .expect_err(why);
+        eprintln!("ensure-user refusal ({why}): {e}");
+    }
+    // A lingering `desk` has a running user manager, like a desktop imported from the prebuilt image.
+    let (code, _, err) = sh(&c, "hx1d-test-c1", "loginctl enable-linger desk").await;
+    assert_eq!(code, 0, "{err}");
+    let mut p = plan.clone();
+    p.post = vec![hx_provision::Step::RenameUser {
+        from: "desk".into(),
+        to: "hxuser".into(),
+    }];
+    let t = std::time::Instant::now();
+    apply_stage(&exec, &p, Stage::Post, &Secrets::none(), &mut |_| {})
+        .await
+        .unwrap();
+    eprintln!("rename-user desk -> hxuser took {:?}", t.elapsed());
+    let (_, ids, _) = sh(&c, "hx1d-test-c1", "id -u hxuser; getent passwd hxuser | cut -d: -f6; getent group hxuser | cut -d: -f1; id -u desk 2>&1 | head -1; ls /var/lib/systemd/linger").await;
+    eprintln!("after rename: {ids:?}");
+    let lines: Vec<&str> = ids.lines().collect();
+    assert_eq!(&lines[..3], ["1000", "/home/hxuser", "hxuser"]);
+    assert!(lines[3].contains("no such user"), "{lines:?}");
+    assert!(
+        lines.contains(&"hxuser") && !lines.contains(&"desk"),
+        "linger moved: {lines:?}"
+    );
+    // Re-running is a no-op.
+    apply_stage(&exec, &p, Stage::Post, &Secrets::none(), &mut |_| {})
+        .await
+        .unwrap();
+
     // --- snapshots (btrfs copy-on-write) -----------------------------------------------------------------------
     c.create_snapshot("hx1d-test-c1", "hx-test-snap")
         .await

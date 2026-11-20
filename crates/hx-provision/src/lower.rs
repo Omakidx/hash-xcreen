@@ -80,10 +80,12 @@ fn apt_repo(r: &AptRepo) -> Vec<Action> {
 tmp=$(mktemp); gh=$(mktemp -d)
 trap 'rm -rf "$tmp" "$gh"' EXIT
 export GNUPGHOME="$gh"
-curl -fsSL --retry 3 --connect-timeout 20 --max-time 120 {url} -o "$tmp"
+curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --connect-timeout 20 --max-time 120 {url} -o "$tmp"
 fps=$(gpg --batch --show-keys --with-colons "$tmp" | awk -F: '$1=="pub"{{p=1;next}} p&&$1=="fpr"{{print $10;p=0}}')
 if [ "$fps" != {fp} ]; then echo "key fingerprint mismatch for repository {name}: got [$fps]" >&2; exit 1; fi
-if grep -q 'BEGIN PGP' "$tmp"; then gpg --batch --dearmor < "$tmp" > {key}; else cp "$tmp" {key}; fi
+gpg --batch --quiet --import "$tmp"
+gpg --batch --export-options export-minimal --export {fp} > {key}
+if [ ! -s {key} ]; then echo "could not export the pinned key for repository {name}" >&2; exit 1; fi
 chmod 0644 {key}
 printf 'Types: deb\nURIs: %s\nSuites: %s\nComponents: %s\nSigned-By: %s\n' {uri} {suite} {components} {key} > {sources}
 "#,
@@ -109,20 +111,55 @@ printf 'Types: deb\nURIs: %s\nSuites: %s\nComponents: %s\nSigned-By: %s\n' {uri}
 
 fn ensure_user(u: &UserSpec) -> Action {
     let uid = u.uid.map(|i| format!("--uid {i}")).unwrap_or_default();
-    // Ubuntu base images ship an `ubuntu` user at uid 1000; remove it so the uid is free.
+    let want = u.uid.map(|i| i.to_string()).unwrap_or_default();
+    // Refuse to adopt an existing system account or one with another uid. Ubuntu base images ship
+    // an `ubuntu` user at uid 1000; it is removed so the uid is free.
     let script = format!(
-        r#"if ! id -u {n} >/dev/null 2>&1; then
-  if [ {n} != 'ubuntu' ] && id ubuntu >/dev/null 2>&1; then userdel -r ubuntu 2>/dev/null || true; fi
-  useradd --create-home --shell {sh} {uid} {n}
-  passwd -l {n} >/dev/null
+        r#"n={n}; want={want}
+if id -u "$n" >/dev/null 2>&1; then
+  cur=$(id -u "$n")
+  if [ "$cur" -lt 1000 ]; then echo "account $n already exists as a system account (uid $cur)" >&2; exit 1; fi
+  if [ -n "$want" ] && [ "$cur" != "$want" ]; then echo "account $n already exists with uid $cur, expected $want" >&2; exit 1; fi
+else
+  gid=$(getent group "$n" | cut -d: -f3 || true)
+  if [ -n "$gid" ] && [ "$gid" -lt 1000 ]; then echo "group $n already exists as a system group (gid $gid)" >&2; exit 1; fi
+  if [ "$n" != ubuntu ] && id ubuntu >/dev/null 2>&1; then userdel -r ubuntu 2>/dev/null || true; fi
+  useradd --create-home --shell {sh} {uid} "$n"
+  passwd -l "$n" >/dev/null
 fi
-for g in {groups}; do getent group "$g" >/dev/null || groupadd "$g"; usermod -aG "$g" {n}; done
+for g in {groups}; do getent group "$g" >/dev/null || groupadd "$g"; usermod -aG "$g" "$n"; done
 "#,
         n = sq(&u.name),
+        want = sq(&want),
         sh = sq(&u.shell),
         groups = u.groups.iter().map(|g| sq(g)).collect::<Vec<_>>().join(" "),
     );
     bash(&format!("ensure-user {}", u.name), script, 120)
+}
+
+/// Rename the build user of a prebuilt image to the chosen account. Home directory, primary group
+/// and lingering move with it; processes of the old user (its lingering user manager) are ended
+/// first, and `usermod` is retried while they exit. No-op unless `from` exists and `to` does not.
+fn rename_user(from: &str, to: &str) -> Action {
+    let script = format!(
+        r#"from={from}; to={to}
+if id -u "$from" >/dev/null 2>&1 && ! id -u "$to" >/dev/null 2>&1; then
+  loginctl disable-linger "$from" >/dev/null 2>&1 || true
+  loginctl terminate-user "$from" >/dev/null 2>&1 || true
+  ok=0
+  for i in $(seq 1 30); do
+    if usermod -l "$to" -d "/home/$to" -m "$from" 2>/dev/null; then ok=1; break; fi
+    sleep 1
+  done
+  if [ "$ok" != 1 ]; then echo "could not rename $from to $to" >&2; exit 1; fi
+  if getent group "$from" >/dev/null && ! getent group "$to" >/dev/null; then groupmod -n "$to" "$from"; fi
+  loginctl enable-linger "$to"
+fi
+"#,
+        from = sq(from),
+        to = sq(to),
+    );
+    bash(&format!("rename-user {from} {to}"), script, 120)
 }
 
 fn write_file(f: &FileSpec) -> Vec<Action> {
@@ -232,6 +269,7 @@ pub fn lower(step: &Step, secrets: &Secrets) -> Result<Vec<Action>, MissingSecre
         Step::EnsureUser(u) => vec![ensure_user(u)],
         Step::WriteFile(f) => write_file(f),
         Step::EnableServices { services, linger_user } => vec![enable_services(services, linger_user)],
+        Step::RenameUser { from, to } => vec![rename_user(from, to)],
         Step::SetPassword { user } => {
             let pw = secrets.user_password().ok_or(MissingSecret)?;
             // `user:password\n` on stdin of chpasswd. Nothing secret in argv or env.

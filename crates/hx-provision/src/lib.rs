@@ -28,6 +28,7 @@ pub mod manifest;
 pub mod orchestrate;
 pub mod plan;
 pub mod recipe;
+pub mod user;
 
 pub use catalog::{Addon, Catalog, Desktop, Distro, Preset, RecipeId};
 pub use docker::{DockerOptions, DockerOutcome, enable_docker};
@@ -44,3 +45,4 @@ pub use orchestrate::{
 };
 pub use plan::{ImageRef, Plan, Stage, Step};
 pub use recipe::{DirSource, MemSource, RecipeSource};
+pub use user::{DEFAULT_USERNAME, Username, UsernameError};

@@ -18,7 +18,7 @@ uri = "https://ppa.launchpadcontent.net/mozillateam/ppa/ubuntu"
 suite = "{{codename}}"
 components = "main"
 pin = '''
-Package: *
+Package: firefox*
 Pin: release o=LP-PPA-mozillateam
 Pin-Priority: 1001
 '''

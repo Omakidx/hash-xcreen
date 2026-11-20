@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use hx_provision::catalog::embedded_source;
 use hx_provision::recipe::{resolve, resolve_addon_only};
 use hx_provision::{
-    Addon, Catalog, Distro, MemSource, Plan, Preset, RecipeError, RecipeId, Stage, Step,
+    Action, Addon, Catalog, Distro, MemSource, Plan, Preset, RecipeError, RecipeId, Secrets, Stage,
+    Step,
 };
 
 fn recipes_dir() -> PathBuf {
@@ -675,4 +676,295 @@ fn unknown_catalog_names_are_errors() {
     assert_eq!("developer".parse::<Preset>().unwrap(), Preset::Developer);
     assert_eq!("docker".parse::<Addon>().unwrap(), Addon::Docker);
     assert!("podman".parse::<Addon>().is_err());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review fixes: username contract, X cookie, apt keys, curl protocols, PPA pin
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn usernames_are_validated_and_reserved_names_refused() {
+    use hx_provision::{Username, UsernameError};
+    for ok in [
+        "alice",
+        "a",
+        "_svc",
+        "dev-1",
+        "user_2",
+        &"a".repeat(32),
+        "desk",
+    ] {
+        assert!(Username::new(ok).is_ok(), "{ok}");
+    }
+    for bad in [
+        "",
+        "Alice",
+        "1abc",
+        "-a",
+        "a b",
+        "a;b",
+        "a$(x)",
+        "a\nb",
+        "a/b",
+        "a.b",
+        "é",
+        &"a".repeat(33),
+        "a'b",
+        "a\"b",
+    ] {
+        assert_eq!(
+            Username::new(bad).unwrap_err(),
+            UsernameError::Invalid,
+            "{bad:?}"
+        );
+    }
+    for reserved in [
+        "root",
+        "ubuntu",
+        "debian",
+        "docker",
+        "sudo",
+        "admin",
+        "nobody",
+        "daemon",
+        "www-data",
+        "systemd-resolve",
+        "sshd",
+        "_apt",
+        "adm",
+        "users",
+    ] {
+        assert!(
+            matches!(Username::new(reserved), Err(UsernameError::Reserved(_))),
+            "{reserved}"
+        );
+    }
+    assert_eq!(Username::default_user().as_str(), "desk");
+}
+
+#[test]
+fn recipes_cannot_define_user_or_uid_vars_or_a_bad_user() {
+    for var in ["user", "uid"] {
+        let text = format!(
+            "[recipe]\nname=\"t\"\nbase_image=\"images:debian/13\"\n[vars]\n{var} = \"x\"\n"
+        );
+        let e = resolve(&MemSource::new().with("m.toml", &text), "m.toml", &[]).unwrap_err();
+        assert!(
+            matches!(e, RecipeError::Invalid { ref field, .. } if field == &format!("vars.{var}")),
+            "{e}"
+        );
+    }
+    for bad in ["a; touch /x", "root", "a b", "$(id)"] {
+        let text = format!(
+            "[recipe]\nname=\"t\"\nbase_image=\"images:debian/13\"\n[user]\nname = \"{bad}\"\nuid = 1000\n"
+        );
+        let e = resolve(&MemSource::new().with("m.toml", &text), "m.toml", &[]).unwrap_err();
+        assert!(
+            matches!(e, RecipeError::Invalid { ref field, .. } if field == "user.name"),
+            "{bad}: {e}"
+        );
+    }
+}
+
+#[test]
+fn a_chosen_username_is_used_everywhere_and_prebuilt_images_get_a_rename_step() {
+    use hx_provision::Username;
+    let c = Catalog::embedded();
+    let alice = Username::new("alice").unwrap();
+    let rid = id(Distro::Debian13, Preset::Developer);
+    let p = c.resolve_for(rid, &[Addon::Docker], Some(&alice)).unwrap();
+    assert_eq!(p.user().unwrap().name, "alice");
+    assert_eq!(p.vars["user"], "alice");
+    assert_eq!(p.vars["uid"], "1000");
+    // Post stage: rename the image's `desk` first, then ensure, password, updates, vendor installers.
+    let order: Vec<String> = p.post.iter().map(Step::describe).collect();
+    assert_eq!(order[0], "wait-network");
+    assert_eq!(order[1], "rename-user desk -> alice");
+    assert!(order[2].starts_with("ensure-user alice uid=1000"));
+    assert_eq!(order[3], "set-password alice");
+    assert!(
+        p.post
+            .iter()
+            .any(|s| matches!(s, Step::Command(c) if c.as_user.as_deref() == Some("alice")))
+    );
+    let m = p.manifest();
+    assert_eq!(m.user.as_deref(), Some("alice"));
+    // The X server unit refers to the numeric uid, so the rename leaves it valid.
+    let unit = p
+        .build
+        .iter()
+        .find_map(|s| match s {
+            Step::WriteFile(f) if f.path == "/etc/systemd/system/hx-xorg.service" => {
+                Some(f.content.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        unit.contains("-o 1000 ") && !unit.contains("alice") && !unit.contains("desk"),
+        "{unit}"
+    );
+    // Default and explicit `desk` need no rename.
+    for p in [
+        c.resolve(rid, &[]).unwrap(),
+        c.resolve_for(rid, &[], Some(&Username::default_user()))
+            .unwrap(),
+    ] {
+        assert!(!p.post.iter().any(|s| matches!(s, Step::RenameUser { .. })));
+    }
+    // The add-on plan follows the chosen user.
+    let d = c
+        .resolve_addon_for(rid, Addon::Docker, Some(&alice))
+        .unwrap();
+    assert_eq!(d.manifest().user.as_deref(), Some("alice"));
+    assert!(d.post.is_empty());
+}
+
+#[test]
+fn ensure_user_refuses_system_accounts_and_uid_mismatches_and_rename_is_idempotent() {
+    use hx_provision::lower::lower;
+    let p = Catalog::embedded()
+        .resolve(id(Distro::Ubuntu2404, Preset::Basic), &[])
+        .unwrap();
+    let ensure = p
+        .build
+        .iter()
+        .find(|s| matches!(s, Step::EnsureUser(_)))
+        .unwrap();
+    let s = script_of(&lower(ensure, &Secrets::none()).unwrap()[0]).to_string();
+    assert!(s.contains("[ \"$cur\" -lt 1000 ]") && s.contains("system account"));
+    assert!(s.contains("[ \"$cur\" != \"$want\" ]") && s.contains("want='1000'"));
+    assert!(s.contains("system group"));
+    assert!(
+        s.contains("cut -d: -f3 || true"),
+        "a missing group must not abort the script under pipefail"
+    );
+    let rename = Step::RenameUser {
+        from: "desk".into(),
+        to: "alice".into(),
+    };
+    let s = script_of(&lower(&rename, &Secrets::none()).unwrap()[0]).to_string();
+    assert!(
+        s.contains("usermod -l \"$to\" -d \"/home/$to\" -m \"$from\"") && s.contains("groupmod -n")
+    );
+    assert!(
+        s.contains("id -u \"$from\"") && s.contains("! id -u \"$to\""),
+        "idempotent guard"
+    );
+    assert!(s.contains("from='desk'") && s.contains("to='alice'"));
+}
+
+#[test]
+fn x_cookie_never_reaches_argv_and_the_file_is_created_private() {
+    let p = Catalog::embedded()
+        .resolve(id(Distro::Debian12, Preset::Basic), &[])
+        .unwrap();
+    let unit = p
+        .build
+        .iter()
+        .find_map(|s| match s {
+            Step::WriteFile(f) if f.path == "/etc/systemd/system/hx-xorg.service" => {
+                Some(f.content.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        unit.contains("install -m 0600 -o 1000 /dev/null /run/hx-xorg/Xauthority"),
+        "{unit}"
+    );
+    assert!(
+        unit.contains("echo \"add :0 . $(mcookie)\" | xauth -f /run/hx-xorg/Xauthority source -")
+    );
+    assert!(
+        !unit.contains("xauth -f /run/hx-xorg/Xauthority add"),
+        "cookie as an argument"
+    );
+    assert!(unit.contains("chmod 0600 /run/hx-xorg/Xauthority"));
+}
+
+#[test]
+fn apt_keys_are_imported_into_a_temp_keyring_and_only_the_pinned_key_is_exported() {
+    use hx_provision::lower::lower;
+    let p = Catalog::embedded()
+        .resolve(id(Distro::Ubuntu2404, Preset::Developer), &[Addon::Docker])
+        .unwrap();
+    let mut n = 0;
+    for step in &p.build {
+        if let Step::AptRepo(r) = step {
+            let s = script_of(&lower(step, &Secrets::none()).unwrap()[0]).to_string();
+            assert!(
+                s.contains("export GNUPGHOME=\"$gh\"") && s.contains("gh=$(mktemp -d)"),
+                "{s}"
+            );
+            assert!(s.contains("gpg --batch --quiet --import \"$tmp\""), "{s}");
+            assert!(
+                s.contains(&format!(
+                    "--export-options export-minimal --export '{}'",
+                    r.key_fingerprint
+                )),
+                "{s}"
+            );
+            assert!(
+                !s.contains("--dearmor") && !s.contains("cp \"$tmp\""),
+                "{s}"
+            );
+            assert!(s.contains("fingerprint mismatch"));
+            n += 1;
+        }
+    }
+    assert_eq!(n, 3, "mozillateam, vscode, docker");
+}
+
+#[test]
+fn every_curl_invocation_restricts_protocols_to_https() {
+    use hx_provision::lower::lower;
+    let mut seen = 0;
+    for rid in RecipeId::all() {
+        let p = Catalog::embedded().resolve(rid, &[Addon::Docker]).unwrap();
+        for step in p.build.iter().chain(p.post.iter()) {
+            for a in lower(step, &Secrets::none().with_user_password("x").unwrap()).unwrap() {
+                let Action::Exec(r) = a else { continue };
+                let script = r.argv.last().unwrap().replace("\\\n", " ");
+                for line in script.lines().filter(|l| l.contains("curl -")) {
+                    assert!(
+                        line.contains("--proto '=https' --proto-redir '=https'"),
+                        "{}: {line}",
+                        p.name
+                    );
+                    seen += 1;
+                }
+            }
+        }
+    }
+    assert!(seen >= 24, "{seen}");
+}
+
+#[test]
+fn the_mozilla_pin_only_covers_firefox_packages() {
+    for d in [Distro::Ubuntu2404, Distro::Ubuntu2604] {
+        let p = Catalog::embedded()
+            .resolve(id(d, Preset::Basic), &[])
+            .unwrap();
+        let repo = p
+            .build
+            .iter()
+            .find_map(|s| match s {
+                Step::AptRepo(r) if r.name == "mozillateam" => Some(r.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let pin = repo.pin.unwrap();
+        assert!(
+            pin.contains("Package: firefox*") && !pin.contains("Package: *\n"),
+            "{pin}"
+        );
+    }
+}
+
+fn script_of(a: &Action) -> &str {
+    match a {
+        Action::Exec(r) => r.argv.last().unwrap(),
+        Action::Push(_) => panic!("not an exec"),
+    }
 }

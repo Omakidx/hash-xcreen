@@ -5,7 +5,8 @@ use std::str::FromStr;
 
 use crate::error::RecipeError;
 use crate::plan::Plan;
-use crate::recipe::{DirSource, MemSource, RecipeSource, resolve, resolve_addon_only};
+use crate::recipe::{DirSource, MemSource, RecipeSource, resolve_addon_only_as, resolve_as};
+use crate::user::Username;
 
 /// Guest distro.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -217,15 +218,42 @@ impl Catalog {
         }
     }
 
-    /// Resolve a recipe with the given add-ons into a plan.
+    /// Resolve a recipe with the given add-ons into a plan, with the default user `desk`.
     pub fn resolve(&self, id: RecipeId, addons: &[Addon]) -> Result<Plan, RecipeError> {
+        self.resolve_for(id, addons, None)
+    }
+
+    /// Resolve with the desktop user the caller chose (`None`: the recipe's `desk`). Use this from
+    /// `hx-privd`; a chosen name that differs from `desk` adds a rename step to the post stage so
+    /// prebuilt images (built with `desk`) end up with the right account.
+    pub fn resolve_for(
+        &self,
+        id: RecipeId,
+        addons: &[Addon],
+        username: Option<&Username>,
+    ) -> Result<Plan, RecipeError> {
         let paths: Vec<String> = addons.iter().map(|a| a.path()).collect();
         let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-        resolve(self.source.as_ref(), &id.file_name(), &refs)
+        resolve_as(self.source.as_ref(), &id.file_name(), &refs, username)
     }
 
     /// Resolve only the steps of an add-on, for a desktop that already exists.
     pub fn resolve_addon(&self, id: RecipeId, addon: Addon) -> Result<Plan, RecipeError> {
-        resolve_addon_only(self.source.as_ref(), &id.file_name(), &addon.path())
+        self.resolve_addon_for(id, addon, None)
+    }
+
+    /// Like [`Catalog::resolve_addon`] for a desktop whose user is `username`.
+    pub fn resolve_addon_for(
+        &self,
+        id: RecipeId,
+        addon: Addon,
+        username: Option<&Username>,
+    ) -> Result<Plan, RecipeError> {
+        resolve_addon_only_as(
+            self.source.as_ref(),
+            &id.file_name(),
+            &addon.path(),
+            username,
+        )
     }
 }
