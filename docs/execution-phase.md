@@ -169,8 +169,8 @@ flowchart LR
 - [ ] Installer CI: fresh VM per host OS × both image paths
 
 ### 1F — Session streaming
-- [ ] X11 capture backend (XDamage, XShm, XFixes cursor, RandR resize)
-- [ ] Encode pipeline on dedicated threads with buffer pools; x264 settings from S2
+- [x] X11 capture backend (XDamage, XShm, XFixes cursor, RandR resize)
+- [x] Encode pipeline on dedicated threads with buffer pools; x264 settings from S2
 - [ ] Source-side congestion control, intra refresh, stale-frame cancellation, bandwidth cap
 - [ ] Input injection (XTest, scancodes), cursor channel, clipboard (text, images, files) both ways
 

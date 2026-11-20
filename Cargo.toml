@@ -10,6 +10,18 @@ license = "AGPL-3.0-or-later"
 repository = "https://github.com/Omakidx/hash-xcreen"
 publish = false
 
+# Versions shared by several members. Each crate opts in with `dep.workspace = true`.
+[workspace.dependencies]
+hx-capture = { path = "crates/hx-capture", version = "0.1.0" }
+hx-codec = { path = "crates/hx-codec", version = "0.1.0" }
+crossbeam-channel = "0.5"
+# Links the system FFmpeg (6.1 on Ubuntu 24.04) through pkg-config; 7.1 is the newest ffmpeg-next that supports it.
+ffmpeg-next = { version = "7.1", default-features = false, features = ["codec", "format"] }
+rustix = { version = "1", default-features = false, features = ["std"] }
+thiserror = "2"
+x11rb = { version = "0.13", default-features = false }
+yuvutils-rs = "0.8" # default features keep the SSE/AVX conversion paths
+
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 unused_must_use = "deny"

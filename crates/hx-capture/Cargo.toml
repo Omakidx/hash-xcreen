@@ -10,3 +10,12 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+crossbeam-channel.workspace = true
+rustix = { workspace = true, features = ["event", "fs", "mm", "time"] }
+thiserror.workspace = true
+x11rb = { workspace = true, features = ["damage", "randr", "shm", "xfixes", "xinput"] }
+
+[dev-dependencies]
+x11rb = { workspace = true, features = ["xtest"] }

@@ -32,6 +32,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain
         run: rustup toolchain install
+      - name: Install system libraries
+        # hx-codec links the system FFmpeg (6.1 on Ubuntu 24.04, what ffmpeg-next 7.1 targets)
+        # with libx264 through pkg-config; ffmpeg-sys-next generates its bindings with libclang.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev pkg-config libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libx264-dev
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
@@ -42,11 +48,21 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain
         run: rustup toolchain install
+      - name: Install system libraries and Xvfb
+        # Same FFmpeg/libx264/libclang set as the clippy job, plus a virtual X server for the
+        # capture and pipeline integration tests.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev pkg-config libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libx264-dev xvfb
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      - run: cargo nextest run --workspace --locked --no-tests=pass
+      - name: Run tests
+        env:
+          # Fail instead of silently skipping the X11 tests if Xvfb is missing.
+          HX_REQUIRE_XVFB: "1"
+        run: cargo nextest run --workspace --locked --no-tests=pass
 
   deny:
     name: Licences and advisories (cargo-deny)

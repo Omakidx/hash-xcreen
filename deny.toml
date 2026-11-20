@@ -32,6 +32,13 @@ confidence-threshold = 0.9
 # The allowlist is policy for future dependencies; do not warn about entries not yet in use.
 unused-allowed-license = "allow"
 
+# The FFmpeg bindings are WTFPL, a permissive licence compatible with AGPL distribution.
+# Allowed for these two crates only, not as a general policy.
+exceptions = [
+    { allow = ["WTFPL"], crate = "ffmpeg-next" },
+    { allow = ["WTFPL"], crate = "ffmpeg-sys-next" },
+]
+
 [licenses.private]
 # Our own crates are unpublished (publish = false).
 ignore = true

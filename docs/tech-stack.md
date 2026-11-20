@@ -38,6 +38,9 @@ Every language, library, tool and external service hash-xcreen uses, and why. It
 | Codec framework | **libavcodec** (FFmpeg) via `ffmpeg-next` / `ffmpeg-sys-next` (7.1 against Ubuntu 24.04's FFmpeg 6.1; newer FFmpeg needs a newer `ffmpeg-next`) | One API for every encoder and decoder, software and hardware |
 | Software encoder | **x264** (`ultrafast`, `zerolatency`, `crf=23`, VBV of a few frames, bitrate ladder ≤ 20 Mbps, sliced threads, intra refresh, BT.709 limited-range VUI tags) | Best low-latency software H.264 (4–8 ms encode, 11–17 ms p95 end to end on a quiet VPS in S2); GPL is fine because we are AGPL |
 | Media pipeline threads | Dedicated OS threads joined by bounded `crossbeam-channel` queues, pooled buffers | Keeps the hot path off the async runtime (S2) |
+| Linux system calls | `rustix` (safe wrappers: `poll`, `memfd`, `mmap`, clocks) | Keeps `unsafe` in our code to one read-only shared-memory mapping and one FFmpeg rate-control field |
+| Error types | `thiserror` 2 | Typed errors for libraries; no panics on display or codec failures |
+| Streaming build and test dependencies | FFmpeg dev libraries (`libavcodec`, `libavformat`, `libavutil`, `libswresample`, 6.1), `libx264`, `libclang` and `pkg-config` (bindings); **Xvfb** (integration tests, `HX_REQUIRE_XVFB=1` in CI) | `ffmpeg-sys-next` links the system FFmpeg and generates bindings with bindgen; installed by the CI clippy and test jobs |
 | Later encoders | **SVT-AV1** (real-time presets), **VAAPI**, **NVENC** | Screen-content AV1; hardware encoding when a GPU exists |
 | Audio codec | **Opus** (10 ms frames, in-band FEC) via `audiopus` | Low latency, loss-tolerant |
 | Client hardware decode | libavcodec with **VAAPI** (Linux) | Hardware decode on Intel/AMD; NVIDIA through VAAPI drivers or NVDEC later |
