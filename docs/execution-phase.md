@@ -156,7 +156,7 @@ flowchart LR
 - [ ] Self-update with signature check and rollback
 
 ### 1D — Provisioning
-- [x] Recipe format and recipes for Ubuntu 24.04 / 26.04 and Debian 12 / 13 × XFCE × basic / developer
+- [ ] Recipe format and recipes for Ubuntu 24.04 / 26.04 and Debian 12 / 13 × XFCE × basic / developer (written and resolved in tests; waiting for a real build of every recipe, at the latest in the image CI)
 - [x] Incus orchestration: pool, unprivileged container, limits, network rules (metadata endpoint and agent ports blocked)
 - [ ] Prebuilt image CI (weekly, signed) and build-on-server path from the same recipe; `--image auto` selection with reasons
 - [ ] CI equivalence check between the two paths
