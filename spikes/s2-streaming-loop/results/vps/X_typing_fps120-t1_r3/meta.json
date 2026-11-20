@@ -1,0 +1,28 @@
+{
+ "client": "lan",
+ "profile": "lan",
+ "scenario": "typing",
+ "config": "fps120-t1",
+ "extra": "",
+ "label": "A1: both containers unpinned on 4 vCPU",
+ "client_rc": 0,
+ "tag": "X_typing_fps120-t1_r3",
+ "server_args": "--fps 120 --threads 1 --sliced 0",
+ "netem": null,
+ "vps_loadavg_start": "1.94 1.85 1.68 2/366 718442",
+ "vps_loadavg_mid": "1.78 1.82 1.67 1/397 718482",
+ "vps_loadavg_end": "1.43 1.73 1.65 1/379 718553",
+ "vps_busy_all_pct": 21.6,
+ "vps_steal_pct": 0.26,
+ "vps_iowait_pct": 0.03,
+ "vps_busy_per_core_pct": [
+  22.2,
+  25.1,
+  15.4,
+  23.7
+ ],
+ "local_loadavg_start": "1.94 1.85 1.68 2/365 718442",
+ "local_loadavg_mid": "1.78 1.82 1.67 1/396 718482",
+ "local_loadavg_end": "1.43 1.73 1.65 1/378 718553",
+ "ts": "2026-11-20T14:28:38"
+}

@@ -1,0 +1,28 @@
+{
+ "client": "lan",
+ "profile": "lan",
+ "scenario": "idle",
+ "config": "base",
+ "extra": "",
+ "label": "A1: both containers unpinned on 4 vCPU",
+ "client_rc": 0,
+ "tag": "A1_idle_base_r3",
+ "server_args": "",
+ "netem": null,
+ "vps_loadavg_start": "2.40 2.01 1.67 2/381 674322",
+ "vps_loadavg_mid": "2.21 1.98 1.66 1/411 674360",
+ "vps_loadavg_end": "1.34 1.79 1.60 1/393 674419",
+ "vps_busy_all_pct": 0.9,
+ "vps_steal_pct": 0.05,
+ "vps_iowait_pct": 0.02,
+ "vps_busy_per_core_pct": [
+  0.5,
+  0.9,
+  1.1,
+  0.8
+ ],
+ "local_loadavg_start": "2.40 2.01 1.67 2/381 674323",
+ "local_loadavg_mid": "2.21 1.98 1.66 1/410 674360",
+ "local_loadavg_end": "1.34 1.79 1.60 1/392 674419",
+ "ts": "2026-11-20T14:01:38"
+}

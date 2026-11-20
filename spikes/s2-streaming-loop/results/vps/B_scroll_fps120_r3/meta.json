@@ -1,0 +1,30 @@
+{
+ "client": "local",
+ "profile": "lan",
+ "scenario": "scroll",
+ "config": "fps120",
+ "extra": "",
+ "label": "B: client on the local machine over the internet (server in s2-desktop via UDP proxy)",
+ "client_rc": 0,
+ "tag": "B_scroll_fps120_r3",
+ "server_args": "--fps 120",
+ "netem": null,
+ "vps_loadavg_start": "0.97 1.23 1.26 5/385 771813",
+ "vps_loadavg_mid": "0.98 1.22 1.26 3/400 771993",
+ "vps_loadavg_end": "0.96 1.21 1.26 3/401 772129",
+ "vps_busy_all_pct": 29.2,
+ "vps_steal_pct": 0.36,
+ "vps_iowait_pct": 0.04,
+ "vps_busy_per_core_pct": [
+  27.9,
+  26.8,
+  32.1,
+  30.0
+ ],
+ "local_loadavg_start": "6.87 5.37 4.41 6/3934 1581197",
+ "local_loadavg_mid": "8.00 5.63 4.50 7/3924 1581298",
+ "local_loadavg_end": "7.19 5.61 4.52 4/3921 1581680",
+ "ts": "2026-11-20T16:01:08",
+ "local_busy_all_pct": 18.3,
+ "local_ncpu": 16
+}

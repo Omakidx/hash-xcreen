@@ -1,0 +1,30 @@
+{
+ "client": "local",
+ "profile": "lan",
+ "scenario": "typing",
+ "config": "fps120",
+ "extra": "",
+ "label": "B: client on the local machine over the internet (server in s2-desktop via UDP proxy)",
+ "client_rc": 0,
+ "tag": "B_typing_fps120_r3",
+ "server_args": "--fps 120",
+ "netem": null,
+ "vps_loadavg_start": "0.95 1.25 1.27 1/382 769630",
+ "vps_loadavg_mid": "0.87 1.23 1.27 1/397 769809",
+ "vps_loadavg_end": "1.25 1.30 1.29 2/400 770018",
+ "vps_busy_all_pct": 22.4,
+ "vps_steal_pct": 0.71,
+ "vps_iowait_pct": 0.02,
+ "vps_busy_per_core_pct": [
+  21.9,
+  24.4,
+  21.5,
+  21.6
+ ],
+ "local_loadavg_start": "4.96 4.85 4.21 1/3967 1580314",
+ "local_loadavg_mid": "4.72 4.81 4.20 4/3968 1580406",
+ "local_loadavg_end": "6.59 5.24 4.35 6/3909 1580819",
+ "ts": "2026-11-20T16:00:23",
+ "local_busy_all_pct": 31.6,
+ "local_ncpu": 16
+}

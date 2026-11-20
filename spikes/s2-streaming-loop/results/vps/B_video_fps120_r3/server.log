@@ -1,0 +1,5 @@
+s2-server: display :10 1920x1080, x264 preset=ultrafast threads=4 sliced=true intra_refresh=true crf=23 max=20000kbps
+s2-server: listening on 0.0.0.0:4433
+s2-server: client 127.0.0.1:48339
+cancel: lag=18446744073695 q_med=1 stall=18446744073695 base=14 n=2 rtt=15 med=15307904
+s2-server: client gone

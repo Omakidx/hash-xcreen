@@ -1,0 +1,30 @@
+{
+ "client": "local",
+ "profile": "lan",
+ "scenario": "video",
+ "config": "fps120",
+ "extra": "",
+ "label": "B: client on the local machine over the internet (server in s2-desktop via UDP proxy)",
+ "client_rc": 0,
+ "tag": "B_video_fps120_r2",
+ "server_args": "--fps 120",
+ "netem": null,
+ "vps_loadavg_start": "1.47 1.26 1.27 7/391 765633",
+ "vps_loadavg_mid": "1.75 1.32 1.29 2/406 765811",
+ "vps_loadavg_end": "2.26 1.46 1.34 4/404 765931",
+ "vps_busy_all_pct": 37.6,
+ "vps_steal_pct": 0.23,
+ "vps_iowait_pct": 0.0,
+ "vps_busy_per_core_pct": [
+  38.0,
+  36.5,
+  38.3,
+  37.8
+ ],
+ "local_loadavg_start": "5.92 4.71 4.09 5/3909 1578315",
+ "local_loadavg_mid": "5.85 4.72 4.09 1/3921 1578411",
+ "local_loadavg_end": "7.24 5.05 4.22 6/3915 1578803",
+ "ts": "2026-11-20T15:58:49",
+ "local_busy_all_pct": 24.5,
+ "local_ncpu": 16
+}
