@@ -1,0 +1,19 @@
+{
+ "profile": "mobile",
+ "scenario": "scroll",
+ "config": "base",
+ "extra": "",
+ "client_rc": 0,
+ "loadavg_start": "12.28 10.28 9.39 5/4634 1123830",
+ "loadavg_mid": "11.94 10.24 9.39 3/4661 1124061",
+ "loadavg_end": "11.53 10.26 9.41 11/4638 1124605",
+ "host_busy_cores_12_15_pct": 43.9,
+ "host_busy_cores_0_3_pct": 25.0,
+ "host_busy_all_pct": 29.4,
+ "netem": "delay 40ms 30ms distribution normal loss 0.5% rate 20mbit limit 1000",
+ "server_args": "",
+ "tag": "mobile_scroll_base",
+ "attempt": 1,
+ "quiet_before": true,
+ "noisy": false
+}

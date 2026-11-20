@@ -1,0 +1,14 @@
+s2-server: display :10 1920x1080, x264 preset=ultrafast threads=4 sliced=true intra_refresh=true crf=23 max=20000kbps
+s2-server: listening on 0.0.0.0:4433
+s2-server: client 10.36.142.1:40611
+cancel: lag=159 q_med=159 stall=0 base=174 n=14 rtt=164 med=333151190
+cancel: lag=136 q_med=136 stall=0 base=197 n=5 rtt=210 med=333151190
+cancel: lag=162 q_med=162 stall=0 base=171 n=6 rtt=171 med=333151190
+cancel: lag=169 q_med=169 stall=0 base=164 n=3 rtt=160 med=333151190
+cancel: lag=173 q_med=173 stall=0 base=160 n=1 rtt=159 med=333151190
+[libx264 @ 0x7d6a60000cc0] VBV underflow (frame 0, -6064 bits)
+cancel: lag=175 q_med=175 stall=0 base=158 n=2 rtt=158 med=333151190
+[libx264 @ 0x7d6a60000cc0] VBV underflow (frame 2, -568 bits)
+cancel: lag=187 q_med=187 stall=0 base=158 n=1 rtt=157 med=345387205
+[libx264 @ 0x7d6a60000cc0] VBV underflow (frame 3, -560 bits)
+s2-server: client gone

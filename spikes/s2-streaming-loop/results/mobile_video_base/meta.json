@@ -1,0 +1,19 @@
+{
+ "profile": "mobile",
+ "scenario": "video",
+ "config": "base",
+ "extra": "",
+ "client_rc": 0,
+ "loadavg_start": "3.72 4.03 5.47 6/4253 1168090",
+ "loadavg_mid": "4.30 4.15 5.50 3/4267 1168234",
+ "loadavg_end": "5.03 4.33 5.53 2/4269 1168626",
+ "host_busy_cores_12_15_pct": 29.0,
+ "host_busy_cores_0_3_pct": 12.0,
+ "host_busy_all_pct": 15.3,
+ "netem": "delay 40ms 30ms distribution normal loss 0.5% rate 20mbit limit 1000",
+ "server_args": "",
+ "tag": "mobile_video_base",
+ "attempt": 1,
+ "quiet_before": true,
+ "noisy": false
+}

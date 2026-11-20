@@ -1,0 +1,19 @@
+{
+ "profile": "lan",
+ "scenario": "drag",
+ "config": "noir",
+ "extra": "",
+ "client_rc": 0,
+ "loadavg_start": "8.01 8.50 8.77 3/4504 1081448",
+ "loadavg_mid": "7.45 8.38 8.73 8/4517 1081572",
+ "loadavg_end": "8.63 8.58 8.79 13/4505 1082112",
+ "host_busy_cores_12_15_pct": 44.3,
+ "host_busy_cores_0_3_pct": 35.9,
+ "host_busy_all_pct": 31.2,
+ "netem": null,
+ "server_args": "--intra-refresh 0",
+ "tag": "lan_drag_noir_r2",
+ "attempt": 1,
+ "quiet_before": true,
+ "noisy": false
+}

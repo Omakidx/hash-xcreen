@@ -1,0 +1,19 @@
+{
+ "profile": "rtt50",
+ "scenario": "video",
+ "config": "base",
+ "extra": "",
+ "client_rc": 0,
+ "loadavg_start": "4.80 4.42 5.37 5/4276 1172475",
+ "loadavg_mid": "4.90 4.44 5.38 6/4274 1172600",
+ "loadavg_end": "6.23 4.83 5.47 7/4265 1173313",
+ "host_busy_cores_12_15_pct": 43.8,
+ "host_busy_cores_0_3_pct": 15.7,
+ "host_busy_all_pct": 21.1,
+ "netem": "delay 50ms rate 50mbit limit 1000",
+ "server_args": "",
+ "tag": "recovery_rtt50_video",
+ "attempt": 1,
+ "quiet_before": true,
+ "noisy": false
+}

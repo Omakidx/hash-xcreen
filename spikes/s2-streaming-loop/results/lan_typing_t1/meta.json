@@ -1,0 +1,19 @@
+{
+ "profile": "lan",
+ "scenario": "typing",
+ "config": "t1",
+ "extra": "",
+ "client_rc": 0,
+ "loadavg_start": "15.29 17.83 19.23 3/4686 981593",
+ "loadavg_mid": "14.31 17.59 19.14 3/4719 981709",
+ "loadavg_end": "11.89 16.81 18.85 7/4714 982219",
+ "host_busy_cores_12_15_pct": 45.3,
+ "host_busy_cores_0_3_pct": 28.1,
+ "host_busy_all_pct": 31.9,
+ "netem": null,
+ "server_args": "--threads 1",
+ "tag": "lan_typing_t1",
+ "attempt": 1,
+ "quiet_before": true,
+ "noisy": false
+}

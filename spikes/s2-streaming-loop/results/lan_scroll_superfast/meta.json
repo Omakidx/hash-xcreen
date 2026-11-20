@@ -1,0 +1,19 @@
+{
+ "profile": "lan",
+ "scenario": "scroll",
+ "config": "superfast",
+ "extra": "",
+ "client_rc": 0,
+ "loadavg_start": "6.00 8.33 13.00 8/4411 1019760",
+ "loadavg_mid": "6.16 8.33 12.97 9/4422 1019931",
+ "loadavg_end": "6.04 8.17 12.82 7/4405 1021130",
+ "host_busy_cores_12_15_pct": 47.0,
+ "host_busy_cores_0_3_pct": 21.8,
+ "host_busy_all_pct": 29.0,
+ "netem": null,
+ "server_args": "--preset superfast",
+ "tag": "lan_scroll_superfast",
+ "attempt": 1,
+ "quiet_before": true,
+ "noisy": false
+}

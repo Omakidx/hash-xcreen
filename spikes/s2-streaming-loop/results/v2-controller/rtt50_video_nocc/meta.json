@@ -1,0 +1,19 @@
+{
+ "profile": "rtt50",
+ "scenario": "video",
+ "config": "nocc",
+ "extra": "",
+ "client_rc": 0,
+ "loadavg_start": "9.70 8.57 8.73 10/4661 1117212",
+ "loadavg_mid": "10.21 8.69 8.77 24/4675 1117395",
+ "loadavg_end": "11.67 9.16 8.92 9/4727 1118396",
+ "host_busy_cores_12_15_pct": 63.4,
+ "host_busy_cores_0_3_pct": 42.1,
+ "host_busy_all_pct": 47.6,
+ "netem": "delay 50ms rate 50mbit limit 1000",
+ "server_args": "--cc 0",
+ "tag": "rtt50_video_nocc",
+ "attempt": 1,
+ "quiet_before": true,
+ "noisy": false
+}

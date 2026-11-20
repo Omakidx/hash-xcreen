@@ -1,0 +1,19 @@
+{
+ "profile": "lan",
+ "scenario": "scroll",
+ "config": "fps120",
+ "extra": "",
+ "client_rc": 0,
+ "loadavg_start": "12.02 8.91 8.92 4/4479 1074133",
+ "loadavg_mid": "11.93 8.94 8.93 11/4481 1074401",
+ "loadavg_end": "10.38 8.78 8.88 6/4486 1075511",
+ "host_busy_cores_12_15_pct": 51.7,
+ "host_busy_cores_0_3_pct": 28.6,
+ "host_busy_all_pct": 32.3,
+ "netem": null,
+ "server_args": "--fps 120",
+ "tag": "lan_scroll_fps120_r2",
+ "attempt": 1,
+ "quiet_before": true,
+ "noisy": false
+}

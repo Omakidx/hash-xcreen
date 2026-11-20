@@ -1,0 +1,19 @@
+{
+ "profile": "lan",
+ "scenario": "video",
+ "config": "base",
+ "extra": "",
+ "client_rc": 0,
+ "loadavg_start": "11.03 12.14 15.54 4/4311 1008240",
+ "loadavg_mid": "10.15 11.93 15.46 5/4232 1008516",
+ "loadavg_end": "9.51 11.65 15.29 19/4196 1008971",
+ "host_busy_cores_12_15_pct": 46.3,
+ "host_busy_cores_0_3_pct": 25.1,
+ "host_busy_all_pct": 35.0,
+ "netem": null,
+ "server_args": "",
+ "tag": "lan_video_base",
+ "attempt": 1,
+ "quiet_before": true,
+ "noisy": false
+}

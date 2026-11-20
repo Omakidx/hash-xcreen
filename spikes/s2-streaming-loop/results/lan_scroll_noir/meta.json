@@ -1,0 +1,19 @@
+{
+ "profile": "lan",
+ "scenario": "scroll",
+ "config": "noir",
+ "extra": "",
+ "client_rc": 0,
+ "loadavg_start": "6.00 10.01 14.35 1/4348 1012240",
+ "loadavg_mid": "5.60 9.86 14.28 5/4357 1012356",
+ "loadavg_end": "4.57 9.35 14.02 16/4250 1012790",
+ "host_busy_cores_12_15_pct": 39.5,
+ "host_busy_cores_0_3_pct": 18.2,
+ "host_busy_all_pct": 21.1,
+ "netem": null,
+ "server_args": "--intra-refresh 0",
+ "tag": "lan_scroll_noir",
+ "attempt": 1,
+ "quiet_before": true,
+ "noisy": false
+}

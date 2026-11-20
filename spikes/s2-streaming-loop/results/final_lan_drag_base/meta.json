@@ -1,0 +1,19 @@
+{
+ "profile": "lan",
+ "scenario": "drag",
+ "config": "base",
+ "extra": "",
+ "client_rc": 0,
+ "loadavg_start": "3.70 3.75 4.81 3/4243 1179322",
+ "loadavg_mid": "4.37 3.89 4.85 6/4267 1179444",
+ "loadavg_end": "3.85 3.80 4.80 2/4271 1179829",
+ "host_busy_cores_12_15_pct": 36.5,
+ "host_busy_cores_0_3_pct": 16.1,
+ "host_busy_all_pct": 19.4,
+ "netem": null,
+ "server_args": "",
+ "tag": "final_lan_drag_base",
+ "attempt": 1,
+ "quiet_before": true,
+ "noisy": false
+}

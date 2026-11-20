@@ -1,0 +1,19 @@
+{
+ "profile": "lan",
+ "scenario": "typing",
+ "config": "noir",
+ "extra": "",
+ "client_rc": 0,
+ "loadavg_start": "13.19 14.89 17.59 10/4962 991566",
+ "loadavg_mid": "13.18 14.86 17.56 7/4965 991753",
+ "loadavg_end": "13.36 14.80 17.49 11/4444 993057",
+ "host_busy_cores_12_15_pct": 39.3,
+ "host_busy_cores_0_3_pct": 31.8,
+ "host_busy_all_pct": 33.8,
+ "netem": null,
+ "server_args": "--intra-refresh 0",
+ "tag": "lan_typing_noir",
+ "attempt": 1,
+ "quiet_before": true,
+ "noisy": false
+}
