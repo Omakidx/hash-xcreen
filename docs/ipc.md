@@ -1,6 +1,6 @@
 # Internal IPC contracts
 
-Status: draft v0.1 (2026-11-20), written for review **before any implementation** (execution-phase.md, "Contracts before consumers"). Nothing in this file exists in code yet.
+Status: draft v0.2 (2026-11-20), revised after the independent security review ("approve with changes"; every required change is applied, and §22 records the decisions taken on the open questions of v0.1). Written **before any implementation** (execution-phase.md, "Contracts before consumers"). Nothing in this file exists in code yet.
 
 Two contracts between hash-xcreen's own server-side processes:
 
@@ -204,7 +204,7 @@ Rules for every secret (Linux password, PIN-related MAC inputs, Phase 2 Drive to
 
 ### 5.3 Verifier hashes and the pepper
 
-Decision (§22, Q1 and M3). gatewayd keeps **two verifiers** in the registry, both of the form `HMAC-SHA256(pepper_purpose, Argon2id(secret, salt))`:
+Decision (§22, decision 1). gatewayd keeps **two verifiers** in the registry, both of the form `HMAC-SHA256(pepper_purpose, Argon2id(secret, salt))`:
 
 - the **PIN verifier**, used on every connection (architecture §8.3);
 - the **Linux-password verifier**, set whenever the password is set through hash-xcreen (`CreateDesktop`, `SetUserPassword`, the installer in the SSH path), used for re-pairing after a lockout (architecture §8.3: "re-pairing needs the password") and for the web client's first login (Phase 3). A password changed inside the desktop with `passwd` makes the verifier stale: re-pairing by password then fails, and the user resets it with `hx-agent password reset` (Admin; it recomputes the verifier).
@@ -758,29 +758,45 @@ A **violation** (malformed frame or preamble, forbidden kind, oversize length, s
 | `input`, `mouse` | The XTest injector of 1F; not part of the pipeline |
 | clipboard, files | The clipboard and file components of 1F |
 
-## 21. Implementation notes and gaps
+## 21. Implementation notes and follow-ups
 
-Not part of the contract; for the people implementing it.
+Not part of the contract; for the people implementing it. Each follow-up names its owner.
 
-1. **Schema location.** Both IPC contracts are internal to one release, so their protobuf need not live in the public client schema. Proposal: a new workspace crate `hx-ipc` holding the framing (§4, §13), the `hx.privd.v1` and `hx.link.v1` messages and helpers, shared by `hx-gatewayd`, `hx-privd`, the CLI and `hx-session` (it must not pull in `quinn`). That adds a crate to architecture §3 and dependencies to tech-stack.md (`zeroize`, an HPKE implementation, `rustix` for `SO_PEERCRED` and `mlock`); both documents change in the branch that adds the crate.
-2. **`hx-provision` gaps** (1D): (a) a device-add call on the Incus client for the proxy device (§6.11); (b) a standalone password-change entry point built on the post stage's stdin-file mechanism (§6.9); (c) setting limits on a live instance, including the root disk size (§6.8); (d) recipe vars for `settings`: hostname, timezone, locale, keyboard (§6.5); (e) the Docker disable path (§6.9) and the host-network-only fallback; (f) teardown helpers that delete only marked objects (§6.13). Until they exist the matching commands return `UNIMPLEMENTED`, or privd uses `Client` methods directly.
-3. **Unit naming.** The recipe's `hx-session.service` currently runs `xfce4-session`. The streaming daemon needs another unit name (for example `hx-stream.service`), enabled with `systemctl --global enable`; `InstallSession` and `RestartSession` use that name.
-4. **Resumed installs.** The installer's resume (architecture §5.3) re-calls idempotent commands; the app resends the password after a gatewayd restart.
-5. **Version coupling.** gatewayd, privd, the CLI and the in-container `hx-session` ship from one release. The link tolerates a minor mismatch only; after an update gatewayd calls `InstallSession` for any desktop reporting an older major.
+1. **`hx-ipc` crate (1C).** One new internal crate holds the framing (§4, §13), the `hx.privd.v1`, `hx.gatewayd-admin.v1` and `hx.link.v1` messages and helpers. It depends on `hx-proto` for the shared `hx.v1` types (`InputEvent`, `CursorEvent`, `TransferHeader`, `ClientStats`, `VideoCodec`), and splits the privd side and the link side by Cargo feature, so that `hx-session` does not compile the privd messages (and nothing pulls in `quinn`). Architecture §3 and tech-stack.md are updated **when the crate is added in 1C** (new dependencies: `zeroize`, an HPKE implementation, `rustix` for `SO_PEERCRED`, `mlock`, `openat2`).
+2. **`hx-provision` follow-ups (1D):** (a) a device-add call on the Incus client for the proxy device (§6.11); (b) a standalone "check current password, set password" entry point on the post stage's stdin-file mechanism, shielded against cancellation (§4, §6.9); (c) an API that exposes the Incus background operation so privd can cancel it and wait (§4); (d) setting limits on a live instance including the root disk size (§6.8); (e) recipe vars for `settings` (hostname, timezone, locale, keyboard; §6.5); (f) `Catalog::embedded()`, recipes compiled into the binary (§6.5); (g) the Docker disable path and the host-network-only fallback (§6.9); (h) teardown helpers that delete only marked objects (§6.13); (i) `ExecSpec` has no user field, which matters only if `hx-session` ever becomes a user unit (§6.11). Until they exist the matching commands return `UNIMPLEMENTED`, or privd uses `Client` methods directly.
+3. **Recipes follow-up (1D):** rename the recipe unit that runs `xfce4-session` (`hx-session.service` today) to `hx-xsession.service`; add the in-container `hx-session.socket` and `hx-session.service` (system units, `User=<uid>`, §11) and the root-owned `/run/hx-session` directory. The streaming daemon owns the name `hx-session`.
+4. **`protocol.md` follow-ups (owner of 1A; for the 1C implementation round, not edited here):** a `TAKEN_OVER` close code (§18); a numeric-only `ServerStats` message for the stats overlay (§14.2); a maximum file size, default 4 GiB, enforced in both directions (§13, §16); a client "revoke that device" action available after a takeover (§18).
+5. **1B:** the verifier format for PIN and Linux password (§5.3), the admin-socket pairing-token semantics (§9) and the hook that delivers privd's recipient public key through the authenticated pairing exchange (§5.2, one-liner path only).
+6. **1E (installer):** it is the `Admin` caller for `BeginSetup`, `SetupHost`, `CreateDesktop`, `EnrolOwnerKey` and the admin-socket verifier and token commands; it performs stage 4's package installation and stage 6's port opening itself (§5.1); in the SSH path it receives the password and Drive token over SSH so gatewayd never sees them; **Gate 1 applies to the installer's own argv**, including the one-liner's `--token` (§5.2).
+7. **Resumed installs.** The installer's resume (architecture §5.3) re-calls idempotent commands; the app resends the password after a gatewayd restart.
+8. **Version coupling.** gatewayd, privd, the CLI and the in-container `hx-session` ship from one release. The link tolerates a minor mismatch only; after an update gatewayd calls `InstallSession` for any desktop reporting an older major.
 
-## 22. Open questions for review
+## 22. Decisions and deferred items
 
-Decisions the reviewer should challenge.
+### Decisions
 
-1. **Device registry in gatewayd, not privd** (§2). It keeps pre-auth data out of root and lets revocation close live sessions, but a compromised gatewayd can add its own device. The alternative (registry in privd, gatewayd asks on every connection) adds a round trip and a root-side parser for no real gain against a compromised gatewayd, which relays the desktop anyway. Is that argument convincing?
-2. **Keeping the Drive token and backup key out of gatewayd needs sealing to a privd key** (§5.2), and the client must learn privd's public key through an authenticated path. That needs a change in 1B's pairing exchange (for example the key included in the SPAKE2-confirmed transcript). Until then the architecture claim "gatewayd never sees the Drive token" (§8.6) cannot be met, because the paired channel terminates at gatewayd. It is a Phase 2 blocker; in Phase 1 the password is plain, so gatewayd sees it in transit. Accept, or require sealing of the password too?
-3. **Setup window** (§5.1): the gateway may create the host and desktop only while an Admin-opened window is open, up to 24 hours. Is a window the right control, or should the installer perform stages 4 to 8 itself as root, with the app only displaying progress? The latter removes gatewayd's setup power entirely but means the installer needs the wizard's secrets, which the architecture says arrive over the paired channel.
-4. **Takeover policy** (§18): default `allow`, last authenticated wins, the displaced client told with `Goodbye(BUSY)`. protocol.md needs a `TAKEN_OVER` close code (note for its owner; not edited here). Is `allow` the right default?
-5. **No server-to-client statistics message in protocol.md**: the stats overlay of architecture §11.1 needs one (the gateway has `SessionStats` and `transport_stats`). Note for the protocol owner.
-6. **Docker enable from the Gateway role** (§6.9): it reduces container isolation, and a compromised gatewayd could trigger it (with the acknowledgement flag) to make a later container escape easier. Mitigations are the flag, logging, a 3 per hour rate and the roll-back; the alternative is Admin-only plus a CLI step. Acceptable for v1?
-7. **File size limit** of 4 GiB (§13, §16): protocol.md sets a limit only for the clipboard (64 MiB). Needs agreement; the transfer UI and the gateway's per-link bounds assume it.
-8. **A hostile session can feed the client's video decoder** (§10): the gateway does not decode, so a crafted H.264 stream or cursor reaches libavcodec in the client. Should the gateway at least check NAL structure (Annex B framing), accepting the CPU cost? A fuzz-and-sandbox answer in the client (1G/1H) may be better.
-9. **Where the schemas live**: a new `hx-ipc` crate (§21, note 1) versus `crates/hx-proto/proto`. Affects who owns the contract and the crate dependency graph.
-10. **Proxy device semantics** (§11): the `uid`, `gid`, `mode` and `security.*` behaviour of unix-to-unix proxies on Incus 6.0 with isolated idmaps, and their throughput at the media rate, are assumed from the documentation and must be verified before implementation; the fallback is stated.
-11. **Several desktops**: with one desktop per server (v1) a single gateway-side socket suffices. Per-desktop listen paths already exist (§11), but the missing isolation between desktops on one bridge (architecture §4.2, "Known limit") is separate and unsolved.
-12. **Network access by the update fetcher and image fetcher** (§6.5, §6.12) is specified as a sandboxed child so that root never makes HTTP requests; the sandbox profile and the exact signature scheme for prebuilt images belong to 1C and 1D and are not specified here.
+Answers to the open questions of v0.1, taken after the security review.
+
+1. **The device registry stays in gatewayd** (§2). PIN and Linux-password verifiers are `HMAC(pepper, Argon2id(secret))` with the HMAC computed by privd through a rate-limited `PepperMac` command (§5.3, §6.15), so offline cracking of a stolen registry needs privd. Registry changes are recorded in privd's audit log (`RecordEvent`) and shown to all paired devices. The residual risk of a memory-resident gatewayd is stated in §1.2.
+2. **Phase 1 accepts the plain Linux password passing through gatewayd** (one-liner path). Phase 2 secrets (Drive token, backup key) use the sealed, owner-authenticated, nonce-bound form of §5.2, whose fields are reserved now.
+3. **The setup window stays for the one-liner path** (2 hours by default, extendable by Admin only; §5.1). In the SSH install path the password and Drive token go over SSH to the root installer (an `Admin` caller), which writes the verifiers through the admin socket, so gatewayd never sees them.
+4. **Takeover default is `allow`** (§18): the displaced client gets a `TAKEN_OVER` code and a "revoke that device" action; takeovers are rate limited (3 per 10 minutes) and audited. The `TAKEN_OVER` close code is a protocol.md follow-up (§21, item 4).
+5. **A numeric-only `ServerStats` message is added to protocol.md** (follow-up, §21 item 4); session text is never forwarded to a client (§19.1, rule 3).
+6. **Docker enable**: Gateway only while the setup window is open; Admin-only afterwards (`hx-agent docker enable`); `DisableDocker` stays open to Gateway (§5.1, §6.9, §7 rule 5).
+7. **File size**: default maximum 4 GiB, configurable lower, enforced in both directions; a protocol.md follow-up (§21 item 4).
+8. **Hostile video**: both layers. gatewayd checks Annex B structure and, on key frames, the SPS dimensions (§15.1); the client decodes in a sandbox with a `max_pixels` limit and is fuzzed (1G/1H).
+9. **Schemas live in a new internal `hx-ipc` crate** that depends on `hx-proto` for the shared `hx.v1` types, with the privd and link modules split by feature (§21 item 1). Architecture §3 and tech-stack.md are updated when the crate is added in 1C.
+10. **Proxy-device semantics** (`uid`, `gid`, `mode`, `security.uid`/`security.gid` under an isolated idmap; symlink and replacement test; restart and reboot; throughput) **are verified on real Incus as the first step of 1C implementation** (§11). There is no fallback to a root-identity connect: a failure reopens the design.
+11. **Single desktop in v1.** Multi-desktop isolation, the device-to-desktop mapping and per-desktop link directories are deferred.
+12. **Fetcher rules are contract-level now** (§6.12: dynamic user, no capabilities, no `AF_UNIX`, timeouts, size quotas, read-once verified copy, strict version regex, monotonic manifest timestamp, safe extraction); the sandbox details belong to 1C and 1D.
+13. **Unit naming.** The streaming daemon is `hx-session.service` (a system unit running as the desktop user, started through `hx-session.socket`, §11); the recipe unit that runs `xfce4-session` is renamed (for example `hx-xsession.service`), a 1D/recipes follow-up (§21 item 3).
+
+### Deferred
+
+- **privd-backed signing oracle** for the identity key (a rustls custom `SigningKey` that asks privd for each handshake signature), the target design that takes key impersonation out of a gatewayd compromise (§2.1).
+- **A separate, more restricted relay process** for the session link parser, if the in-process parser plus `forbid(unsafe_code)` and fuzzing proves insufficient (§19.1).
+- **Owner-key-signed Docker enable** requested from the app after setup (§5.1).
+- **Multi-desktop** isolation and per-desktop link directories (decision 11).
+- `HOST_NETWORK_ONLY` Docker mode, `UpgradeIncus`, and the Phase 2 commands, which stay named and `UNIMPLEMENTED` (§6.9, §6.13, §6.14).
+- Fetcher sandbox profiles and the signature scheme for prebuilt images (1C, 1D).
+- The pairing-exchange hook that delivers privd's recipient key without SSH (1B).
