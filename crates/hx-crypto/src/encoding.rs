@@ -36,8 +36,15 @@ fn nibble(c: u8) -> Option<u8> {
 const B32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 
 /// RFC 4648 base32, lowercase, no padding.
+#[cfg(test)]
 pub(crate) fn base32_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity((bytes.len() * 8).div_ceil(5));
+    base32_encode_into(&mut out, bytes);
+    out
+}
+
+/// Append the base32 form of `bytes` to `out` (no intermediate copy of secret material).
+pub(crate) fn base32_encode_into(out: &mut String, bytes: &[u8]) {
     let (mut acc, mut bits) = (0u32, 0u32);
     for &b in bytes {
         acc = (acc << 8) | u32::from(b);
@@ -51,7 +58,6 @@ pub(crate) fn base32_encode(bytes: &[u8]) -> String {
     if bits > 0 {
         out.push(char::from(B32[((acc << (5 - bits)) & 31) as usize]));
     }
-    out
 }
 
 /// Inverse of [`base32_encode`]. Case-insensitive; `None` for any other character, for a

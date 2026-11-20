@@ -7,7 +7,7 @@ use std::fmt;
 use zeroize::Zeroizing;
 
 use crate::{
-    encoding::{CROCKFORD, base32_decode, base32_encode, crockford_value},
+    encoding::{CROCKFORD, base32_decode, base32_encode_into, crockford_value},
     error::{Error, Result},
     keys::random_bytes,
 };
@@ -47,7 +47,10 @@ impl PairingToken {
         let mut raw = Zeroizing::new([0u8; TOKEN_ID_LEN + TOKEN_SECRET_LEN]);
         raw[..TOKEN_ID_LEN].copy_from_slice(&self.id);
         raw[TOKEN_ID_LEN..].copy_from_slice(&*self.secret);
-        Zeroizing::new(format!("{TOKEN_PREFIX}{}", base32_encode(&*raw)))
+        let mut s = Zeroizing::new(String::with_capacity(TOKEN_PREFIX.len() + 64));
+        s.push_str(TOKEN_PREFIX);
+        base32_encode_into(&mut s, &*raw);
+        s
     }
 
     /// Parse the written form.
