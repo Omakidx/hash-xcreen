@@ -74,9 +74,12 @@ and several attempts. In S3, `apt-get update` hung for over nine minutes twice.
 
 ### Secrets
 
-Recipes contain no secrets, and the validator rejects nothing that could hold one by design: the
-only secret in the system, the desktop user's Linux password, never appears in a recipe. It is
-supplied by the caller at run time. Vendor installers in `post_step` must not need credentials.
+Recipes contain no secrets. The only secret in provisioning, the desktop user's Linux password,
+is supplied by the caller at run time and reaches the container only as the stdin of `chpasswd`
+(never argv, environment, logs or error messages). Recipe commands must not need credentials;
+the vendor installers in `post_step` do not.
+
+An escaped `\{{` produces a literal `{{` (for example in a Go template inside a script).
 
 ## Adding a recipe
 

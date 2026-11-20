@@ -1,0 +1,118 @@
+{
+  "recipe": "debian-13-xfce-developer",
+  "packages": [
+    "adwaita-icon-theme",
+    "build-essential",
+    "ca-certificates",
+    "code",
+    "containerd.io",
+    "curl",
+    "dbus-user-session",
+    "dbus-x11",
+    "docker-buildx-plugin",
+    "docker-ce",
+    "docker-ce-cli",
+    "docker-compose-plugin",
+    "firefox-esr",
+    "fonts-dejavu-core",
+    "git",
+    "gnupg",
+    "jq",
+    "less",
+    "libpam-systemd",
+    "locales",
+    "mousepad",
+    "openssh-client",
+    "pipewire",
+    "pipewire-bin",
+    "pipewire-pulse",
+    "pkg-config",
+    "pulseaudio-utils",
+    "python3",
+    "sudo",
+    "thunar",
+    "unzip",
+    "wireplumber",
+    "x11-utils",
+    "x11-xserver-utils",
+    "xauth",
+    "xdg-utils",
+    "xfce4-notifyd",
+    "xfce4-panel",
+    "xfce4-session",
+    "xfce4-settings",
+    "xfce4-terminal",
+    "xfconf",
+    "xfdesktop4",
+    "xfwm4",
+    "xserver-xorg-core",
+    "xserver-xorg-video-dummy"
+  ],
+  "apt_repos": [
+    {
+      "name": "docker",
+      "fingerprint": "9DC858229FC7DD38854AE2D88D81803C0EBFCD88",
+      "uri": "https://download.docker.com/linux/debian",
+      "suite": "trixie"
+    },
+    {
+      "name": "vscode",
+      "fingerprint": "BC528686B50D79E339D3721CEB3E94ADBE1229CF",
+      "uri": "https://packages.microsoft.com/repos/code",
+      "suite": "stable"
+    }
+  ],
+  "files": [
+    {
+      "path": "/etc/hx/xorg-dummy.conf",
+      "mode": "0644",
+      "owner": "root:root",
+      "sha256": "2c4b8728bcb56ee0e5912d9b5abdfa1adad51a881454ac38436890fb918ff6ae"
+    },
+    {
+      "path": "/etc/pipewire/pipewire.conf.d/10-hx-null-sink.conf",
+      "mode": "0644",
+      "owner": "root:root",
+      "sha256": "52ad58b48e93d328a25ee4c93b8da6e31d2b21d61adf7f83f806d94d3607c93f"
+    },
+    {
+      "path": "/etc/systemd/system/hx-xorg.service",
+      "mode": "0644",
+      "owner": "root:root",
+      "sha256": "270bbd4ee8dae241040c0dc7fa05ee658d8d72de9e87c8fa6a8996ee8d18f9e3"
+    },
+    {
+      "path": "/etc/systemd/user/hx-session.service",
+      "mode": "0644",
+      "owner": "root:root",
+      "sha256": "135b8be531e2a9aad302ce1c783ac5280866dec13c5239964ed229c5f5e0be01"
+    }
+  ],
+  "system_services": [
+    "containerd.service",
+    "docker.service",
+    "hx-xorg.service"
+  ],
+  "user_services": [
+    "hx-session.service",
+    "pipewire-pulse.socket",
+    "pipewire.socket",
+    "wireplumber.service"
+  ],
+  "user": "desk",
+  "user_groups": [
+    "audio",
+    "docker",
+    "sudo",
+    "video"
+  ],
+  "incus_config": {
+    "security.nesting": "true",
+    "security.syscalls.intercept.mknod": "true",
+    "security.syscalls.intercept.setxattr": "true"
+  },
+  "post_commands": [
+    "claude-code",
+    "codex-cli"
+  ]
+}

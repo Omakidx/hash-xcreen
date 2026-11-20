@@ -1,0 +1,32 @@
+recipe debian-13-xfce-developer
+base_image images:debian/13
+var codename=trixie
+var desktop=xfce
+var distro=debian
+var distro_version=13
+var preset=developer
+var user=desk
+incus_config security.nesting=true
+incus_config security.syscalls.intercept.mknod=true
+incus_config security.syscalls.intercept.setxattr=true
+[build]
+01 wait-network
+02 apt-bootstrap
+03 apt-repo vscode fingerprint=BC528686B50D79E339D3721CEB3E94ADBE1229CF
+04 apt-repo docker fingerprint=9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+05 command vscode-debconf
+06 apt-install sudo curl ca-certificates gnupg xdg-utils locales xserver-xorg-core xserver-xorg-video-dummy xauth x11-xserver-utils x11-utils dbus-x11 dbus-user-session libpam-systemd xfce4-session xfwm4 xfdesktop4 xfce4-panel xfce4-settings xfconf xfce4-terminal xfce4-notifyd thunar mousepad adwaita-icon-theme fonts-dejavu-core pipewire pipewire-pulse wireplumber pipewire-bin pulseaudio-utils firefox-esr code git build-essential pkg-config unzip jq python3 less openssh-client docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+07 ensure-user desk uid=1000 groups=sudo,audio,video,docker
+08 write-file /etc/hx/xorg-dummy.conf mode=0644 owner=root:root sha256=2c4b8728bcb56ee0e5912d9b5abdfa1adad51a881454ac38436890fb918ff6ae
+09 write-file /etc/systemd/system/hx-xorg.service mode=0644 owner=root:root sha256=270bbd4ee8dae241040c0dc7fa05ee658d8d72de9e87c8fa6a8996ee8d18f9e3
+10 write-file /etc/systemd/user/hx-session.service mode=0644 owner=root:root sha256=135b8be531e2a9aad302ce1c783ac5280866dec13c5239964ed229c5f5e0be01
+11 write-file /etc/pipewire/pipewire.conf.d/10-hx-null-sink.conf mode=0644 owner=root:root sha256=52ad58b48e93d328a25ee4c93b8da6e31d2b21d61adf7f83f806d94d3607c93f
+12 enable-services system=[hx-xorg.service,docker.service,containerd.service] user-global=[hx-session.service,pipewire.socket,pipewire-pulse.socket,wireplumber.service] linger=desk
+13 command apt-cleanup
+[post]
+01 wait-network
+02 ensure-user desk uid=1000 groups=sudo,audio,video,docker
+03 set-password desk
+04 security-updates
+05 command claude-code as=desk optional
+06 command codex-cli as=desk optional
