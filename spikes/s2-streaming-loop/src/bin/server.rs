@@ -45,6 +45,8 @@ struct Cfg {
     dump_every: u64,
     /// Tag the stream as BT.709 limited range in the H.264 VUI.
     vui: bool,
+    /// VBV buffer size in frames of the current rate (1.0 = one frame, the spike default).
+    vbv_frames: f64,
 }
 
 #[derive(Default)]
@@ -301,7 +303,7 @@ fn open_encoder(cfg: &Cfg, kbps: u32, fps: u32, w: u32, h: u32) -> Result<ffmpeg
     enc.set_frame_rate(Some((fps as i32, 1)));
     enc.set_max_b_frames(0);
     enc.set_flags(ffmpeg::codec::Flags::LOW_DELAY);
-    let bufsize = (kbps / fps).max(1); // one-frame VBV, kbit
+    let bufsize = ((kbps as f64 / fps as f64) * cfg.vbv_frames).max(1.0) as u32; // kbit; one frame by default
     let mut params = format!(
         "crf={}:vbv-maxrate={}:vbv-bufsize={}:keyint={}:bframes=0:rc-lookahead=0:sync-lookahead=0:repeat-headers=1:annexb=1:aud=0:threads={}:sliced-threads={}:intra-refresh={}",
         cfg.crf,
@@ -756,6 +758,7 @@ fn main() -> Result<()> {
         dump_dir: a.get_str("dump", ""),
         dump_every: a.get("dump-every", 40),
         vui: a.get::<u32>("vui", 0) == 1,
+        vbv_frames: a.get("vbv-frames", 1.0),
     };
     let dump_every = if cfg.dump_dir.is_empty() { 0 } else { cfg.dump_every };
     ffmpeg::init()?;

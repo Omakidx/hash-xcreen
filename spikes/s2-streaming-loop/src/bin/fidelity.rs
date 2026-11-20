@@ -326,10 +326,10 @@ fn main() -> Result<()> {
     }
 
     if !crop_dir.is_empty() {
-        // median-PSNR frame, busiest region of its source
+        // median-PSNR frame (or the worst with --crop-pick worst), busiest region of its source
         let mut order: Vec<usize> = (0..res.len()).collect();
         order.sort_by(|&i, &j| res[i].psnr_rgb.partial_cmp(&res[j].psnr_rgb).unwrap());
-        let mi = order[order.len() / 2];
+        let mi = if a.get_str("crop-pick", "median") == "worst" { order[0] } else { order[order.len() / 2] };
         let (n, srgb, drgb) = &rgbs[mi];
         let (rx, ry) = if a.get::<i64>("crop-x", -1) >= 0 { (a.get("crop-x", 0usize), a.get("crop-y", 0usize)) } else { busiest_region(srgb, w, h, cw_, ch_) };
         fs::create_dir_all(&crop_dir)?;
