@@ -25,7 +25,8 @@ Every language, library, tool and external service hash-xcreen uses, and why. It
 | Process management | **systemd** units with sandboxing, `systemd-creds` for secrets | Hardening and TPM-sealed secrets without extra software |
 | Firewall | ufw or nftables, whichever the host uses | Avoid fighting the host's existing setup |
 | Async runtime | **tokio** (networking only) | Standard for quinn and HTTP; kept out of the media hot path |
-| Incus API client | Incus REST API over its unix socket (`hyper` + `serde`) | No CLI scraping; typed requests from `hx-privd` |
+| Incus API client | Incus REST API over its unix socket (`hyper` 1.x with `hyper-util`, `http-body-util` and `bytes`; `serde` + `serde_json`; `tokio` for the socket and timeouts) | No CLI scraping; typed requests from `hx-privd` |
+| Recipe engine | `toml` 0.8 + `serde` (unknown keys rejected), `sha2` (file hashes in the equivalence manifest), `thiserror` (typed errors) | Pure, deterministic parsing and resolution in `hx-provision` |
 
 ## Streaming
 
@@ -52,8 +53,9 @@ Every language, library, tool and external service hash-xcreen uses, and why. It
 | Browser transport | **WebTransport** over HTTP/3 via `wtransport` running on our own quinn endpoint, dispatched by ALPN (`h3` / `hx/1`); `h3` + `h3-webtransport` as the fallback library | Same QUIC and the same port for both clients (proven in S5) |
 | Fallback | WebSocket over TLS (`tokio-tungstenite`) on the same port number over TCP | Networks that block UDP, and Safari until it is tested |
 | TLS | `rustls` | Pure Rust, no OpenSSL; supports pinned raw keys |
-| Control messages | **Protocol Buffers** via `prost` | Schema evolution, language-neutral for future mobile clients |
+| Control messages | **Protocol Buffers** via `prost`; schema compiled in `build.rs` with the pure-Rust `protox` + `prost-build` (no `protoc` binary needed on CI or developer machines, no generated code to keep in sync) | Schema evolution, language-neutral for future mobile clients |
 | Media framing | Fixed little-endian binary header | No parsing cost on the hot path |
+| Protocol and transport support crates | `bytes` (zero-copy buffers), `thiserror` (typed errors), `tracing` (diagnostics, no payloads or secrets), `futures-util` (WebSocket sink/stream split), `tokio-rustls` (TLS under the WebSocket fallback), `proptest` (round-trip and totality tests) | Small, widely used crates behind `hx-proto` and `hx-transport` |
 | Web certificates | Let's Encrypt via ACME (`instant-acme` 0.8 with `ring`, default features off so `aws-lc-rs` stays out); short-lived IP-address certificates when there is no domain, renewed by ACME Renewal Information; `rcgen` for keys and CSRs, `x509-parser` for the renewal ID; fallback: self-signed ECDSA P-256 certificate from `rcgen`, pinned with `serverCertificateHashes` | Real HTTPS for the browser without a domain (issued and renewed in production in S5) |
 
 ## Security

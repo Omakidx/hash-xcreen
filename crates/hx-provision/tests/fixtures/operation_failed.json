@@ -1,0 +1,1 @@
+{"type":"sync","status":"Success","status_code":200,"operation":"","error_code":0,"error":"","metadata":{"id":"6b2d0c1e-0a5e-4f0e-9a52-0f0b7d3e3b11","class":"task","description":"Creating instance","status":"Failure","status_code":400,"resources":{},"metadata":null,"may_cancel":false,"err":"Failed instance creation: Image not found","location":"none"}}

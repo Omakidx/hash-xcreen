@@ -1,0 +1,14 @@
+# Debian 13 (trixie). Firefox ESR is a normal deb here.
+# The Incus compatibility rule (raw.apparmor "signal,") that Debian 13 guests need on newer
+# host kernels is not part of the recipe: it is instance configuration and lives in the hx
+# Incus profile (hx-provision's `profiles` module), because prebuilt images carry no instance config.
+[recipe]
+base_image = "images:debian/13"
+
+[vars]
+distro = "debian"
+codename = "trixie"
+distro_version = "13"
+
+[apt]
+packages = ["firefox-esr"]

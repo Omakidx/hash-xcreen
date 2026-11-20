@@ -1,0 +1,26 @@
+recipe ubuntu-24.04-xfce-basic
+base_image images:ubuntu/24.04
+var codename=noble
+var desktop=xfce
+var distro=ubuntu
+var distro_version=24.04
+var preset=basic
+var uid=1000
+var user=desk
+[build]
+01 wait-network
+02 apt-bootstrap
+03 apt-repo mozillateam fingerprint=0AB215679C571D1C8325275B9BDB3D89CE49EC21
+04 apt-install sudo curl ca-certificates gnupg xdg-utils locales xserver-xorg-core xserver-xorg-video-dummy xauth x11-xserver-utils x11-utils dbus-x11 dbus-user-session libpam-systemd xfce4-session xfwm4 xfdesktop4 xfce4-panel xfce4-settings xfconf xfce4-terminal xfce4-notifyd thunar mousepad adwaita-icon-theme fonts-dejavu-core pipewire pipewire-pulse wireplumber pipewire-bin pulseaudio-utils firefox
+05 ensure-user desk uid=1000 groups=sudo,audio,video
+06 write-file /etc/hx/xorg-dummy.conf mode=0644 owner=root:root sha256=2c4b8728bcb56ee0e5912d9b5abdfa1adad51a881454ac38436890fb918ff6ae
+07 write-file /etc/systemd/system/hx-xorg.service mode=0644 owner=root:root sha256=0caac8be5bb8177bafdf5cdd717441d5b2ea264fc46416ff801f27dc5aebfd39
+08 write-file /etc/systemd/user/hx-session.service mode=0644 owner=root:root sha256=135b8be531e2a9aad302ce1c783ac5280866dec13c5239964ed229c5f5e0be01
+09 write-file /etc/pipewire/pipewire.conf.d/10-hx-null-sink.conf mode=0644 owner=root:root sha256=52ad58b48e93d328a25ee4c93b8da6e31d2b21d61adf7f83f806d94d3607c93f
+10 enable-services system=[hx-xorg.service] user-global=[hx-session.service,pipewire.socket,pipewire-pulse.socket,wireplumber.service] linger=desk
+11 command apt-cleanup
+[post]
+01 wait-network
+02 ensure-user desk uid=1000 groups=sudo,audio,video
+03 set-password desk
+04 security-updates
