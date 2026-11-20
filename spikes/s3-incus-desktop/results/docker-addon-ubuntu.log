@@ -1,0 +1,12 @@
+STAGE incus-config 2.5s ok
+STAGE wait-network 2.3s ok
+STAGE apt-bootstrap 9.7s ok
+STAGE apt-repos 0.9s ok
+STAGE pre-steps 0.0s ok
+STAGE apt-install 26.4s ok
+STAGE user 0.3s ok
+STAGE files 0.5s ok
+STAGE services 2.7s ok
+  step 'apt-cleanup'
+STAGE steps 0.2s ok
+TOTAL apply 45.5s

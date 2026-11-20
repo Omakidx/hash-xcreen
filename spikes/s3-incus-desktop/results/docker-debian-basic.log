@@ -1,0 +1,128 @@
+## incus config
+true
+true
+true
+## docker version + storage driver
+client=29.10.0 server=29.10.0
+driver=overlayfs backing=driver-type=io.containerd.snapshotter.v1  cgroup=systemd/2 rootless=[name=apparmor,profile=default name=seccomp,profile=builtin name=cgroupns]
+## hello-world
+Unable to find image 'hello-world:latest' locally
+latest: Pulling from library/hello-world
+4f55086f7dd0: Pulling fs layer
+4f55086f7dd0: Download complete
+d5e71e642bf5: Download complete
+4f55086f7dd0: Pull complete
+Digest: sha256:1e4c05b897a751332ce85c7e9449da2d93514ea2dea6dbb0e2753c9e949b2bfa
+Status: Downloaded newer image for hello-world:latest
+docker: Error response from daemon: failed to create task for container: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: error during container init: open sysctl net.ipv4.ip_unprivileged_port_start file: reopen fd 8: permission denied
+
+Run 'docker run --help' for more information
+  -> rc=0 6.108495538s
+## compose app with a named volume
+ Container compose-test-init-1 Creating 
+ Container compose-test-init-1 Created 
+ Container compose-test-web-1 Creating 
+ Container compose-test-web-1 Created 
+ Container compose-test-init-1 Starting 
+ Container compose-test-init-1 Error response from daemon: failed to create task for container: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: error during container init: open sysctl net.ipv4.ip_unprivileged_port_start file: reopen fd 8: permission denied 
+ Container compose-test-web-1 not started: condition "service_completed_successfully" of service "init" not reached: interrupted by the failure of Container compose-test-init-1 
+Error response from daemon: failed to create task for container: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: error during container init: open sysctl net.ipv4.ip_unprivileged_port_start file: reopen fd 8: permission denied
+  -> rc=0 11.932372833s
+curl: 
+ Container compose-test-init-1 Removing 
+ Container compose-test-init-1 Removed 
+ Network compose-test_default Removing 
+ Network compose-test_default Removed 
+  -> rc=0 1.270234185s
+ Container compose-test-init-1 Error response from daemon: failed to create task for container: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: error during container init: open sysctl net.ipv4.ip_unprivileged_port_start file: reopen fd 8: permission denied 
+ Container compose-test-web-1 not started: condition "service_completed_successfully" of service "init" not reached: interrupted by the failure of Container compose-test-init-1 
+Error response from daemon: failed to create task for container: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: error during container init: open sysctl net.ipv4.ip_unprivileged_port_start file: reopen fd 8: permission denied
+  -> rc=0 2.343204176s
+curl after down/up (volume persisted?): 
+ Volume compose-test_data Removed 
+ Network compose-test_default Removed 
+## same compose app with network_mode: host (workaround when bridge networking fails)
+ Container compose-test-init-1 Waiting 
+ Container compose-test-init-1 Exited 
+ Container compose-test-web-1 Starting 
+ Container compose-test-web-1 Started 
+curl (host mode): <!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+html { color-scheme: light dark; }
+body { width: 35em; margin: 0 auto;
+font-family: Tahoma, Verdana, Arial, sans-serif; }
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, nginx is successfully installed and working.
+Further configuration is required for the web server, reverse proxy, 
+API gateway, load balancer, content cache, or other features.</p>
+
+<p>For online documentation and support please refer to
+<a href="https://nginx.org/">nginx.org</a>.<br/>
+To engage with the community please visit
+<a href="https://community.nginx.org/">community.nginx.org</a>.<br/>
+For enterprise grade support, professional services, additional 
+security features and capabilities please refer to
+<a href="https://f5.com/nginx">f5.com/nginx</a>.</p>
+
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>
+ Container compose-test-init-1 Removing 
+ Container compose-test-init-1 Removed 
+ Container compose-test-web-1 Started 
+curl after down/up (volume persisted?): <!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+html { color-scheme: light dark; }
+body { width: 35em; margin: 0 auto;
+font-family: Tahoma, Verdana, Arial, sans-serif; }
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, nginx is successfully installed and working.
+Further configuration is required for the web server, reverse proxy, 
+API gateway, load balancer, content cache, or other features.</p>
+
+<p>For online documentation and support please refer to
+<a href="https://nginx.org/">nginx.org</a>.<br/>
+To engage with the community please visit
+<a href="https://community.nginx.org/">community.nginx.org</a>.<br/>
+For enterprise grade support, professional services, additional 
+security features and capabilities please refer to
+<a href="https://f5.com/nginx">f5.com/nginx</a>.</p>
+
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>
+ Volume compose-test_data Removed 
+## hello-world with --network host
+
+Hello from Docker!
+## mknod / setxattr under Docker (intercepted syscalls)
+mknod: /tmp/n: Operation not permitted
+## image pull of a layer with xattrs/device nodes (debian:stable-slim)
+Unable to find image 'debian:stable-slim' locally
+stable-slim: Pulling from library/debian
+2ec981fa50fa: Pulling fs layer
+2ec981fa50fa: Download complete
+ecc0336becaf: Download complete
+2ec981fa50fa: Pull complete
+Digest: sha256:fbfb4059d2127120aa05b6e6064523d2102552f0cf0026ddf0701c12f1f8f3e0
+Status: Downloaded newer image for debian:stable-slim
+crw-rw-rw- 1 nobody nogroup 1, 3 Nov 19 17:45 /dev/null
+debian-ok
+  -> rc=0 6.459216659s
+## errors in dockerd journal
+-- No entries --
+## filesystem of /var/lib/docker
+/dev/loop11    btrfs   60G   12G   47G  21% /
+ Storage Driver: overlayfs

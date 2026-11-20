@@ -1,0 +1,41 @@
+container=s3-deb-dev
+loadavg_host 11.55 8.99 8.86
+Failed to connect to system scope bus via local transport: No such file or directory
+desktop_up=yes
+W: Failed to fetch http://deb.debian.org/debian/dists/trixie/InRelease  Unable to connect to deb.debian.org:http:
+W: Failed to fetch http://deb.debian.org/debian/dists/trixie-updates/InRelease  Unable to connect to deb.debian.org:http:
+W: Failed to fetch http://deb.debian.org/debian-security/dists/trixie-security/InRelease  Unable to connect to deb.debian.org:http:
+W: Some index files failed to download. They have been ignored, or old ones used instead.
+settling 90s
+version number:    11.0
+  dimensions:    1920x1080 pixels (509x286 millimeters)
+bash: line 1: scrot: command not found
+Error: Command not found
+screenshot=FAILED
+cpu_avg_cores=.0003
+mem_limit_mib=8192
+mem_current_mib=189
+mem_anon_mib=157
+mem_file_cache_mib=13
+mem_shmem_mib=8
+mem_kernel_mib=17
+free_strict_mib=8002
+free_reclaimable_mib=8008
+--- free -m (lxcfs view)
+               total        used        free      shared  buff/cache   available
+Mem:            8192         175        8002           8          13        8016
+Swap:              0           0           0
+--- top RSS
+  RSS COMMAND
+111344 Xorg
+110232 xfwm4
+77664 xfce4-session
+49092 xfdesktop
+31980 xfce4-panel
+26788 wrapper-2.0
+23480 wrapper-2.0
+22792 xfsettingsd
+22320 Thunar
+19164 xfce4-notifyd
+18260 systemd-journal
+--- procs: 33

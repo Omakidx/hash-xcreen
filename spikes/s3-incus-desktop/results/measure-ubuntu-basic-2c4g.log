@@ -1,0 +1,34 @@
+container=s3-ub-basic
+loadavg_host 37.27 33.05 22.28
+Failed to connect to bus: No such file or directory
+desktop_up=yes
+settling 90s
+version number:    11.0
+  dimensions:    1920x1080 pixels (508x285 millimeters)
+cpu_avg_cores=.0006
+mem_limit_mib=4096
+mem_current_mib=384
+mem_anon_mib=153
+mem_file_cache_mib=209
+mem_shmem_mib=0
+mem_kernel_mib=22
+free_strict_mib=3711
+free_reclaimable_mib=3919
+--- free -m (lxcfs view)
+               total        used        free      shared  buff/cache   available
+Mem:            4096         175        3710           0         209        3920
+Swap:              0           0           0
+--- top RSS
+  RSS COMMAND
+108972 Xorg
+81032 xfce4-session
+40388 xfdesktop
+32624 xfce4-panel
+29980 xfwm4
+27404 panel-10-notifi
+26960 panel-14-action
+26332 xfsettingsd
+24952 panel-6-systray
+24412 Thunar
+24388 xfce4-notifyd
+--- procs: 35

@@ -1,0 +1,42 @@
+container=s3-deb-dev
+loadavg_host 6.71 7.52 8.56
+Failed to connect to system scope bus via local transport: No such file or directory
+desktop_up=yes
+W: Failed to fetch http://deb.debian.org/debian/dists/trixie/InRelease  Unable to connect to deb.debian.org:http:
+W: Failed to fetch http://deb.debian.org/debian/dists/trixie-updates/InRelease  Unable to connect to deb.debian.org:http:
+W: Failed to fetch http://deb.debian.org/debian-security/dists/trixie-security/InRelease  Unable to connect to deb.debian.org:http:
+W: Failed to fetch https://packages.microsoft.com/repos/code/dists/stable/InRelease  Unable to connect to packages.microsoft.com:https:
+W: Some index files failed to download. They have been ignored, or old ones used instead.
+settling 90s
+version number:    11.0
+  dimensions:    1920x1080 pixels (509x286 millimeters)
+bash: line 1: scrot: command not found
+Error: Command not found
+screenshot=FAILED
+cpu_avg_cores=.0004
+mem_limit_mib=4096
+mem_current_mib=165
+mem_anon_mib=134
+mem_file_cache_mib=12
+mem_shmem_mib=8
+mem_kernel_mib=17
+free_strict_mib=3930
+free_reclaimable_mib=3935
+--- free -m (lxcfs view)
+               total        used        free      shared  buff/cache   available
+Mem:            4096         152        3930           8          12        3943
+Swap:              0           0           0
+--- top RSS
+  RSS COMMAND
+104760 Xorg
+77716 xfce4-session
+49104 xfdesktop
+32452 xfce4-panel
+29316 xfwm4
+26780 wrapper-2.0
+23572 wrapper-2.0
+23064 xfsettingsd
+22396 Thunar
+19180 xfce4-notifyd
+17608 systemd-journal
+--- procs: 33
