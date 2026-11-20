@@ -1,0 +1,12 @@
+host[s3-debian-13-developer-max-before-start] used_mib=1079 available_mib=6856 loadavg=0.07 0.29 0.55 incusd_rss_mib=102 steal=0
+host[s3-debian-13-developer-max-after-settle] used_mib=1107 available_mib=6828 loadavg=0.04 0.22 0.50 incusd_rss_mib=110 steal=0
+host-cgroup memory.current of s3-debian-13-developer: 22 MiB (limit 6400MiB)
+               total        used        free      shared  buff/cache   available
+Mem:            7936        1110        1980           4        5322        6825
+Swap:              0           0           0
+host[s3-debian-13-developer-max-before-start] used_mib=901 available_mib=7034 loadavg=0.24 0.89 0.74 incusd_rss_mib=99 steal=0
+host[s3-debian-13-developer-max-after-settle] used_mib=1105 available_mib=6830 loadavg=0.06 0.56 0.64 incusd_rss_mib=119 steal=0
+host-cgroup memory.current of s3-debian-13-developer: 286 MiB (limit 6400MiB)
+               total        used        free      shared  buff/cache   available
+Mem:            7936        1107         262          12        6883        6828
+Swap:              0           0           0

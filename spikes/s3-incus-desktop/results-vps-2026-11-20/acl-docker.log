@@ -1,0 +1,11 @@
+docker container -> metadata [reach expected]: reach
+docker container -> gateway 10.77.3.1:9443 [reach expected]: reach
+docker container -> host public 85.190.123.74:9443 [reach expected]: reach
+docker container -> internet (example.com) [reach expected]: reach
+WITH ACL: docker container -> metadata [blocked expected]: blocked
+WITH ACL: docker container -> gateway 10.77.3.1:9443 [blocked expected]: blocked
+WITH ACL: docker container -> host public 85.190.123.74:9443 [blocked expected]: blocked
+WITH ACL: docker container -> internet (example.com) [reach expected]: reach
+WITH ACL: docker pull ok
+Network ACL s3-isolate-docker deleted
+acl-docker-test.sh: line 33: kill: (615070) - No such process

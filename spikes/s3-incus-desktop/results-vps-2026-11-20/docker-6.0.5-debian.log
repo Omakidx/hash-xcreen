@@ -1,0 +1,77 @@
+## incus config
+true
+true
+true
+## docker version + storage driver
+client=29.10.0 server=29.10.0
+driver=overlayfs backing=driver-type=io.containerd.snapshotter.v1  cgroup=systemd/2 rootless=[name=apparmor,profile=default name=seccomp,profile=builtin name=cgroupns]
+## hello-world
+Unable to find image 'hello-world:latest' locally
+latest: Pulling from library/hello-world
+4f55086f7dd0: Pulling fs layer
+4f55086f7dd0: Download complete
+4f55086f7dd0: Pull complete
+d5e71e642bf5: Download complete
+Digest: sha256:1e4c05b897a751332ce85c7e9449da2d93514ea2dea6dbb0e2753c9e949b2bfa
+Status: Downloaded newer image for hello-world:latest
+
+Hello from Docker!
+This message shows that your installation appears to be working correctly.
+
+  -> rc=0 2.622700833s
+## compose app with a named volume
+ Container compose-test-web-1 Creating 
+ Container compose-test-web-1 Created 
+ Container compose-test-init-1 Starting 
+ Container compose-test-init-1 Started 
+ Container compose-test-init-1 Waiting 
+ Container compose-test-init-1 Exited 
+ Container compose-test-web-1 Starting 
+ Container compose-test-web-1 Started 
+  -> rc=0 4.763676927s
+stamp after first up: 257473.82 1001702.58
+ Container compose-test-init-1 Removing 
+ Container compose-test-init-1 Removed 
+ Network compose-test_default Removing 
+ Network compose-test_default Removed 
+  -> rc=0 .614396191s
+ Container compose-test-init-1 Exited 
+ Container compose-test-web-1 Starting 
+ Container compose-test-web-1 Started 
+  -> rc=0 1.267236950s
+stamp after down/up (volume persisted if identical): 257473.82 1001702.58
+ Volume compose-test_data Removed 
+ Network compose-test_default Removed 
+## same compose app with network_mode: host (workaround when bridge networking fails)
+ Container compose-test-init-1 Waiting 
+ Container compose-test-init-1 Exited 
+ Container compose-test-web-1 Starting 
+ Container compose-test-web-1 Started 
+stamp (host mode): 257483.70 1001736.75
+ Container compose-test-init-1 Removing 
+ Container compose-test-init-1 Removed 
+ Container compose-test-web-1 Started 
+stamp after down/up (host mode): 257483.70 1001736.75
+ Volume compose-test_data Removed 
+## hello-world with --network host
+
+Hello from Docker!
+## mknod / setxattr under Docker (intercepted syscalls)
+mknod: /tmp/n: Operation not permitted
+## image pull of a layer with xattrs/device nodes (debian:stable-slim)
+Unable to find image 'debian:stable-slim' locally
+stable-slim: Pulling from library/debian
+2ec981fa50fa: Pulling fs layer
+2ec981fa50fa: Download complete
+ecc0336becaf: Download complete
+2ec981fa50fa: Pull complete
+Digest: sha256:fbfb4059d2127120aa05b6e6064523d2102552f0cf0026ddf0701c12f1f8f3e0
+Status: Downloaded newer image for debian:stable-slim
+crw-rw-rw- 1 nobody nogroup 1, 3 Nov 17 13:32 /dev/null
+debian-ok
+  -> rc=0 3.470100714s
+## errors in dockerd journal
+-- No entries --
+## filesystem of /var/lib/docker
+/dev/loop0     btrfs  103G   10G   92G  10% /
+ Storage Driver: overlayfs

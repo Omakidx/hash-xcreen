@@ -1,0 +1,21 @@
+loadavg_start 0.08 0.49 0.72
+publish_s=143.9
+image_compression=default (server default: )
+export_s=1.9
+export_file s3-img-s3-ubuntu-24-04-developer.tar.gz 1049488938 bytes
+image_bytes=1049488938 image_mib=1000
+download_estimate_100mbps_s=83.9  (ESTIMATE, size / line rate, no protocol overhead)
+download_estimate_1000mbps_s=8.3  (ESTIMATE, size / line rate, no protocol overhead)
+import_s=2.3
+launch_s=20.6
+STAGE wait-network 1.1s ok
+STAGE user 0.1s ok
+STAGE password 0.1s ok
+STAGE security-updates 4.8s ok
+STAGE post-steps 0.0s ok
+TOTAL post 6.1s
+post_steps_s=6.1
+PREBUILT_LOCAL_TOTAL_s=29.1  (import+launch+post, excludes download)
+loadavg_end 2.34 1.11 0.92
+total 1024896
+-rw-r--r-- 1 root root 1049488938 Nov 20 12:15 s3-img-s3-ubuntu-24-04-developer.tar.gz

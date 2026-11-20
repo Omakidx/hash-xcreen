@@ -1,0 +1,12 @@
+host[s3-debian-13-basic-max-before-start] used_mib=894 available_mib=7041 loadavg=0.19 0.61 0.75 incusd_rss_mib=105 steal=0
+host[s3-debian-13-basic-max-after-settle] used_mib=915 available_mib=7020 loadavg=0.18 0.48 0.69 incusd_rss_mib=110 steal=0
+host-cgroup memory.current of s3-debian-13-basic: 22 MiB (limit 6400MiB)
+               total        used        free      shared  buff/cache   available
+Mem:            7936         916        2596           4        4732        7019
+Swap:              0           0           0
+host[s3-debian-13-basic-max-before-start] used_mib=1027 available_mib=6908 loadavg=0.11 0.50 0.49 incusd_rss_mib=98 steal=0
+host[s3-debian-13-basic-max-after-settle] used_mib=1241 available_mib=6694 loadavg=0.17 0.35 0.43 incusd_rss_mib=117 steal=0
+host-cgroup memory.current of s3-debian-13-basic: 283 MiB (limit 6400MiB)
+               total        used        free      shared  buff/cache   available
+Mem:            7936        1241         807          12        6372        6694
+Swap:              0           0           0

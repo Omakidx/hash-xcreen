@@ -1,0 +1,6 @@
+host[s3-ubuntu-24-04-developer-2c4g-before-start] used_mib=871 available_mib=7064 loadavg=1.54 1.30 0.99 incusd_rss_mib=98 steal=0
+host[s3-ubuntu-24-04-developer-2c4g-after-settle] used_mib=1025 available_mib=6910 loadavg=0.22 0.83 0.87 incusd_rss_mib=104 steal=0
+host-cgroup memory.current of s3-ubuntu-24-04-developer: 640 MiB (limit 4GiB)
+               total        used        free      shared  buff/cache   available
+Mem:            7936        1026         370           4        6849        6909
+Swap:              0           0           0

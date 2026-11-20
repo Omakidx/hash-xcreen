@@ -1,0 +1,207 @@
+
+######## ubuntu-24.04 / basic (s3-ubuntu-24-04-basic)
+loadavg_start 1.85 1.64 0.87
+LAUNCH base=images:ubuntu/24.04 .520738546s (includes image download if not cached)
+STAGE wait-network 1.1s ok
+STAGE apt-bootstrap 8.2s ok
+STAGE apt-repos 0.2s ok
+STAGE pre-steps 0.0s ok
+STAGE apt-install 194.8s ok
+STAGE user 0.4s ok
+STAGE files 0.4s ok
+STAGE services 0.4s ok
+STAGE steps 0.1s ok
+TOTAL apply 205.7s
+TOTAL_BUILD_INCL_LAUNCH 206.214295511s
+loadavg_end 0.70 1.40 0.95
+host[s3-ubuntu-24-04-basic-2c4g-before-start] used_mib=833 available_mib=7102 loadavg=0.50 1.31 0.93 incusd_rss_mib=90 steal=0
+desktop_up=yes
+cpu_avg_cores=.0002
+mem_limit_mib=4096
+mem_current_mib=628
+mem_anon_mib=153
+mem_file_cache_mib=454
+mem_shmem_mib=0
+mem_kernel_mib=20
+free_strict_mib=3467
+free_reclaimable_mib=3921
+--- free -m (lxcfs view)
+--- top RSS
+108976 Xorg
+--- procs: 37
+host[s3-ubuntu-24-04-basic-2c4g-after-settle] used_mib=1003 available_mib=6932 loadavg=0.27 0.90 0.84 incusd_rss_mib=103 steal=0
+host-cgroup memory.current of s3-ubuntu-24-04-basic: 628 MiB (limit 4GiB)
+               total        used        free      shared  buff/cache   available
+Mem:            7936        1004        1449           4        5792        6931
+Swap:              0           0           0
+host[s3-ubuntu-24-04-basic-max-before-start] used_mib=813 available_mib=7122 loadavg=0.26 0.86 0.83 incusd_rss_mib=86 steal=0
+desktop_up=yes
+cpu_avg_cores=.0002
+mem_limit_mib=6400
+mem_current_mib=321
+mem_anon_mib=172
+mem_file_cache_mib=130
+mem_shmem_mib=0
+mem_kernel_mib=17
+free_strict_mib=6078
+free_reclaimable_mib=6209
+--- free -m (lxcfs view)
+--- top RSS
+115096 Xorg
+--- procs: 37
+host[s3-ubuntu-24-04-basic-max-after-settle] used_mib=1046 available_mib=6889 loadavg=0.11 0.56 0.72 incusd_rss_mib=104 steal=0
+host-cgroup memory.current of s3-ubuntu-24-04-basic: 320 MiB (limit 6400MiB)
+               total        used        free      shared  buff/cache   available
+Mem:            7936        1040        1396           4        5809        6895
+Swap:              0           0           0
+loadavg_start 0.08 0.52 0.70
+publish_s=70.8
+export_s=.9
+export_file s3-img-s3-ubuntu-24-04-basic.tar.gz 545931151 bytes
+image_bytes=545931151 image_mib=520
+download_estimate_100mbps_s=43.6  (ESTIMATE, size / line rate, no protocol overhead)
+download_estimate_1000mbps_s=4.3  (ESTIMATE, size / line rate, no protocol overhead)
+import_s=1.0
+launch_s=12.1
+TOTAL post 6.1s
+post_steps_s=6.1
+PREBUILT_LOCAL_TOTAL_s=19.3  (import+launch+post, excludes download)
+loadavg_end 1.79 0.91 0.82
+
+######## ubuntu-24.04 / developer (s3-ubuntu-24-04-developer)
+loadavg_start 1.28 0.85 0.80
+LAUNCH base=images:ubuntu/24.04 .679960015s (includes image download if not cached)
+STAGE wait-network 1.1s ok
+STAGE apt-bootstrap 7.1s ok
+STAGE apt-repos 0.4s ok
+STAGE pre-steps 4.0s ok
+Selecting previously unselected package liberror-perl.
+Preparing to unpack .../163-liberror-perl_0.17029-2_all.deb ...
+Unpacking liberror-perl (0.17029-2) ...
+Setting up liberror-perl (0.17029-2) ...
+STAGE apt-install 177.0s ok
+STAGE user 0.3s ok
+STAGE files 0.4s ok
+STAGE services 0.4s ok
+STAGE steps 0.1s ok
+TOTAL apply 190.9s
+TOTAL_BUILD_INCL_LAUNCH 191.544323357s
+loadavg_end 2.15 1.39 1.01
+host[s3-ubuntu-24-04-developer-2c4g-before-start] used_mib=871 available_mib=7064 loadavg=1.54 1.30 0.99 incusd_rss_mib=98 steal=0
+desktop_up=yes
+cpu_avg_cores=.0002
+mem_limit_mib=4096
+mem_current_mib=641
+mem_anon_mib=153
+mem_file_cache_mib=466
+mem_shmem_mib=0
+mem_kernel_mib=21
+free_strict_mib=3454
+free_reclaimable_mib=3920
+--- free -m (lxcfs view)
+--- top RSS
+108908 Xorg
+--- procs: 37
+host[s3-ubuntu-24-04-developer-2c4g-after-settle] used_mib=1025 available_mib=6910 loadavg=0.22 0.83 0.87 incusd_rss_mib=104 steal=0
+host-cgroup memory.current of s3-ubuntu-24-04-developer: 640 MiB (limit 4GiB)
+               total        used        free      shared  buff/cache   available
+Mem:            7936        1026         370           4        6849        6909
+Swap:              0           0           0
+host[s3-ubuntu-24-04-developer-max-before-start] used_mib=860 available_mib=7075 loadavg=0.15 0.78 0.85 incusd_rss_mib=87 steal=0
+desktop_up=yes
+cpu_avg_cores=.0002
+mem_limit_mib=6400
+mem_current_mib=322
+mem_anon_mib=172
+mem_file_cache_mib=131
+mem_shmem_mib=0
+mem_kernel_mib=17
+free_strict_mib=6077
+free_reclaimable_mib=6209
+--- free -m (lxcfs view)
+--- top RSS
+115248 Xorg
+--- procs: 37
+host[s3-ubuntu-24-04-developer-max-after-settle] used_mib=1057 available_mib=6879 loadavg=0.11 0.52 0.74 incusd_rss_mib=108 steal=0
+host-cgroup memory.current of s3-ubuntu-24-04-developer: 321 MiB (limit 6400MiB)
+               total        used        free      shared  buff/cache   available
+Mem:            7936        1058         320           4        6867        6877
+Swap:              0           0           0
+loadavg_start 0.08 0.49 0.72
+publish_s=143.9
+export_s=1.9
+export_file s3-img-s3-ubuntu-24-04-developer.tar.gz 1049488938 bytes
+image_bytes=1049488938 image_mib=1000
+download_estimate_100mbps_s=83.9  (ESTIMATE, size / line rate, no protocol overhead)
+download_estimate_1000mbps_s=8.3  (ESTIMATE, size / line rate, no protocol overhead)
+import_s=2.3
+launch_s=20.6
+TOTAL post 6.1s
+post_steps_s=6.1
+PREBUILT_LOCAL_TOTAL_s=29.1  (import+launch+post, excludes download)
+loadavg_end 2.34 1.11 0.92
+
+######## debian-13 / basic (s3-debian-13-basic)
+loadavg_start 1.60 1.04 0.90
+LAUNCH base=images:debian/13 4.914785367s (includes image download if not cached)
+STAGE wait-network 60.3s FAILED
+error: exit status exit status: 1
+host[s3-debian-13-basic-2c4g-before-start] used_mib=884 available_mib=7051 loadavg=0.55 0.84 0.84 incusd_rss_mib=103 steal=0
+desktop_up=NO
+host[s3-debian-13-basic-2c4g-after-settle] used_mib=923 available_mib=7012 loadavg=0.29 0.66 0.77 incusd_rss_mib=122 steal=0
+host-cgroup memory.current of s3-debian-13-basic: 22 MiB (limit 4GiB)
+               total        used        free      shared  buff/cache   available
+Mem:            7936         922        2596           4        4727        7013
+Swap:              0           0           0
+host[s3-debian-13-basic-max-before-start] used_mib=894 available_mib=7041 loadavg=0.19 0.61 0.75 incusd_rss_mib=105 steal=0
+desktop_up=NO
+host[s3-debian-13-basic-max-after-settle] used_mib=915 available_mib=7020 loadavg=0.18 0.48 0.69 incusd_rss_mib=110 steal=0
+host-cgroup memory.current of s3-debian-13-basic: 22 MiB (limit 6400MiB)
+               total        used        free      shared  buff/cache   available
+Mem:            7936         916        2596           4        4732        7019
+Swap:              0           0           0
+loadavg_start 0.29 0.49 0.69
+publish_s=18.7
+export_s=.1
+export_file s3-img-s3-debian-13-basic.tar.gz 139830139 bytes
+image_bytes=139830139 image_mib=133
+download_estimate_100mbps_s=11.1  (ESTIMATE, size / line rate, no protocol overhead)
+download_estimate_1000mbps_s=1.1  (ESTIMATE, size / line rate, no protocol overhead)
+import_s=.2
+launch_s=3.6
+post_steps_s=60.3
+PREBUILT_LOCAL_TOTAL_s=64.2  (import+launch+post, excludes download)
+loadavg_end 0.31 0.47 0.66
+
+######## debian-13 / developer (s3-debian-13-developer)
+loadavg_start 0.43 0.49 0.66
+LAUNCH base=images:debian/13 .488566555s (includes image download if not cached)
+STAGE wait-network 60.5s FAILED
+error: exit status exit status: 1
+host[s3-debian-13-developer-2c4g-before-start] used_mib=1078 available_mib=6857 loadavg=0.11 0.37 0.61 incusd_rss_mib=101 steal=0
+desktop_up=NO
+host[s3-debian-13-developer-2c4g-after-settle] used_mib=1111 available_mib=6824 loadavg=0.10 0.31 0.56 incusd_rss_mib=119 steal=0
+host-cgroup memory.current of s3-debian-13-developer: 24 MiB (limit 4GiB)
+               total        used        free      shared  buff/cache   available
+Mem:            7936        1112        1979           4        5321        6823
+Swap:              0           0           0
+host[s3-debian-13-developer-max-before-start] used_mib=1079 available_mib=6856 loadavg=0.07 0.29 0.55 incusd_rss_mib=102 steal=0
+desktop_up=NO
+host[s3-debian-13-developer-max-after-settle] used_mib=1107 available_mib=6828 loadavg=0.04 0.22 0.50 incusd_rss_mib=110 steal=0
+host-cgroup memory.current of s3-debian-13-developer: 22 MiB (limit 6400MiB)
+               total        used        free      shared  buff/cache   available
+Mem:            7936        1110        1980           4        5322        6825
+Swap:              0           0           0
+loadavg_start 0.02 0.20 0.48
+publish_s=19.4
+export_s=.2
+export_file s3-img-s3-debian-13-developer.tar.gz 139830150 bytes
+image_bytes=139830150 image_mib=133
+download_estimate_100mbps_s=11.1  (ESTIMATE, size / line rate, no protocol overhead)
+download_estimate_1000mbps_s=1.1  (ESTIMATE, size / line rate, no protocol overhead)
+import_s=.2
+launch_s=4.0
+post_steps_s=60.3
+PREBUILT_LOCAL_TOTAL_s=64.6  (import+launch+post, excludes download)
+loadavg_end 0.27 0.28 0.49
+MATRIX_DONE

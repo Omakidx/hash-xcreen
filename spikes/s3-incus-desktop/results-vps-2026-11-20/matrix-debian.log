@@ -1,0 +1,151 @@
+
+######## debian-13 / basic (s3-debian-13-basic)
+loadavg_start 0.14 0.20 0.34
+LAUNCH base=images:debian/13 .449907657s (includes image download if not cached)
+STAGE wait-network 1.1s ok
+Selecting previously unselected package libgpg-error0:amd64.
+Preparing to unpack .../01-libgpg-error0_1.51-4_amd64.deb ...
+Unpacking libgpg-error0:amd64 (1.51-4) ...
+Setting up libgpg-error0:amd64 (1.51-4) ...
+STAGE apt-bootstrap 5.4s ok
+STAGE apt-repos 0.0s ok
+STAGE pre-steps 0.0s ok
+STAGE apt-install 77.7s ok
+STAGE user 0.4s ok
+STAGE files 0.5s ok
+STAGE services 0.5s ok
+STAGE steps 0.1s ok
+TOTAL apply 85.7s
+TOTAL_BUILD_INCL_LAUNCH 86.185253242s
+loadavg_end 1.99 0.84 0.56
+host[s3-debian-13-basic-2c4g-before-start] used_mib=1046 available_mib=6889 loadavg=1.43 0.78 0.55 incusd_rss_mib=112 steal=0
+desktop_up=yes
+cpu_avg_cores=.0003
+mem_limit_mib=4096
+mem_current_mib=483
+mem_anon_mib=147
+mem_file_cache_mib=315
+mem_shmem_mib=8
+mem_kernel_mib=20
+free_strict_mib=3612
+free_reclaimable_mib=3920
+--- free -m (lxcfs view)
+--- top RSS
+113072 Xorg
+--- procs: 33
+host[s3-debian-13-basic-2c4g-after-settle] used_mib=1214 available_mib=6721 loadavg=0.17 0.55 0.50 incusd_rss_mib=114 steal=0
+host-cgroup memory.current of s3-debian-13-basic: 482 MiB (limit 4GiB)
+               total        used        free      shared  buff/cache   available
+Mem:            7936        1215         834          12        6372        6720
+Swap:              0           0           0
+host[s3-debian-13-basic-max-before-start] used_mib=1027 available_mib=6908 loadavg=0.11 0.50 0.49 incusd_rss_mib=98 steal=0
+desktop_up=yes
+cpu_avg_cores=.0002
+mem_limit_mib=6400
+mem_current_mib=284
+mem_anon_mib=165
+mem_file_cache_mib=100
+mem_shmem_mib=8
+mem_kernel_mib=17
+free_strict_mib=6115
+free_reclaimable_mib=6208
+--- free -m (lxcfs view)
+--- top RSS
+119408 Xorg
+--- procs: 33
+host[s3-debian-13-basic-max-after-settle] used_mib=1241 available_mib=6694 loadavg=0.17 0.35 0.43 incusd_rss_mib=117 steal=0
+host-cgroup memory.current of s3-debian-13-basic: 283 MiB (limit 6400MiB)
+               total        used        free      shared  buff/cache   available
+Mem:            7936        1241         807          12        6372        6694
+Swap:              0           0           0
+loadavg_start 0.11 0.32 0.41
+publish_s=70.9
+export_s=.9
+export_file s3-img-s3-debian-13-basic.tar.gz 558562636 bytes
+image_bytes=558562636 image_mib=532
+download_estimate_100mbps_s=44.6  (ESTIMATE, size / line rate, no protocol overhead)
+download_estimate_1000mbps_s=4.4  (ESTIMATE, size / line rate, no protocol overhead)
+import_s=.8
+launch_s=11.3
+TOTAL post 3.8s
+post_steps_s=3.8
+PREBUILT_LOCAL_TOTAL_s=16.0  (import+launch+post, excludes download)
+loadavg_end 1.62 0.72 0.55
+
+######## debian-13 / developer (s3-debian-13-developer)
+loadavg_start 1.12 0.68 0.54
+LAUNCH base=images:debian/13 1.964405621s (includes image download if not cached)
+STAGE wait-network 1.1s ok
+Selecting previously unselected package libgpg-error0:amd64.
+Preparing to unpack .../01-libgpg-error0_1.51-4_amd64.deb ...
+Unpacking libgpg-error0:amd64 (1.51-4) ...
+Setting up libgpg-error0:amd64 (1.51-4) ...
+STAGE apt-bootstrap 5.5s ok
+STAGE apt-repos 0.1s ok
+STAGE pre-steps 2.2s ok
+Selecting previously unselected package liberror-perl.
+Preparing to unpack .../166-liberror-perl_0.17030-1_all.deb ...
+Unpacking liberror-perl (0.17030-1) ...
+Setting up liberror-perl (0.17030-1) ...
+STAGE apt-install 127.6s ok
+STAGE user 0.3s ok
+STAGE files 0.4s ok
+STAGE services 0.3s ok
+STAGE steps 0.1s ok
+TOTAL apply 137.5s
+TOTAL_BUILD_INCL_LAUNCH 139.506982330s
+loadavg_end 2.95 1.45 0.84
+host[s3-debian-13-developer-2c4g-before-start] used_mib=898 available_mib=7037 loadavg=2.11 1.35 0.82 incusd_rss_mib=105 steal=0
+desktop_up=yes
+cpu_avg_cores=.0002
+mem_limit_mib=4096
+mem_current_mib=480
+mem_anon_mib=139
+mem_file_cache_mib=321
+mem_shmem_mib=8
+mem_kernel_mib=20
+free_strict_mib=3615
+free_reclaimable_mib=3928
+--- free -m (lxcfs view)
+--- top RSS
+104820 Xorg
+--- procs: 33
+host[s3-debian-13-developer-2c4g-after-settle] used_mib=1070 available_mib=6865 loadavg=0.33 0.95 0.76 incusd_rss_mib=117 steal=0
+host-cgroup memory.current of s3-debian-13-developer: 480 MiB (limit 4GiB)
+               total        used        free      shared  buff/cache   available
+Mem:            7936        1071         306          12        6876        6864
+Swap:              0           0           0
+host[s3-debian-13-developer-max-before-start] used_mib=901 available_mib=7034 loadavg=0.24 0.89 0.74 incusd_rss_mib=99 steal=0
+desktop_up=yes
+cpu_avg_cores=.0002
+mem_limit_mib=6400
+mem_current_mib=287
+mem_anon_mib=165
+mem_file_cache_mib=104
+mem_shmem_mib=8
+mem_kernel_mib=16
+free_strict_mib=6112
+free_reclaimable_mib=6209
+--- free -m (lxcfs view)
+--- top RSS
+119316 Xorg
+--- procs: 33
+host[s3-debian-13-developer-max-after-settle] used_mib=1105 available_mib=6830 loadavg=0.06 0.56 0.64 incusd_rss_mib=119 steal=0
+host-cgroup memory.current of s3-debian-13-developer: 286 MiB (limit 6400MiB)
+               total        used        free      shared  buff/cache   available
+Mem:            7936        1107         262          12        6883        6828
+Swap:              0           0           0
+loadavg_start 0.25 0.56 0.64
+publish_s=155.1
+export_s=2.0
+export_file s3-img-s3-debian-13-developer.tar.gz 1088082483 bytes
+image_bytes=1088082483 image_mib=1037
+download_estimate_100mbps_s=87.0  (ESTIMATE, size / line rate, no protocol overhead)
+download_estimate_1000mbps_s=8.7  (ESTIMATE, size / line rate, no protocol overhead)
+import_s=2.4
+launch_s=21.4
+TOTAL post 3.5s
+post_steps_s=3.5
+PREBUILT_LOCAL_TOTAL_s=27.5  (import+launch+post, excludes download)
+loadavg_end 1.72 1.00 0.79
+MATRIX_DONE

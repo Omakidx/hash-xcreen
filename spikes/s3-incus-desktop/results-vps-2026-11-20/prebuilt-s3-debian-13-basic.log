@@ -1,0 +1,21 @@
+loadavg_start 0.11 0.32 0.41
+publish_s=70.9
+image_compression=default (server default: )
+export_s=.9
+export_file s3-img-s3-debian-13-basic.tar.gz 558562636 bytes
+image_bytes=558562636 image_mib=532
+download_estimate_100mbps_s=44.6  (ESTIMATE, size / line rate, no protocol overhead)
+download_estimate_1000mbps_s=4.4  (ESTIMATE, size / line rate, no protocol overhead)
+import_s=.8
+launch_s=11.3
+STAGE wait-network 1.1s ok
+STAGE user 0.1s ok
+STAGE password 0.1s ok
+STAGE security-updates 2.5s ok
+STAGE post-steps 0.0s ok
+TOTAL post 3.8s
+post_steps_s=3.8
+PREBUILT_LOCAL_TOTAL_s=16.0  (import+launch+post, excludes download)
+loadavg_end 1.62 0.72 0.55
+total 545476
+-rw-r--r-- 1 root root 558562636 Nov 20 12:47 s3-img-s3-debian-13-basic.tar.gz
