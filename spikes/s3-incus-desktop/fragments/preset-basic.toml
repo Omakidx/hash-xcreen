@@ -1,0 +1,4 @@
+# Preset "basic": XFCE (from xfce-desktop.toml), browser (per distro fragment),
+# file manager (thunar) and text editor (mousepad) are already covered. Nothing more to add.
+[vars]
+preset = "basic"

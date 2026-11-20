@@ -1,0 +1,17 @@
+# Spike-only crate. The empty [workspace] table keeps it out of the root workspace.
+[workspace]
+
+[package]
+name = "hx-recipe-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "AGPL-3.0-or-later"
+
+[[bin]]
+name = "hx-recipe"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

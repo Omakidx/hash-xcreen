@@ -1,0 +1,9 @@
+# Recipe: debian-13 x xfce x developer. Order matters only for array concatenation and scalar overrides.
+include = [
+  "../fragments/xfce-desktop.toml",
+  "../fragments/distro-debian-13.toml",
+  "../fragments/preset-developer.toml",
+]
+
+[recipe]
+name = "debian-13-xfce-developer"

@@ -1,0 +1,24 @@
+# Docker add-on (opt-in). Needs {{distro}} and {{codename}} from the distro fragment.
+# Incus-side keys are applied with `incus config set` and the container is restarted.
+
+[incus_config]
+"security.nesting" = "true"
+"security.syscalls.intercept.mknod" = "true"
+"security.syscalls.intercept.setxattr" = "true"
+
+[[apt_repo]]
+name = "docker"
+key_url = "https://download.docker.com/linux/{{distro}}/gpg"
+key_fingerprint = "9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
+uri = "https://download.docker.com/linux/{{distro}}"
+suite = "{{codename}}"
+components = "stable"
+
+[apt]
+packages = ["docker-ce", "docker-ce-cli", "containerd.io", "docker-buildx-plugin", "docker-compose-plugin"]
+
+[user]
+groups = ["docker"]
+
+[services]
+system_enable = ["docker.service", "containerd.service"]
