@@ -43,12 +43,18 @@ impl Drop for Secret {
     }
 }
 
+/// Longest accepted password, in bytes.
+pub const MAX_PASSWORD_BYTES: usize = 1024;
+
 /// Why a password was refused.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SecretError {
     /// Empty.
     #[error("the password is empty")]
     Empty,
+    /// Longer than [`MAX_PASSWORD_BYTES`].
+    #[error("the password is longer than 1024 bytes")]
+    TooLong,
     /// Contains a newline, carriage return or NUL, which `chpasswd` input cannot represent.
     #[error("the password contains a newline or NUL byte")]
     BadCharacter,
@@ -70,6 +76,9 @@ impl Secrets {
     pub fn with_user_password(mut self, password: &str) -> Result<Self, SecretError> {
         if password.is_empty() {
             return Err(SecretError::Empty);
+        }
+        if password.len() > MAX_PASSWORD_BYTES {
+            return Err(SecretError::TooLong);
         }
         if password.contains(['\n', '\r', '\0']) {
             return Err(SecretError::BadCharacter);

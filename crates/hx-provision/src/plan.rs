@@ -193,6 +193,39 @@ impl Step {
     }
 }
 
+/// The only instance configuration keys a recipe or add-on may set (the Docker add-on's).
+pub const ALLOWED_INSTANCE_CONFIG: [&str; 3] = [
+    "security.nesting",
+    "security.syscalls.intercept.mknod",
+    "security.syscalls.intercept.setxattr",
+];
+
+/// Check recipe-supplied instance configuration against the exact allowlist
+/// [`ALLOWED_INSTANCE_CONFIG`], with `"true"`/`"false"` values. Returns the offending key and why.
+/// Used by recipe validation, `DesktopSpec::to_create` and `enable_docker`, so no path can pass
+/// `raw.lxc`, `raw.idmap`, `linux.kernel_modules`, `security.privileged`, or other intercepts such
+/// as `security.syscalls.intercept.bpf*`.
+pub fn check_instance_config(cfg: &BTreeMap<String, String>) -> Result<(), (String, String)> {
+    for (k, v) in cfg {
+        if k == "security.privileged" {
+            return Err((
+                k.clone(),
+                "desktops are always unprivileged; this key is not allowed".into(),
+            ));
+        }
+        if !ALLOWED_INSTANCE_CONFIG.contains(&k.as_str()) {
+            return Err((
+                k.clone(),
+                "only `security.nesting`, `security.syscalls.intercept.mknod` and `security.syscalls.intercept.setxattr` may be set from a recipe".into(),
+            ));
+        }
+        if v != "true" && v != "false" {
+            return Err((k.clone(), "must be \"true\" or \"false\"".into()));
+        }
+    }
+    Ok(())
+}
+
 /// Which half of the plan to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]

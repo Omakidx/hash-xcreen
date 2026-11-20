@@ -45,7 +45,7 @@ values themselves are not expanded.
 |---|---|
 | `[recipe]` | `name` (required), `base_image` (required, `images:debian/13`-style alias on the Incus image server, or `local:<alias>`). |
 | `[vars]` | String variables, see above. |
-| `[incus_config]` | Instance configuration applied to the container, not content inside it. Only `security.nesting` and `security.syscalls.intercept.*` are allowed; `security.privileged` is always rejected (desktops are unprivileged). Used by the Docker add-on. |
+| `[incus_config]` | Instance configuration applied to the container, not content inside it. Only `security.nesting`, `security.syscalls.intercept.mknod` and `security.syscalls.intercept.setxattr` are allowed (values `true`/`false`); everything else, `security.privileged`, `raw.*` and the other intercepts included, is rejected. Used by the Docker add-on. |
 | `[[apt_repo]]` | `name`, `key_url`, `key_fingerprint` (40 hex characters), `uri`, `suite`, `components`, optional `pin` (apt preferences body). The downloaded key must contain exactly the pinned primary key fingerprint or the step fails. Written as a deb822 `.sources` file with `Signed-By`. |
 | `[apt]` | `packages`: installed with `--no-install-recommends`; duplicates are removed, first occurrence wins. |
 | `[user]` | `name`, `uid`, `shell`, `groups`, `linger`. The desktop user is created locked (no password); the password is set in the post stage from a secret handed over at run time. An add-on may add `groups` only. |

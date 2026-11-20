@@ -348,9 +348,10 @@ fn desktop_spec_builds_an_unprivileged_container_with_limits() {
         cpu: Some(2),
         memory_mib: Some(4096),
         disk_gib: Some(40),
+        processes: Some(4096),
     };
     let spec = DesktopSpec::for_plan("hx1d-test-c1", naming.clone(), &plan, limits);
-    let body = spec.to_create();
+    let body = spec.to_create().unwrap();
     assert_eq!(
         body.profiles,
         ["hx1d-test-desktop", "hx1d-test-compat-debian13"]
@@ -374,7 +375,9 @@ fn desktop_spec_builds_an_unprivileged_container_with_limits() {
 
     // No limits: nothing set, no root override; Ubuntu gets no compat profile.
     let ub = c.resolve(id(Distro::Ubuntu2404), &[]).unwrap();
-    let b = DesktopSpec::for_plan("c", naming.clone(), &ub, Limits::default()).to_create();
+    let b = DesktopSpec::for_plan("c", naming.clone(), &ub, Limits::default())
+        .to_create()
+        .unwrap();
     assert_eq!(b.profiles, ["hx1d-test-desktop"]);
     assert!(b.devices.is_empty() && !b.config.contains_key("limits.cpu"));
 
@@ -383,7 +386,7 @@ fn desktop_spec_builds_an_unprivileged_container_with_limits() {
     sneaky
         .extra_config
         .insert("security.privileged".into(), "true".into());
-    assert_eq!(sneaky.to_create().config["security.privileged"], "false");
+    assert!(sneaky.to_create().is_err());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -858,6 +861,7 @@ async fn build_on_server_runs_create_start_ready_build_post_in_order() {
             cpu: Some(1),
             memory_mib: Some(1024),
             disk_gib: None,
+            processes: None,
         },
     );
     let mut steps = Vec::new();
@@ -1126,10 +1130,15 @@ async fn docker_selftest_failure_is_a_structured_result_not_an_error() {
         hint,
         output_tail,
         fallbacks,
+        isolation_restored,
     } = out
     else {
         panic!("{out:?}")
     };
+    assert!(
+        isolation_restored,
+        "nesting and the intercepts were switched back off"
+    );
     assert_eq!(hint, SelfTestHint::RuncSysctlDenied);
     assert!(output_tail.contains("ip_unprivileged_port_start"));
     assert_eq!(
@@ -1329,4 +1338,335 @@ async fn existing_bridge_with_ipv6_or_no_nat_is_reconciled_and_without_ipv4_reje
     });
     let e = ensure_host(&fake.client(), &host_spec()).await.unwrap_err();
     assert!(e.to_string().contains("no IPv4 address"), "{e}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review fixes: exact config allowlist, hardening keys, rollback, password cap
+// ---------------------------------------------------------------------------------------------
+
+const FORBIDDEN_KEYS: [&str; 7] = [
+    "raw.lxc",
+    "raw.idmap",
+    "linux.kernel_modules",
+    "security.syscalls.intercept.bpf.devices",
+    "security.syscalls.intercept.bpf",
+    "security.syscalls.intercept.sched_setscheduler",
+    "security.privileged",
+];
+
+#[test]
+fn instance_config_allowlist_is_exact_at_the_recipe_sink() {
+    use hx_provision::RecipeError;
+    for k in FORBIDDEN_KEYS {
+        let text = format!(
+            "[recipe]\nname=\"t\"\nbase_image=\"images:debian/13\"\n[incus_config]\n\"{k}\" = \"true\"\n"
+        );
+        let e =
+            hx_provision::recipe::resolve(&MemSource::new().with("m.toml", &text), "m.toml", &[])
+                .unwrap_err();
+        assert!(
+            matches!(e, RecipeError::Invalid { ref field, .. } if field == &format!("incus_config.{k}")),
+            "{k}: {e}"
+        );
+    }
+    for k in [
+        "security.nesting",
+        "security.syscalls.intercept.mknod",
+        "security.syscalls.intercept.setxattr",
+    ] {
+        let text = format!(
+            "[recipe]\nname=\"t\"\nbase_image=\"images:debian/13\"\n[incus_config]\n\"{k}\" = \"true\"\n"
+        );
+        assert!(
+            hx_provision::recipe::resolve(&MemSource::new().with("m.toml", &text), "m.toml", &[])
+                .is_ok(),
+            "{k}"
+        );
+    }
+}
+
+#[test]
+fn instance_config_allowlist_is_exact_at_the_create_sink() {
+    let ub = Catalog::embedded()
+        .resolve(id(Distro::Ubuntu2404), &[])
+        .unwrap();
+    let naming = Naming::with_prefix("hx1d-test-").unwrap();
+    for k in FORBIDDEN_KEYS {
+        let mut spec = DesktopSpec::for_plan("c", naming.clone(), &ub, Limits::default());
+        spec.extra_config.insert(k.to_string(), "true".into());
+        let e = spec.to_create().unwrap_err();
+        assert!(e.to_string().contains(k), "{k}: {e}");
+    }
+    let mut spec = DesktopSpec::for_plan("c", naming, &ub, Limits::default());
+    spec.extra_config
+        .insert("security.nesting".into(), "yes".into());
+    assert!(spec.to_create().is_err(), "values must be true/false");
+}
+
+#[tokio::test]
+async fn instance_config_allowlist_is_exact_at_the_docker_sink() {
+    for k in FORBIDDEN_KEYS {
+        let fake = Fake::start().await;
+        let mut plan = docker_plan();
+        plan.incus_config.insert(k.to_string(), "true".into());
+        let e = enable_docker(
+            &fake.client(),
+            "c1",
+            &plan,
+            DockerOptions::default(),
+            &mut |_| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(e, ProvisionError::Invalid(ref m) if m.contains(k)),
+            "{k}: {e:?}"
+        );
+        assert!(fake.log().is_empty(), "nothing is sent for {k}");
+    }
+}
+
+#[test]
+fn desktops_get_hardening_keys_and_a_process_limit() {
+    let ub = Catalog::embedded()
+        .resolve(id(Distro::Ubuntu2404), &[])
+        .unwrap();
+    let naming = Naming::with_prefix("hx1d-test-").unwrap();
+    let c = DesktopSpec::for_plan("c", naming.clone(), &ub, Limits::default())
+        .to_create()
+        .unwrap()
+        .config;
+    assert_eq!(c["security.guestapi"], "false");
+    assert_eq!(c["security.idmap.isolated"], "true");
+    assert_eq!(c["security.privileged"], "false");
+    assert_eq!(
+        c["limits.processes"],
+        hx_provision::orchestrate::DEFAULT_PROCESSES.to_string()
+    );
+    let lim = Limits {
+        processes: Some(1000),
+        ..Limits::default()
+    };
+    assert_eq!(
+        DesktopSpec::for_plan("c", naming.clone(), &ub, lim)
+            .to_create()
+            .unwrap()
+            .config["limits.processes"],
+        "1000"
+    );
+    for zero in [
+        Limits {
+            cpu: Some(0),
+            ..Limits::default()
+        },
+        Limits {
+            memory_mib: Some(0),
+            ..Limits::default()
+        },
+        Limits {
+            disk_gib: Some(0),
+            ..Limits::default()
+        },
+        Limits {
+            processes: Some(0),
+            ..Limits::default()
+        },
+    ] {
+        assert!(
+            DesktopSpec::for_plan("c", naming.clone(), &ub, zero)
+                .to_create()
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn docker_install_failure_rolls_the_isolation_back() {
+    let fake = Fake::start().await;
+    fake.with(|s| {
+        s.instances.insert("c1".into(), "Running".into());
+    });
+    fake.rule(
+        "'docker-ce'",
+        100,
+        "",
+        "E: Unable to locate package docker-ce",
+    );
+    let e = enable_docker(
+        &fake.client(),
+        "c1",
+        &docker_plan(),
+        DockerOptions::default(),
+        &mut |_| {},
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(e, ProvisionError::Apply(_)));
+    let patches: Vec<Value> = fake
+        .log()
+        .iter()
+        .filter(|r| r.method == "PATCH" && r.path == "/1.0/instances/c1")
+        .map(|r| r.json())
+        .collect();
+    assert_eq!(patches.len(), 2, "enable, then roll back");
+    assert_eq!(
+        patches[1]["config"],
+        json!({"security.nesting":"false","security.syscalls.intercept.mknod":"false","security.syscalls.intercept.setxattr":"false"})
+    );
+}
+
+#[tokio::test]
+async fn docker_selftest_failure_rolls_back_and_reports_it() {
+    let fake = Fake::start().await;
+    fake.with(|s| {
+        s.instances.insert("c1".into(), "Running".into());
+    });
+    fake.rule("docker --version", 0, "Docker version 27\n", "");
+    fake.rule(
+        "docker run --rm hello-world",
+        125,
+        "",
+        "runc: ip_unprivileged_port_start\n",
+    );
+    let out = enable_docker(
+        &fake.client(),
+        "c1",
+        &docker_plan(),
+        DockerOptions::default(),
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+    let DockerOutcome::SelfTestFailed {
+        isolation_restored, ..
+    } = out
+    else {
+        panic!("{out:?}")
+    };
+    assert!(isolation_restored);
+    let log = fake.log();
+    let last_patch = log.iter().rposition(|r| r.method == "PATCH").unwrap();
+    assert_eq!(
+        log[last_patch].json()["config"]["security.nesting"],
+        "false"
+    );
+    let restart_after = log[last_patch..]
+        .iter()
+        .any(|r| r.path.ends_with("/state") && r.json()["action"] == "restart");
+    assert!(
+        restart_after,
+        "the desktop is restarted so the config takes effect"
+    );
+
+    // A rollback that cannot be done is reported, not hidden.
+    let fake = Fake::start().await;
+    fake.with(|s| {
+        s.instances.insert("c1".into(), "Running".into());
+    });
+    fake.rule("docker run --rm hello-world", 125, "", "boom\n");
+    // The second PATCH (the rollback) fails.
+    let log_len = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _ = log_len;
+    fake.with(|s| {
+        s.fail_second_instance_patch = true;
+    });
+    let out = enable_docker(
+        &fake.client(),
+        "c1",
+        &docker_plan(),
+        DockerOptions::default(),
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+    let DockerOutcome::SelfTestFailed {
+        isolation_restored, ..
+    } = out
+    else {
+        panic!("{out:?}")
+    };
+    assert!(!isolation_restored);
+}
+
+#[test]
+fn password_length_is_capped() {
+    use hx_provision::SecretError;
+    assert!(
+        Secrets::none()
+            .with_user_password(&"a".repeat(1024))
+            .is_ok()
+    );
+    assert_eq!(
+        Secrets::none()
+            .with_user_password(&"a".repeat(1025))
+            .unwrap_err(),
+        SecretError::TooLong
+    );
+}
+
+#[test]
+fn container_text_is_sanitized_and_truncated() {
+    use hx_provision::exec::sanitize;
+    assert_eq!(
+        sanitize("a\u{1b}[1;31mred\u{1b}[0m b\u{7}\r\u{0}c\td\n", 100),
+        "ared bc\td"
+    );
+    assert_eq!(
+        sanitize("x\u{1b}]8;;http://evil\u{7}link\u{1b}]8;;\u{1b}\\", 100),
+        "xlink"
+    );
+    assert_eq!(sanitize("\u{1b}", 10), "");
+    let long = "é".repeat(5000);
+    let t = sanitize(&long, 100);
+    assert!(t.starts_with("...") && t.len() <= 103 + 2);
+    assert!(t.chars().all(|c| c == '.' || c == 'é'));
+}
+
+#[tokio::test]
+async fn step_failures_and_readiness_errors_are_sanitized() {
+    let fake = Fake::start().await;
+    fake.rule(
+        "chpasswd",
+        1,
+        "",
+        "\u{1b}[31mchpasswd: \u{1b}]0;pwned\u{7}failed\u{0}\n",
+    );
+    let c = fake.client();
+    let plan = Catalog::embedded()
+        .resolve(id(Distro::Debian13), &[])
+        .unwrap();
+    let secrets = Secrets::none().with_user_password(PASSWORD).unwrap();
+    let e = apply_stage(
+        &IncusExecutor::new(&c, "c1"),
+        &plan,
+        Stage::Post,
+        &secrets,
+        &mut |_| {},
+    )
+    .await
+    .unwrap_err();
+    let msg = e.to_string();
+    assert!(
+        msg.contains("chpasswd: failed") && !msg.contains('\u{1b}') && !msg.contains("pwned"),
+        "{msg:?}"
+    );
+
+    fake.with(|s| s.running_states = ["\u{1b}[2Jweird\u{0}state".to_string()].into());
+    let e = wait_system_running(
+        &c,
+        "c1",
+        ReadyOptions {
+            timeout: Duration::from_millis(1500),
+            allow_degraded: false,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        e,
+        ReadyError::Timeout {
+            last: "weirdstate".into(),
+            after: Duration::from_millis(1500)
+        }
+    );
 }

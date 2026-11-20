@@ -55,8 +55,13 @@ pub enum DockerOutcome {
         /// Options to offer.
         fallbacks: Vec<DockerFallback>,
     },
-    /// Installed, but `docker run --rm hello-world` did not work.
+    /// Installed, but `docker run --rm hello-world` did not work. Nesting and the syscall
+    /// interception were rolled back (see `isolation_restored`).
     SelfTestFailed {
+        /// Whether `security.nesting` and the intercepts were switched back off (and the desktop
+        /// restarted). When `false` the desktop keeps the reduced isolation; the caller must retry
+        /// the rollback or warn the user.
+        isolation_restored: bool,
         /// Diagnosis.
         hint: SelfTestHint,
         /// Tail of the output.
@@ -144,6 +149,9 @@ async fn restart<T: Transport>(client: &Client<T>, name: &str) -> Result<(), Pro
 /// 4. restart so the user manager sees the new group;
 /// 5. run the self-test and report a structured result.
 ///
+/// On an install error or a failed self-test, `security.nesting` and the intercepts are switched
+/// back off and the desktop restarted (a failing self-test reports `isolation_restored`).
+///
 /// Errors (`Err`) are failures to carry out a step; a failing self-test is `Ok(SelfTestFailed)`.
 pub async fn enable_docker<T: Transport>(
     client: &Client<T>,
@@ -157,6 +165,8 @@ pub async fn enable_docker<T: Transport>(
             "the plan has no incus_config: it is not the Docker add-on".into(),
         ));
     }
+    crate::plan::check_instance_config(&addon_plan.incus_config)
+        .map_err(|(k, why)| ProvisionError::Invalid(format!("instance config `{k}`: {why}")))?;
     let found = client.server_info().await?.version()?;
     if !incus_supports_docker(found) && !opts.allow_old_incus {
         return Ok(DockerOutcome::UnsupportedIncus {
@@ -168,6 +178,54 @@ pub async fn enable_docker<T: Transport>(
 
     let config: BTreeMap<String, String> = addon_plan.incus_config.clone();
     client.patch_instance_config(instance, &config).await?;
+    let result = install_and_test(client, instance, addon_plan, opts, on_progress).await;
+    match result {
+        Ok(DockerOutcome::SelfTestFailed {
+            hint,
+            output_tail,
+            fallbacks,
+            ..
+        }) => {
+            let isolation_restored = rollback(client, instance, &config).await;
+            Ok(DockerOutcome::SelfTestFailed {
+                isolation_restored,
+                hint,
+                output_tail,
+                fallbacks,
+            })
+        }
+        Ok(other) => Ok(other),
+        Err(e) => {
+            // Do not leave nesting and syscall interception on for a desktop without working Docker.
+            let _ = rollback(client, instance, &config).await;
+            Err(e)
+        }
+    }
+}
+
+/// Switch the add-on's instance config back off and restart. `true` when it worked.
+async fn rollback<T: Transport>(
+    client: &Client<T>,
+    instance: &str,
+    config: &BTreeMap<String, String>,
+) -> bool {
+    let off: BTreeMap<String, String> = config
+        .keys()
+        .map(|k| (k.clone(), "false".to_string()))
+        .collect();
+    if client.patch_instance_config(instance, &off).await.is_err() {
+        return false;
+    }
+    restart(client, instance).await.is_ok()
+}
+
+async fn install_and_test<T: Transport>(
+    client: &Client<T>,
+    instance: &str,
+    addon_plan: &Plan,
+    opts: DockerOptions,
+    on_progress: &mut (dyn FnMut(&Progress) + Send),
+) -> Result<DockerOutcome, ProvisionError> {
     restart(client, instance).await?;
 
     let exec = IncusExecutor::new(client, instance);
@@ -191,7 +249,7 @@ pub async fn enable_docker<T: Transport>(
             timeout: Duration::from_secs(30),
         })
         .await
-        .map(|o| o.stdout.trim().to_string())
+        .map(|o| tail(&o.stdout, 200))
         .unwrap_or_default();
 
     let test = exec
@@ -211,14 +269,16 @@ pub async fn enable_docker<T: Transport>(
         Ok(o) => {
             let all = format!("{}\n{}", o.stderr.trim(), o.stdout.trim());
             Ok(DockerOutcome::SelfTestFailed {
+                isolation_restored: false,
                 hint: classify_selftest(&all),
                 output_tail: tail(&all, 2000),
                 fallbacks: fallbacks(),
             })
         }
         Err(e) => Ok(DockerOutcome::SelfTestFailed {
+            isolation_restored: false,
             hint: SelfTestHint::Unknown,
-            output_tail: e.to_string(),
+            output_tail: tail(&e.to_string(), 2000),
             fallbacks: fallbacks(),
         }),
     }

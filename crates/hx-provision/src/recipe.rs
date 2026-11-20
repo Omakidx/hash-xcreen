@@ -482,26 +482,8 @@ fn parse_image(s: &str) -> Result<ImageRef, RecipeError> {
 }
 
 fn check_incus_config(cfg: &BTreeMap<String, String>) -> Result<(), RecipeError> {
-    for (k, v) in cfg {
-        let field = format!("incus_config.{k}");
-        if k == "security.privileged" {
-            return Err(RecipeError::invalid(
-                field,
-                "desktops are always unprivileged; this key is not allowed",
-            ));
-        }
-        let allowed = k == "security.nesting" || k.starts_with("security.syscalls.intercept.");
-        if !allowed {
-            return Err(RecipeError::invalid(
-                field,
-                "only `security.nesting` and `security.syscalls.intercept.*` may be set from a recipe",
-            ));
-        }
-        if v != "true" && v != "false" {
-            return Err(RecipeError::invalid(field, "must be \"true\" or \"false\""));
-        }
-    }
-    Ok(())
+    crate::plan::check_instance_config(cfg)
+        .map_err(|(k, why)| RecipeError::invalid(format!("incus_config.{k}"), why))
 }
 
 fn convert_steps(

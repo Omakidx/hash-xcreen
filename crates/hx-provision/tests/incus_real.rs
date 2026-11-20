@@ -213,10 +213,11 @@ async fn lifecycle(c: Client<UnixTransport>) {
         cpu: Some(1),
         memory_mib: Some(512),
         disk_gib: Some(3),
+        processes: Some(2048),
     };
     let dspec = DesktopSpec::for_plan("hx1d-test-c1", n.clone(), &plan, limits).with_image(image);
     assert!(dspec.compat_profile);
-    c.create_instance(&dspec.to_create(), Duration::from_secs(900))
+    c.create_instance(&dspec.to_create().unwrap(), Duration::from_secs(900))
         .await
         .unwrap();
     let inst = c.get_instance("hx1d-test-c1").await.unwrap().unwrap();
@@ -261,6 +262,25 @@ async fn lifecycle(c: Client<UnixTransport>) {
     assert_eq!(nproc.trim(), "1");
     let (_, memmax, _) = sh(&c, "hx1d-test-c1", "cat /sys/fs/cgroup/memory.max").await;
     assert_eq!(memmax.trim(), (512u64 * 1024 * 1024).to_string());
+    let (_, pids, _) = sh(&c, "hx1d-test-c1", "cat /sys/fs/cgroup/pids.max").await;
+    assert_eq!(pids.trim(), "2048", "limits.processes");
+    assert_eq!(
+        inst.config
+            .get("security.idmap.isolated")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        inst.config.get("security.guestapi").map(String::as_str),
+        Some("false")
+    );
+    let (_, devlxd, _) = sh(
+        &c,
+        "hx1d-test-c1",
+        "ls /dev/lxd /dev/incus 2>/dev/null | wc -l",
+    )
+    .await;
+    assert_eq!(devlxd.trim(), "0", "no guest API socket");
     let (_, uid_map, _) = sh(&c, "hx1d-test-c1", "cat /proc/self/uid_map").await;
     assert!(
         !uid_map.contains("4294967295"),

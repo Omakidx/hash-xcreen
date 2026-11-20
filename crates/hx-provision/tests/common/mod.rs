@@ -69,6 +69,9 @@ pub struct State {
     pub files: HashMap<String, Vec<u8>>,
     /// Store pushed `.../stdin-*` files, then answer the push with an error.
     pub fail_stdin_push_after_store: bool,
+    /// Answer the second `PATCH /1.0/instances/<n>` with an error.
+    pub fail_second_instance_patch: bool,
+    pub instance_patches: u32,
     /// Waits that answer `Running` before an operation completes.
     pub pending_waits: HashMap<String, u32>,
     pub next: u64,
@@ -94,6 +97,8 @@ impl State {
             ops: HashMap::new(),
             files: HashMap::new(),
             fail_stdin_push_after_store: false,
+            fail_second_instance_patch: false,
+            instance_patches: 0,
             pending_waits: HashMap::new(),
             next: 0,
             overrides: HashMap::new(),
@@ -244,7 +249,16 @@ impl State {
                 self.instances.remove(*n);
                 self.new_op(Value::Null, 0)
             }
-            ("PATCH", ["1.0", "instances", _]) => self.new_op(Value::Null, 0),
+            ("PATCH", ["1.0", "instances", _]) => {
+                self.instance_patches += 1;
+                if self.fail_second_instance_patch && self.instance_patches == 2 {
+                    return (
+                        500,
+                        json!({"type":"error","error_code":500,"error":"busy"}).to_string(),
+                    );
+                }
+                self.new_op(Value::Null, 0)
+            }
             ("PUT", ["1.0", "instances", n, "state"]) => {
                 let st = match body["action"].as_str() {
                     Some("stop") => "Stopped",

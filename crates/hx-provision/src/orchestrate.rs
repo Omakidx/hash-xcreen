@@ -355,7 +355,13 @@ pub struct Limits {
     pub memory_mib: Option<u64>,
     /// Root disk quota in GiB (the root device's `size`).
     pub disk_gib: Option<u64>,
+    /// Maximum number of processes and threads (`limits.processes`). `None` means
+    /// [`DEFAULT_PROCESSES`]; there is no unlimited setting, so a fork bomb cannot exhaust the host.
+    pub processes: Option<u32>,
 }
+
+/// Default `limits.processes` of a desktop.
+pub const DEFAULT_PROCESSES: u32 = 8192;
 
 /// A desktop container to create.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -403,10 +409,36 @@ impl DesktopSpec {
 
     /// The Incus request. The instance is always unprivileged (`security.privileged=false`) and
     /// starts at boot.
-    pub fn to_create(&self) -> InstanceCreate {
+    ///
+    /// Hardening on every desktop: `security.guestapi=false` (no guest API socket),
+    /// `security.idmap.isolated=true` (own uid/gid range, so desktops cannot share ids with each
+    /// other or the host), and `limits.processes`. Fails when `extra_config` holds a key outside
+    /// the recipe allowlist ([`crate::plan::check_instance_config`]).
+    pub fn to_create(&self) -> Result<InstanceCreate, IncusError> {
+        crate::plan::check_instance_config(&self.extra_config).map_err(|(k, why)| {
+            IncusError::InvalidArgument(format!("instance config `{k}`: {why}"))
+        })?;
+        if self.limits.cpu == Some(0)
+            || self.limits.memory_mib == Some(0)
+            || self.limits.disk_gib == Some(0)
+            || self.limits.processes == Some(0)
+        {
+            return Err(IncusError::InvalidArgument(
+                "limits must not be zero".into(),
+            ));
+        }
         let mut config: BTreeMap<String, String> = BTreeMap::new();
         config.insert("security.privileged".into(), "false".into());
+        config.insert("security.guestapi".into(), "false".into());
+        config.insert("security.idmap.isolated".into(), "true".into());
         config.insert("boot.autostart".into(), "true".into());
+        config.insert(
+            "limits.processes".into(),
+            self.limits
+                .processes
+                .unwrap_or(DEFAULT_PROCESSES)
+                .to_string(),
+        );
         if let Some(c) = self.limits.cpu {
             config.insert("limits.cpu".into(), c.to_string());
         }
@@ -414,10 +446,7 @@ impl DesktopSpec {
             config.insert("limits.memory".into(), format!("{m}MiB"));
         }
         for (k, v) in &self.extra_config {
-            // A recipe can never lift the unprivileged setting.
-            if k != "security.privileged" {
-                config.insert(k.clone(), v.clone());
-            }
+            config.insert(k.clone(), v.clone());
         }
         let mut devices = BTreeMap::new();
         if let Some(d) = self.limits.disk_gib {
@@ -436,13 +465,13 @@ impl DesktopSpec {
         if self.compat_profile {
             profiles.push(self.naming.compat_profile.clone());
         }
-        InstanceCreate {
+        Ok(InstanceCreate {
             name: self.name.clone(),
             image: self.image.clone(),
             profiles,
             config,
             devices,
-        }
+        })
     }
 }
 
@@ -481,7 +510,7 @@ async fn launch<T: Transport>(
     ready: ReadyOptions,
 ) -> Result<(), ProvisionError> {
     client
-        .create_instance(&spec.to_create(), CREATE_DEADLINE)
+        .create_instance(&spec.to_create()?, CREATE_DEADLINE)
         .await?;
     client
         .set_state(
