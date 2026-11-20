@@ -10,7 +10,7 @@ use hx_provision::incus::{
     AclAction, Client, DOCKER_MIN_INCUS, ExecSpec, ImageSource, IncusError, IncusVersion,
     InstanceCreate, StateAction, Transport, UnixTransport,
 };
-use serde_json::{Value, json};
+use serde_json::json;
 
 fn cfg<const N: usize>(p: [(&str, &str); N]) -> BTreeMap<String, String> {
     p.into_iter()
@@ -391,7 +391,7 @@ async fn snapshots_create_list_delete() {
 }
 
 #[tokio::test]
-async fn exec_returns_exit_code_and_output_and_cleans_up_logs() {
+async fn exec_never_records_output_and_returns_only_the_status() {
     let fake = Fake::start().await;
     fake.rule("echo hi", 3, "out text\n", "err text\n");
     let spec = ExecSpec {
@@ -403,24 +403,47 @@ async fn exec_returns_exit_code_and_output_and_cleans_up_logs() {
     let r = fake.client().exec("c1", &spec).await.unwrap();
     assert_eq!(
         (r.exit_code, r.stdout.as_str(), r.stderr.as_str()),
-        (3, "out text\n", "err text\n")
+        (3, "", "")
     );
     let body = fake.log()[0].json();
     assert_eq!(body["command"], json!(["sh", "-c", "echo hi"]));
     assert_eq!(body["environment"], json!({"A":"b"}));
     assert_eq!(body["cwd"], "/tmp");
-    assert_eq!(body["record-output"], true);
+    // record-output would make the *host* write unbounded output files under /var/log/incus.
+    assert_eq!(body["record-output"], false);
     assert_eq!(body["wait-for-websocket"], false);
     assert_eq!(body["interactive"], false);
     assert!(
-        fake.with(|s| s.logs.is_empty()),
-        "exec-output files must be deleted"
-    );
-    assert!(
+        fake.keys().iter().all(|k| !k.contains("exec-output")),
+        "{:?}",
         fake.keys()
-            .iter()
-            .any(|k| k.starts_with("DELETE /1.0/instances/c1/logs/exec-output/"))
     );
+}
+
+#[tokio::test]
+async fn read_and_delete_file_are_bounded_and_missing_is_not_an_error() {
+    let fake = Fake::start().await;
+    fake.with(|s| {
+        s.files.insert("/run/x".into(), b"hello".to_vec());
+        s.overrides.insert(
+            "GET /1.0/instances/c1/files?path=/run/big".into(),
+            (200, "x".repeat(5000)),
+        );
+    });
+    let c = fake.client();
+    assert_eq!(
+        c.read_file("c1", "/run/x", 100).await.unwrap().unwrap(),
+        b"hello"
+    );
+    assert!(c.read_file("c1", "/run/none", 100).await.unwrap().is_none());
+    assert_eq!(
+        c.read_file("c1", "/run/big", 100).await.unwrap_err(),
+        IncusError::TooLarge { limit: 100 }
+    );
+    c.delete_file("c1", "/run/x").await.unwrap();
+    c.delete_file("c1", "/run/x").await.unwrap(); // already gone
+    assert!(fake.with(|s| s.files.is_empty()));
+    assert!(c.read_file("c1", "relative", 1).await.is_err());
 }
 
 #[tokio::test]
@@ -606,41 +629,7 @@ async fn malformed_responses_never_panic() {
 }
 
 #[tokio::test]
-async fn evil_exec_output_paths_are_not_followed() {
-    let fake = Fake::start().await;
-    let mut op: Value = serde_json::from_str(&fixture("exec_done.json")).unwrap();
-    op["metadata"]["metadata"]["output"]["1"] = json!("/1.0/instances/other/logs/exec-output/x");
-    op["metadata"]["metadata"]["output"]["2"] = json!("/1.0/certificates");
-    fake.with(|s| {
-        s.overrides.insert(
-            "POST /1.0/instances/c1/exec".into(),
-            (200, fixture("operation_async.json")),
-        );
-        s.overrides.insert(
-            format!("GET /1.0/operations/{OP_ID}/wait?timeout=30"),
-            (200, op.to_string()),
-        );
-    });
-    let spec = ExecSpec {
-        command: vec!["true".into()],
-        env: vec![],
-        cwd: None,
-        timeout: Duration::from_secs(30),
-    };
-    let e = fake.client().exec("c1", &spec).await.unwrap_err();
-    assert!(matches!(e, IncusError::Protocol(_)), "{e}");
-    // Nothing but the exec call and the operation waits was requested.
-    assert!(
-        fake.keys()
-            .iter()
-            .all(|k| !k.contains("certificates") && !k.contains("/other/")),
-        "{:?}",
-        fake.keys()
-    );
-}
-
-#[tokio::test]
-async fn recorded_exec_fixture_parses() {
+async fn exec_result_fixture_parses() {
     let fake = Fake::start().await;
     fake.with(|s| {
         s.overrides.insert(
@@ -651,9 +640,6 @@ async fn recorded_exec_fixture_parses() {
             format!("GET /1.0/operations/{OP_ID}/wait?timeout=30"),
             (200, fixture("exec_done.json")),
         );
-        s.logs
-            .insert("exec_0f7a1c52.stdout".into(), "hello\n".into());
-        s.logs.insert("exec_0f7a1c52.stderr".into(), String::new());
     });
     let spec = ExecSpec {
         command: vec!["true".into()],
@@ -662,7 +648,7 @@ async fn recorded_exec_fixture_parses() {
         timeout: Duration::from_secs(30),
     };
     let r = fake.client().exec("c1", &spec).await.unwrap();
-    assert_eq!((r.exit_code, r.stdout.as_str()), (0, "hello\n"));
+    assert_eq!(r.exit_code, 0);
 }
 
 // A transport that records nothing and always fails: the client surfaces the error untouched.
@@ -687,4 +673,24 @@ async fn transport_errors_propagate() {
         c.get_instance("c1").await.unwrap_err(),
         IncusError::Http("boom".into())
     );
+}
+
+#[test]
+fn request_debug_never_prints_the_body() {
+    use hx_provision::incus::Request;
+    let r = Request {
+        method: hyper::Method::POST,
+        path: "/1.0/instances/c1/files?path=/run/hx-provision/stdin-1".into(),
+        headers: vec![("X-Incus-mode", "0600".into())],
+        body: bytes::Bytes::from_static(b"desk:SuperSecretPassword\n"),
+        content_type: Some("application/octet-stream"),
+        timeout: Duration::from_secs(1),
+        max_response: None,
+    };
+    let dbg = format!("{r:?} {:#?}", r.clone());
+    assert!(
+        !dbg.contains("SuperSecret") && !dbg.contains("desk:"),
+        "{dbg}"
+    );
+    assert!(dbg.contains("<25 bytes>"), "{dbg}");
 }

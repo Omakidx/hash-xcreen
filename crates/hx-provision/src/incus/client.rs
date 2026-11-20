@@ -14,8 +14,8 @@ use serde_json::{Value, json};
 use super::error::IncusError;
 use super::transport::{Request, Response, Transport, UnixTransport};
 use super::types::{
-    Acl, ExecResult, ExecSpec, Instance, InstanceCreate, InstanceState, MAX_OUTPUT, Network,
-    Operation, ProfileSpec, ServerInfo, Snapshot, StateAction, StoragePool,
+    Acl, ExecResult, ExecSpec, Instance, InstanceCreate, InstanceState, Network, Operation,
+    ProfileSpec, ServerInfo, Snapshot, StateAction, StoragePool,
 };
 
 /// Default timeout of a plain request.
@@ -195,6 +195,7 @@ impl<T: Transport> Client<T> {
                 headers: Vec::new(),
                 body,
                 content_type,
+                max_response: None,
                 timeout,
             })
             .await
@@ -277,6 +278,7 @@ impl<T: Transport> Client<T> {
                         headers: Vec::new(),
                         body: Bytes::new(),
                         content_type: None,
+                        max_response: None,
                         timeout: Duration::from_secs(10),
                     })
                     .await;
@@ -590,14 +592,16 @@ impl<T: Transport> Client<T> {
                 ],
                 body: content,
                 content_type: Some("application/octet-stream"),
+                max_response: None,
                 timeout: Duration::from_secs(120),
             })
             .await?;
         parse_envelope(r.status, &r.body).map(drop)
     }
 
-    /// Write a file owned by root with `mode`. The parent directory must exist. The mode applies
-    /// at creation, so a 0600 file is never briefly readable by others.
+    /// Write a file owned by root with `mode`. The parent directory must exist. Confidentiality of
+    /// a secret written this way comes from the 0700 directory it is placed in (see
+    /// [`crate::orchestrate::IncusExecutor`]); the file is also created with `mode`.
     pub async fn push_file(
         &self,
         instance: &str,
@@ -621,10 +625,75 @@ impl<T: Transport> Client<T> {
             .await
     }
 
+    /// Read a file out of an instance, refusing bodies larger than `max_bytes`.
+    ///
+    /// `Ok(None)` when the file does not exist. The content is untrusted when the instance has run
+    /// user code: treat it as data.
+    pub async fn read_file(
+        &self,
+        instance: &str,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, IncusError> {
+        let name = checked("instance", instance)?;
+        if !path.starts_with('/') || path.contains('\0') {
+            return Err(IncusError::InvalidArgument(format!(
+                "file path `{path}` must be absolute"
+            )));
+        }
+        let r = self
+            .transport
+            .send(Request {
+                method: Method::GET,
+                path: format!("/1.0/instances/{name}/files?path={}", encode_query(path)),
+                headers: Vec::new(),
+                body: Bytes::new(),
+                content_type: None,
+                max_response: Some(max_bytes),
+                timeout: Duration::from_secs(60),
+            })
+            .await?;
+        if r.status >= 400 {
+            return match parse_envelope(r.status, &r.body) {
+                Err(e) if e.is_not_found() => Ok(None),
+                Err(e) => Err(e),
+                Ok(_) => Err(IncusError::Protocol(
+                    "error status with a success body".into(),
+                )),
+            };
+        }
+        Ok(Some(r.body.to_vec()))
+    }
+
+    /// Delete a file in an instance (a missing file is not an error).
+    pub async fn delete_file(&self, instance: &str, path: &str) -> Result<(), IncusError> {
+        let name = checked("instance", instance)?;
+        if !path.starts_with('/') || path.contains('\0') {
+            return Err(IncusError::InvalidArgument(format!(
+                "file path `{path}` must be absolute"
+            )));
+        }
+        match self
+            .envelope(
+                Method::DELETE,
+                format!("/1.0/instances/{name}/files?path={}", encode_query(path)),
+                None::<&Value>,
+                Duration::from_secs(30),
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if e.is_not_found() => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     // --- exec ------------------------------------------------------------------------------
 
-    /// Run a command and capture its output (no stdin: see
-    /// [`crate::orchestrate::IncusExecutor`] for stdin via a 0600 file).
+    /// Run a command and return only its exit status. **Output is never recorded** (`record-output`
+    /// is false, so nothing is written to the host's `/var/log/incus`), and `stdout`/`stderr` of
+    /// the result are empty. For output, see
+    /// [`crate::orchestrate::exec_captured`], which routes it through a size-capped file.
     pub async fn exec(&self, instance: &str, spec: &ExecSpec) -> Result<ExecResult, IncusError> {
         let name = checked("instance", instance)?;
         if spec.command.is_empty() {
@@ -645,66 +714,11 @@ impl<T: Transport> Client<T> {
             .and_then(Value::as_i64)
             .and_then(|c| i32::try_from(c).ok())
             .ok_or_else(|| IncusError::Protocol("exec result has no `return` code".into()))?;
-        let prefix = format!("/1.0/instances/{name}/logs/exec-output/");
-        let stdout = self
-            .read_exec_log(&prefix, op.metadata.pointer("/output/1"))
-            .await?;
-        let stderr = self
-            .read_exec_log(&prefix, op.metadata.pointer("/output/2"))
-            .await?;
         Ok(ExecResult {
             exit_code,
-            stdout,
-            stderr,
+            stdout: String::new(),
+            stderr: String::new(),
         })
-    }
-
-    async fn read_exec_log(
-        &self,
-        prefix: &str,
-        path: Option<&Value>,
-    ) -> Result<String, IncusError> {
-        let Some(path) = path.and_then(Value::as_str) else {
-            return Ok(String::new());
-        };
-        // Only ever fetch (and delete) the daemon's own exec-output files for this instance.
-        let file = path.strip_prefix(prefix).unwrap_or_default();
-        if file.is_empty()
-            || !file
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-        {
-            return Err(IncusError::Protocol(format!(
-                "unexpected exec output path `{path}`"
-            )));
-        }
-        let r = self
-            .transport
-            .send(Request {
-                method: Method::GET,
-                path: path.to_string(),
-                headers: Vec::new(),
-                body: Bytes::new(),
-                content_type: None,
-                timeout: Duration::from_secs(60),
-            })
-            .await?;
-        if r.status >= 400 {
-            return Err(IncusError::Api {
-                code: r.status,
-                message: format!("reading {path}"),
-            });
-        }
-        let _ = self
-            .send_json(
-                Method::DELETE,
-                path.to_string(),
-                None::<&Value>,
-                Duration::from_secs(30),
-            )
-            .await;
-        let bytes = &r.body[r.body.len().saturating_sub(MAX_OUTPUT)..];
-        Ok(String::from_utf8_lossy(bytes).into_owned())
     }
 
     // --- snapshots -------------------------------------------------------------------------

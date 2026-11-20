@@ -225,13 +225,5 @@ pub async fn enable_docker<T: Transport>(
 }
 
 fn tail(s: &str, max: usize) -> String {
-    let t = s.trim();
-    if t.len() <= max {
-        return t.to_string();
-    }
-    let mut start = t.len() - max;
-    while !t.is_char_boundary(start) {
-        start += 1;
-    }
-    format!("...{}", &t[start..])
+    crate::exec::sanitize(s, max)
 }

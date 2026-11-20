@@ -32,6 +32,12 @@ pub enum IncusError {
         /// Message from Incus.
         message: String,
     },
+    /// A response body exceeded the limit set for the request.
+    #[error("response larger than {limit} bytes")]
+    TooLarge {
+        /// The limit.
+        limit: usize,
+    },
     /// The response did not have the documented shape.
     #[error("unexpected Incus response: {0}")]
     Protocol(String),

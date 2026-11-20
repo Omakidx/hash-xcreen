@@ -1,10 +1,24 @@
 //! Creating a desktop container and running a plan in it.
 //!
-//! [`IncusExecutor`] implements [`Executor`] on top of the Incus client. Incus can only feed
-//! stdin to a command over a websocket, which the REST client does not use; instead, stdin is
-//! written to a root-only (0600) file in a root-only (0700) directory inside the container and
-//! redirected into the command, and the file is removed when the command ends. The secret is
-//! never in argv, in the environment, or visible to other users in the container.
+//! [`IncusExecutor`] implements [`Executor`] on top of the Incus client.
+//!
+//! # Output and stdin without websockets or host-side logs
+//!
+//! Incus can feed stdin to a command, or record its output, only through websockets or log files
+//! that the *host* writes under `/var/log/incus` without any size limit. A container that has run
+//! user code could use that to fill the host disk. So no exec in this crate sets `record-output`.
+//! Instead [`exec_captured`] runs the command under a small `sh` wrapper that writes stdout and
+//! stderr to files in a root-only (0700) directory inside the container, truncated to their last
+//! 64 KiB, and reads them back through the file API with a hard size cap. The exit status comes
+//! from the exec operation itself. Whatever the container writes there is *untrusted data*
+//! (sanitized before it reaches an error or outcome).
+//!
+//! Stdin works the same way: the bytes are written to a 0600 file in that directory, redirected
+//! into the command, and removed afterwards (also when the push or the command fails, and by a
+//! sweep around the post stage). The secret is never in argv, in the environment, or in a URL.
+//!
+//! Which functions may run on a container that has executed user code: [`wait_system_running`],
+//! [`IncusExecutor`] and `enable_docker` all use the bounded path, so all of them may.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,16 +26,100 @@ use std::time::{Duration, Instant};
 
 use crate::exec::{
     ApplyError, ExecError, ExecOutput, ExecRequest, Executor, FilePush, Progress, Secrets,
-    StageReport, apply_stage,
+    StageReport, apply_stage, sanitize,
 };
 use crate::host::{Naming, needs_compat_profile};
 use crate::incus::{
-    Client, ExecSpec, ImageSource, IncusError, InstanceCreate, StateAction, Transport,
+    Client, ExecResult, ExecSpec, ImageSource, IncusError, InstanceCreate, MAX_OUTPUT, StateAction,
+    Transport,
 };
 use crate::plan::{ImageRef, Plan, Stage};
 
-/// Directory inside the container for stdin files.
-const STDIN_DIR: &str = "/run/hx-provision";
+/// Root-only directory inside the container for stdin and captured-output files.
+pub const WORK_DIR: &str = "/run/hx-provision";
+
+/// Runs the command given as `"$@"` with optional stdin file `$f`, output to `$o.out`/`$o.err`
+/// (kept to their last 64 KiB); exits with the command's status.
+const CAPTURE_SCRIPT: &str = r#"o=$1; f=$2; shift 2
+if [ -n "$f" ]; then "$@" <"$f" >"$o.out" 2>"$o.err"; else "$@" </dev/null >"$o.out" 2>"$o.err"; fi
+rc=$?
+if [ -n "$f" ]; then rm -f -- "$f"; fi
+for s in out err; do tail -c 65536 "$o.$s" >"$o.$s.t" 2>/dev/null && mv -f "$o.$s.t" "$o.$s"; done
+exit $rc"#;
+
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn unique_name(kind: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!(
+        "{kind}-{}-{}-{nanos}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+async fn read_capture<T: Transport>(client: &Client<T>, instance: &str, path: &str) -> String {
+    match client.read_file(instance, path, 2 * MAX_OUTPUT).await {
+        Ok(Some(bytes)) => sanitize(&String::from_utf8_lossy(&bytes), MAX_OUTPUT),
+        Ok(None) => String::new(),
+        Err(IncusError::TooLarge { .. }) => "(output too large, discarded)".into(),
+        Err(e) => format!("(output unavailable: {e})"),
+    }
+}
+
+/// Run a command and capture its output through the bounded file path (see the module docs).
+///
+/// `stdin_file` is a path inside the container to redirect into the command; the wrapper deletes
+/// it. The command is also bounded by `timeout(1)` inside the container. Output files are always
+/// deleted, including after errors and timeouts.
+pub async fn exec_captured<T: Transport>(
+    client: &Client<T>,
+    instance: &str,
+    argv: &[String],
+    env: &[(String, String)],
+    cwd: Option<&str>,
+    stdin_file: Option<&str>,
+    timeout: Duration,
+) -> Result<ExecResult, IncusError> {
+    client.push_dir(instance, WORK_DIR, 0o700).await?;
+    let base = format!("{WORK_DIR}/o-{}", unique_name("o"));
+    let mut command: Vec<String> = vec![
+        "sh".into(),
+        "-c".into(),
+        CAPTURE_SCRIPT.into(),
+        "sh".into(),
+        base.clone(),
+        stdin_file.unwrap_or("").to_string(),
+        "timeout".into(),
+        "--kill-after=15".into(),
+        timeout.as_secs().max(1).to_string(),
+    ];
+    command.extend(argv.iter().cloned());
+    let spec = ExecSpec {
+        command,
+        env: env.to_vec(),
+        cwd: cwd.map(str::to_string),
+        // Leave room for `timeout`'s own kill-after grace so the in-container limit fires first.
+        timeout: timeout + Duration::from_secs(60),
+    };
+    let status = client.exec(instance, &spec).await;
+    let stdout = read_capture(client, instance, &format!("{base}.out")).await;
+    let stderr = read_capture(client, instance, &format!("{base}.err")).await;
+    for suffix in [".out", ".err", ".out.t", ".err.t"] {
+        let _ = client
+            .delete_file(instance, &format!("{base}{suffix}"))
+            .await;
+    }
+    let status = status?;
+    Ok(ExecResult {
+        exit_code: status.exit_code,
+        stdout,
+        stderr,
+    })
+}
 
 /// Runs commands in one container through the Incus API.
 #[derive(Debug)]
@@ -29,8 +127,6 @@ pub struct IncusExecutor<'a, T: Transport> {
     client: &'a Client<T>,
     instance: String,
 }
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl<'a, T: Transport> IncusExecutor<'a, T> {
     /// Executor for `instance`.
@@ -41,42 +137,23 @@ impl<'a, T: Transport> IncusExecutor<'a, T> {
         }
     }
 
-    fn unique_name() -> String {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
-        format!(
-            "stdin-{}-{}-{nanos}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        )
-    }
-}
-
-/// The in-container command for a request: bounded by `timeout(1)` so that the process dies
-/// inside the container even if the API-side operation cannot be cancelled.
-pub(crate) fn wrap_command(req: &ExecRequest, stdin_file: Option<&str>) -> Vec<String> {
-    let mut v = vec![
-        "timeout".to_string(),
-        "--kill-after=15".into(),
-        req.timeout.as_secs().max(1).to_string(),
-    ];
-    v.extend(req.argv.iter().cloned());
-    match stdin_file {
-        None => v,
-        Some(file) => {
-            let mut w = vec![
-                "sh".to_string(),
-                "-c".into(),
-                // Redirect the secret file into the command, then remove it, keeping the exit status.
-                r#"f=$1; shift; "$@" < "$f"; rc=$?; rm -f -- "$f"; exit $rc"#.into(),
-                "sh".into(),
-                file.to_string(),
-            ];
-            w.extend(v);
-            w
-        }
+    /// Remove everything in [`WORK_DIR`]: leftover stdin files and captured output. Call it before
+    /// and after a stage that handles secrets ([`run_post_stage`] does). Non-zero exit (for
+    /// example the directory does not exist yet) is not an error.
+    pub async fn sweep(&self) -> Result<(), IncusError> {
+        let spec = ExecSpec {
+            command: vec![
+                "find".into(),
+                WORK_DIR.into(),
+                "-mindepth".into(),
+                "1".into(),
+                "-delete".into(),
+            ],
+            env: Vec::new(),
+            cwd: None,
+            timeout: Duration::from_secs(30),
+        };
+        self.client.exec(&self.instance, &spec).await.map(drop)
     }
 }
 
@@ -89,35 +166,36 @@ impl<T: Transport> Executor for IncusExecutor<'_, T> {
         let stdin_file = match &req.stdin {
             Some(secret) => {
                 self.client
-                    .push_dir(&self.instance, STDIN_DIR, 0o700)
+                    .push_dir(&self.instance, WORK_DIR, 0o700)
                     .await
                     .map_err(backend)?;
-                let path = format!("{STDIN_DIR}/{}", Self::unique_name());
-                self.client
+                let path = format!("{WORK_DIR}/{}", unique_name("stdin"));
+                if let Err(e) = self
+                    .client
                     .push_file(&self.instance, &path, secret.expose(), 0o600)
                     .await
-                    .map_err(backend)?;
+                {
+                    // The daemon may have stored the file before failing: remove it.
+                    let _ = self.client.delete_file(&self.instance, &path).await;
+                    return Err(backend(e));
+                }
                 Some(path)
             }
             None => None,
         };
-        let spec = ExecSpec {
-            command: wrap_command(req, stdin_file.as_deref()),
-            env: req.env.clone(),
-            cwd: req.cwd.clone(),
-            // Leave room for `timeout`'s own kill-after grace so the in-container limit fires first.
-            timeout: req.timeout + Duration::from_secs(60),
-        };
-        let result = self.client.exec(&self.instance, &spec).await;
+        let result = exec_captured(
+            self.client,
+            &self.instance,
+            &req.argv,
+            &req.env,
+            req.cwd.as_deref(),
+            stdin_file.as_deref(),
+            req.timeout,
+        )
+        .await;
         if let (Some(path), Err(_)) = (&stdin_file, &result) {
-            // The command may not have run to its cleanup: best-effort removal of the secret file.
-            let rm = ExecSpec {
-                command: vec!["rm".into(), "-f".into(), "--".into(), path.clone()],
-                env: Vec::new(),
-                cwd: None,
-                timeout: Duration::from_secs(30),
-            };
-            let _ = self.client.exec(&self.instance, &rm).await;
+            // The command may not have run to its cleanup.
+            let _ = self.client.delete_file(&self.instance, path).await;
         }
         let out = result.map_err(backend)?;
         if out.exit_code == 124 {
@@ -136,6 +214,22 @@ impl<T: Transport> Executor for IncusExecutor<'_, T> {
             .await
             .map_err(|e| ExecError::Backend(e.to_string()))
     }
+}
+
+/// Run the post stage (the only stage that handles the password) with the work directory swept
+/// before and after.
+pub async fn run_post_stage<T: Transport>(
+    client: &Client<T>,
+    instance: &str,
+    plan: &Plan,
+    secrets: &Secrets,
+    on_progress: &mut (dyn FnMut(&Progress) + Send),
+) -> Result<StageReport, ProvisionError> {
+    let exec = IncusExecutor::new(client, instance);
+    let _ = exec.sweep().await;
+    let result = apply_stage(&exec, plan, Stage::Post, secrets, on_progress).await;
+    let _ = exec.sweep().await;
+    Ok(result?)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -194,17 +288,21 @@ pub async fn wait_system_running<T: Transport>(
 ) -> Result<(), ReadyError> {
     let started = Instant::now();
     let mut last: String;
-    let probe = |cmd: &[&str]| ExecSpec {
-        command: cmd.iter().map(|s| s.to_string()).collect(),
-        env: Vec::new(),
-        cwd: None,
-        timeout: Duration::from_secs(20),
+    let probe = async |cmd: &[&str]| {
+        let argv: Vec<String> = cmd.iter().map(|s| s.to_string()).collect();
+        exec_captured(
+            client,
+            instance,
+            &argv,
+            &[],
+            None,
+            None,
+            Duration::from_secs(20),
+        )
+        .await
     };
     loop {
-        match client
-            .exec(instance, &probe(&["systemctl", "is-system-running"]))
-            .await
-        {
+        match probe(&["systemctl", "is-system-running"]).await {
             Ok(r) => {
                 let state = r.stdout.trim().to_string();
                 match state.as_str() {
@@ -213,13 +311,9 @@ pub async fn wait_system_running<T: Transport>(
                         if opts.allow_degraded {
                             return Ok(());
                         }
-                        let failed = client
-                            .exec(
-                                instance,
-                                &probe(&["systemctl", "--failed", "--no-legend", "--plain"]),
-                            )
+                        let failed = probe(&["systemctl", "--failed", "--no-legend", "--plain"])
                             .await
-                            .map(|f| f.stdout.trim().replace('\n', "; "))
+                            .map(|f| sanitize(&f.stdout, 2000).replace('\n', "; "))
                             .unwrap_or_else(|e| format!("(could not list: {e})"));
                         return Err(ReadyError::Degraded { failed });
                     }
@@ -227,14 +321,14 @@ pub async fn wait_system_running<T: Transport>(
                         last = if state.is_empty() {
                             format!("(empty, exit {})", r.exit_code)
                         } else {
-                            state
+                            sanitize(&state, 200)
                         }
                     }
                 }
             }
             // The instance is still booting or not yet running: retry.
-            Err(IncusError::Api { message, .. }) => last = message,
-            Err(IncusError::Operation(m)) => last = m,
+            Err(IncusError::Api { message, .. }) => last = sanitize(&message, 200),
+            Err(IncusError::Operation(m)) => last = sanitize(&m, 200),
             Err(IncusError::Timeout { .. }) => last = "systemctl did not answer".into(),
             Err(e) => return Err(e.into()),
         }
@@ -415,7 +509,7 @@ pub async fn build_on_server<T: Transport>(
     launch(client, spec, ReadyOptions::default()).await?;
     let exec = IncusExecutor::new(client, spec.name.clone());
     let build = apply_stage(&exec, plan, Stage::Build, &Secrets::none(), on_progress).await?;
-    let post = apply_stage(&exec, plan, Stage::Post, secrets, on_progress).await?;
+    let post = run_post_stage(client, &spec.name, plan, secrets, on_progress).await?;
     Ok(ProvisionReport {
         build: Some(build),
         post: Some(post),
@@ -437,8 +531,7 @@ pub async fn finish_prebuilt<T: Transport>(
         ));
     }
     launch(client, spec, ReadyOptions::default()).await?;
-    let exec = IncusExecutor::new(client, spec.name.clone());
-    let post = apply_stage(&exec, plan, Stage::Post, secrets, on_progress).await?;
+    let post = run_post_stage(client, &spec.name, plan, secrets, on_progress).await?;
     Ok(ProvisionReport {
         build: None,
         post: Some(post),

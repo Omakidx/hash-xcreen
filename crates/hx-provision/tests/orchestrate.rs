@@ -24,7 +24,7 @@ use hx_provision::{
     Action, Addon, ApplyError, Catalog, Desktop, Distro, ExecError, ExecRequest, Executor,
     MemSource, Preset, RecipeId, Secrets, Stage, StepFailure, apply_stage,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 
 const GIB: u64 = 1024 * 1024 * 1024;
 const PASSWORD: &str = "Tr0ub4dor&3-horse-staple";
@@ -432,12 +432,16 @@ async fn password_goes_to_the_container_through_a_0600_file_never_argv() {
         .unwrap();
     assert_eq!(dir.headers["x-incus-mode"], "0700");
     assert!(dir.path.ends_with("path=/run/hx-provision"));
-    // Never in a URL, header, or exec command line.
+    // Never in a URL, header, or exec command line; no exec records output.
     for r in &log {
         assert!(!r.path.contains(PASSWORD) && !r.path.contains("horse"));
         assert!(r.headers.values().all(|v| !v.contains(PASSWORD)));
+        if r.path.ends_with("/exec") {
+            assert_eq!(r.json()["record-output"], false, "{}", r.key());
+        }
     }
-    // The chpasswd exec reads the file through a redirect and removes it.
+    // The chpasswd exec goes through the capture wrapper, with the stdin file as its second
+    // argument, and the file is gone from the container afterwards.
     let exec_calls: Vec<Value> = log
         .iter()
         .filter(|r| r.path.ends_with("/exec"))
@@ -453,22 +457,24 @@ async fn password_goes_to_the_container_through_a_0600_file_never_argv() {
         .iter()
         .map(|x| x.as_str().unwrap())
         .collect();
-    assert_eq!(
-        &argv[..3],
-        [
-            "sh",
-            "-c",
-            r#"f=$1; shift; "$@" < "$f"; rc=$?; rm -f -- "$f"; exit $rc"#
-        ]
-    );
-    assert!(argv[4].starts_with("/run/hx-provision/stdin-"));
-    assert_eq!(&argv[5..], ["timeout", "--kill-after=15", "60", "chpasswd"]);
+    assert_eq!(&argv[..2], ["sh", "-c"]);
+    assert!(argv[2].contains("\"$@\" <\"$f\""), "{}", argv[2]);
+    assert!(argv[4].starts_with("/run/hx-provision/o-"));
+    assert!(argv[5].starts_with("/run/hx-provision/stdin-"));
+    assert_eq!(&argv[6..], ["timeout", "--kill-after=15", "60", "chpasswd"]);
     assert!(!chpasswd.to_string().contains(PASSWORD));
     assert!(
         chpasswd["environment"]
             .to_string()
             .find("PASSWORD")
             .is_none()
+    );
+    assert!(
+        fake.with(|s| s
+            .files
+            .keys()
+            .all(|k| !k.contains("/stdin-") && !k.contains("/o-"))),
+        "stdin and output files are removed"
     );
 }
 
@@ -492,8 +498,59 @@ async fn failed_stdin_command_still_removes_the_secret_file() {
             ..
         }
     ));
+    assert!(e.to_string().contains("chpasswd: boom") && !e.to_string().contains(PASSWORD));
+    assert!(
+        fake.with(|s| s.files.is_empty()),
+        "no secret or output file left"
+    );
+}
+
+fn stdin_request(secrets: &Secrets) -> ExecRequest {
+    ExecRequest {
+        label: "t".into(),
+        argv: vec!["cat".into()],
+        env: vec![],
+        cwd: None,
+        stdin: hx_provision::lower::lower(
+            &hx_provision::Step::SetPassword { user: "u".into() },
+            secrets,
+        )
+        .unwrap()
+        .into_iter()
+        .find_map(|a| match a {
+            Action::Exec(r) => r.stdin,
+            _ => None,
+        }),
+        timeout: Duration::from_secs(5),
+    }
+}
+
+#[tokio::test]
+async fn push_error_after_the_daemon_stored_the_secret_removes_it() {
+    let fake = Fake::start().await;
+    fake.with(|s| s.fail_stdin_push_after_store = true);
+    let c = fake.client();
+    let secrets = Secrets::none().with_user_password(PASSWORD).unwrap();
+    let exec = IncusExecutor::new(&c, "c1");
+    let e = exec.exec(&stdin_request(&secrets)).await.unwrap_err();
+    assert!(matches!(e, ExecError::Backend(_)), "{e:?}");
     assert!(!e.to_string().contains(PASSWORD));
-    // Make the exec itself fail at the API level: the executor removes the file in a follow-up.
+    // The fake stored the file before answering 500; the executor deleted it.
+    assert!(fake.with(|s| s.files.keys().all(|k| !k.contains("/stdin-"))));
+    assert!(
+        fake.keys()
+            .iter()
+            .any(|k| k.starts_with("DELETE /1.0/instances/c1/files?path=/run/hx-provision/stdin-"))
+    );
+    assert!(
+        fake.keys().iter().all(|k| !k.ends_with("/exec")),
+        "the command never ran"
+    );
+}
+
+#[tokio::test]
+async fn api_failure_of_the_exec_itself_removes_the_secret_file_too() {
+    let fake = Fake::start().await;
     fake.with(|s| {
         s.overrides.insert(
             "POST /1.0/instances/c1/exec".into(),
@@ -503,32 +560,148 @@ async fn failed_stdin_command_still_removes_the_secret_file() {
             ),
         );
     });
-    let req = ExecRequest {
-        label: "t".into(),
-        argv: vec!["cat".into()],
-        env: vec![],
-        cwd: None,
-        stdin: hx_provision::lower::lower(
-            &hx_provision::Step::SetPassword { user: "u".into() },
-            &secrets,
-        )
-        .unwrap()
-        .into_iter()
-        .find_map(|a| match a {
-            Action::Exec(r) => r.stdin,
-            _ => None,
-        }),
-        timeout: Duration::from_secs(5),
-    };
-    let before = fake.log().len();
-    assert!(exec.exec(&req).await.is_err());
-    let after = &fake.log()[before..];
-    // push dir, push file, failed exec, then a cleanup exec attempt (also failing here, best effort).
-    assert!(
-        after.iter().filter(|r| r.path.ends_with("/exec")).count() >= 2,
-        "{:?}",
-        after.iter().map(|r| r.key()).collect::<Vec<_>>()
+    let c = fake.client();
+    let secrets = Secrets::none().with_user_password(PASSWORD).unwrap();
+    let exec = IncusExecutor::new(&c, "c1");
+    assert!(exec.exec(&stdin_request(&secrets)).await.is_err());
+    assert!(fake.with(|s| s.files.keys().all(|k| !k.contains("/stdin-"))));
+}
+
+#[tokio::test]
+async fn post_stage_sweeps_the_work_directory_before_and_after() {
+    let fake = Fake::start().await;
+    let c = fake.client();
+    let plan = Catalog::embedded()
+        .resolve(id(Distro::Debian13), &[])
+        .unwrap();
+    let secrets = Secrets::none().with_user_password(PASSWORD).unwrap();
+    hx_provision::orchestrate::run_post_stage(&c, "c1", &plan, &secrets, &mut |_| {})
+        .await
+        .unwrap();
+    let execs: Vec<Vec<String>> = fake
+        .log()
+        .iter()
+        .filter(|r| r.path.ends_with("/exec"))
+        .map(|r| {
+            r.json()["command"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_str().unwrap().to_string())
+                .collect()
+        })
+        .collect();
+    let sweep = ["find", "/run/hx-provision", "-mindepth", "1", "-delete"];
+    assert_eq!(execs.first().unwrap(), &sweep);
+    assert_eq!(execs.last().unwrap(), &sweep);
+}
+
+#[tokio::test]
+async fn captured_output_is_bounded_sanitized_and_files_are_deleted() {
+    use hx_provision::orchestrate::exec_captured;
+    let fake = Fake::start().await;
+    fake.rule(
+        "noisy",
+        0,
+        "ok \u{1b}[31mred\u{1b}[0m\u{7}\r\nline2\u{1b}]0;title\u{7}\n",
+        "e\u{0}rr\n",
     );
+    let c = fake.client();
+    let r = exec_captured(
+        &c,
+        "c1",
+        &["noisy".into()],
+        &[],
+        None,
+        None,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.stdout, "ok red\nline2");
+    assert_eq!(r.stderr, "err");
+    // Oversized output file: refused by the size cap instead of buffered.
+    fake.with(|s| {
+        s.exec_rules.clear();
+    });
+    fake.rule("huge", 0, &"A".repeat(300_000), "");
+    let r = exec_captured(
+        &c,
+        "c1",
+        &["huge".into()],
+        &[],
+        None,
+        None,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.stdout, "(output too large, discarded)");
+    assert!(
+        fake.with(|s| s.files.keys().all(|k| !k.contains("/o-"))),
+        "output files deleted"
+    );
+    // A failing exec call still cleans up.
+    fake.with(|s| {
+        s.overrides.insert(
+            "POST /1.0/instances/c1/exec".into(),
+            (
+                500,
+                "{\"type\":\"error\",\"error_code\":500,\"error\":\"x\"}".into(),
+            ),
+        );
+    });
+    assert!(
+        exec_captured(
+            &c,
+            "c1",
+            &["true".into()],
+            &[],
+            None,
+            None,
+            Duration::from_secs(5)
+        )
+        .await
+        .is_err()
+    );
+    assert!(fake.with(|s| s.files.keys().all(|k| !k.contains("/o-"))));
+    let deletes = fake
+        .keys()
+        .iter()
+        .filter(|k| k.starts_with("DELETE /1.0/instances/c1/files"))
+        .count();
+    assert!(deletes >= 12, "{deletes}");
+}
+
+#[tokio::test]
+async fn readiness_and_docker_execs_never_record_output() {
+    let fake = Fake::start().await;
+    fake.with(|s| {
+        s.instances.insert("c1".into(), "Running".into());
+    });
+    fake.rule("docker --version", 0, "Docker version 27\n", "");
+    fake.rule("docker run --rm hello-world", 0, "Hello from Docker!\n", "");
+    let c = fake.client();
+    wait_system_running(&c, "c1", ReadyOptions::default())
+        .await
+        .unwrap();
+    enable_docker(
+        &c,
+        "c1",
+        &docker_plan(),
+        DockerOptions::default(),
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+    let execs: Vec<_> = fake
+        .log()
+        .into_iter()
+        .filter(|r| r.path.ends_with("/exec"))
+        .collect();
+    assert!(execs.len() > 5);
+    assert!(execs.iter().all(|r| r.json()["record-output"] == false));
+    assert!(fake.keys().iter().all(|k| !k.contains("logs/exec-output")));
 }
 
 #[tokio::test]
@@ -549,10 +722,22 @@ async fn in_container_timeout_maps_to_exec_error_timeout() {
         exec.exec(&req).await.unwrap_err(),
         ExecError::Timeout(Duration::from_secs(7))
     );
-    let body = fake.log()[0].json();
+    let body = fake
+        .log()
+        .into_iter()
+        .find(|r| r.path.ends_with("/exec"))
+        .unwrap()
+        .json();
+    let cmd = body["command"].as_array().unwrap();
     assert_eq!(
-        body["command"],
-        serde_json::json!(["timeout", "--kill-after=15", "7", "sleep", "999"])
+        &cmd[6..],
+        &[
+            json!("timeout"),
+            json!("--kill-after=15"),
+            json!("7"),
+            json!("sleep"),
+            json!("999")
+        ]
     );
 }
 

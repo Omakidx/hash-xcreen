@@ -22,7 +22,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use hx_provision::docker::{DockerOptions, DockerOutcome, SelfTestHint, enable_docker};
 use hx_provision::host::{HostSpec, Naming, PoolSource, ensure_host};
-use hx_provision::incus::{Client, ExecSpec, ImageSource, Request, Transport, UnixTransport};
+use hx_provision::incus::{Client, ImageSource, Request, Transport, UnixTransport};
 use hx_provision::orchestrate::{
     DesktopSpec, IncusExecutor, Limits, ReadyOptions, destroy_instance, wait_system_running,
 };
@@ -98,6 +98,7 @@ async fn local_debian13_image() -> Option<String> {
             headers: vec![],
             body: Bytes::new(),
             content_type: None,
+            max_response: None,
             timeout: Duration::from_secs(30),
         })
         .await
@@ -124,18 +125,18 @@ fn tiny_plan() -> hx_provision::Plan {
 }
 
 async fn sh(c: &Client<UnixTransport>, instance: &str, script: &str) -> (i32, String, String) {
-    let r = c
-        .exec(
-            instance,
-            &ExecSpec {
-                command: vec!["bash".into(), "-c".into(), script.into()],
-                env: vec![],
-                cwd: None,
-                timeout: Duration::from_secs(60),
-            },
-        )
-        .await
-        .unwrap_or_else(|e| panic!("exec `{script}`: {e}"));
+    let argv = vec!["bash".to_string(), "-c".to_string(), script.to_string()];
+    let r = hx_provision::orchestrate::exec_captured(
+        c,
+        instance,
+        &argv,
+        &[],
+        None,
+        None,
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("exec `{script}`: {e}"));
     (r.exit_code, r.stdout, r.stderr)
 }
 
@@ -310,7 +311,12 @@ async fn lifecycle(c: Client<UnixTransport>) {
     )
     .await;
     assert_eq!(stat.trim(), "640 root:desk");
-    let (_, left, _) = sh(&c, "hx1d-test-c1", "ls -A /run/hx-provision | wc -l").await;
+    let (_, left, _) = sh(
+        &c,
+        "hx1d-test-c1",
+        "ls -A /run/hx-provision | grep -c stdin- || true",
+    )
+    .await;
     assert_eq!(left.trim(), "0", "the stdin file is removed after use");
     let (_, dirmode, _) = sh(&c, "hx1d-test-c1", "stat -c '%a %U' /run/hx-provision").await;
     assert_eq!(dirmode.trim(), "700 root");
@@ -381,6 +387,14 @@ async fn lifecycle(c: Client<UnixTransport>) {
         .unwrap();
     let (_, again, _) = sh(&c, "hx1d-test-c1", &probe).await;
     assert_eq!(again.trim(), "BLOCKED", "ACL re-attached");
+    // Link-local metadata addresses other than 169.254.169.254 (Tencent) are covered by the /16 rule.
+    let (_, meta, _) = sh(
+        &c,
+        "hx1d-test-c1",
+        "timeout 4 curl -s -m 3 http://169.254.0.23/ >/dev/null 2>&1 && echo REACHED || echo BLOCKED",
+    )
+    .await;
+    assert_eq!(meta.trim(), "BLOCKED", "169.254.0.23 must not be reachable");
     // Internet egress is informational: it depends on the host's own forwarding rules (a host
     // Docker needs the DOCKER-USER rules the installer adds; S3).
     let (_, net, _) = sh(

@@ -16,7 +16,9 @@ use super::error::IncusError;
 pub const MAX_BODY: usize = 32 * 1024 * 1024;
 
 /// One HTTP request to the daemon.
-#[derive(Debug, Clone)]
+///
+/// `Debug` prints only the body length: bodies carry secrets (the stdin file of `chpasswd`).
+#[derive(Clone)]
 pub struct Request {
     /// HTTP method.
     pub method: Method,
@@ -30,6 +32,22 @@ pub struct Request {
     pub content_type: Option<&'static str>,
     /// Give up after this long (connect, send and read the whole response).
     pub timeout: Duration,
+    /// Refuse response bodies larger than this ([`MAX_BODY`] when `None`).
+    pub max_response: Option<usize>,
+}
+
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Request")
+            .field("method", &self.method)
+            .field("path", &self.path)
+            .field("headers", &self.headers)
+            .field("body", &format_args!("<{} bytes>", self.body.len()))
+            .field("content_type", &self.content_type)
+            .field("timeout", &self.timeout)
+            .field("max_response", &self.max_response)
+            .finish()
+    }
 }
 
 /// The daemon's reply.
@@ -97,16 +115,25 @@ impl UnixTransport {
         let req = builder
             .body(Full::new(request.body))
             .map_err(|e| IncusError::InvalidArgument(format!("bad request: {e}")))?;
+        let limit = request.max_response.unwrap_or(MAX_BODY);
         let result = async {
             let resp = sender
                 .send_request(req)
                 .await
                 .map_err(|e| IncusError::Http(e.to_string()))?;
             let status = resp.status().as_u16();
-            let body = Limited::new(resp.into_body(), MAX_BODY)
+            let body = Limited::new(resp.into_body(), limit)
                 .collect()
                 .await
-                .map_err(|e| IncusError::Http(format!("reading response body: {e}")))?
+                .map_err(|e| {
+                    if e.downcast_ref::<http_body_util::LengthLimitError>()
+                        .is_some()
+                    {
+                        IncusError::TooLarge { limit }
+                    } else {
+                        IncusError::Http(format!("reading response body: {e}"))
+                    }
+                })?
                 .to_bytes();
             Ok(Response { status, body })
         }

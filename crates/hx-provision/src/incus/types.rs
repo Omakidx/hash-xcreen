@@ -420,7 +420,7 @@ impl ExecSpec {
             "environment": env,
             "wait-for-websocket": false,
             "interactive": false,
-            "record-output": true,
+            "record-output": false,
         });
         if let (Some(cwd), Some(o)) = (&self.cwd, v.as_object_mut()) {
             o.insert("cwd".into(), Value::String(cwd.clone()));
@@ -440,8 +440,8 @@ pub struct ExecResult {
     pub stderr: String,
 }
 
-/// Largest amount of stdout or stderr kept per command.
-pub const MAX_OUTPUT: usize = 256 * 1024;
+/// Largest amount of stdout or stderr kept per command by the bounded capture path.
+pub const MAX_OUTPUT: usize = 64 * 1024;
 
 /// Instance state actions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

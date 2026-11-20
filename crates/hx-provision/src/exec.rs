@@ -261,8 +261,47 @@ pub enum ApplyError {
     },
 }
 
-fn tail(s: &str, max: usize) -> String {
-    let t = s.trim_end();
+/// Make text that came from inside a container safe to show or log: ANSI/OSC escape sequences
+/// and control characters (except newline and tab) are removed, and only the last `max` bytes are
+/// kept (on a character boundary).
+pub fn sanitize(s: &str, max: usize) -> String {
+    let mut out = String::with_capacity(s.len().min(max + 8));
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.peek() {
+                // CSI: ESC [ params... final byte 0x40-0x7e
+                Some('[') => {
+                    chars.next();
+                    for n in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: ESC ] ... BEL or ESC \
+                Some(']') => {
+                    chars.next();
+                    while let Some(n) = chars.next() {
+                        if n == '\u{7}' {
+                            break;
+                        }
+                        if n == '\u{1b}' {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    chars.next();
+                }
+            },
+            '\n' | '\t' => out.push(c),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    let t = out.trim_end();
     if t.len() <= max {
         return t.to_string();
     }
@@ -271,6 +310,10 @@ fn tail(s: &str, max: usize) -> String {
         start += 1;
     }
     format!("...{}", &t[start..])
+}
+
+fn tail(s: &str, max: usize) -> String {
+    sanitize(s, max)
 }
 
 /// Run one stage of `plan` in order, stopping at the first failure.

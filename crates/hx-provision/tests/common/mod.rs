@@ -65,7 +65,10 @@ pub struct State {
     /// Answers to `systemctl is-system-running`, consumed in order; the last one repeats.
     pub running_states: VecDeque<String>,
     pub ops: HashMap<String, Value>,
-    pub logs: HashMap<String, String>,
+    /// Files in the container (pushed, or written by the capture wrapper), by path.
+    pub files: HashMap<String, Vec<u8>>,
+    /// Store pushed `.../stdin-*` files, then answer the push with an error.
+    pub fail_stdin_push_after_store: bool,
     /// Waits that answer `Running` before an operation completes.
     pub pending_waits: HashMap<String, u32>,
     pub next: u64,
@@ -89,7 +92,8 @@ impl State {
             exec_rules: Vec::new(),
             running_states: VecDeque::from(["running".to_string()]),
             ops: HashMap::new(),
-            logs: HashMap::new(),
+            files: HashMap::new(),
+            fail_stdin_push_after_store: false,
             pending_waits: HashMap::new(),
             next: 0,
             overrides: HashMap::new(),
@@ -255,7 +259,30 @@ impl State {
                 ),
                 None => not_found("instance"),
             },
-            ("POST", ["1.0", "instances", _, "files"]) => sync(Value::Null),
+            ("POST", ["1.0", "instances", _, "files"]) => {
+                let p = query_path(&r.path);
+                if r.headers.get("x-incus-type").map(String::as_str) != Some("directory") {
+                    self.files.insert(p.clone(), r.body.clone());
+                }
+                if self.fail_stdin_push_after_store && p.contains("/stdin-") {
+                    return (
+                        500,
+                        json!({"type":"error","error_code":500,"error":"disk full"}).to_string(),
+                    );
+                }
+                sync(Value::Null)
+            }
+            ("GET", ["1.0", "instances", _, "files"]) => match self.files.get(&query_path(&r.path))
+            {
+                Some(b) => (200, String::from_utf8_lossy(b).into_owned()),
+                None => not_found("file"),
+            },
+            ("DELETE", ["1.0", "instances", _, "files"]) => {
+                match self.files.remove(&query_path(&r.path)) {
+                    Some(_) => sync(Value::Null),
+                    None => not_found("file"),
+                }
+            }
             ("POST", ["1.0", "instances", n, "exec"]) => self.exec(n, &body),
             ("POST", ["1.0", "instances", _, "snapshots"]) => {
                 self.snapshots
@@ -273,14 +300,6 @@ impl State {
                     .map(|s| json!({"name":format!("{n}/{s}"),"created_at":"2026-11-20T10:00:00Z","stateful":false}))
                     .collect();
                 sync(Value::Array(items))
-            }
-            ("GET", ["1.0", "instances", _, "logs", "exec-output", f]) => match self.logs.get(*f) {
-                Some(t) => (200, t.clone()),
-                None => not_found("log"),
-            },
-            ("DELETE", ["1.0", "instances", _, "logs", "exec-output", f]) => {
-                self.logs.remove(*f);
-                sync(Value::Null)
             }
             ("GET", ["1.0", "operations", id, "wait"]) => {
                 if self.stuck_ops {
@@ -308,7 +327,7 @@ impl State {
         }
     }
 
-    fn exec(&mut self, instance: &str, body: &Value) -> (u16, String) {
+    fn exec(&mut self, _instance: &str, body: &Value) -> (u16, String) {
         let cmd: Vec<String> = body["command"]
             .as_array()
             .map(|a| {
@@ -317,7 +336,16 @@ impl State {
                     .collect()
             })
             .unwrap_or_default();
-        let joined = cmd.join(" ");
+        // The capture wrapper: sh -c SCRIPT sh <base> <stdin-file|""> timeout --kill-after=N SECS argv...
+        let wrapped = cmd.first().map(String::as_str) == Some("sh")
+            && cmd.get(3).map(String::as_str) == Some("sh")
+            && cmd.len() > 6;
+        let inner: Vec<String> = if wrapped {
+            cmd[6..].to_vec()
+        } else {
+            cmd.clone()
+        };
+        let joined = inner.join(" ");
         let (exit, out, err) = if joined.contains("systemctl is-system-running") {
             let s = if self.running_states.len() > 1 {
                 self.running_states.pop_front().unwrap()
@@ -335,12 +363,37 @@ impl State {
                 None => (0, String::new(), String::new()),
             }
         };
-        let tag = format!("exec_{}", self.next + 1);
-        self.logs.insert(format!("{tag}.stdout"), out);
-        self.logs.insert(format!("{tag}.stderr"), err);
-        let meta = json!({"output":{"1":format!("/1.0/instances/{instance}/logs/exec-output/{tag}.stdout"),"2":format!("/1.0/instances/{instance}/logs/exec-output/{tag}.stderr")},"return":exit});
-        self.new_op(meta, 0)
+        if wrapped {
+            let base = &cmd[4];
+            self.files.insert(format!("{base}.out"), out.into_bytes());
+            self.files.insert(format!("{base}.err"), err.into_bytes());
+            if !cmd[5].is_empty() {
+                self.files.remove(&cmd[5]); // the wrapper removes the stdin file
+            }
+        }
+        self.new_op(json!({ "return": exit }), 0)
     }
+}
+
+fn query_path(path: &str) -> String {
+    let q = path.split_once("path=").map(|(_, q)| q).unwrap_or_default();
+    let q = q.split('&').next().unwrap_or_default();
+    let b = q.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let Ok(v) = u8::from_str_radix(&q[i + 1..i + 3], 16)
+        {
+            out.push(v);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 impl Fake {
