@@ -40,6 +40,12 @@ ignore = true
 multiple-versions = "warn"
 wildcards = "deny"
 
+# The wire protocol is TLS 1.3 only (docs/protocol.md section 1). rustls's `tls12` feature is not
+# compiled in today; this fails CI if any crate in the graph turns it on.
+[[bans.features]]
+crate = "rustls"
+deny = ["tls12"]
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"

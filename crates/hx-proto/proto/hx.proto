@@ -1,0 +1,188 @@
+// hash-xcreen wire protocol, version 1.0. Normative description: docs/protocol.md.
+// Field numbers are never reused; adding fields or messages is a minor-version change.
+syntax = "proto3";
+
+package hx.v1;
+
+message Version {
+  uint32 major = 1;
+  uint32 minor = 2;
+}
+
+enum VideoCodec {
+  VIDEO_CODEC_UNSPECIFIED = 0;
+  VIDEO_CODEC_H264 = 1;
+  VIDEO_CODEC_AV1 = 2;
+  VIDEO_CODEC_H265 = 3;
+}
+
+message Capabilities {
+  repeated VideoCodec video_codecs = 1;
+  uint64 features = 2;
+}
+
+enum Intent {
+  INTENT_UNSPECIFIED = 0;
+  INTENT_SESSION = 1;
+  INTENT_PAIR = 2;
+}
+
+message Hello {
+  Version version = 1;
+  Capabilities capabilities = 2;
+  Intent intent = 3;
+  string software = 4;
+  string device_name = 5;
+}
+
+message HelloAck {
+  Version version = 1;
+  Capabilities capabilities = 2;
+  bytes session_id = 3;
+  string software = 4;
+}
+
+enum RefuseReason {
+  REFUSE_REASON_UNSPECIFIED = 0;
+  REFUSE_REASON_UPDATE_REQUIRED = 1;
+  REFUSE_REASON_UNAUTHORIZED = 2;
+  REFUSE_REASON_BUSY = 3;
+  REFUSE_REASON_PAIRING_CLOSED = 4;
+}
+
+message Refuse {
+  RefuseReason reason = 1;
+  string message = 2;
+  Version version = 3;
+}
+
+message ViewConfig {
+  VideoCodec codec = 1;
+  uint32 max_fps = 2;
+  uint32 bandwidth_cap_kbps = 3;
+  uint32 width = 4;
+  uint32 height = 5;
+  uint32 scale_percent = 6;
+  bool audio_enabled = 7;
+  bool clipboard_enabled = 8;
+}
+
+message StreamInfo {
+  VideoCodec codec = 1;
+  uint32 width = 2;
+  uint32 height = 3;
+  uint32 fps = 4;
+  uint32 first_frame = 5;
+}
+
+message RequestKeyframe {
+  uint32 last_decoded_frame = 1;
+}
+
+message Ping {
+  uint64 nonce = 1;
+}
+
+message Pong {
+  uint64 nonce = 1;
+}
+
+message ClientStats {
+  uint32 interval_ms = 1;
+  uint32 decoded_frames = 2;
+  uint32 dropped_frames = 3;
+  uint32 decode_p95_us = 4;
+}
+
+message Goodbye {
+  uint32 code = 1;
+  string message = 2;
+}
+
+// Opaque carrier for messages owned by workstream 1B (pairing, PIN/auth).
+message Opaque {
+  bytes data = 1;
+}
+
+message ControlMessage {
+  oneof message {
+    Hello hello = 1;
+    HelloAck hello_ack = 2;
+    Refuse refuse = 3;
+    ViewConfig view_config = 4;
+    StreamInfo stream_info = 5;
+    RequestKeyframe request_keyframe = 6;
+    Ping ping = 7;
+    Pong pong = 8;
+    ClientStats stats = 9;
+    Goodbye goodbye = 10;
+    Opaque pairing = 100;
+    Opaque auth = 101;
+  }
+}
+
+enum MouseButton {
+  MOUSE_BUTTON_UNSPECIFIED = 0;
+  MOUSE_BUTTON_LEFT = 1;
+  MOUSE_BUTTON_RIGHT = 2;
+  MOUSE_BUTTON_MIDDLE = 3;
+  MOUSE_BUTTON_BACK = 4;
+  MOUSE_BUTTON_FORWARD = 5;
+}
+
+message KeyEvent {
+  uint32 scancode = 1;
+  bool pressed = 2;
+}
+
+message ButtonEvent {
+  MouseButton button = 1;
+  bool pressed = 2;
+  sint32 x = 3;
+  sint32 y = 4;
+}
+
+message ScrollEvent {
+  sint32 dx = 1;
+  sint32 dy = 2;
+}
+
+message ReleaseAll {}
+
+message InputEvent {
+  oneof event {
+    KeyEvent key = 1;
+    ButtonEvent button = 2;
+    ScrollEvent scroll = 3;
+    ReleaseAll release_all = 4;
+  }
+}
+
+message CursorShape {
+  uint64 id = 1;
+  uint32 width = 2;
+  uint32 height = 3;
+  uint32 hotspot_x = 4;
+  uint32 hotspot_y = 5;
+  bytes rgba = 6;
+}
+
+message CursorPosition {
+  sint32 x = 1;
+  sint32 y = 2;
+  uint64 shape_id = 3;
+  bool visible = 4;
+}
+
+message CursorEvent {
+  oneof event {
+    CursorShape shape = 1;
+    CursorPosition position = 2;
+  }
+}
+
+message TransferHeader {
+  string mime = 1;
+  string name = 2;
+  uint64 size = 3;
+}
