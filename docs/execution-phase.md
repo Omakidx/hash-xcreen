@@ -81,29 +81,29 @@ All five spikes ran locally on an Ubuntu 24.04 VM (16 cores, no GPU, no KVM, sha
 | Spike | Result | Decision | Still unproven |
 |---|---|---|---|
 | [S1](spikes/s1-slint-video.md) Slint video | All criteria UNVERIFIED (no GPU); every path builds and runs or reports why it can't | Provisional: VAAPI → DMA-BUF → EGL → OpenGL texture → Slint borrowed texture; CPU upload as fallback; wgpu route kept as an option | Every performance number; needs the GPU run |
-| [S2](spikes/s2-streaming-loop.md) Streaming loop | PASS: p95 added latency 24.6–34.6 ms (typing, scroll, drag), 40.5 ms video; encoder 0.5–0.6 cores; idle 0.01 cores and 0 bytes | x264 settings, capture-when-free pacing, dedicated threads, frame-per-stream with ack-driven congestion control | Quiet-VPS re-measure; decoded-pixel fidelity; jitter-adaptive controller |
+| [S2](spikes/s2-streaming-loop.md) Streaming loop | PASS: p95 added latency 24.6–34.6 ms (typing, scroll, drag), 40.5 ms video; encoder 0.5–0.6 cores; idle 0.01 cores and 0 bytes. On a quiet VPS: 10.7–16.5 ms, and 20.4–24.8 ms over the internet | x264 settings, capture-when-free pacing, dedicated threads, frame-per-stream with ack-driven congestion control | Quiet-VPS re-measure; decoded-pixel fidelity; jitter-adaptive controller |
 | [S3](spikes/s3-incus-desktop.md) Incus desktop | PASS locally: 3.5–3.9 GB free at 2 vCPU / 4 GB; prebuilt ~1.5–2.5 min; build 3.5–5 min. **FAIL: nested Docker** on Docker's default bridge | Minimum spec kept; btrfs pool sized to the disk; TOML recipe format; sysctl inotify limits required | Real-VPS numbers; metadata-address ACL; Docker on newer Incus |
 | [S4](spikes/s4-backup-roundtrip.md) Backup round trip | PASS locally: 2.24 GB desktop → 906 MB; 98 MB simulated day; bit-exact restore that boots; SQLite intact; resume works with `repair index` | zstd level 3; OpenDAL `gdrive` behind an hx retry wrapper (rclone fallback); revised exclude/protected rules | Everything on real Google Drive |
 | [S5](spikes/s5-webtransport.md) Browser transport | PASS: one port for WebTransport and native QUIC; Chrome decodes 1080p60; Firefox transport works | `wtransport` on our quinn endpoint with ALPN dispatch; WebSocket fallback for Safari; IP certificate or pinned self-signed certificate | Real IP-certificate issuance; Safari; Firefox decode on real hardware |
 
 ### 0.4 Follow-up runs before Gate 0 closes
 
-These need hardware or accounts the spike machine didn't have. The scripts are ready on each spike branch.
+These needed hardware or accounts the spike machine didn't have. They ran on 2026-11-20 on a throwaway 4 vCPU VPS (Ubuntu 26.04, Incus 6.0.5) and a real Google Drive test account, except where noted. Each spike report has a section for its run.
 
-- [ ] **S1 GPU run:** on a Linux PC with an Intel or AMD GPU, preferably a Wayland session, run `spikes/s1-slint-video/run-gpu-bench.sh` (see `RUN_ON_GPU.md`)
-- [ ] **S3 VPS run:** on throwaway Ubuntu 24.04 and Debian 13 servers, run `spikes/s3-incus-desktop/run-on-vps.sh` as root, including Docker on newer Incus (Zabbly) and the metadata-address rule
-- [ ] **Docker decision:** fix nested Docker on the default bridge, or choose host-network-only Docker, an Incus VM when Docker is on, or a targeted AppArmor change
-- [ ] **S4 Drive run:** with a Google Cloud OAuth client (Desktop app, Drive API) and a test account, repeat the S4 cycle on Google Drive and confirm `drive.file` is enough
-- [ ] **S5 public-server run:** issue and renew a Let's Encrypt IP certificate; test Safari 26.4+ when a Mac is available
-- [ ] **S2 quiet re-measure:** repeat the final S2 runs on a quiet 4 vCPU VPS and check decoded-pixel fidelity
+- [ ] **S1 GPU run:** on a Linux PC with an Intel or AMD GPU, preferably a Wayland session, run `spikes/s1-slint-video/run-gpu-bench.sh` (see `RUN_ON_GPU.md`). **Deferred to before workstream 1G** (desktop client video): no GPU machine yet. Nothing before 1G depends on it, and the CPU-upload fallback is a working floor.
+- [x] **S3 VPS run:** all S3 criteria PASS on the VPS: 3.45–3.93 GB free at 2 vCPU / 4 GB, build on the server 86–206 s, prebuilt 16–29 s plus download, metadata-address and host-IP rules verified, inotify failure reproduced and fixed. New: Debian 13 guests need `raw.apparmor "signal,"` on this kernel; host Docker does cut container IPv4 (two `DOCKER-USER` rules fix it). Ubuntu 24.04 and Debian 13 **hosts**, a real 4 GB server and reboot persistence of the firewall rules are deferred to the 1E installer test matrix.
+- [x] **Docker decision:** nested Docker on Docker's default bridge works on Incus 6.0.5 (failed on 6.0.0). Decision: nesting + syscall interception on Incus ≥ 6.0.5, an installer self-test (`docker run --rm hello-world`), then fallbacks in order: Zabbly Incus, host-network-only Docker, Incus VM (not v1). See architecture §4.3.
+- [x] **S4 Drive run:** `drive.file` is enough. Full backup 2.44 GB → 1.0 GB in 125 s, simulated day 98 MB, restore exact (81,070 entries) and boots, `repair index` resume works on Drive, retry wrapper tested by fault injection. New: Drive deletes go to the trash and keep using quota, so the backend must delete permanently; one fixed OAuth client is required. Real rate-limit replies, packs ≥ 128 MB, slow uplinks and token revocation are deferred to Phase 2's nightly Drive test.
+- [x] **S5 public-server run:** Let's Encrypt IP certificates issued and renewed in production (160 h, ARI), and Chrome and Firefox ran WebTransport over the internet on IPv4. Chrome fails to an IPv6 literal (WebSocket fallback covers it). **Safari deferred to Phase 3** (needs a Mac).
+- [x] **S2 quiet re-measure:** PASS with 3 repeats per scenario: p95 10.7–16.5 ms on the same host and 20.4–24.8 ms over the internet (14 ms RTT), 0.45–0.75 server cores, idle about 0. Decoded fidelity 47 dB while typing, 34–44 dB in motion; colour correct once the stream is tagged BT.709. Lossy-link behaviour on a real path is deferred to workstream 1F (`tc netem` had no effect through the Incus proxy device).
 
 ### Gate 0
 
 - [x] All five spike reports written
-- [ ] Every failed criterion has an accepted alternative (open: nested Docker)
+- [x] Every failed criterion has an accepted alternative (nested Docker: self-test with fallbacks, §0.4)
 - [x] `architecture.md` and `tech-stack.md` updated with spike outcomes (remaining uncertainties marked **(provisional)**)
 - [x] CI foundations green on `main`
-- [ ] Follow-up runs in 0.4 done, or explicitly deferred with a reason
+- [x] Follow-up runs in 0.4 done, or explicitly deferred with a reason (S1 GPU run before 1G; Safari in Phase 3; other hosts in 1E; real rate limits in Phase 2)
 
 ---
 
@@ -175,6 +175,7 @@ flowchart LR
 - [ ] Input injection (XTest, scancodes), cursor channel, clipboard (text, images, files) both ways
 
 ### 1G — Desktop client
+- [ ] S1 GPU run done (deferred from Phase 0, §0.4) and the rendering path confirmed or switched to the fallback
 - [ ] Design mockups (dark-first + light) approved before UI implementation
 - [ ] Home, Add server wizard (SSH and one-liner paths), live progress, connect with PIN
 - [ ] SSH setup via `russh` with host-key confirmation

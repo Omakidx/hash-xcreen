@@ -1,6 +1,6 @@
 # Tech stack
 
-Every language, library, tool and external service hash-xcreen uses, and why. Items marked **(provisional)** were chosen in the Phase 0 spikes but still need the follow-up run listed in [execution-phase.md](execution-phase.md) §0.4 before we depend on them.
+Every language, library, tool and external service hash-xcreen uses, and why. Items marked **(provisional)** were chosen in the Phase 0 spikes but still need the follow-up run listed in [execution-phase.md](execution-phase.md) §0.4 before we depend on them (only the desktop client's video path, pending the S1 GPU run).
 
 ## Languages
 
@@ -15,11 +15,11 @@ Every language, library, tool and external service hash-xcreen uses, and why. It
 
 | Area | Choice | Why |
 |---|---|---|
-| Desktop isolation | **Incus** system containers (unprivileged) | Real distro images with systemd, built-in snapshots and export, image server, VMs available later |
+| Desktop isolation | **Incus** system containers (unprivileged), 6.0.5 or newer for Docker (distro package, or Zabbly) | Real distro images with systemd, built-in snapshots and export, image server, VMs available later |
 | Storage | **ZFS** or **btrfs** pool (spare disk or loop file) | Instant copy-on-write snapshots for consistent backups |
 | Desktop (v1) | **XFCE** on headless **Xorg** with the `dummy` driver | Lightest desktop, simplest and most efficient capture path |
 | Audio in the desktop | **PipeWire** | Standard on current Ubuntu/Debian; capture for streaming |
-| Docker (opt-in) | Docker Engine from Docker's apt repository, Incus `security.nesting` **(provisional: failing on Incus 6.0, see architecture §4.3)** | Official packages |
+| Docker (opt-in) | Docker Engine from Docker's apt repository, Incus `security.nesting` with `mknod`/`setxattr` interception, Incus ≥ 6.0.5, installer self-test with fallbacks (architecture §4.3) | Official packages; nested Docker on the default bridge proven in S3 on a VPS |
 | Host tuning | `/etc/sysctl.d/90-hx-incus.conf` (inotify limits, `vm.max_map_count`) | All unprivileged containers share one inotify budget; the default (128) blocks a second desktop |
 | Provisioning recipes | TOML fragments (`include`, `[vars]`, add-ons, `post` stage) applied by `hx-provision` | Same recipe drives prebuilt images and building on the server |
 | Process management | **systemd** units with sandboxing, `systemd-creds` for secrets | Hardening and TPM-sealed secrets without extra software |
@@ -35,7 +35,7 @@ Every language, library, tool and external service hash-xcreen uses, and why. It
 | Input injection | **XTest** (X11); **libei** later for Wayland desktops | Standard injection APIs per display stack |
 | Colour conversion | `yuvutils-rs` (SIMD) | Fast RGB→YUV without a C dependency |
 | Codec framework | **libavcodec** (FFmpeg) via `ffmpeg-next` / `ffmpeg-sys-next` (7.1 against Ubuntu 24.04's FFmpeg 6.1; newer FFmpeg needs a newer `ffmpeg-next`) | One API for every encoder and decoder, software and hardware |
-| Software encoder | **x264** (`ultrafast`, `zerolatency`, `crf=23`, one-frame VBV, bitrate ladder ≤ 20 Mbps, sliced threads, intra refresh) | Best low-latency software H.264 (4–8 ms encode in S2); GPL is fine because we are AGPL |
+| Software encoder | **x264** (`ultrafast`, `zerolatency`, `crf=23`, VBV of a few frames, bitrate ladder ≤ 20 Mbps, sliced threads, intra refresh, BT.709 limited-range VUI tags) | Best low-latency software H.264 (4–8 ms encode, 11–17 ms p95 end to end on a quiet VPS in S2); GPL is fine because we are AGPL |
 | Media pipeline threads | Dedicated OS threads joined by bounded `crossbeam-channel` queues, pooled buffers | Keeps the hot path off the async runtime (S2) |
 | Later encoders | **SVT-AV1** (real-time presets), **VAAPI**, **NVENC** | Screen-content AV1; hardware encoding when a GPU exists |
 | Audio codec | **Opus** (10 ms frames, in-band FEC) via `audiopus` | Low latency, loss-tolerant |
@@ -51,7 +51,7 @@ Every language, library, tool and external service hash-xcreen uses, and why. It
 | TLS | `rustls` | Pure Rust, no OpenSSL; supports pinned raw keys |
 | Control messages | **Protocol Buffers** via `prost` | Schema evolution, language-neutral for future mobile clients |
 | Media framing | Fixed little-endian binary header | No parsing cost on the hot path |
-| Web certificates | Let's Encrypt via ACME (`instant-acme`); short-lived IP-address certificates when there is no domain **(provisional: not yet issued for real)**; fallback: self-signed ECDSA P-256 certificate from `rcgen`, pinned with `serverCertificateHashes` | Real HTTPS for the browser without a domain |
+| Web certificates | Let's Encrypt via ACME (`instant-acme` 0.8 with `ring`, default features off so `aws-lc-rs` stays out); short-lived IP-address certificates when there is no domain, renewed by ACME Renewal Information; `rcgen` for keys and CSRs, `x509-parser` for the renewal ID; fallback: self-signed ECDSA P-256 certificate from `rcgen`, pinned with `serverCertificateHashes` | Real HTTPS for the browser without a domain (issued and renewed in production in S5) |
 
 ## Security
 
@@ -71,8 +71,8 @@ Every language, library, tool and external service hash-xcreen uses, and why. It
 | Area | Choice | Why |
 |---|---|---|
 | Backup engine | **`rustic_core`** (Rust implementation of the restic format), zstd level 3; versions pinned because its API is still unstable | Content-defined chunking, deduplication, compression, authenticated encryption; restic-compatible format; full round trip proven locally in S4 |
-| Google Drive access | **OpenDAL** `gdrive` service through `rustic_backend`, with only that service enabled (all services made a 43 MB binary), wrapped by hash-xcreen for 429/403 rate limits and the daily cap; rclone backend as fallback **(provisional: untested against Drive)** | Native Rust Drive backend for rustic |
-| Google auth | OAuth 2.0 for installed apps (PKCE, loopback redirect) via `oauth2`; scope `drive.file` | Sign-in happens in the client's browser; least-privilege scope with light verification |
+| Google Drive access | **OpenDAL** (`opendal` used directly with only `services-gdrive`, not `rustic_backend`'s `opendal` feature: 20 MB binary instead of 43 MB), behind hash-xcreen's own backend for rate limits, the daily cap, timeouts, listing errors and permanent deletes; rclone backend as fallback for very large packs or slow uplinks | Native Rust Drive backend for rustic; `drive.file` proven on real Drive in S4 |
+| Google auth | OAuth 2.0 for installed apps (PKCE, loopback redirect) via `oauth2`; scope `drive.file`; one fixed OAuth client for all installs | Sign-in happens in the client's browser; least-privilege scope with light verification; `drive.file` only sees files from the same client |
 | Scheduling | In-agent scheduler (wall-clock times, catch-up, no overlap) | Needs knowledge of sessions (upload cap) and quotas |
 | Alerts | **ntfy** HTTP API, generic **webhooks** (`reqwest`) | Push to phones and chat tools without a central service |
 
