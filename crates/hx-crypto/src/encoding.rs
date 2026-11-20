@@ -17,7 +17,9 @@ pub(crate) fn hex_decode(s: &str) -> Option<Vec<u8>> {
     if !b.len().is_multiple_of(2) {
         return None;
     }
-    b.chunks_exact(2)
+    b.as_chunks::<2>()
+        .0
+        .iter()
         .map(|p| Some((nibble(p[0])? << 4) | nibble(p[1])?))
         .collect()
 }

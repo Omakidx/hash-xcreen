@@ -18,6 +18,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod auth;
 pub mod clock;
 mod encoding;
 pub mod error;
@@ -26,10 +27,12 @@ pub mod pairing;
 pub mod pin;
 pub mod registry;
 pub mod secrets;
+pub mod session;
 pub mod text;
 pub mod tls;
 pub mod wire;
 
+pub use auth::{Authenticator, AuthenticatorConfig, Outcome};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use error::{Error, Result};
 pub use keys::{DeviceId, Fingerprint, IdentityKey, PublicKey};
@@ -39,3 +42,4 @@ pub use registry::{
     DeviceRecord, DeviceRegistry, FileRegistry, MemoryRegistry, Revocation, RevokeReason,
 };
 pub use secrets::{PairingCode, PairingCredential, PairingToken, Pin};
+pub use session::{AwaitingPin, PinReply, SessionOptions, connect_session, connect_with_pin};

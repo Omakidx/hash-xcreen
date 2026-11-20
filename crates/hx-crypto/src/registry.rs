@@ -508,7 +508,7 @@ mod tests {
             "hx-crypto-{tag}-{}-{}",
             std::process::id(),
             crate::keys::random_bytes::<4>()
-                .map(|b| u32::from_le_bytes(b))
+                .map(u32::from_le_bytes)
                 .unwrap_or(0)
         ));
         fs::create_dir_all(&d).expect("tmp dir");

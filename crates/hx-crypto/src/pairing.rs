@@ -362,6 +362,7 @@ pub struct PairedDevice {
 /// Run the server side of the pairing exchange on an accepted `INTENT_PAIR` connection.
 /// Registers the device before telling the client it succeeded. On failure the client is told
 /// (coarsely) and the error is returned; the caller closes the connection.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_pairing(
     conn: &Connection,
     window: &PairingWindow,
