@@ -21,8 +21,8 @@ path = "src/bin/bench/main.rs"
 
 [dependencies]
 crossbeam-channel.workspace = true
-hx-capture = { path = "../../crates/hx-capture" }
-hx-codec = { path = "../../crates/hx-codec" }
+hx-capture.workspace = true
+hx-codec.workspace = true
 rustix = { workspace = true, features = ["time"] }
 thiserror.workspace = true
 x11rb.workspace = true
