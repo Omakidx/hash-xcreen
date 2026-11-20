@@ -40,6 +40,11 @@ struct Cfg {
     stats_path: String,
     slots: usize,
     cursor: bool,
+    /// Directory for raw BGRA source frames (fidelity runs); empty = off.
+    dump_dir: String,
+    dump_every: u64,
+    /// Tag the stream as BT.709 limited range in the H.264 VUI.
+    vui: bool,
 }
 
 #[derive(Default)]
@@ -82,6 +87,8 @@ struct CapJob {
 }
 
 struct ConvJob {
+    /// Raw BGRA copy of the captured source frame (fidelity runs only).
+    dump: Option<Vec<u8>>,
     yuv: ffmpeg::frame::Video,
     t_damage: u64,
     t_capture: u64,
@@ -236,9 +243,10 @@ fn convert_thread(
     out_tx: Sender<ConvJob>,
     w: u32,
     h: u32,
+    dump_every: u64,
 ) -> Result<()> {
     use yuvutils_rs::*;
-    for job in job_rx {
+    for (n, job) in (0u64..).zip(job_rx) {
         let mut frame = match yuv_free_rx.recv() {
             Ok(f) => f,
             Err(_) => return Ok(()),
@@ -265,8 +273,15 @@ fn convert_thread(
                 .map_err(|e| anyhow!("convert: {e:?}"))?;
         }
         let t_convert = now_ns();
+        // Fidelity runs: keep a copy of every Nth captured frame; n equals the frame number the encoder assigns.
+        let dump = if dump_every > 0 && n.is_multiple_of(dump_every) {
+            // SAFETY: slot still owned by this thread until it is released below.
+            Some(unsafe { std::slice::from_raw_parts(slots[job.slot].ptr, (w * h * 4) as usize) }.to_vec())
+        } else {
+            None
+        };
         let _ = free_tx.send(job.slot);
-        if out_tx.send(ConvJob { yuv: frame, t_damage: job.t_damage, t_capture: job.t_capture, t_convert, resync: job.resync }).is_err() {
+        if out_tx.send(ConvJob { dump, yuv: frame, t_damage: job.t_damage, t_capture: job.t_capture, t_convert, resync: job.resync }).is_err() {
             return Ok(());
         }
     }
@@ -299,6 +314,9 @@ fn open_encoder(cfg: &Cfg, kbps: u32, fps: u32, w: u32, h: u32) -> Result<ffmpeg
     );
     if !cfg.intra_refresh {
         params.push_str(":scenecut=0");
+    }
+    if cfg.vui {
+        params.push_str(":colorprim=bt709:transfer=bt709:colormatrix=bt709:fullrange=off");
     }
     let mut opts = ffmpeg::Dictionary::new();
     opts.set("preset", &cfg.preset);
@@ -365,6 +383,9 @@ fn encode_thread(
         let t_enc_end = now_ns();
         let _ = yuv_free_tx.send(job.yuv);
         let Some((payload, key)) = out else { continue };
+        if let Some(raw) = job.dump.take() {
+            let _ = std::fs::write(format!("{}/src-{:06}.bgra", cfg.dump_dir, frame_no), raw);
+        }
         sh.frames_enc.fetch_add(1, Relaxed);
         sh.bytes_enc.fetch_add(payload.len() as u64, Relaxed);
         let hdr = FrameHeader {
@@ -416,6 +437,24 @@ async fn serve_connection(
     sh.min_interval_ns.store(1_000_000_000 / fps_for(cfg, cfg.max_kbps) as u64, Relaxed);
     sh.force_idr.store(true, Relaxed);
     sh.conn_epoch.fetch_add(1, Relaxed);
+
+    // Clock probe responder (NTP-style, over QUIC datagrams): echo t1, add server receive time t2 and send time t3.
+    {
+        let c = conn.clone();
+        tokio::spawn(async move {
+            while let Ok(d) = c.read_datagram().await {
+                let t2 = now_ns();
+                if d.len() < 8 {
+                    continue;
+                }
+                let mut r = Vec::with_capacity(24);
+                r.extend_from_slice(&d[..8]);
+                r.extend_from_slice(&t2.to_le_bytes());
+                r.extend_from_slice(&now_ns().to_le_bytes());
+                let _ = c.send_datagram(r.into());
+            }
+        });
+    }
 
     // Cursor channel: one long-lived unidirectional stream.
     let cconn = conn.clone();
@@ -714,7 +753,11 @@ fn main() -> Result<()> {
         stats_path: a.get_str("stats", "/tmp/s2-server-stats.csv"),
         slots: a.get("slots", 3),
         cursor: a.get::<u32>("cursor", 1) == 1,
+        dump_dir: a.get_str("dump", ""),
+        dump_every: a.get("dump-every", 40),
+        vui: a.get::<u32>("vui", 0) == 1,
     };
+    let dump_every = if cfg.dump_dir.is_empty() { 0 } else { cfg.dump_every };
     ffmpeg::init()?;
     ffmpeg::util::log::set_level(ffmpeg::util::log::Level::Warning);
 
@@ -774,7 +817,7 @@ fn main() -> Result<()> {
     {
         let slots = slots.clone();
         std::thread::Builder::new().name("convert".into()).spawn(move || {
-            if let Err(e) = convert_thread(job_rx, slots, free_tx, yuv_free_rx, conv_tx, w as u32, h as u32) {
+            if let Err(e) = convert_thread(job_rx, slots, free_tx, yuv_free_rx, conv_tx, w as u32, h as u32, dump_every) {
                 eprintln!("convert thread: {e:#}");
                 std::process::exit(1);
             }
