@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>S5 WebTransport + WebCodecs spike</title>
+<style>body{font:14px monospace;margin:16px}pre{white-space:pre-wrap}</style>
+</head>
+<body>
+<h3>hash-xcreen spike S5</h3>
+<pre id="out">starting...</pre>
+<script>
+"use strict";
+const params = new URLSearchParams(location.search);
+const FRAMES = Number(params.get("frames") || 300);       // frames per run
+const W = Number(params.get("w") || 1920), H = Number(params.get("h") || 1080), FPS = 60;
+const BITRATE = Number(params.get("bitrate") || 8_000_000);
+const HW = params.get("hw") || "no-preference";            // hardwareAcceleration hint
+const out = document.getElementById("out");
+const report = { userAgent: navigator.userAgent, frames: FRAMES, size: `${W}x${H}`, fps: FPS, hw: HW, steps: {} };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const epochUs = () => Math.round((performance.timeOrigin + performance.now()) * 1000);
+function log(m) {
+  out.textContent += "\n" + m;
+  fetch("/log", { method: "POST", body: m }).catch(() => {});
+}
+function pct(arr, p) {
+  if (!arr.length) return null;
+  const s = [...arr].sort((a, b) => a - b);
+  return +s[Math.min(s.length - 1, Math.floor((p / 100) * s.length))].toFixed(3);
+}
+function summary(arr) {
+  if (!arr.length) return null;
+  const sum = arr.reduce((a, b) => a + b, 0);
+  return { n: arr.length, mean: +(sum / arr.length).toFixed(3), p50: pct(arr, 50), p95: pct(arr, 95), p99: pct(arr, 99), max: pct(arr, 100) };
+}
+async function finish() {
+  log("REPORT " + JSON.stringify(report));
+  try { await fetch("/report", { method: "POST", body: JSON.stringify(report) }); } catch (e) {}
+  document.title = "DONE";
+}
+
+// ---- test pattern: moving gradient + bars + text + frame counter
+const cv = new OffscreenCanvas(W, H);
+const ctx = cv.getContext("2d");
+function draw(i) {
+  const t = i / FPS;
+  const g = ctx.createLinearGradient(0, 0, W, H);
+  g.addColorStop(0, `hsl(${(i * 2) % 360},70%,45%)`);
+  g.addColorStop(1, `hsl(${(i * 2 + 120) % 360},70%,25%)`);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  for (let k = 0; k < 24; k++) {
+    ctx.fillStyle = `hsl(${(k * 15 + i * 3) % 360},80%,60%)`;
+    const x = ((k * 97 + i * (6 + k)) % (W + 200)) - 100;
+    ctx.fillRect(x, 40 + k * 40, 160, 28);
+  }
+  ctx.fillStyle = "#fff"; ctx.font = "bold 96px monospace";
+  ctx.fillText(`hash-xcreen S5  frame ${i}`, 60, H - 120);
+  ctx.font = "32px monospace";
+  ctx.fillText("The quick brown fox jumps over the lazy dog 0123456789", 60, H - 60);
+  ctx.beginPath(); ctx.arc(W / 2 + Math.cos(t * 3) * 500, H / 2 + Math.sin(t * 3) * 250, 90, 0, 7); ctx.fillStyle = "#ff0"; ctx.fill();
+}
+
+function header(idx, key, clientUs) {
+  const b = new ArrayBuffer(24); const v = new DataView(b);
+  v.setUint32(0, idx, true); v.setUint32(4, key ? 1 : 0, true);
+  v.setBigUint64(8, BigInt(clientUs), true); v.setBigUint64(16, 0n, true);
+  return new Uint8Array(b);
+}
+
+async function readAll(stream) {
+  const reader = stream.getReader(); const chunks = []; let len = 0;
+  for (;;) { const { value, done } = await reader.read(); if (done) break; chunks.push(value); len += value.length; }
+  const buf = new Uint8Array(len); let o = 0; for (const c of chunks) { buf.set(c, o); o += c.length; }
+  return buf;
+}
+
+async function main() {
+  const info = await (await fetch("/info")).json();
+  const hash = Uint8Array.from(info.hash.match(/../g).map((h) => parseInt(h, 16)));
+  report.hasWebTransport = typeof WebTransport !== "undefined";
+  report.hasVideoEncoder = typeof VideoEncoder !== "undefined";
+  report.hasVideoDecoder = typeof VideoDecoder !== "undefined";
+  report.secureContext = isSecureContext;
+  log(`secure=${isSecureContext} WT=${report.hasWebTransport} enc=${report.hasVideoEncoder} dec=${report.hasVideoDecoder}`);
+  if (!report.hasWebTransport) { report.error = "WebTransport undefined"; return finish(); }
+
+  // ---- 1. WebTransport connect with certificate pinning
+  let wt;
+  const t0 = performance.now();
+  try {
+    wt = new WebTransport(`https://127.0.0.1:${info.udpPort}/wt`, {
+      serverCertificateHashes: [{ algorithm: "sha-256", value: hash }],
+    });
+    await wt.ready;
+  } catch (e) { report.steps.connect = { ok: false, error: String(e) }; report.error = "connect: " + e; return finish(); }
+  report.steps.connect = { ok: true, ms: +(performance.now() - t0).toFixed(1), reliability: wt.reliability, congestionControl: wt.congestionControl, maxDatagramSize: wt.datagrams.maxDatagramSize };
+  log("WebTransport connected " + JSON.stringify(report.steps.connect));
+
+  const incoming = wt.incomingUnidirectionalStreams.getReader();
+  // ---- 2. datagram path (echo)
+  {
+    const N = 200, sentAt = new Map(), rtts = []; let received = 0;
+    const w = wt.datagrams.writable.getWriter(); const r = wt.datagrams.readable.getReader();
+    const reading = (async () => {
+      for (;;) {
+        const { value, done } = await r.read(); if (done) break;
+        const v = new DataView(value.buffer, value.byteOffset, value.byteLength);
+        const seq = v.getUint32(0, true);
+        if (sentAt.has(seq)) { rtts.push((performance.now() - sentAt.get(seq))); received++; }
+      }
+    })();
+    for (let i = 0; i < N; i++) {
+      const b = new Uint8Array(64); new DataView(b.buffer).setUint32(0, i, true);
+      sentAt.set(i, performance.now()); await w.write(b); await sleep(5);
+    }
+    await sleep(500);
+    report.steps.datagrams = { sent: N, received, lossPct: +(((N - received) / N) * 100).toFixed(2), rttMs: summary(rtts) };
+    log("datagrams " + JSON.stringify(report.steps.datagrams));
+    r.cancel().catch(() => {}); await reading.catch(() => {});
+  }
+
+  // ---- 3. encode FRAMES frames with VideoEncoder (H.264, annexb, realtime)
+  if (!report.hasVideoEncoder || !report.hasVideoDecoder) { report.error = "no WebCodecs"; return finish(); }
+  const candidates = ["avc1.64002a", "avc1.4d002a", "avc1.42002a", "avc1.640028"];
+  let encCfg = null;
+  report.steps.encoderSupport = {};
+  for (const codec of candidates) {
+    const c = { codec, width: W, height: H, framerate: FPS, bitrate: BITRATE, latencyMode: "realtime", avc: { format: "annexb" }, hardwareAcceleration: HW };
+    try { const s = await VideoEncoder.isConfigSupported(c); report.steps.encoderSupport[codec] = s.supported; if (s.supported && !encCfg) encCfg = c; }
+    catch (e) { report.steps.encoderSupport[codec] = "error " + e; }
+  }
+  if (!encCfg) { report.error = "no supported H.264 encoder config"; return finish(); }
+  report.encoderConfig = encCfg;
+  const chunks = []; let encErr = null;
+  const enc = new VideoEncoder({
+    output: (chunk) => { const d = new Uint8Array(chunk.byteLength); chunk.copyTo(d); chunks.push({ key: chunk.type === "key", ts: chunk.timestamp, data: d }); },
+    error: (e) => { encErr = e; },
+  });
+  enc.configure(encCfg);
+  const te = performance.now();
+  for (let i = 0; i < FRAMES; i++) {
+    draw(i);
+    const f = new VideoFrame(cv, { timestamp: Math.round((i * 1e6) / FPS), duration: Math.round(1e6 / FPS) });
+    enc.encode(f, { keyFrame: i % 120 === 0 });
+    f.close();
+    while (enc.encodeQueueSize > 4) await sleep(1);
+    if (encErr) break;
+  }
+  await enc.flush();
+  const encMs = performance.now() - te;
+  if (encErr) { report.error = "encoder: " + encErr; return finish(); }
+  const total = chunks.reduce((a, c) => a + c.data.length, 0);
+  report.steps.encode = { frames: chunks.length, ms: +encMs.toFixed(1), fps: +((chunks.length * 1000) / encMs).toFixed(1), totalBytes: total, avgFrameBytes: Math.round(total / chunks.length), maxFrameBytes: Math.max(...chunks.map((c) => c.data.length)), keyFrames: chunks.filter((c) => c.key).length, mbps: +((total * 8 * FPS) / chunks.length / 1e6).toFixed(2) };
+  log("encode " + JSON.stringify(report.steps.encode));
+
+  // ---- decoder factory
+  const decodeCfg = { codec: encCfg.codec, optimizeForLatency: true, hardwareAcceleration: HW };
+  const ds = await VideoDecoder.isConfigSupported(decodeCfg);
+  report.steps.decoderSupport = ds.supported;
+  if (!ds.supported) { report.error = "decoder config unsupported"; return finish(); }
+  const grab = (f) => { // sample a pixel to prove real pixels were decoded
+    const c = new OffscreenCanvas(64, 64); const x = c.getContext("2d");
+    x.drawImage(f, 0, 0, 64, 64); const p = x.getImageData(0, 0, 1, 1).data; return [p[0], p[1], p[2]];
+  };
+
+  // ---- 4. burst decode from memory: decoder throughput ceiling
+  {
+    const times = new Map(); const dts = []; let got = 0, sample = null, derr = null;
+    const dec = new VideoDecoder({
+      output: (f) => { const k = f.timestamp; dts.push(performance.now() - times.get(k)); got++; if (got === FRAMES) sample = grab(f); f.close(); },
+      error: (e) => { derr = e; },
+    });
+    dec.configure(decodeCfg);
+    const tb = performance.now();
+    for (const c of chunks) {
+      times.set(c.ts, performance.now());
+      dec.decode(new EncodedVideoChunk({ type: c.key ? "key" : "delta", timestamp: c.ts, data: c.data }));
+      while (dec.decodeQueueSize > 8) await sleep(0);
+    }
+    await dec.flush(); const ms = performance.now() - tb;
+    report.steps.burstDecode = { frames: got, ms: +ms.toFixed(1), fps: +((got * 1000) / ms).toFixed(1), error: derr ? String(derr) : null, lastFramePixel: sample, note: "queue-limited burst; per-frame time includes queueing" };
+    log("burstDecode " + JSON.stringify(report.steps.burstDecode));
+    dec.close();
+  }
+
+  // ---- 5. real-time run: pace at 60 fps over WebTransport, one uni stream per frame, echo back, decode in order
+  {
+    const sendAt = new Map(), rtt = [], oneWay = [], decMs = [], e2e = [], sizes = [];
+    const dtimes = new Map(); const pending = new Map(); let next = 0, decoded = 0, derr = null, sample = null; let lastOut = 0; const outGaps = [];
+    const dec = new VideoDecoder({
+      output: (f) => { const now = performance.now(); decMs.push(now - dtimes.get(f.timestamp)); if (lastOut) outGaps.push(now - lastOut); lastOut = now; decoded++; if (decoded === FRAMES) sample = grab(f); f.close(); },
+      error: (e) => { derr = e; },
+    });
+    dec.configure(decodeCfg);
+    const feed = () => { while (pending.has(next)) { const c = pending.get(next); pending.delete(next); dtimes.set(c.ts, performance.now()); dec.decode(new EncodedVideoChunk({ type: c.key ? "key" : "delta", timestamp: c.ts, data: c.data })); next++; } };
+    // receive side: accept server uni streams
+    const rd = incoming;
+    let recvCount = 0, outOfOrder = 0, maxIdx = -1;
+    const receiver = (async () => {
+      const tasks = [];
+      while (recvCount < FRAMES) {
+        const { value: s, done } = await rd.read(); if (done) break;
+        recvCount++;
+        tasks.push((async () => {
+          const buf = await readAll(s); const done = epochUs();
+          const v = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+          const idx = v.getUint32(0, true), key = v.getUint32(4, true) === 1;
+          const cUs = Number(v.getBigUint64(8, true)), sUs = Number(v.getBigUint64(16, true));
+          rtt.push((done - cUs) / 1000); oneWay.push((done - sUs) / 1000); sizes.push(buf.length - 24);
+          if (idx < maxIdx) outOfOrder++; maxIdx = Math.max(maxIdx, idx);
+          pending.set(idx, { key, ts: Math.round((idx * 1e6) / FPS), data: buf.subarray(24) });
+          e2e.push(performance.now()); feed();
+        })());
+      }
+      await Promise.all(tasks);
+    })();
+    const tr = performance.now();
+    for (let i = 0; i < FRAMES; i++) {
+      const due = tr + (i * 1000) / FPS; const wait = due - performance.now(); if (wait > 1) await sleep(wait);
+      const c = chunks[i]; const s = await wt.createUnidirectionalStream(); const w = s.getWriter();
+      await w.write(header(i, c.key, epochUs())); await w.write(c.data); await w.close();
+    }
+    const sendMs = performance.now() - tr;
+    await Promise.race([receiver, sleep(10000)]);
+    await dec.flush().catch((e) => { derr = derr || e; }); const ms = performance.now() - tr;
+    report.steps.realtime = {
+      sent: FRAMES, received: recvCount, decoded, sendMs: +sendMs.toFixed(1), totalMs: +ms.toFixed(1), decodedFps: +((decoded * 1000) / ms).toFixed(1), outOfOrder,
+      rttMs: summary(rtt), serverToBrowserOneWayMs: summary(oneWay), decodeMs: summary(decMs), decodeOutputGapMs: summary(outGaps),
+      frameBytes: summary(sizes), error: derr ? String(derr) : null, lastFramePixel: sample,
+    };
+    log("realtime " + JSON.stringify(report.steps.realtime));
+    dec.close();
+  }
+
+  // ---- 6. bulk: send all frames back-to-back (no pacing) to measure stream throughput
+  {
+    const rd = incoming; let recv = 0, bytes = 0;
+    const tb = performance.now();
+    const receiver = (async () => { const tasks = []; while (recv < FRAMES) { const { value: s, done } = await rd.read(); if (done) break; recv++; tasks.push(readAll(s).then((b) => { bytes += b.length; })); } await Promise.all(tasks); })();
+    for (let i = 0; i < FRAMES; i++) { const c = chunks[i]; const s = await wt.createUnidirectionalStream(); const w = s.getWriter(); await w.write(header(i, c.key, epochUs())); await w.write(c.data); await w.close(); }
+    await Promise.race([receiver, sleep(15000)]);
+    const ms = performance.now() - tb;
+    report.steps.bulkEcho = { frames: recv, ms: +ms.toFixed(1), fps: +((recv * 1000) / ms).toFixed(1), mbpsEcho: +((bytes * 8) / ms / 1000).toFixed(1) };
+    log("bulkEcho " + JSON.stringify(report.steps.bulkEcho));
+  }
+  wt.close({ closeCode: 0, reason: "done" });
+  report.ok = true;
+  return finish();
+}
+main().catch((e) => { report.error = "uncaught: " + e + " " + (e && e.stack); finish(); });
+</script>
+</body>
+</html>
