@@ -73,6 +73,7 @@ both!(
     undecided_sessions_are_refused_busy,
     authorize_cannot_be_widened_by_a_second_call,
     failed_accept_closes_with_an_explicit_code,
+    cursor_position_bursts_are_coalesced,
 );
 
 async fn server_sends_need_authorization(pref: TransportPreference) {
@@ -375,7 +376,7 @@ async fn websocket_unread_input_never_blocks_control_and_overflow_closes() {
         auth_message()
     );
     // A peer that outpaces an application which is not reading is cut off, not buffered.
-    for _ in 0..2000 {
+    for _ in 0..9000 {
         if p.client.send_input(&key()).await.is_err() {
             break;
         }
@@ -629,4 +630,60 @@ async fn a_peer_that_grants_no_credit_cannot_stall_accept() {
         .await
         .expect("a new client connects");
     within(ok).await.expect("join").expect("accepted");
+}
+
+/// A burst of cursor positions the application does not read is coalesced, not fatal.
+async fn cursor_position_bursts_are_coalesced(pref: TransportPreference) {
+    let p = pair_full(
+        pref,
+        ServerOptions::default(),
+        server_hello(),
+        client_hello(),
+        true,
+    )
+    .await;
+    let shape = hx_proto::pb::CursorEvent {
+        event: Some(hx_proto::pb::cursor_event::Event::Shape(pb::CursorShape {
+            id: 7,
+            width: 1,
+            height: 1,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            rgba: Bytes::from_static(&[1, 2, 3, 4]),
+        })),
+    };
+    let pos = |x: i32| hx_proto::pb::CursorEvent {
+        event: Some(hx_proto::pb::cursor_event::Event::Position(
+            pb::CursorPosition {
+                x,
+                y: 0,
+                shape_id: 7,
+                visible: true,
+            },
+        )),
+    };
+    p.srv.send_cursor(&shape).await.expect("shape");
+    for x in 0..3000 {
+        p.srv.send_cursor(&pos(x)).await.expect("position");
+    }
+    // The client application was not reading. Wait for the burst to arrive, then drain.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        p.client.close_info().is_none(),
+        "a position burst must not disconnect"
+    );
+    assert_eq!(
+        within(p.client.recv_cursor()).await.expect("shape first"),
+        shape
+    );
+    let mut last = None;
+    let mut count = 0;
+    while let Ok(Ok(e)) =
+        tokio::time::timeout(Duration::from_millis(300), p.client.recv_cursor()).await
+    {
+        last = Some(e);
+        count += 1;
+    }
+    assert_eq!(last, Some(pos(2999)), "the newest position survives");
+    assert!(count < 3000, "positions were coalesced ({count} delivered)");
 }

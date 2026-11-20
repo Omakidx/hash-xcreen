@@ -96,7 +96,8 @@ Rules:
 | Clipboard transfer total | 67108864 (64 MiB) |
 | WebSocket transfer chunk | 65536 |
 | Queued, unread incoming transfer data (WebSocket) | 1 MiB per transfer and 4 MiB per connection; a transfer that exceeds either is aborted (`abort`, §9.4). On QUIC the same bound comes from stream and connection flow control (§1) |
-| Unread input or cursor messages queued (WebSocket) | 256 each; a peer that outpaces the application beyond this is closed with `PROTOCOL_ERROR` (QUIC: per-stream flow control instead) |
+| Unread input messages queued (WebSocket) | 4096; a peer that outpaces the application beyond this is closed with `PROTOCOL_ERROR` (QUIC: per-stream flow control instead) |
+| Unread cursor events queued | 256. Cursor **positions** are coalesced, latest wins: a burst the application has not read collapses into the newest position (a position never overtakes the shape sent before it); only more than 256 queued shapes is an overflow (`PROTOCOL_ERROR`) |
 
 A receiver that sees a value above its limit treats it as a protocol error (reliable channels) or drops the datagram. Limits are checked **before** allocating.
 
@@ -415,7 +416,7 @@ There are none on the wire. The sender SHOULD interleave: control, input, mouse 
 | Duplicate control, input or cursor stream | Close, `PROTOCOL_ERROR` |
 | Channel sent by the wrong role or without its feature | Close, `PROTOCOL_ERROR` |
 | Control message other than `pairing`, `auth`, `goodbye`, `ping`, `pong` while restricted; transfer, audio or video message while restricted (WebSocket) | Close, `PROTOCOL_ERROR` |
-| Input or cursor queue overflow (WebSocket) | Close, `PROTOCOL_ERROR` |
+| Input queue overflow (WebSocket) or cursor shape queue overflow | Close, `PROTOCOL_ERROR` |
 | Input or mouse data while restricted | Drop, count, continue |
 | Not authorized within the authorization deadline | Close, `UNAUTHORIZED` |
 | Pending session not decided within the decision window | `Refuse(BUSY)`, close `BUSY` |

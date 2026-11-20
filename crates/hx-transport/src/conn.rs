@@ -136,11 +136,53 @@ pub(crate) enum Backend {
     Ws(WsBackend),
 }
 
+/// Unread input events a connection may queue (generous: key and button events are tiny).
+/// WebSocket peers that outpace an application beyond this are closed (protocol §3.1).
+const INPUT_QUEUE: usize = 4096;
+/// Queued cursor events; position updates beyond this coalesce, shapes beyond it are an overflow.
+const CURSOR_QUEUE: usize = 256;
+
+/// Cursor events with latest-wins coalescing of positions: a burst of pointer positions the
+/// application has not consumed collapses into the newest one, while shapes are never lost
+/// or reordered relative to the positions that follow them.
+#[derive(Default)]
+pub(crate) struct CursorQueue {
+    q: StdMutex<std::collections::VecDeque<CursorEvent>>,
+    notify: Notify,
+}
+
+impl CursorQueue {
+    fn push(&self, e: CursorEvent) -> Result<()> {
+        let is_position =
+            |e: &CursorEvent| matches!(e.event, Some(pb::cursor_event::Event::Position(_)));
+        let mut q = self.q.lock().map_err(|_| Error::ChannelClosed)?;
+        if is_position(&e) {
+            if let Some(back) = q.back_mut().filter(|b| is_position(b)) {
+                *back = e;
+                self.notify.notify_one();
+                return Ok(());
+            }
+            if q.len() >= CURSOR_QUEUE {
+                return Ok(()); // a newer position will follow
+            }
+        } else if q.len() >= CURSOR_QUEUE {
+            return Err(Error::Violation("cursor shape queue overflow".into()));
+        }
+        q.push_back(e);
+        self.notify.notify_one();
+        Ok(())
+    }
+
+    fn pop(&self) -> Option<CursorEvent> {
+        self.q.lock().ok().and_then(|mut q| q.pop_front())
+    }
+}
+
 /// Sender halves used by the transport's reader tasks.
 pub(crate) struct Router {
     control: mpsc::Sender<ControlMessage>,
     input: mpsc::Sender<InputEvent>,
-    cursor: mpsc::Sender<CursorEvent>,
+    cursor: CursorQueue,
     video: mpsc::Sender<VideoFrame>,
     audio: mpsc::Sender<AudioPacket>,
     pub(crate) transfers: mpsc::Sender<IncomingTransfer>,
@@ -159,7 +201,6 @@ struct VideoRx {
 struct Rx {
     control: Mutex<mpsc::Receiver<ControlMessage>>,
     input: Mutex<mpsc::Receiver<InputEvent>>,
-    cursor: Mutex<mpsc::Receiver<CursorEvent>>,
     video: Mutex<VideoRx>,
     audio: Mutex<mpsc::Receiver<AudioPacket>>,
     transfers: Mutex<mpsc::Receiver<IncomingTransfer>>,
@@ -217,8 +258,7 @@ pub(crate) struct Parts {
 impl Inner {
     pub(crate) fn new(p: Parts, backend: Backend) -> Arc<Self> {
         let (control_tx, control_rx) = mpsc::channel(64);
-        let (input_tx, input_rx) = mpsc::channel(256);
-        let (cursor_tx, cursor_rx) = mpsc::channel(256);
+        let (input_tx, input_rx) = mpsc::channel(INPUT_QUEUE);
         let (video_tx, video_rx) = mpsc::channel(16);
         let (audio_tx, audio_rx) = mpsc::channel(64);
         let (transfer_tx, transfer_rx) = mpsc::channel(16);
@@ -241,7 +281,7 @@ impl Inner {
             router: Router {
                 control: control_tx,
                 input: input_tx,
-                cursor: cursor_tx,
+                cursor: CursorQueue::default(),
                 video: video_tx,
                 audio: audio_tx,
                 transfers: transfer_tx,
@@ -251,7 +291,6 @@ impl Inner {
             rx: Rx {
                 control: Mutex::new(control_rx),
                 input: Mutex::new(input_rx),
-                cursor: Mutex::new(cursor_rx),
                 video: Mutex::new(VideoRx {
                     raw: video_rx,
                     window: ReorderWindow::new(p.options.reorder_capacity),
@@ -440,7 +479,7 @@ impl Inner {
     }
 
     pub(crate) async fn deliver_cursor(&self, e: CursorEvent) -> Result<()> {
-        self.deliver_bounded(&self.router.cursor, e, "cursor").await
+        self.router.cursor.push(e)
     }
 
     /// QUIC: await space (per-stream flow control is the backpressure). WebSocket: one reader
@@ -875,8 +914,22 @@ impl Connection {
     pub async fn recv_cursor(&self) -> Result<CursorEvent> {
         self.require_role(Role::Client, "recv_cursor")?;
         let i = self.inner();
-        let mut g = i.rx.cursor.lock().await;
-        i.recv_or_closed(&mut g).await
+        let mut closed = i.subscribe_closed();
+        loop {
+            if let Some(e) = i.router.cursor.pop() {
+                return Ok(e);
+            }
+            tokio::select! {
+                () = i.router.cursor.notify.notified() => {}
+                r = wait_closed(&mut closed) => {
+                    // Deliver what was queued before the close.
+                    if let Some(e) = i.router.cursor.pop() {
+                        return Ok(e);
+                    }
+                    return Err(r.map_or(Error::ChannelClosed, Error::Closed));
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------ video (server to client)
