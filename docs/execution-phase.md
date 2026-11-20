@@ -47,7 +47,7 @@ Each spike is throwaway code in `spikes/<name>/`, time-boxed, and ends with a sh
 **S1 — Slint video presentation** (time box: 1 week)
 - Goal: show hardware-decoded 1080p60 H.264 in a Slint window with no CPU copy per frame.
 - Method: libavcodec + VAAPI decode → wgpu texture → `slint::Image`; compare with an OpenGL underlay and a CPU upload path.
-- Pass: sustained 60 fps with even frame pacing; decode-to-present ≤ 8 ms; UI stays responsive.
+- Pass: sustained 60 fps with even frame pacing; decode to render complete ≤ 8 ms (restated after S1: with vsync at 60 Hz a frame waits ~8.3 ms on average before scan-out whatever the path, so a literal 8 ms decode-to-photon target is unattainable); UI stays responsive.
 - Decides: the client rendering path.
 
 **S2 — Streaming loop** (time box: 2 weeks)
@@ -74,11 +74,36 @@ Each spike is throwaway code in `spikes/<name>/`, time-boxed, and ends with a sh
 - Pass: WebTransport works in Chromium and Firefox (Safari status recorded); IP certificate issues and renews; browser decode at 1080p60.
 - Decides: WebTransport library, Safari fallback (WebSocket), certificate strategy without a domain.
 
+### 0.3 Spike results (2026-11-20)
+
+All five spikes ran locally on an Ubuntu 24.04 VM (16 cores, no GPU, no KVM, shared by all five spikes at once, so timings are indicative). Full reports are in `docs/spikes/`.
+
+| Spike | Result | Decision | Still unproven |
+|---|---|---|---|
+| [S1](spikes/s1-slint-video.md) Slint video | All criteria UNVERIFIED (no GPU); every path builds and runs or reports why it can't | Provisional: VAAPI → DMA-BUF → EGL → OpenGL texture → Slint borrowed texture; CPU upload as fallback; wgpu route kept as an option | Every performance number; needs the GPU run |
+| [S2](spikes/s2-streaming-loop.md) Streaming loop | PASS: p95 added latency 24.6–34.6 ms (typing, scroll, drag), 40.5 ms video; encoder 0.5–0.6 cores; idle 0.01 cores and 0 bytes | x264 settings, capture-when-free pacing, dedicated threads, frame-per-stream with ack-driven congestion control | Quiet-VPS re-measure; decoded-pixel fidelity; jitter-adaptive controller |
+| [S3](spikes/s3-incus-desktop.md) Incus desktop | PASS locally: 3.5–3.9 GB free at 2 vCPU / 4 GB; prebuilt ~1.5–2.5 min; build 3.5–5 min. **FAIL: nested Docker** on Docker's default bridge | Minimum spec kept; btrfs pool sized to the disk; TOML recipe format; sysctl inotify limits required | Real-VPS numbers; metadata-address ACL; Docker on newer Incus |
+| [S4](spikes/s4-backup-roundtrip.md) Backup round trip | PASS locally: 2.24 GB desktop → 906 MB; 98 MB simulated day; bit-exact restore that boots; SQLite intact; resume works with `repair index` | zstd level 3; OpenDAL `gdrive` behind an hx retry wrapper (rclone fallback); revised exclude/protected rules | Everything on real Google Drive |
+| [S5](spikes/s5-webtransport.md) Browser transport | PASS: one port for WebTransport and native QUIC; Chrome decodes 1080p60; Firefox transport works | `wtransport` on our quinn endpoint with ALPN dispatch; WebSocket fallback for Safari; IP certificate or pinned self-signed certificate | Real IP-certificate issuance; Safari; Firefox decode on real hardware |
+
+### 0.4 Follow-up runs before Gate 0 closes
+
+These need hardware or accounts the spike machine didn't have. The scripts are ready on each spike branch.
+
+- [ ] **S1 GPU run:** on a Linux PC with an Intel or AMD GPU, preferably a Wayland session, run `spikes/s1-slint-video/run-gpu-bench.sh` (see `RUN_ON_GPU.md`)
+- [ ] **S3 VPS run:** on throwaway Ubuntu 24.04 and Debian 13 servers, run `spikes/s3-incus-desktop/run-on-vps.sh` as root, including Docker on newer Incus (Zabbly) and the metadata-address rule
+- [ ] **Docker decision:** fix nested Docker on the default bridge, or choose host-network-only Docker, an Incus VM when Docker is on, or a targeted AppArmor change
+- [ ] **S4 Drive run:** with a Google Cloud OAuth client (Desktop app, Drive API) and a test account, repeat the S4 cycle on Google Drive and confirm `drive.file` is enough
+- [ ] **S5 public-server run:** issue and renew a Let's Encrypt IP certificate; test Safari 26.4+ when a Mac is available
+- [ ] **S2 quiet re-measure:** repeat the final S2 runs on a quiet 4 vCPU VPS and check decoded-pixel fidelity
+
 ### Gate 0
 
-- [ ] All five spike reports written; any failed criterion has an accepted alternative
-- [ ] `architecture.md` and `tech-stack.md` updated with spike outcomes (all **(spike)** markers resolved)
-- [ ] CI foundations green on `main`
+- [x] All five spike reports written
+- [ ] Every failed criterion has an accepted alternative (open: nested Docker)
+- [x] `architecture.md` and `tech-stack.md` updated with spike outcomes (remaining uncertainties marked **(provisional)**)
+- [x] CI foundations green on `main`
+- [ ] Follow-up runs in 0.4 done, or explicitly deferred with a reason
 
 ---
 
