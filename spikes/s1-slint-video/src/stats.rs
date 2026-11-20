@@ -34,7 +34,7 @@ pub struct Samples {
     pub frames_presented: u64,
     /// Decoded frames replaced in the mailbox before they were rendered.
     pub frames_dropped: u64,
-    /// Frames the decoder delivered later than their 1/fps schedule slot by more than half a frame.
+    /// Frames whose decode started more than half a frame after their 1/fps schedule slot.
     pub decoder_late: u64,
 }
 

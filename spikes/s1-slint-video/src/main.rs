@@ -676,7 +676,7 @@ fn run(args: &Args) -> Result<serde_json::Value> {
             "sustained_60fps": verdict(c_fps),
             "even_frame_pacing": verdict(c_pace),
             "decode_to_present_le_8ms": verdict(c_d2p),
-            "ui_responsive": verdict(c_ui),
+            "ui_responsive": if ev.n == 0 { "UNVERIFIED (probe not measured: overlay hidden or no clicks)" } else { verdict(c_ui) },
             "decode_to_present_caveat": "measured decode-complete -> end of Slint render (AfterRendering); swap/scanout latency is not observable from the rendering notifier",
         },
     }))

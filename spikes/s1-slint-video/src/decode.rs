@@ -365,7 +365,9 @@ impl Decoder {
                         }
                     };
                     let now = Instant::now();
-                    if self.opts.realtime && now > start + frame_dur.mul_f64(n as f64) + frame_dur / 2 {
+                    // Late = decoding of this frame could only start more than half a frame after its slot
+                    // (the decoder was still busy with earlier frames).
+                    if self.opts.realtime && t0 > start + frame_dur.mul_f64(n as f64) + frame_dur / 2 {
                         stats.with(|s| s.decoder_late += 1);
                     }
                     let f = DecodedFrame { decode_done: now, payload };
