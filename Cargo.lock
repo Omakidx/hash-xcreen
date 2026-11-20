@@ -666,6 +666,7 @@ dependencies = [
  "crossbeam-channel",
  "hx-capture",
  "hx-codec",
+ "hx-proto",
  "rustix",
  "thiserror",
  "x11rb",

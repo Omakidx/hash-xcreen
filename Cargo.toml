@@ -14,6 +14,7 @@ publish = false
 [workspace.dependencies]
 hx-capture = { path = "crates/hx-capture", version = "0.1.0" }
 hx-codec = { path = "crates/hx-codec", version = "0.1.0" }
+hx-proto = { path = "crates/hx-proto", version = "0.1.0" }
 crossbeam-channel = "0.5"
 # Links the system FFmpeg (6.1 on Ubuntu 24.04) through pkg-config; 7.1 is the newest ffmpeg-next that supports it.
 ffmpeg-next = { version = "7.1", default-features = false, features = ["codec", "format"] }

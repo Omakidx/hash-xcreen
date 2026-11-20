@@ -10,6 +10,7 @@
 //! and `hx-capture` must not know about video codecs.
 
 pub mod congestion;
+pub mod input;
 pub mod pacing;
 pub mod pipeline;
 pub mod stats;
