@@ -18,6 +18,7 @@
 #![forbid(unsafe_code)]
 
 pub mod catalog;
+pub mod docker;
 pub mod error;
 pub mod exec;
 pub mod host;
@@ -29,6 +30,7 @@ pub mod plan;
 pub mod recipe;
 
 pub use catalog::{Addon, Catalog, Desktop, Distro, Preset, RecipeId};
+pub use docker::{DockerOptions, DockerOutcome, enable_docker};
 pub use error::RecipeError;
 pub use exec::{
     Action, ApplyError, ExecError, ExecOutput, ExecRequest, Executor, FilePush, Progress, Secret,
