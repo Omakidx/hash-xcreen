@@ -241,7 +241,7 @@ Sent separately as shape (cached by hash) and position, and drawn by the client,
 ### 6.4 Audio, clipboard, files
 
 - Audio: PipeWire capture in the container, Opus 10 ms frames with in-band FEC, sent as datagrams.
-- Clipboard: both directions for text, images and files; can be switched off per paired device.
+- Clipboard: both directions for text, images and files; can be switched off per paired device. X11 side: XFixes owner notifications, `TARGETS` probed lazily, data read only when the other side asks, `INCR` both ways, 64 MiB limit, text must be UTF-8 and images PNG, PRIMARY off by default. Files are a transfer list (validated names, sizes, race-safe open); client files are staged in a session-owned 0700 directory when a local application pastes, and the paste receives `file://` URIs (also as `x-special/gnome-copied-files`).
 - Files: copy and paste or drag and drop; each transfer on its own low-priority stream with progress.
 
 ### 6.5 Clients
@@ -252,7 +252,7 @@ Sent separately as shape (cached by hash) and position, and drawn by the client,
   - Copy-free display needs an EGL context. Slint's winit backend creates one on Wayland but a GLX context on X11, so X11 needs a custom Slint platform that creates its own EGL context.
   - Decoded colour must use the stream's colour space and range, not a fixed BT.709 assumption, and frame hand-off needs explicit GPU fences rather than `glFinish`.
 - **Web**: WebCodecs hardware decode into a WebGL/WebGPU canvas; Pointer Lock and Keyboard Lock; protocol code shared as WASM.
-- Keyboard input is sent as physical scancodes so every layout works.
+- Keyboard input is sent as physical scancodes so every layout works. The session maps HID usage → evdev → X keycode (`+ 8`) and injects through XTest; held keys and buttons are released on focus loss, disconnect and drop, pointer coordinates are clamped to the screen, scroll arrives in 1/120 notches and becomes wheel clicks, and untrusted input is rate-limited (key/button/scroll and pointer motion separately; releases exempt).
 - Remote resolution follows the client window (RandR); HiDPI scaling supported.
 
 ## 7. Wire protocol
@@ -290,6 +290,7 @@ Sent separately as shape (cached by hash) and position, and drawn by the client,
 - The completion of each frame's stream is the per-frame acknowledgement that drives the sender's controller, which steps a bitrate ladder. In S2, with a 150 ms round trip, 10 Mbps and 1% loss, video settled at about 3.5 Mbps and 29 fps; without the controller, frames queued to a 1.4 s median delay. Follow-ups: a jitter-adaptive lag threshold (the fixed 40 ms threshold over-reacts on jittery links), faster ramp-up after congestion, and starting below the top of the ladder.
 - Frames can arrive out of order across streams. The client keeps a small reorder window and drops any frame older than the newest one it has decoded (S5).
 - Per-device bandwidth cap: Auto, 5, 10, 25, 50 Mbps.
+- **Implemented (`apps/hx-session::congestion`, pure logic):** queueing excess = ack delay minus a 10 s windowed minimum minus the frame's time at the target rate; the controller reacts to the median of the last 9 acks and to a stall term (time since the later of the oldest unacked send and the last ack), so one retransmission behind a healthy stream is not congestion. Thresholds scale with a smoothed jitter estimate (step down at 30 ms + 4 × jitter, at most 120 ms; stale at 100 ms + 3 × jitter, at most 300 ms). Ladder 0.5 to 20 Mbps (to the cap when higher), start at 4 Mbps; a step down jumps below the measured delivery rate when the link, not the source, was the limit; failed levels back off 0.5 s doubling to 4 s; recovery climbs 1–2 steps per 150 ms back to the proven level, then probes slowly and only when at least 40 % of the rate is in use. The fps ceiling follows the rate (about 30 kbit per frame, 10–60). Stale: every unacked frame is cancelled, two levels down, an IDR is requested, frames encoded before it are dropped unsent and the IDR is flagged `RESYNC`.
 
 ### 7.5 Versioning
 
