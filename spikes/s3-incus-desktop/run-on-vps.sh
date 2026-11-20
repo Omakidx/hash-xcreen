@@ -7,7 +7,7 @@
 # Environment (all optional):
 #   GUEST_DISTROS="ubuntu-24.04 debian-13"   which guests to build
 #   PRESETS="basic developer"                which presets to build
-#   POOL_GB=30                               btrfs loop-file pool size (GiB)
+#   POOL_GB=<60% of free disk, 12..200>      btrfs loop-file pool size (GiB), architecture 4.2
 #   POOL_DEVICE=/dev/vdb                     use a spare block device instead of a loop file
 #   HOST_RESERVE_MIB=512                     RAM left to the host; container limit = RAM - reserve
 #   HX_RECIPE=/path/to/hx-recipe             prebuilt runner binary (skips the Rust toolchain install)
@@ -19,12 +19,15 @@ here=$(cd "$(dirname "$0")" && pwd)
 cd "$here"
 . /etc/os-release
 case "$ID-$VERSION_ID" in
-  ubuntu-24.04|debian-13) ;;
-  *) echo "unsupported host $ID-$VERSION_ID (need Ubuntu 24.04 or Debian 13)"; exit 1 ;;
+  ubuntu-24.04|ubuntu-26.04|debian-13) ;;   # 26.04 added for the second VPS run (Incus 6.0.5 in the distro repo)
+  *) echo "unsupported host $ID-$VERSION_ID (need Ubuntu 24.04/26.04 or Debian 13)"; exit 1 ;;
 esac
 GUEST_DISTROS=${GUEST_DISTROS:-"ubuntu-24.04 debian-13"}
 PRESETS=${PRESETS:-"basic developer"}
-POOL_GB=${POOL_GB:-30}
+free_gb=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
+POOL_GB=${POOL_GB:-$(( free_gb * 60 / 100 ))}
+[ "$POOL_GB" -ge 12 ] || POOL_GB=12
+[ "$POOL_GB" -le 200 ] || POOL_GB=200
 HOST_RESERVE_MIB=${HOST_RESERVE_MIB:-512}
 res="$here/results-$(hostname)-$(date +%Y%m%d-%H%M)"
 mkdir -p "$res"
@@ -58,15 +61,37 @@ if [ "${RAISE_INOTIFY:-1}" = 1 ]; then
   echo "after: $(sysctl -n fs.inotify.max_user_instances) instances, $(sysctl -n fs.inotify.max_user_watches) watches"
 fi
 
-echo "### incus init (btrfs ${POOL_DEVICE:-loop file ${POOL_GB}GiB})"
+echo "### incus init (btrfs ${POOL_DEVICE:-loop file ${POOL_GB}GiB}, dedicated bridge hxbr0)"
 if ! incus storage show default >/dev/null 2>&1; then
-  if [ -n "${POOL_DEVICE:-}" ]; then
-    incus admin init --auto --storage-backend btrfs --storage-create-device "$POOL_DEVICE"
-  else
-    incus admin init --auto --storage-backend btrfs --storage-create-loop "$POOL_GB"
-  fi
+  if [ -n "${POOL_DEVICE:-}" ]; then pool_cfg="source: $POOL_DEVICE"; else pool_cfg="size: ${POOL_GB}GiB"; fi
+  incus admin init --preseed <<EOF2
+config: {}
+storage_pools:
+- name: default
+  driver: btrfs
+  config:
+    $pool_cfg
+networks:
+- name: hxbr0
+  type: bridge
+  config:
+    ipv4.address: 10.77.3.1/24
+    ipv4.nat: "true"
+    ipv6.address: none
+profiles:
+- name: default
+  devices:
+    root: {path: /, pool: default, type: disk}
+    eth0: {name: eth0, network: hxbr0, type: nic}
+EOF2
 fi
 incus storage show default | grep -E 'driver|source'
+# A host that runs Docker has FORWARD policy DROP: without these rules containers lose IPv4 egress (verified on Ubuntu 26.04).
+if iptables -S DOCKER-USER >/dev/null 2>&1; then
+  iptables -C DOCKER-USER -i hxbr0 -j ACCEPT 2>/dev/null || iptables -I DOCKER-USER -i hxbr0 -j ACCEPT
+  iptables -C DOCKER-USER -o hxbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -I DOCKER-USER -o hxbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+  echo "host Docker detected: DOCKER-USER accept rules for hxbr0 added (not persistent across reboot)"
+fi
 
 echo "### recipe runner"
 bin=${HX_RECIPE:-$here/runner/target/release/hx-recipe}
@@ -115,7 +140,7 @@ done
 
 if [ -z "${SKIP_NET:-}" ]; then
   echo "### network isolation test"
-  ./net-test.sh 2>&1 | tee "$res/net-test.log"
+  BR=hxbr0 PORT=${NET_TEST_PORT:-9443} ./net-test.sh 2>&1 | tee "$res/net-test.log"
 fi
 echo; echo "### summary"; column -t -s$'\t' "$res/summary.tsv"
 echo "pass criteria: free_reclaimable >= 1536 MiB on the 2 vCPU/4 GB spec; docker hello-world ok; build < 1200 s; prebuilt (local + estimated download) < 300 s"

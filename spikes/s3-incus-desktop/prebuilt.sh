@@ -35,7 +35,8 @@ t0=$(now)
 # --alias must be given after the files for `image import`
 incus image import --quiet "$out"/"$alias"* --alias "$alias" >/dev/null
 t1=$(now); echo "import_s=$(span "$t0" "$t1")"
-incus launch --quiet "$alias" "$new" -c limits.cpu="$cpu" -c limits.memory="$mem" >/dev/null
+# shellcheck disable=SC2086
+incus launch --quiet "$alias" "$new" -c limits.cpu="$cpu" -c limits.memory="$mem" ${INCUS_LAUNCH_ARGS:-} >/dev/null
 t2=$(now); echo "launch_s=$(span "$t1" "$t2")"
 HX_PASSWORD=${HX_PASSWORD:-s3-test-password} "$bin" post "$recipe" "$new" 2>&1 | grep -E 'STAGE|TOTAL|error' || true
 t3=$(now)
