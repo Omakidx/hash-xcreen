@@ -53,6 +53,20 @@ pub enum Error {
         /// Server text (untrusted, may be shown).
         message: String,
     },
+    /// The PIN was wrong.
+    #[error("wrong PIN ({attempts_left} attempts left before this device is revoked)")]
+    WrongPin {
+        /// Wrong PINs still allowed.
+        attempts_left: u32,
+        /// How long to wait before the next attempt.
+        retry_after: std::time::Duration,
+    },
+    /// Too soon after a wrong PIN.
+    #[error("too many attempts; retry in {retry_after:?}")]
+    Backoff {
+        /// Remaining wait.
+        retry_after: std::time::Duration,
+    },
     /// The server cannot verify a PIN (none configured).
     #[error("the server has no PIN configured")]
     PinNotAvailable,

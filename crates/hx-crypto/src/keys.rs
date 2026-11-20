@@ -77,10 +77,6 @@ impl PublicKey {
         id.copy_from_slice(&fp.0[..16]);
         DeviceId(id)
     }
-
-    pub(crate) fn verifying_key(&self) -> Result<VerifyingKey> {
-        VerifyingKey::from_bytes(&self.0).map_err(|_| Error::InvalidKey)
-    }
 }
 
 /// Public keys are not secret, but the short fingerprint is what logs should show.

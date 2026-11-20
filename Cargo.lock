@@ -770,6 +770,7 @@ dependencies = [
  "hmac",
  "hx-proto",
  "hx-transport",
+ "proptest",
  "prost",
  "rcgen",
  "rustls",
