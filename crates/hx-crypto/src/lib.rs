@@ -23,6 +23,7 @@ mod encoding;
 pub mod error;
 pub mod keys;
 pub mod pairing;
+pub mod pin;
 pub mod registry;
 pub mod secrets;
 pub mod text;
@@ -33,6 +34,7 @@ pub use clock::{Clock, ManualClock, SystemClock};
 pub use error::{Error, Result};
 pub use keys::{DeviceId, Fingerprint, IdentityKey, PublicKey};
 pub use pairing::{PairClientOptions, PairedServer, PairingLimits, PairingWindow, pair_device};
+pub use pin::{MAX_PIN_FAILURES, PinHash, PinParams};
 pub use registry::{
     DeviceRecord, DeviceRegistry, FileRegistry, MemoryRegistry, Revocation, RevokeReason,
 };
