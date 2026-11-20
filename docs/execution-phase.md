@@ -1,0 +1,263 @@
+# Execution phases
+
+The plan we follow to build hash-xcreen v1. Each phase ends at a **gate**: its exit criteria must all pass before the next phase starts. Design detail is in [architecture.md](architecture.md), libraries in [tech-stack.md](tech-stack.md), and the user experience in [userflow.md](userflow.md).
+
+## Rules we work by
+
+- **Gates are hard.** A phase is done when every exit criterion passes, not when the tasks are ticked.
+- **Riskiest first.** Spikes in Phase 0 settle the unknowns before code depends on them. If a spike fails, we update the architecture and tech stack before continuing.
+- **One owner per area.** Each workstream owns its crates and files; shared contracts (protocol, IPC commands, recipe format) have exactly one owner and their consumers start after the contract is merged.
+- **Contracts before consumers.** `docs/protocol.md` and the `hx-privd` command set are written and reviewed before the code that uses them.
+- **Everything through PRs** to `main` with CI green, DCO sign-off and Conventional Commits.
+- **Security-sensitive changes** (pairing, auth, privilege boundaries, secrets, parsers) get an independent security review before merge.
+- **Status** is tracked with the checkboxes below; update them in the same PR that completes the work.
+
+Size: **S** = days, **M** = one to two weeks, **L** = several weeks (for one focused developer).
+
+## Overview
+
+```mermaid
+flowchart LR
+    P0[Phase 0<br/>Foundations + spikes] --> P1[Phase 1<br/>Core: install, stream, client]
+    P1 --> P2[Phase 2<br/>Backups + restore]
+    P1 --> P3[Phase 3<br/>Web client]
+    P2 --> P4[Phase 4<br/>Polish]
+    P3 --> P4
+    P4 --> R[v1.0 release]
+```
+
+Phases 2 and 3 can run in parallel once Phase 1 passes its gate; backups come first if only one can be staffed, because they are the core promise.
+
+---
+
+## Phase 0 — Foundations and spikes
+
+### 0.1 Repository foundations (S)
+
+- [ ] Cargo workspace with the crate and app layout from architecture §3 (empty crates that compile)
+- [ ] `LICENSE` (AGPL-3.0), `SECURITY.md`, `CONTRIBUTING.md` (DCO, Conventional Commits)
+- [ ] CI: `cargo fmt --check`, `clippy -D warnings`, `cargo nextest`, `cargo-deny` (licences + advisories), `cargo-audit`, DCO check
+- [ ] Renovate configuration
+- [ ] `rust-toolchain.toml` pinning stable
+
+### 0.2 Spikes
+
+Each spike is throwaway code in `spikes/<name>/`, time-boxed, and ends with a short written result in `docs/spikes/<name>.md`: what was measured, the numbers, and the decision.
+
+**S1 — Slint video presentation** (time box: 1 week)
+- Goal: show hardware-decoded 1080p60 H.264 in a Slint window with no CPU copy per frame.
+- Method: libavcodec + VAAPI decode → wgpu texture → `slint::Image`; compare with an OpenGL underlay and a CPU upload path.
+- Pass: sustained 60 fps with even frame pacing; decode-to-present ≤ 8 ms; UI stays responsive.
+- Decides: the client rendering path.
+
+**S2 — Streaming loop** (time box: 2 weeks)
+- Goal: prove the latency and CPU budget end to end.
+- Method: XFCE on headless Xorg in an Incus container → XDamage/XShm capture → `yuvutils-rs` → x264 (`ultrafast`, `zerolatency`, intra refresh) → quinn, one stream per frame → headless client decode. Per-stage timestamps; scenarios: idle, typing, scrolling, video, window drag; `tc netem` LAN and 50 ms profiles.
+- Pass (4 vCPU, no GPU): added latency ≤ 40 ms p95 on LAN; ≤ 1.5 cores while typing or scrolling; ~0 CPU and bandwidth when idle.
+- Decides: encoder settings, threading model, frame-per-stream versus alternatives.
+
+**S3 — Incus desktop on a VPS** (time box: 1 week)
+- Goal: confirm the desktop fits the minimum server and both image paths work.
+- Method: fresh Ubuntu 24.04 and Debian 13 VPSs at 2 vCPU / 4 GB and 4 vCPU / 8 GB; Incus with a loop-file btrfs pool; unprivileged XFCE + PipeWire container; Docker with nesting; time a prebuilt image import against building on the server.
+- Pass: desktop idle with ≥ 1.5 GB RAM free on the minimum spec; Docker `hello-world` runs nested; prebuilt path < 5 min, build path < 20 min.
+- Decides: minimum spec confirmation, pool defaults, recipe format.
+
+**S4 — Backup round trip** (time box: 1 week)
+- Goal: prove full-desktop backup and restore through Google Drive.
+- Method: `rustic_core` with OpenDAL's `gdrive` backend (`drive.file` token from a PKCE desktop flow); back up a mounted snapshot of the S3 container with zstd; simulate a day of use and back up again; restore into a fresh container; check Claude Code and Codex CLI history and logins survive.
+- Pass: restored desktop boots with everything intact; typical daily increment < 500 MB; interrupted upload resumes without re-uploading.
+- Decides: OpenDAL vs rclone backend, exclude list defaults, compression level.
+
+**S5 — Browser transport and certificates** (time box: 3 days)
+- Goal: confirm the web client's foundations.
+- Method: WebTransport server (`wtransport` or `h3` + quinn) on the same port as native QUIC; test Chromium, Firefox and Safari; issue a Let's Encrypt IP-address certificate with `instant-acme`; WebCodecs decode of the S2 stream.
+- Pass: WebTransport works in Chromium and Firefox (Safari status recorded); IP certificate issues and renews; browser decode at 1080p60.
+- Decides: WebTransport library, Safari fallback (WebSocket), certificate strategy without a domain.
+
+### Gate 0
+
+- [ ] All five spike reports written; any failed criterion has an accepted alternative
+- [ ] `architecture.md` and `tech-stack.md` updated with spike outcomes (all **(spike)** markers resolved)
+- [ ] CI foundations green on `main`
+
+---
+
+## Phase 1 — Core: install, stream, connect
+
+### Workstreams
+
+| # | Workstream | Owns | Depends on | Size |
+|---|---|---|---|---|
+| 1A | Protocol and transport | `hx-proto`, `hx-transport`, `docs/protocol.md` | Gate 0 | M |
+| 1B | Crypto and pairing | `hx-crypto` | 1A (handshake messages) | M |
+| 1C | Agent core | `apps/hx-agent` (`hx-gatewayd`, `hx-privd`, CLI), systemd units, privd command set | 1A, 1B | L |
+| 1D | Provisioning | `hx-provision`, `recipes/`, image CI | Gate 0 | L |
+| 1E | Installer | `installer/install.sh`, preflight, stages | 1C, 1D | M |
+| 1F | Session streaming | `hx-capture`, `hx-codec` (encode), `apps/hx-session` | 1A | L |
+| 1G | Desktop client | `apps/hx-desktop`, `hx-codec` (decode) | 1A, 1B, design mockups | L |
+| 1H | Hardening | fuzz targets, perf suite, security review | 1A–1G | M |
+
+```mermaid
+flowchart LR
+    A[1A Protocol] --> B[1B Pairing]
+    A --> F[1F Session]
+    A --> G[1G Client]
+    B --> C[1C Agent]
+    B --> G
+    D[1D Provisioning] --> E[1E Installer]
+    C --> E
+    C --> H[1H Hardening]
+    E --> H
+    F --> H
+    G --> H
+```
+
+### 1A — Protocol and transport
+- [ ] `docs/protocol.md`: handshake, versioning, channel table, every control message, media header layout
+- [ ] Protobuf schema and generated types; media header encode/decode
+- [ ] QUIC endpoint and client with the channel layout (streams, datagrams, priorities); WebSocket fallback
+- [ ] Property tests for every message round trip
+
+### 1B — Crypto and pairing
+- [ ] Identity and device keys; pinned-key TLS verification in rustls
+- [ ] SPAKE2 pairing for long tokens and short codes; token expiry and single use
+- [ ] PIN verification (Argon2id) with lockout and device revocation
+
+### 1C — Agent core
+- [ ] `hx-privd` command set specified and reviewed before implementation
+- [ ] `hx-gatewayd` unprivileged with systemd hardening and seccomp allowlist
+- [ ] Unix-socket IPC: gateway ↔ privd, gateway ↔ session
+- [ ] Device list and revocation; `hx-agent` CLI (status, devices, logs, uninstall)
+- [ ] Self-update with signature check and rollback
+
+### 1D — Provisioning
+- [ ] Recipe format and recipes for Ubuntu 24.04 / 26.04 and Debian 12 / 13 × XFCE × basic / developer
+- [ ] Incus orchestration: pool, unprivileged container, limits, network rules (metadata endpoint and agent ports blocked)
+- [ ] Prebuilt image CI (weekly, signed) and build-on-server path from the same recipe; `--image auto` selection with reasons
+- [ ] CI equivalence check between the two paths
+- [ ] Docker opt-in (nesting, syscall interception, apt install)
+
+### 1E — Installer
+- [ ] `install.sh`: preflight, download, minisign verification (current and next key), hand-off to the agent
+- [ ] All options from architecture §5.2; `--interactive` mode with pairing code
+- [ ] Idempotent stages with resume; `hx-agent uninstall`
+- [ ] Installer CI: fresh VM per host OS × both image paths
+
+### 1F — Session streaming
+- [ ] X11 capture backend (XDamage, XShm, XFixes cursor, RandR resize)
+- [ ] Encode pipeline on dedicated threads with buffer pools; x264 settings from S2
+- [ ] Source-side congestion control, intra refresh, stale-frame cancellation, bandwidth cap
+- [ ] Input injection (XTest, scancodes), cursor channel, clipboard (text, images, files) both ways
+
+### 1G — Desktop client
+- [ ] Design mockups (dark-first + light) approved before UI implementation
+- [ ] Home, Add server wizard (SSH and one-liner paths), live progress, connect with PIN
+- [ ] SSH setup via `russh` with host-key confirmation
+- [ ] Desktop view with the rendering path from S1; toolbar, stats overlay, reconnect overlay
+- [ ] Device key in the system keyring; Server details (Overview, Security, Desktop, Danger zone)
+- [ ] `.deb` and AppImage packaging
+
+### 1H — Hardening
+- [ ] Fuzz targets for every pre-auth and container-supplied parser, running nightly
+- [ ] Performance suite on the dedicated runner with regression thresholds
+- [ ] End-to-end tests: install → pair → connect → type and scroll → disconnect, under netem profiles
+- [ ] Independent security review of 1B, 1C and 1E; findings fixed
+
+### Gate 1
+
+- [ ] On a fresh 4 vCPU VPS, a user goes from **Add server** to a working XFCE desktop in the app without touching the server (SSH path) and via the one-liner
+- [ ] Re-running a failed install resumes and succeeds
+- [ ] Added latency ≤ 40 ms p95 on LAN; idle ≈ 0 CPU and bandwidth; typing/scrolling ≤ 1.5 cores
+- [ ] Wrong PIN ×5 revokes the device; revoked devices cannot connect
+- [ ] No secret appears in any command line, log or process list
+- [ ] Security review findings resolved; fuzzers clean for 7 nights
+
+---
+
+## Phase 2 — Backups and restore
+
+| # | Workstream | Owns | Size |
+|---|---|---|---|
+| 2A | Backup engine | `hx-backup`: rustic_core, Drive backend, excludes and protected paths, manifest | L |
+| 2B | Scheduling and operations | scheduler, catch-up, upload cap, retention, prune, verification, quota handling, alerts | M |
+| 2C | Restore | restore to same server and new server, safety snapshot, resume | L |
+| 2D | Client backup UI | Google sign-in, wizard Backups step, recovery key, Backups tab, warnings | M |
+
+### Tasks
+- [ ] Backup worker spawned by `hx-privd`; snapshot → read-only mount → rustic → manifest → cleanup
+- [ ] Exclude rules and protected list; property test that protected paths are never excluded
+- [ ] Docker backup modes: Complete and Light
+- [ ] Recovery key generation and display; Drive token sealed with `systemd-creds`
+- [ ] Scheduler: fixed times, jitter, catch-up, no overlap; nice/ionice; 50% upload cap during sessions
+- [ ] Failure handling per architecture §9.6
+- [ ] Quota estimate, 80/95% warnings, auto-prune to the two-backup floor, then stop and notify
+- [ ] Retention defaults; weekly prune; weekly metadata check; monthly 5% data check
+- [ ] Restore into temporary container, resume, boot check, swap, 7-day safety snapshot
+- [ ] Restore onto a new server from the app (Drive sign-in, backup picker, recovery key)
+- [ ] ntfy and webhook alerts; missing-backup detection in the client
+- [ ] Nightly real-Drive tests including the AI and chat app history test
+
+### Gate 2
+
+- [ ] 12h and 24h schedules run unattended for 7 days on a test server; increments within S4 numbers
+- [ ] Restore onto a **different** fresh server produces a desktop with apps, files, Docker data, Claude Code and Codex history and logins intact
+- [ ] Killing the agent mid-backup and cutting the network mid-restore both recover without user action
+- [ ] Drive-full and revoked-token scenarios behave as designed
+- [ ] Security review of the backup worker, key handling and restore path
+
+---
+
+## Phase 3 — Web client
+
+| # | Workstream | Owns | Size |
+|---|---|---|---|
+| 3A | Web transport and hosting | WebTransport endpoint, WebSocket fallback, `axum` hosting, certificates | M |
+| 3B | Web auth | enable/disable switch, password + PIN, passkeys, rate limits and lockouts | M |
+| 3C | Web app | WASM protocol core, TypeScript shell, WebCodecs, canvas, Pointer/Keyboard Lock, clipboard, Server details | L |
+
+### Tasks
+- [ ] Web access off by default; enabling from the desktop app shows the address
+- [ ] Let's Encrypt for `--domain`, IP certificate otherwise, automatic renewal
+- [ ] First login password + PIN; passkey registration; passkey + PIN afterwards
+- [ ] Desktop view and toolbar parity with the desktop app
+- [ ] Playwright tests in Chromium and Firefox
+
+### Gate 3
+
+- [ ] Web client meets the same latency target in Chromium on LAN
+- [ ] Web access disabled means the login page is unreachable
+- [ ] Security review of web auth and the browser-facing surface
+
+---
+
+## Phase 4 — Polish
+
+- [ ] Opus audio from the desktop
+- [ ] File drag-and-drop and transfer progress
+- [ ] Sharp-text refinement
+- [ ] SVT-AV1 where CPU and client allow
+- [ ] VAAPI and NVENC encoding when a GPU exists
+- [ ] Docker toggle UI and Light/Complete switch in Server details
+- [ ] Upgrade tests (previous release ↔ new release)
+- [ ] Accessibility and keyboard navigation pass on the desktop app
+
+### Gate 4
+
+- [ ] All scenario performance targets met on the dedicated runner
+- [ ] Upgrade tests pass
+
+---
+
+## v1.0 release checklist
+
+- [ ] Google OAuth app published to production, brand verification complete
+- [ ] Release signing keys generated; current and next public keys embedded in `install.sh`
+- [ ] GitHub build provenance attestations on all artifacts
+- [ ] Stable and beta channels live; prebuilt images for all four guest distros
+- [ ] Docs published on GitHub Pages: install, user guide, protocol spec, security model
+- [ ] Final independent security review of the full release
+- [ ] Dedicated Google test account in place for nightly backup tests
+
+## After v1
+
+KDE Plasma and GNOME backends, Windows and macOS clients, mobile clients, 120 fps, multi-monitor, microphone input, more backup targets, arm64 servers, custom domain, Flatpak.
