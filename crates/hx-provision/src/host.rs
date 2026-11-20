@@ -16,10 +16,16 @@ pub const MIN_POOL_GIB: u64 = 12;
 /// See [`MIN_POOL_GIB`].
 pub const MAX_POOL_GIB: u64 = 200;
 
-/// The cloud metadata endpoint every desktop must not reach.
-pub const METADATA_V4: &str = "169.254.169.254/32";
-/// The AWS IPv6 metadata endpoint.
-pub const METADATA_V6: &str = "fd00:ec2::254/128";
+/// Destinations every desktop must not reach: all IPv4 link-local space (AWS/GCP/Azure/Oracle
+/// metadata at 169.254.169.254, Tencent 169.254.0.23, AWS ECS 169.254.170.2, AWS Time Sync
+/// 169.254.169.123, ...), Alibaba's 100.100.100.200, Azure's WireServer 168.63.129.16, and the
+/// AWS IPv6 metadata range.
+pub const METADATA_DROPS: [(&str, &str); 4] = [
+    ("169.254.0.0/16", "IPv4 link-local: cloud metadata services"),
+    ("100.100.100.200/32", "Alibaba Cloud metadata"),
+    ("168.63.129.16/32", "Azure WireServer"),
+    ("fd00:ec2::/32", "AWS IPv6 metadata"),
+];
 
 /// Loop-file pool size: about 60% of the free disk, bounded to 12-200 GiB.
 pub fn default_loop_size_gib(free_bytes: u64) -> u64 {
@@ -156,10 +162,10 @@ impl HostSpec {
 /// DNS and DHCP to the bridge gateway keep working because Incus permits them on its own
 /// (verified in S3), even though the gateway address is dropped.
 pub fn isolation_rules(gateway: Option<IpAddr>, host_addresses: &[IpAddr]) -> Vec<AclRule> {
-    let mut rules = vec![
-        AclRule::to(AclAction::Drop, METADATA_V4, "cloud metadata"),
-        AclRule::to(AclAction::Drop, METADATA_V6, "cloud metadata (AWS IPv6)"),
-    ];
+    let mut rules: Vec<AclRule> = METADATA_DROPS
+        .iter()
+        .map(|(cidr, why)| AclRule::to(AclAction::Drop, *cidr, *why))
+        .collect();
     let mut seen = std::collections::BTreeSet::new();
     let mut hosts: Vec<(IpAddr, &str)> = Vec::new();
     if let Some(g) = gateway {
@@ -191,8 +197,29 @@ pub fn isolation_acl(name: &str, gateway: Option<IpAddr>, host_addresses: &[IpAd
         description: "hash-xcreen: desktops reach the internet, not the host or cloud metadata"
             .into(),
         egress: isolation_rules(gateway, host_addresses),
-        ingress: Vec::new(),
+        ingress: ingress_rules(gateway),
     }
+}
+
+/// Ingress: only the bridge gateway (the host, where the agent runs) may open connections to a
+/// desktop; everything else is dropped by the default ingress action. ACLs are stateful, so
+/// replies to the desktop's own connections still arrive.
+pub fn ingress_rules(gateway: Option<IpAddr>) -> Vec<AclRule> {
+    gateway
+        .map(|g| {
+            let cidr = match g {
+                IpAddr::V4(a) => format!("{a}/32"),
+                IpAddr::V6(a) => format!("{a}/128"),
+            };
+            vec![AclRule {
+                action: AclAction::Allow,
+                destination: None,
+                source: Some(cidr),
+                description: "connections from the host (bridge gateway)".into(),
+                state: "enabled",
+            }]
+        })
+        .unwrap_or_default()
 }
 
 fn map<const N: usize>(pairs: [(&str, &str); N]) -> BTreeMap<String, String> {
@@ -221,15 +248,55 @@ pub fn network_config(ipv4: &str) -> BTreeMap<String, String> {
 
 /// Keys that attach the ACL and set the default actions.
 ///
-/// Egress defaults to allow (the ACL's final rule is allow anyway); ingress defaults to allow so
-/// the agent can reach the desktop. Desktops cannot reach the host, which is the direction that
-/// matters.
+/// Egress defaults to allow (the ACL's final rule is allow anyway). Ingress defaults to drop; the
+/// ACL's one ingress rule admits the bridge gateway (see [`ingress_rules`]).
 pub fn acl_attachment(acl: &str) -> BTreeMap<String, String> {
     map([
         ("security.acls", acl),
         ("security.acls.default.egress.action", "allow"),
-        ("security.acls.default.ingress.action", "allow"),
+        ("security.acls.default.ingress.action", "drop"),
     ])
+}
+
+/// nftables ruleset that stops anything arriving from the desktop bridge from reaching host
+/// listeners: the ACL only knows the host's unicast addresses, but a service bound to `0.0.0.0`
+/// is also reachable via broadcast, multicast, link-local and addresses added later.
+///
+/// The `input` chain (traffic *to* the host; forwarding to the internet is a different hook and
+/// untouched) accepts, for packets that enter on `bridge`: established/related traffic, DHCP
+/// (udp 67-68), and DNS (udp and tcp 53) addressed to the gateway; everything else is dropped, for
+/// IPv4 and IPv6 alike (`inet` family). The text starts with a declaration and `delete table`, so
+/// loading it with `nft -f` replaces any earlier version.
+///
+/// **The caller installs it** (`hx-privd` / the installer, workstream 1C/1E) and must persist it
+/// across reboots, for example with an `nftables.service` include or a unit ordered after Incus.
+pub fn nft_host_protection(bridge: &str, gateway: Option<Ipv4Addr>) -> Result<String, IncusError> {
+    let ok = !bridge.is_empty()
+        && bridge.len() <= 15
+        && bridge
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !ok {
+        return Err(IncusError::InvalidArgument(format!(
+            "`{bridge}` is not a safe interface name"
+        )));
+    }
+    let mut out = String::new();
+    out.push_str(
+        "# hash-xcreen: desktops may not talk to host services (generated by hx-provision)\n",
+    );
+    out.push_str("table inet hx\ndelete table inet hx\n");
+    out.push_str("table inet hx {\n  chain input {\n");
+    out.push_str("    type filter hook input priority -10; policy accept;\n");
+    out.push_str(&format!("    iifname != \"{bridge}\" return\n"));
+    out.push_str("    ct state established,related accept\n");
+    out.push_str("    ip protocol udp udp dport { 67, 68 } accept\n");
+    if let Some(g) = gateway {
+        out.push_str(&format!("    ip daddr {g} udp dport 53 accept\n"));
+        out.push_str(&format!("    ip daddr {g} tcp dport 53 accept\n"));
+    }
+    out.push_str("    counter drop\n  }\n}\n");
+    Ok(out)
 }
 
 /// The profile every desktop uses: root disk on our pool, NIC on our bridge.
@@ -287,6 +354,10 @@ pub enum Ensured {
 /// What [`ensure_host`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostReport {
+    /// nftables ruleset protecting the host from the bridge ([`nft_host_protection`]). `hx-privd`
+    /// (or the installer) must load it and keep it loaded across reboots; `hx-provision` never
+    /// touches the host's firewall itself.
+    pub host_firewall: String,
     /// Storage pool.
     pub pool: Ensured,
     /// Bridge network.
@@ -321,7 +392,7 @@ pub async fn ensure_host<T: Transport>(
         Ensured::Created
     };
 
-    let (network, existing) = match client.get_network(&n.bridge).await? {
+    let (mut network, mut existing) = match client.get_network(&n.bridge).await? {
         Some(net) => (Ensured::Existed, net),
         None => {
             client
@@ -336,6 +407,28 @@ pub async fn ensure_host<T: Transport>(
             (Ensured::Created, net)
         }
     };
+    // An existing bridge must match what the isolation design assumes: no IPv6 (the ACL and the
+    // nftables rules reason about IPv4 hosts) and NAT on. Reconcile instead of trusting it.
+    let expected = network_config(&spec.ipv4);
+    let drift: BTreeMap<String, String> = ["ipv6.address", "ipv4.nat"]
+        .iter()
+        .filter(|k| existing.config.get(**k) != expected.get(**k))
+        .filter_map(|k| expected.get(*k).map(|v| (k.to_string(), v.clone())))
+        .collect();
+    if !drift.is_empty() {
+        client.patch_network_config(&n.bridge, &drift).await?;
+        existing.config.extend(drift);
+        network = Ensured::Updated;
+    }
+    match existing.config.get("ipv4.address").map(String::as_str) {
+        None | Some("") | Some("none") => {
+            return Err(IncusError::InvalidArgument(format!(
+                "network `{}` has no IPv4 address; hash-xcreen needs one to isolate desktops",
+                n.bridge
+            )));
+        }
+        _ => {}
+    }
     let gateway = existing
         .config
         .get("ipv4.address")
@@ -370,7 +463,12 @@ pub async fn ensure_host<T: Transport>(
     let desktop = ensure_profile(desktop_profile(n)).await?;
     let compat = ensure_profile(compat_profile(n)).await?;
 
+    let host_firewall = match gateway {
+        Some(IpAddr::V4(g)) => nft_host_protection(&n.bridge, Some(g))?,
+        _ => nft_host_protection(&n.bridge, None)?,
+    };
     Ok(HostReport {
+        host_firewall,
         pool,
         network,
         gateway,

@@ -267,6 +267,9 @@ pub struct AclRule {
     /// Destination CIDR (egress rules); `None` matches any destination.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub destination: Option<String>,
+    /// Source CIDR (ingress rules); `None` matches any source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     /// Free text.
     pub description: String,
     /// Always `enabled`.
@@ -283,6 +286,7 @@ impl AclRule {
         Self {
             action,
             destination: Some(destination.into()),
+            source: None,
             description: description.into(),
             state: "enabled",
         }
@@ -293,6 +297,7 @@ impl AclRule {
         Self {
             action,
             destination: None,
+            source: None,
             description: description.into(),
             state: "enabled",
         }
