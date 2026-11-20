@@ -296,11 +296,51 @@ impl Wire for TransferHeader {
         }
         check_str("transfer.mime", &self.mime, 255)?;
         check_str("transfer.name", &self.name, 255)?;
-        if self.name.chars().any(|c| matches!(c, '/' | '\\' | '\0')) {
-            return Err(invalid("transfer.name", "contains a path separator or NUL"));
+        if !self.name.is_empty() {
+            file_name_problem(&self.name)
+                .map_or(Ok(()), |reason| Err(invalid("transfer.name", reason)))?;
         }
         Ok(())
     }
+}
+
+/// Why `name` is not an acceptable file-name hint, or `None` if it is.
+///
+/// The name is only a display hint: receivers MUST write inside a directory of their own
+/// choosing and never use it as a path. These checks keep obviously dangerous or confusing
+/// names off the wire on every platform (protocol §5.5).
+pub fn file_name_problem(name: &str) -> Option<&'static str> {
+    if name == "." || name == ".." {
+        return Some("is a dot name");
+    }
+    for c in name.chars() {
+        match c {
+            '/' | '\\' => return Some("contains a path separator"),
+            ':' => return Some("contains a colon"),
+            '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{061C}' => {
+                return Some("contains a bidirectional control character");
+            }
+            c if c.is_control() => return Some("contains a control character"),
+            _ => {}
+        }
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        return Some("ends with a dot or space");
+    }
+    let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ');
+    let upper = stem.to_ascii_uppercase();
+    let reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.len() == 4
+            && matches!(upper.as_bytes().get(3), Some(b'1'..=b'9')));
+    if reserved {
+        return Some("is a reserved device name");
+    }
+    None
 }
 
 impl TransferHeader {

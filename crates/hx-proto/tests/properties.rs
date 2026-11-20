@@ -206,7 +206,7 @@ fn cursor() -> impl Strategy<Value = CursorEvent> {
 }
 
 fn transfer() -> impl Strategy<Value = TransferHeader> {
-    let name = text(255).prop_map(|s| s.replace(['/', '\\'], "_"));
+    let name = "f[a-z0-9_-]{0,40}(\\.[a-z]{1,4})?";
     ("[a-z/;=0-9-]{1,64}", name, any::<u64>()).prop_map(|(mime, name, size)| TransferHeader {
         mime,
         name,
@@ -534,6 +534,43 @@ fn malformed_messages_are_rejected() {
     assert!(t("../a").validate().is_err());
     assert!(t("a\\b").validate().is_err());
     assert!(t("a\0b").validate().is_err());
+    for bad in [
+        ".",
+        "..",
+        "a:b",
+        "C:",
+        "a\u{1}b",
+        "a\u{7f}b",
+        "a\u{85}b",
+        "a\u{202E}txt.exe",
+        "a\u{2066}b",
+        "a\u{2069}",
+        "name.",
+        "name ",
+        "CON",
+        "con",
+        "Nul.txt",
+        "aux.tar.gz",
+        "COM1",
+        "lpt9.log",
+        "COM1 .txt",
+    ] {
+        assert!(t(bad).validate().is_err(), "{bad:?} must be rejected");
+    }
+    for ok in [
+        "a.txt",
+        "...hidden",
+        ".bashrc",
+        "CONSOLE",
+        "COM10",
+        "COM0",
+        "LPT",
+        "report v2.pdf",
+        "naïve.txt",
+        "日本語.txt",
+    ] {
+        assert!(t(ok).validate().is_ok(), "{ok:?} must be accepted");
+    }
     assert!(t(&"n".repeat(256)).validate().is_err());
     let clip = TransferHeader {
         mime: "text/plain".into(),
