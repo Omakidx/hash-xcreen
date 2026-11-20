@@ -18,7 +18,7 @@ Conventions: "MUST", "SHOULD" and "MAY" are used in the RFC 2119 sense. All mult
 - One QUIC endpoint serves both ALPN values `hx/1` and `h3`. The accept loop dispatches on the negotiated ALPN: `hx/1` goes to the native handler, `h3` to a pluggable handler (absent in Phase 1: the endpoint then offers only `hx/1`). Any other ALPN is refused at the TLS handshake.
 - The major version is part of the ALPN and of the WebSocket path (`hx/1`, `/hx/1`). A future major `2` is a new ALPN (`hx/2`), which lets one server support the current and previous major side by side (architecture §7.5). The `Hello` also carries the version and the two MUST agree (§4).
 - Congestion control: BBR on QUIC.
-- QUIC keep-alive 5 s, idle timeout 30 s. The server limits peer-opened streams: 4 bidirectional (only one is ever used, §3), 1024 unidirectional.
+- QUIC keep-alive 5 s, idle timeout 30 s. Each side limits the streams its peer may open: the server allows the client 4 bidirectional (only one is ever used, §3) and 64 unidirectional streams; the client allows the server 0 bidirectional and 1024 unidirectional streams (one per in-flight video frame).
 - The server MAY require QUIC address validation (a Retry) before spending handshake state on an unvalidated source address; `hx-transport` does by default.
 - Pre-authentication resource bounds: at most 64 concurrent connections that have not finished the hello exchange (excess is refused at the transport), and 10 s from transport accept to a valid `Hello` (`HELLO_TIMEOUT`, §8). Until the hello exchange succeeds, nothing but the control stream (WebSocket: control messages) is processed.
 
@@ -211,7 +211,7 @@ Video colour is always BT.709, limited range (also tagged in the bitstream VUI; 
 
 `RequestKeyframe` (C → S): `last_decoded_frame` (1, uint32). The server answers with a frame flagged `KEY | RESYNC`.
 
-`Ping` / `Pong`: `nonce` (1, uint64); the `Pong` echoes it. Either side may probe; the sender measures RTT locally.
+`Ping` / `Pong`: `nonce` (1, uint64); the `Pong` echoes it. Either side may probe; the sender measures RTT locally. A receiver answers a `Ping` immediately and does not surface either message to the application (`hx-transport` handles both).
 
 `ClientStats` (C → S, about once per second): `interval_ms` (1), `decoded_frames` (2), `dropped_frames` (3, stale or undecodable), `decode_p95_us` (4); all uint32, counts are for the interval.
 
@@ -281,7 +281,7 @@ Streams are independent, so frames can complete in a different order than they w
 1. Track `last_released`, the frame number last handed to the decoder.
 2. A frame whose number is **not newer** than `last_released` (equal or older in serial order) is dropped as stale and counted.
 3. A frame equal to `last_released + 1` is released at once, followed by any held frames that are now contiguous.
-4. Another newer frame is held until its predecessors arrive, until more than the window capacity is held, or until the hold time expires; then the lowest held frame is released (the missing numbers become stale and are dropped if they arrive later).
+4. Another newer frame is held until its predecessors arrive, until more than the window capacity is held, or until the hold time expires (the timer restarts whenever a frame is released); then the lowest held frame is released (the missing numbers become stale and are dropped if they arrive later).
 5. A frame flagged `KEY` or `RESYNC` is released at once and discards held frames older than it.
 6. The very first frame is released immediately.
 
@@ -364,6 +364,8 @@ Every message is `channel id (1 byte)` followed by the body. Channels `0x01`–`
 | `0x07` Clipboard, `0x08` Files | Transfer chunk message, §9.4 |
 | `0x09` Frame ack | `frame_number` (u32 LE), 4 bytes |
 
+Keep-alive: each side sends a WebSocket `Ping` every 5 s; a connection with no inbound traffic for 30 s is dropped (close reason `idle timeout`, code `INTERNAL_ERROR` locally).
+
 ### 9.1 Handshake over WebSocket
 
 Identical to §2 using control messages; the first WebSocket message after the upgrade MUST be a control `Hello`. Close is a WebSocket close frame with code `4000 + code` (§8).
@@ -400,6 +402,8 @@ There are none on the wire. The sender SHOULD interleave: control, input, mouse 
 | Video frame not newer than `last_released` | Drop the frame, count it, continue |
 | Malformed or unknown datagram | Drop it, count it, continue |
 | Transfer body length mismatch | Reset that stream, continue |
+| Control message sent by the wrong role (`ViewConfig`, `RequestKeyframe`, `ClientStats` from the server; `StreamInfo` from the client) | Close, `PROTOCOL_ERROR` |
+| `Hello`, `HelloAck` or `Refuse` after the handshake | Close, `PROTOCOL_ERROR` |
 | Different major in `Hello` | `Refuse(UPDATE_REQUIRED)`, close `UPDATE_REQUIRED` |
 | No `Hello` in 10 s | Close `HELLO_TIMEOUT` |
 

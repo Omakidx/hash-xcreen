@@ -47,7 +47,6 @@ macro_rules! scenarios {
                 #[tokio::test]
                 async fn quic() { super::$name(TransportPreference::Quic).await }
                 #[tokio::test]
-                #[ignore = "WebSocket fallback lands in the next commit"]
                 async fn websocket() { super::$name(TransportPreference::WebSocket).await }
             }
         )*
@@ -436,10 +435,11 @@ async fn video_frames_are_acked(pref: TransportPreference) {
         assert_eq!(ack.frame_number, n as u32);
         assert_eq!(ack.bytes, 1000 + n * 20_000);
     }
-    let seen = seen.lock().expect("lock");
-    assert_eq!(seen.len(), 10);
-    assert!(seen.iter().all(|a| a.outcome == AckOutcome::Delivered));
-    drop(seen);
+    {
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen.len(), 10);
+        assert!(seen.iter().all(|a| a.outcome == AckOutcome::Delivered));
+    }
     let s = p.srv.stats();
     assert_eq!((s.frames_sent, s.frames_delivered), (10, 10));
     assert_eq!(p.client.stats().frames_received, 10);
@@ -546,10 +546,7 @@ async fn close_code_is_reported(pref: TransportPreference) {
     assert!(
         matches!(within(p.client.recv_control()).await, Err(Error::Closed(c)) if c.code == CloseCode::Shutdown)
     );
-    assert!(matches!(
-        p.client.send_input(&InputEvent::default()).await,
-        Err(_)
-    ));
+    assert!(p.client.send_input(&InputEvent::default()).await.is_err());
     let local = p.srv.close_info().expect("local close recorded");
     assert!(!local.by_peer);
     // Closing twice is harmless.

@@ -246,6 +246,10 @@ impl Inner {
         })
     }
 
+    pub(crate) fn subscribe_closed(&self) -> watch::Receiver<Option<CloseInfo>> {
+        self.closed.subscribe()
+    }
+
     pub(crate) fn closed_info(&self) -> Option<CloseInfo> {
         self.closed.borrow().clone()
     }
@@ -286,9 +290,8 @@ impl Inner {
     /// Error to return when a channel ended: the close info if the connection closed.
     async fn ended(&self) -> Error {
         let mut rx = self.closed.subscribe();
-        let wait = rx.wait_for(|c| c.is_some());
-        match tokio::time::timeout(Duration::from_millis(500), wait).await {
-            Ok(Ok(c)) => c.clone().map_or(Error::ChannelClosed, Error::Closed),
+        match tokio::time::timeout(Duration::from_millis(500), wait_closed(&mut rx)).await {
+            Ok(Some(c)) => Error::Closed(c),
             _ => Error::ChannelClosed,
         }
     }
@@ -301,7 +304,7 @@ impl Inner {
         let mut closed = self.closed.subscribe();
         tokio::select! {
             v = rx.recv() => v,
-            _ = closed.wait_for(|c| c.is_some()) => rx.try_recv().ok(),
+            _ = wait_closed(&mut closed) => rx.try_recv().ok(),
         }
     }
 
@@ -547,18 +550,11 @@ impl Connection {
     /// Wait until the connection is closed and return how.
     pub async fn closed(&self) -> CloseInfo {
         let mut rx = self.inner().closed.subscribe();
-        match rx.wait_for(|c| c.is_some()).await {
-            Ok(c) => c.clone().unwrap_or(CloseInfo {
-                code: CloseCode::InternalError,
-                reason: "unknown".into(),
-                by_peer: false,
-            }),
-            Err(_) => CloseInfo {
-                code: CloseCode::InternalError,
-                reason: "closed".into(),
-                by_peer: false,
-            },
-        }
+        wait_closed(&mut rx).await.unwrap_or(CloseInfo {
+            code: CloseCode::InternalError,
+            reason: "closed".into(),
+            by_peer: false,
+        })
     }
 
     /// Close with `code` and a short reason (at most 120 characters, never secrets), then wait
@@ -711,11 +707,8 @@ impl Connection {
             }
             tokio::select! {
                 _ = i.router.mouse_notify.notified() => {}
-                r = closed.wait_for(|c| c.is_some()) => {
-                    return Err(match r {
-                        Ok(c) => c.clone().map_or(Error::ChannelClosed, Error::Closed),
-                        Err(_) => Error::ChannelClosed,
-                    });
+                r = wait_closed(&mut closed) => {
+                    return Err(r.map_or(Error::ChannelClosed, Error::Closed));
                 }
             }
         }
@@ -763,6 +756,7 @@ impl Connection {
         let job = VideoJob {
             frame_number: header.frame_number,
             head,
+            payload_len: payload.len(),
             payload,
             cancel: cancel.clone(),
             done: tx,
@@ -905,11 +899,18 @@ impl Connection {
     }
 }
 
+/// Wait until a close is recorded (the guard is dropped before any await, keeping futures `Send`).
+pub(crate) async fn wait_closed(rx: &mut watch::Receiver<Option<CloseInfo>>) -> Option<CloseInfo> {
+    let r = rx.wait_for(|c| c.is_some()).await;
+    r.ok().and_then(|g| g.clone())
+}
+
 /// One frame on its way out (shared by both backends).
 pub(crate) struct VideoJob {
     pub frame_number: u32,
     pub head: [u8; hx_proto::media::MEDIA_HEADER_LEN],
     pub payload: Bytes,
+    pub payload_len: usize,
     pub cancel: Arc<CancelFlag>,
     pub done: oneshot::Sender<FrameAck>,
     pub started: Instant,
@@ -919,7 +920,7 @@ impl VideoJob {
     pub(crate) fn finish(self, inner: &Inner, outcome: AckOutcome) {
         let ack = FrameAck {
             frame_number: self.frame_number,
-            bytes: self.payload.len(),
+            bytes: self.payload_len,
             elapsed: self.started.elapsed(),
             outcome,
         };

@@ -11,7 +11,7 @@ publish.workspace = true
 [dependencies]
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
-hx-proto = { path = "../hx-proto" }
+hx-proto = { version = "0.1.0", path = "../hx-proto" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 thiserror = "2"
