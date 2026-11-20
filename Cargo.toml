@@ -10,6 +10,13 @@ license = "AGPL-3.0-or-later"
 repository = "https://github.com/Omakidx/hash-xcreen"
 publish = false
 
+# Versions shared by several members. Each crate opts in with `dep.workspace = true`.
+[workspace.dependencies]
+crossbeam-channel = "0.5"
+rustix = { version = "1", default-features = false, features = ["std"] }
+thiserror = "2"
+x11rb = { version = "0.13", default-features = false }
+
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 unused_must_use = "deny"
