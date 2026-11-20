@@ -531,7 +531,7 @@ On **every** `PendingSession` the application looks the peer key up in the curre
 
 - Never call `authorize()` on an `Outcome::Paired` connection: it is a pairing connection with no features.
 - Post-pairing password and PIN setup is allowed only for first-time setup, or when the request proves the current Linux password. It must finish inside the transport's authorization deadline (30 s by default; the pairing exchange itself may take up to 20 s of it).
-- CLI revoke, remove and reinstate go through the agent. `reinstate` only after the Linux password was verified by `hx-privd`'s peppered verifier (`PepperMac`, see `docs/ipc.md` on branch `phase-1/1c-ipc-spec`).
+- CLI revoke, remove and reinstate go through the agent. `reinstate` only after the Linux password was verified by `hx-privd`'s peppered verifier (`PepperVerify`, a failure-capped yes/no check, with `PepperEnrol` for setting it up; see `docs/ipc.md` v0.3 on branch `phase-1/1c-ipc-spec`).
 - Clients must sanitise `Refuse.message` (and any server text) before showing it; the server's refusal text for unknown, revoked and unsetup cases is deliberately uniform.
 - The identity seed is root-only (`systemd-creds`), the registry directory must not be writable by group or others, and the registry file is 0600 and owned by the agent user.
 
