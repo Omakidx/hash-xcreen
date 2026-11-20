@@ -30,6 +30,8 @@ CONFIGS = {
     "fps120-t1": ["--fps", "120", "--threads", "1", "--sliced", "0"],
     "fps120-t2": ["--fps", "120", "--threads", "2"],
     "fps120-vui": ["--fps", "120", "--vui", "1"],
+    "fps120-vbv4": ["--fps", "120", "--vbv-frames", "4", "--vui", "1"],
+    "fps120-vbv4n": ["--fps", "120", "--vbv-frames", "4"],
     "nocc": ["--fps", "120", "--cc", "0"],
 }
 

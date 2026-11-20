@@ -8,7 +8,7 @@ the NTP-style probe estimate is still computed and printed as a validation of th
 WAN runs estimate offset theta = server - client from client-clock.csv (t1 client send, t2 server receive, t3 server
 send, t4 client receive; theta = ((t2-t1)+(t3-t4))/2, delay = (t4-t1)-(t3-t2)). Only the 10 % lowest-delay samples are
 used and a straight line theta(t) is fitted to them (drift). Worst-case error bound = min delay / 2 (all of the delay
-asymmetry on one leg); the empirical scatter of the selected samples is reported as well.
+asymmetry on one leg); for netem runs the known asymmetry (delay on the return leg only) is corrected; the empirical scatter of the selected samples is reported as well.
 Client-clock timestamps are mapped to the server clock as t_client + theta(t).
 """
 import csv, glob, json, math, os, re, sys
@@ -61,7 +61,12 @@ def load(run):
 def analyse(run):
     meta, s, rows, srv, clk = load(run)
     lan = meta["client"] == "lan"
-    off = (lambda t: 0.0) if lan else clk["theta"]
+    # netem delays only the server->client direction (container egress), so the probe's return leg is longer by the
+    # configured delay and the NTP estimate is low by delay/2: add it back (exact for fixed delays; for `mobile`,
+    # whose delay is 40 ms +- 30 ms, the lowest-delay samples carry a smaller delay, so the result is only indicative).
+    m = re.search(r"delay (\d+)ms", meta.get("netem") or "")
+    bias = int(m.group(1)) * 1e6 / 2 if (m and not lan) else 0.0
+    off = (lambda t: 0.0) if lan else (lambda t: clk["theta"](t) + bias)
     t0, t1 = s["t0_ns"], s["t1_ns"]
     wall = (t1 - t0) / 1e9
     st = {k: [] for k in ("cap", "conv", "encq", "enc", "sendq", "net", "decq", "dec", "total")}
