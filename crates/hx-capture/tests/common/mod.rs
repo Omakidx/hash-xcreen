@@ -56,6 +56,14 @@ impl Xvfb {
     }
 }
 
+impl Xvfb {
+    /// Kill the server while clients are connected.
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 impl Drop for Xvfb {
     fn drop(&mut self) {
         let _ = self.child.kill();
