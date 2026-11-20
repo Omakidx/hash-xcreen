@@ -1,4 +1,5 @@
 /target
-/clip*.mp4
 *.mp4
-/results/*.local.json
+/results/gpu-*
+/results/**/*.stderr
+/results/**/*.stdout
