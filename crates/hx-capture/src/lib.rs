@@ -26,6 +26,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod clipboard;
 mod clock;
 mod cursor;
 mod error;
