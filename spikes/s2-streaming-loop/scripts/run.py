@@ -120,7 +120,7 @@ def run_once(a):
     # server
     cexec("pkill s2-server; sleep 0.5; true")
     sargs = " ".join(CONFIGS[a.config] + a.extra.split())
-    cexec(f"cd /home/desk && DISPLAY=:10 nohup ./s2-server --stats /tmp/st.csv {sargs} > /tmp/server.log 2>&1 &", user="desk")
+    cexec(f"cd /home/desk && DISPLAY=:10 S2_DEBUG=1 nohup ./s2-server --stats /tmp/st.csv {sargs} > /tmp/server.log 2>&1 &", user="desk")
     for _ in range(50):
         if "listening" in cexec("cat /tmp/server.log", check=False).stdout:
             break

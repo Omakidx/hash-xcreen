@@ -394,7 +394,8 @@ struct Inflight {
     cancel: tokio::sync::oneshot::Sender<()>,
 }
 
-type AckLog = Arc<Mutex<(u64, std::collections::VecDeque<u64>)>>;
+// (time of last ack, [(ack time, ack delay)] of the most recent frames)
+type AckLog = Arc<Mutex<(u64, std::collections::VecDeque<(u64, u64)>)>>;
 type InflightMap = Arc<Mutex<BTreeMap<u32, Inflight>>>;
 
 async fn serve_connection(
@@ -468,7 +469,11 @@ async fn serve_connection(
     };
     let mut cursor_task = Box::pin(cursor_task);
 
-    let mut rtt_min = u64::MAX;
+    // Base RTT: 20th percentile of the smoothed RTT over the last ~10 s (robust to jitter and to the
+    // initial RTT guess; a plain minimum made jittery links look permanently congested).
+    let mut rtt_hist: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+    let mut rtt_hist_at = 0u64;
+    let mut base_rtt_ms = 0u64;
     let mut last_change = now_ns();
     let mut good_since = now_ns();
     let mut tick_active = true;
@@ -493,7 +498,6 @@ async fn serve_connection(
                 // --- congestion controller (sender side, no client feedback needed) ---
                 let st = conn.stats();
                 let rtt = st.path.rtt.as_millis() as u64;
-                if st.path.rtt.as_millis() > 0 && st.path.cwnd > 0 { rtt_min = rtt_min.min(rtt); }
                 sh.rtt_ms.store(rtt as u32, Relaxed);
                 let now = now_ns();
                 let (oldest, n) = {
@@ -506,12 +510,23 @@ async fn serve_connection(
                     tick_active = n > 0;
                     tick = tokio::time::interval(std::time::Duration::from_millis(if tick_active { 4 } else { 100 }));
                 }
-                let base = if rtt_min == u64::MAX { 0 } else { rtt_min };
+                if acks.lock().unwrap().0 != 0 && now - rtt_hist_at >= 100_000_000 {
+                    rtt_hist_at = now;
+                    rtt_hist.push_back(rtt);
+                    if rtt_hist.len() > 100 {
+                        rtt_hist.pop_front();
+                    }
+                    let mut v: Vec<u64> = rtt_hist.iter().copied().collect();
+                    v.sort_unstable();
+                    base_rtt_ms = if v.len() < 5 { rtt } else { v[v.len() / 5] };
+                }
+                let base = if base_rtt_ms == 0 { rtt } else { base_rtt_ms };
                 // Queueing estimate that ignores single-packet loss recovery: median ack delay of the
                 // last frames (minus the base RTT), or the time since anything was acked if all stalled.
                 let (med, last_ack) = {
                     let a = acks.lock().unwrap();
-                    let mut v: Vec<u64> = a.1.iter().copied().collect();
+                    // only acks from the last second describe the current queue
+                    let mut v: Vec<u64> = a.1.iter().filter(|(t, _)| now - *t < 1_000_000_000).map(|(_, d)| *d).collect();
                     v.sort_unstable();
                     (v.get(v.len() / 2).copied().unwrap_or(0), a.0)
                 };
@@ -527,6 +542,9 @@ async fn serve_connection(
                 if !cfg.congestion { continue; }
                 if lag_ms > 100 && now - last_change > 150_000_000 {
                     // Stale: cancel queued frame streams and send a fresh full image.
+                    if std::env::var_os("S2_DEBUG").is_some() {
+                        eprintln!("cancel: lag={lag_ms} q_med={q_med} stall={stall} base={base} n={n} rtt={rtt} med={med}");
+                    }
                     let mut m = inflight.lock().unwrap();
                     let cancelled = m.len() as u64;
                     for (_, i) in std::mem::take(&mut *m) { let _ = i.cancel.send(()); }
@@ -583,7 +601,7 @@ async fn serve_connection(
                         let t = now_ns();
                         let mut a = acks2.lock().unwrap();
                         a.0 = t;
-                        a.1.push_back(t - t_sent);
+                        a.1.push_back((t, t - t_sent));
                         if a.1.len() > 8 {
                             a.1.pop_front();
                         }
