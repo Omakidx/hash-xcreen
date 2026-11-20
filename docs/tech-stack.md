@@ -49,7 +49,7 @@ Every language, library, tool and external service hash-xcreen uses, and why. It
 | Browser transport | **WebTransport** over HTTP/3 via `wtransport` running on our own quinn endpoint, dispatched by ALPN (`h3` / `hx/1`); `h3` + `h3-webtransport` as the fallback library | Same QUIC and the same port for both clients (proven in S5) |
 | Fallback | WebSocket over TLS (`tokio-tungstenite`) on the same port number over TCP | Networks that block UDP, and Safari until it is tested |
 | TLS | `rustls` | Pure Rust, no OpenSSL; supports pinned raw keys |
-| Control messages | **Protocol Buffers** via `prost` | Schema evolution, language-neutral for future mobile clients |
+| Control messages | **Protocol Buffers** via `prost`; schema compiled in `build.rs` with the pure-Rust `protox` + `prost-build` (no `protoc` binary needed on CI or developer machines, no generated code to keep in sync) | Schema evolution, language-neutral for future mobile clients |
 | Media framing | Fixed little-endian binary header | No parsing cost on the hot path |
 | Web certificates | Let's Encrypt via ACME (`instant-acme` 0.8 with `ring`, default features off so `aws-lc-rs` stays out); short-lived IP-address certificates when there is no domain, renewed by ACME Renewal Information; `rcgen` for keys and CSRs, `x509-parser` for the renewal ID; fallback: self-signed ECDSA P-256 certificate from `rcgen`, pinned with `serverCertificateHashes` | Real HTTPS for the browser without a domain (issued and renewed in production in S5) |
 
