@@ -188,5 +188,9 @@ fn worst_case_bodies_are_rejected_without_amplification() {
     let got = privd::decode(raw, Side::Server).unwrap();
     BIG_FROM.store(0, SeqCst);
     assert!(matches!(got, Incoming::Secret(_)));
-    assert_eq!(BIG_COUNT.load(SeqCst), 2, "frame buffer + Secret, no other copy of the secret");
+    assert_eq!(
+        BIG_COUNT.load(SeqCst),
+        2,
+        "frame buffer + Secret, no other copy of the secret"
+    );
 }

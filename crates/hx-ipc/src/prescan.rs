@@ -129,6 +129,7 @@ fn too_many(what: &'static str) -> FrameError {
 
 /// privd `Frame`: `request`(3) holds `secret_slots`(3, at most `max_slots`) and, in
 /// `setup_host`(15), `extra_host_addresses`(4) with at most 16 `addresses`(1).
+#[cfg(feature = "privd")]
 pub(crate) fn check_privd_frame(frame_body: &[u8], max_slots: usize) -> Result<(), FrameError> {
     each_sub(frame_body, 3, |req| {
         if count(req, 3, false)? > max_slots {
@@ -144,6 +145,7 @@ pub(crate) fn check_privd_frame(frame_body: &[u8], max_slots: usize) -> Result<(
 }
 
 /// Admin `Frame`: `request`(3) holds `secret_slots`(3, at most `max_slots`).
+#[cfg(feature = "privd")]
 pub(crate) fn check_admin_frame(frame_body: &[u8], max_slots: usize) -> Result<(), FrameError> {
     each_sub(frame_body, 3, |req| {
         if count(req, 3, false)? > max_slots {
@@ -154,6 +156,7 @@ pub(crate) fn check_admin_frame(frame_body: &[u8], max_slots: usize) -> Result<(
 }
 
 /// Link `SessionToGateway`: `info`(1) holds `codecs`(3, packed or not, at most `max_codecs`).
+#[cfg(feature = "link")]
 pub(crate) fn check_session_message(body: &[u8], max_codecs: usize) -> Result<(), FrameError> {
     if count_in(body, 1, 3, true)? > max_codecs {
         return Err(too_many("info.codecs: too many"));
@@ -162,6 +165,7 @@ pub(crate) fn check_session_message(body: &[u8], max_codecs: usize) -> Result<()
 }
 
 /// Link `GatewayToSession`: `frame_feedback`(7) holds `results`(1, at most `max_results`).
+#[cfg(feature = "link")]
 pub(crate) fn check_gateway_message(body: &[u8], max_results: usize) -> Result<(), FrameError> {
     if count_in(body, 7, 1, false)? > max_results {
         return Err(too_many("frame_feedback.results: too many"));
