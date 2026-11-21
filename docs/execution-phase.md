@@ -153,7 +153,7 @@ flowchart LR
 - [x] `hx-gatewayd` unprivileged with systemd hardening and seccomp allowlist
 - [ ] Unix-socket IPC: gateway ↔ privd, gateway ↔ session
 - [ ] Device list and revocation; `hx-agent` CLI (status, devices, logs, uninstall)
-- [ ] Self-update with signature check and rollback
+- [x] Self-update with signature check and rollback
 
 ### 1D — Provisioning
 - [x] Recipe format and recipes for Ubuntu 24.04 / 26.04 and Debian 12 / 13 × XFCE × basic / developer (all eight built for real in an unprivileged Incus container, see recipes/README.md)
