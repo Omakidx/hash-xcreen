@@ -436,3 +436,41 @@ async fn n5_a_rotation_does_not_lose_what_was_appended_to_the_old_file() {
     assert!(pos("unterminated-3") < pos("new-1"));
     assert!(pos("new-1") < pos("new-2"));
 }
+
+// ----------------------------------------------------------------------------------------- L6
+
+#[tokio::test]
+async fn l6_usage_errors_never_echo_what_was_typed() {
+    let dir = private_tempdir();
+    let cfg = unreachable_config(dir.path());
+    let secret = "hxt1-SECRETSECRETSECRETSECRETSECRETSECRETSECRETSECRET";
+    for args in [
+        vec!["pairing", "token", secret],
+        vec!["pairing", "code", secret],
+        vec!["desktop", "password", secret],
+        vec!["pin", "set", secret],
+        vec!["pin", "reset-lockout", secret],
+        vec!["status", secret],
+        vec!["devices", "list", secret],
+        vec!["pairing", "token", "--ttl", secret],
+        vec!["pairing", secret],
+        vec![secret],
+        vec!["pairing", "token", "--generate", &format!("--{secret}")],
+        vec!["pairing", "token", &format!("-{secret}")],
+        vec!["setup", "extend", secret],
+        vec!["setup", "begin", "--for", secret],
+    ] {
+        for json in [false, true] {
+            let mut a = args.clone();
+            if json {
+                a.push("--json");
+            }
+            let r = cli(&cfg, &a, &[], &[]).await;
+            assert_eq!(r.code, 2, "{a:?}: {r:?}");
+            assert!(
+                !r.stderr.contains("SECRET") && !r.stdout.contains("SECRET"),
+                "{a:?}: {r:?}"
+            );
+        }
+    }
+}

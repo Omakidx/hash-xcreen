@@ -153,9 +153,11 @@ impl Opts {
         } else if self.pos.len() < n {
             Err(usage(format!("missing {names}")))
         } else {
+            // Never echoed: an argument that does not belong may be a secret typed in the wrong
+            // place (a token after `pairing token`), and error text goes to terminals and logs.
             Err(usage(format!(
-                "unexpected argument {:?}",
-                super::text::peer(&self.pos[n], 64)
+                "unexpected argument number {} (its value is not shown)",
+                n + 1
             )))
         }
     }
@@ -214,10 +216,9 @@ fn opts(
                 return Err(usage(format!("{name} given twice")));
             }
         } else {
-            return Err(usage(format!(
-                "unknown option {:?}",
-                super::text::peer(name, 64)
-            )));
+            return Err(usage(
+                "unknown option (its text is not shown; see: hx-agent help)",
+            ));
         }
     }
     Ok(o)
@@ -225,12 +226,7 @@ fn opts(
 
 /// `90`, `90s`, `15m`, `2h`.
 pub fn parse_secs(s: &str) -> Result<u32, CliError> {
-    let bad = || {
-        usage(format!(
-            "bad duration {:?} (use 90, 15m or 2h)",
-            super::text::peer(s, 32)
-        ))
-    };
+    let bad = || usage("bad duration (use 90, 15m or 2h)");
     let (num, mult) = match s.chars().last() {
         Some('s') => (&s[..s.len() - 1], 1u64),
         Some('m') => (&s[..s.len() - 1], 60),
@@ -303,9 +299,8 @@ fn parse_cmd(args: &[String], help: bool) -> Result<Cmd, CliError> {
     let group = |names: &[&str]| -> Result<(String, Vec<String>), CliError> {
         match rest.first() {
             Some(sub) if names.contains(&sub.as_str()) => Ok((sub.clone(), rest[1..].to_vec())),
-            Some(sub) => Err(usage(format!(
-                "unknown {verb} command {:?} (expected one of: {})",
-                super::text::peer(sub, 32),
+            Some(_) => Err(usage(format!(
+                "unknown {verb} command (expected one of: {})",
                 names.join(", ")
             ))),
             None => Err(usage(format!(
@@ -590,10 +585,7 @@ fn parse_cmd(args: &[String], help: bool) -> Result<Cmd, CliError> {
                 yes: o.flag("--yes"),
             })
         }
-        other => Err(usage(format!(
-            "unknown command {:?} (try: hx-agent help)",
-            super::text::peer(other, 32)
-        ))),
+        _ => Err(usage("unknown command (try: hx-agent help)")),
     }
 }
 
