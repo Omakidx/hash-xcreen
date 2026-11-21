@@ -21,7 +21,7 @@ gateway-test-hooks = []
 # Test-only hooks of `hx-agent install` (`--test-allow-container`, `--test-fail-after <stage>`) and
 # the fakes of `install::testing`. Never enabled in a release build: the crate's own tests turn it
 # on through the dev-dependency on itself below, and the release gate forbids it (design C12).
-install-test-hooks = []
+install-test-hooks = ["dep:tempfile"] # install::testing builds a TempDir; a bin build with only this feature must compile
 # Test-only hook of hx-privd for hosts where /proc/sys is not writable (a nested VM or an
 # unprivileged container in the installer's tests): a failed `sysctl -p` of the Incus drop-in, or
 # sysctl values that did not take effect, become a warning and `SetupHostResult.sysctl_applied` is
