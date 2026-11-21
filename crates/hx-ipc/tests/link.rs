@@ -635,6 +635,9 @@ fn message_level_validation() {
     assert!(s_ok(info(|i| i.software = "x".repeat(128))));
     assert!(!s_ok(info(|i| i.software = "x".repeat(129))));
     assert!(!s_ok(info(|i| i.codecs = vec![1; 5])));
+    assert!(s_ok(info(|i| i.max_fps = 240)));
+    assert!(!s_ok(info(|i| i.max_fps = 241)));
+    assert!(!s_ok(info(|i| i.max_fps = u32::MAX)));
     assert!(!s_ok(info(|i| i.display = None)));
     assert!(!s_ok(info(|i| i.display = Some(pb::Display {
         width: 0,

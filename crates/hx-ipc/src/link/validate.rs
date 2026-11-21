@@ -136,10 +136,13 @@ pub fn check_cancel_frames(up_to_frame: u32, newest_frame: u32) -> bool {
 
 /// `info` rules (section 13): text length, display size, codec count. `info` is accepted once
 /// per link as the first `ctl` message; enforcing that is the caller's (a second `info` is a
-/// violation).
+/// violation). `max_fps` must be 0 (not stated) or at most 240, so the negotiated ceiling
+/// `min(StreamConfig.max_fps, info.max_fps)` (a 0 on either side means the other) is at most 240
+/// and `budget::limits::video_frames` stays bounded at 480 frames per second.
 pub fn validate_info(i: &pb::Info) -> Result<(), FrameError> {
     require(i.software.len() <= MAX_SOFTWARE_LEN, "info.software")?;
     require(i.codecs.len() <= MAX_INFO_CODECS, "info.codecs")?;
+    require(i.max_fps <= MAX_FPS, "info.max_fps")?;
     let d = i.display.as_ref();
     require(
         d.is_some_and(|d| {
