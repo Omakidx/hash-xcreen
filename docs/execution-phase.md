@@ -152,7 +152,7 @@ flowchart LR
 - [x] `hx-privd` command set specified and reviewed before implementation ([ipc.md](ipc.md) v0.3; the session link too)
 - [x] `hx-gatewayd` unprivileged with systemd hardening and seccomp allowlist
 - [x] Unix-socket IPC: gateway ↔ privd, gateway ↔ session
-- [ ] Device list and revocation; `hx-agent` CLI (status, devices, logs, uninstall; `uninstall` closes with the 1E work, split between the CLI and a narrowed privd `Uninstall`, ipc.md §6.13)
+- [x] Device list and revocation; `hx-agent` CLI (status, devices, logs, uninstall; `uninstall` closed with the 1E work, split between the CLI and a narrowed privd `Uninstall`, ipc.md §6.13; both modes run for real in docs/spikes/1e-installer-nested-incus.md)
 - [x] Self-update with signature check and rollback
 
 ### 1D — Provisioning
@@ -163,9 +163,9 @@ flowchart LR
 - [ ] Docker opt-in (nesting, syscall interception, apt install)
 
 ### 1E — Installer
-- [ ] `install.sh`: preflight, download, minisign verification (current and next key), hand-off to the agent
-- [ ] All options from architecture §5.2; `--interactive` mode with pairing code
-- [ ] Idempotent stages with resume; `hx-agent uninstall`
+- [x] `install.sh`: preflight, download, minisign verification (current and next key), hand-off to the agent
+- [ ] All options from architecture §5.2; `--interactive` mode with pairing code (implemented and tested against a simulated host; `--ssh` ran for real. Still to run on a real host: `--interactive`, `--docker` and hosts that need Zabbly, whose apt key is not provisioned yet)
+- [x] Idempotent stages with resume; `hx-agent uninstall` (resume after every stage, a no-op re-run and both uninstall modes run for real in a nested Incus container on Ubuntu 24.04 and Debian 13: docs/spikes/1e-installer-nested-incus.md)
 - [ ] Installer CI: fresh VM per host OS × both image paths
 
 Design: architecture §4.1, §4.2, §5 and §13, and ipc.md §5.4, §6.12 and §6.13 (written before the code, as AGENTS.md requires). Notes:
