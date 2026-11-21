@@ -241,13 +241,14 @@ Contract between the installer (`hx-agent install --ssh`, architecture §5.2) an
 
 ```
 "HXI1" | { kind u8 | len u16 LE | bytes[len] }* | kind 0, len 0
-1 USER_PASSWORD     1..=1024 bytes, no \r \n NUL                 required
+1 USER_PASSWORD     1..=511 bytes, no \r \n NUL                  required
 2 PIN               6..=16 ASCII digits                         required
 3 PAIRING_TOKEN     hxt1-…, at most 1024 bytes                  optional: the app's own token, used right after the install
 4 OWNER_PUBLIC_KEY  32 bytes                                    optional: EnrolOwnerKey (Phase 2 shape)
 5 DRIVE_TOKEN       reserved: exit 2 in Phase 1
 ```
 
+- The password cap of 511 bytes is libxcrypt's limit (`hx-pwcheck` and `crypt_rn` refuse longer input), so a longer password could never be checked later.
 - At most 8192 bytes in total, each kind at most once, the whole input within 30 s. EOF before the end record, or any byte after it, is exit 2.
 - Bytes are read straight into `Zeroizing` buffers, never into a `String`; afterwards `/dev/null` is duplicated onto fd 0. Stdin must not be a tty, and `--json` is implied.
 - Where each goes: the password to `CreateDesktop` (slot 0), through Argon2id and `PepperEnrol(PASSWORD)` to `SetPasswordVerifier`; the PIN through Argon2id and `PepperEnrol(PIN)` to `SetPinVerifier{all}`; the token to `CreatePairingToken` (a secret frame) as the **last** stage, so its 15-minute life starts after the desktop build; the owner key to `EnrolOwnerKey`.
