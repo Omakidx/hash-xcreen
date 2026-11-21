@@ -119,8 +119,7 @@ impl FrameQueue {
         g.0.drain(..).collect()
     }
 
-    /// Bytes queued (tests).
-    #[cfg(test)]
+    /// Bytes queued.
     pub(super) fn queued_bytes(&self) -> u64 {
         lock(&self.q).1
     }
@@ -198,6 +197,10 @@ pub(super) struct VideoShared {
     pub(super) sent: AtomicU32,
     /// Frames cancelled or dropped (interval counter for `ServerStats`).
     pub(super) dropped: AtomicU32,
+    /// Totals since the client attached (for [`super::RelaySnapshot`]).
+    pub(super) total_sent: AtomicU64,
+    pub(super) total_dropped: AtomicU64,
+    pub(super) total_cancelled: AtomicU64,
 }
 
 impl VideoShared {
@@ -215,7 +218,16 @@ impl VideoShared {
             delivered_bytes: AtomicU64::new(0),
             sent: AtomicU32::new(0),
             dropped: AtomicU32::new(0),
+            total_sent: AtomicU64::new(0),
+            total_dropped: AtomicU64::new(0),
+            total_cancelled: AtomicU64::new(0),
         })
+    }
+
+    /// Queued and in-flight frames and bytes: `(queued_bytes, inflight_frames, inflight_bytes)`.
+    pub(super) fn occupancy(&self) -> (u64, usize, u64) {
+        let (n, b) = self.counts();
+        (self.queue.queued_bytes(), n, b)
     }
 
     fn result(
@@ -237,6 +249,7 @@ impl VideoShared {
     /// Reports a frame the relay discarded without sending it.
     pub(super) fn report_dropped(&self, f: &Frame) {
         self.dropped.fetch_add(1, Relaxed);
+        self.total_dropped.fetch_add(1, Relaxed);
         let queued = u32::try_from(f.received_at.elapsed().as_micros()).unwrap_or(u32::MAX);
         self.feedback.push(Self::result(
             f.number(),
@@ -276,6 +289,7 @@ impl VideoShared {
             }
         } else {
             self.dropped.fetch_add(1, Relaxed);
+            self.total_cancelled.fetch_add(1, Relaxed);
             // A frame older than the newest key frame sent does not break the chain.
             let before_key = self.have_key.load(Relaxed)
                 && serial_gt(self.last_key.load(Relaxed), ack.frame_number);
@@ -479,6 +493,7 @@ async fn send_frame(
     match tokio::time::timeout(SEND_BUDGET, conn.send_video_frame(frame.header, payload)).await {
         Ok(Ok(ticket)) => {
             video.sent.fetch_add(1, Relaxed);
+            video.total_sent.fetch_add(1, Relaxed);
             video.attach(number, ticket);
             true
         }
@@ -537,6 +552,65 @@ mod tests {
             elapsed: Duration::from_millis(3),
             outcome,
         }
+    }
+
+    fn frame(n: u32, key: bool, payload: usize) -> Frame {
+        use hx_proto::media::{FLAG_KEY, MediaHeader};
+        Frame {
+            header: MediaHeader {
+                codec: hx_proto::VideoCodec::H264,
+                flags: if key { FLAG_KEY } else { 0 },
+                frame_number: n,
+                capture_timestamp_us: 0,
+                payload_len: payload as u32,
+            },
+            format: Arc::new(StreamFormat {
+                epoch: 1,
+                codec: hx_proto::VideoCodec::H264,
+                width: 64,
+                height: 64,
+                fps: 30,
+                first_frame: 0,
+            }),
+            received_at: Instant::now(),
+            body: bytes::Bytes::from(vec![0u8; MEDIA_HEADER_LEN + payload]),
+        }
+    }
+
+    #[test]
+    fn the_frame_queue_evicts_the_oldest_and_never_exceeds_its_bounds() {
+        let q = FrameQueue::new(100_000);
+        let mut evicted = Vec::new();
+        for n in 0..10 {
+            evicted.extend(
+                q.push(frame(n, n == 0, 1_000))
+                    .into_iter()
+                    .map(|f| f.number()),
+            );
+        }
+        assert_eq!(evicted, [0, 1, 2, 3, 4, 5], "the four newest stay");
+        assert_eq!(q.pop().unwrap().number(), 6);
+        // Bytes: a frame bigger than the byte bound still queues (it is the only one), and
+        // pushes out everything older.
+        let q = FrameQueue::new(5_000);
+        q.push(frame(1, true, 2_000));
+        q.push(frame(2, false, 2_000));
+        let out = q.push(frame(3, false, 2_000));
+        assert_eq!(out.len(), 1);
+        assert!(q.queued_bytes() <= 5_000 + 1_000);
+        let out = q.push(frame(4, true, 50_000));
+        assert_eq!(out.len(), 2);
+        assert_eq!(q.pop().unwrap().number(), 4);
+        assert!(q.pop().is_none());
+        assert_eq!(q.queued_bytes(), 0);
+        // A cancel up to a number removes the older queued frames only.
+        let q = FrameQueue::new(100_000);
+        for n in 5..9 {
+            q.push(frame(n, false, 10));
+        }
+        let gone: Vec<u32> = q.remove_up_to(6).iter().map(|f| f.number()).collect();
+        assert_eq!(gone, [5, 6]);
+        assert_eq!(q.pop().unwrap().number(), 7);
     }
 
     #[test]

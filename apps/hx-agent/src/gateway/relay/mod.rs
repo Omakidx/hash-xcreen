@@ -139,6 +139,25 @@ impl RelayConfig {
     }
 }
 
+/// What the relay holds for the active client and what it has done for it (metrics, tests).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RelaySnapshot {
+    /// Bytes of video waiting for the sender (bounded: see the module documentation).
+    pub queued_video_bytes: u64,
+    /// Frames handed to the transport and not yet acknowledged.
+    pub inflight_frames: usize,
+    /// Payload bytes of those frames.
+    pub inflight_video_bytes: u64,
+    /// Frames handed to the transport since the client attached.
+    pub frames_sent: u64,
+    /// Frames discarded without being sent (queue evictions, a broken chain, a full window).
+    pub frames_dropped: u64,
+    /// Frames the transport reported cancelled or rejected.
+    pub frames_cancelled: u64,
+    /// Input events refused because the client was no longer the current one.
+    pub input_refused: u64,
+}
+
 struct Core {
     cfg: RelayConfig,
     keeper: Arc<LinkKeeper>,
@@ -387,6 +406,11 @@ impl RelayLink {
                 outdated: AtomicBool::new(false),
             }),
         })
+    }
+
+    /// The active client's relay figures, if a client is attached.
+    pub fn snapshot(&self) -> Option<RelaySnapshot> {
+        lock(&self.core.active).as_ref().map(|r| r.snapshot())
     }
 
     /// The link keeper (tests move the policy through it).

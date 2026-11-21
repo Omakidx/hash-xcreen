@@ -3,7 +3,8 @@
 //! It speaks the framing of section 4 (blocking threads, `recvmsg` reads), derives its own
 //! pepper (which the gateway never sees), and implements only what the gateway role calls:
 //! `PepperVerify` with failure caps and the `LOCKED` state of section 5.3, `PepperEnrol`,
-//! `RecordEvent`, `GetDesktop`, `StartDesktop`, `ProvisionSessionLink`, `GetHostInfo`.
+//! `RecordEvent`, `GetDesktop`, `StartDesktop`, `ProvisionSessionLink`, `RestartSession`,
+//! `InstallSession`, `GetHostInfo`.
 //! Knobs let a test restart it, take it down, slow it, make it lie about the role, or send a
 //! file descriptor along with a response.
 
@@ -49,6 +50,10 @@ pub struct State {
     pub start_calls: u32,
     /// `ProvisionSessionLink` calls.
     pub provision_calls: u32,
+    /// `RestartSession` calls.
+    pub restart_session_calls: u32,
+    /// `InstallSession` calls.
+    pub install_session_calls: u32,
     /// Process a request fully, then close the connection without answering (privd dying
     /// mid-call).
     pub close_after_request: bool,
@@ -399,6 +404,17 @@ fn serve(mut stream: UnixStream, state: Arc<Mutex<State>>, conn: u32) {
                 state.lock().unwrap().provision_calls += 1;
                 R::ProvisionSessionLink(pb::ProvisionSessionLinkResult {
                     socket_path: format!("/run/hx/link/{}.sock", r.desktop_id),
+                })
+            }
+            C::RestartSession(_) => {
+                state.lock().unwrap().restart_session_calls += 1;
+                R::RestartSession(pb::RestartSessionResult {})
+            }
+            C::InstallSession(_) => {
+                state.lock().unwrap().install_session_calls += 1;
+                R::InstallSession(pb::InstallSessionResult {
+                    installed_version: "0".into(),
+                    restarted: true,
                 })
             }
             C::GetHostInfo(_) => R::GetHostInfo(pb::GetHostInfoResult {

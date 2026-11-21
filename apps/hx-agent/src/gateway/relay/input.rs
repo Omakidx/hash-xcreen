@@ -79,12 +79,6 @@ impl InputPath {
         (clamp(d >> 32), clamp(d & 0xffff_ffff))
     }
 
-    /// True while this client's input is accepted.
-    #[cfg(test)]
-    pub(super) fn is_open(&self) -> bool {
-        *lock(&self.open) && self.current.load(Relaxed) == self.epoch
-    }
-
     /// Takeover step (1) and the end of a client: stop accepting input and release every key and
     /// button in the session. Idempotent.
     pub(super) fn release(&self) {

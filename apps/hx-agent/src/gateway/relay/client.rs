@@ -208,6 +208,21 @@ impl ClientRelay {
         });
     }
 
+    /// What the relay holds and has done for this client.
+    pub(super) fn snapshot(&self) -> super::RelaySnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (queued_bytes, inflight_frames, inflight_bytes) = self.video.occupancy();
+        super::RelaySnapshot {
+            queued_video_bytes: queued_bytes,
+            inflight_frames,
+            inflight_video_bytes: inflight_bytes,
+            frames_sent: self.video.total_sent.load(Relaxed),
+            frames_dropped: self.video.total_dropped.load(Relaxed),
+            frames_cancelled: self.video.total_cancelled.load(Relaxed),
+            input_refused: self.input.refused.load(Relaxed),
+        }
+    }
+
     /// True once the relay was detached.
     pub(super) fn is_detached(&self) -> bool {
         self.detached.load(Relaxed)
