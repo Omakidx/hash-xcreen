@@ -112,6 +112,14 @@ current-password checker. `~/Received` links to `/var/lib/hx-session/received`.
 
 ## Status
 
-Verified on a real VPS in S3: Ubuntu 24.04 and Debian 13 with the Docker add-on. Ubuntu 26.04 and
-Debian 12 recipes are derived from them; repository suites were confirmed to exist, but a full
-build of those two has not been run yet.
+Verified on a real VPS in S3: Ubuntu 24.04 and Debian 13 with the Docker add-on. All eight recipes
+(four distros x basic and developer) were then built through `hx-provision` into an unprivileged,
+isolated-idmap Incus 6.0.0 container (`crates/hx-provision/tests/incus_real_session.rs`), booted
+into the XFCE session, and passed the `hx-session` socket and service checks. Not covered by a real
+build: the Docker add-on on these (needs Incus 6.0.5), and the developer recipes' vendor installers
+(optional steps, which need direct internet and were not given it by the test's proxy).
+
+The mozillateam PPA is signed by two keys. Ubuntu 26.04 pins the current one
+(`738BEB93...1867`, from the Launchpad API); Ubuntu 24.04 still pins the older `0AB21567...EC21`,
+which the PPA's noble Release file still carries a signature from. A recipe can pin only one
+fingerprint, so if Launchpad drops the old signature the 24.04 recipe needs the new key too.
