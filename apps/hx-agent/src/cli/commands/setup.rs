@@ -11,7 +11,7 @@ use hx_ipc::admin::pb as apb;
 use hx_ipc::privd::pb::{self, request::Command, response::Result as R};
 use serde_json::json;
 
-use super::{admin, privd};
+use super::{admin, confirm, privd};
 use crate::cli::error::CliError;
 use crate::cli::gatewayd::unexpected as admin_unexpected;
 use crate::cli::privd::unexpected;
@@ -48,7 +48,18 @@ fn remaining(env: &Env<'_>, expires: u64) -> u32 {
     u32::try_from(expires.saturating_sub((env.now)()).clamp(60, 86_400)).unwrap_or(60)
 }
 
-pub(super) fn begin(env: &mut Env<'_>, secs: u32) -> Result<Outcome, CliError> {
+/// What an open setup window lets a compromised gateway do (docs/ipc.md 5.1, 6.3 to 6.9, 7).
+const WINDOW_WARNING: &str =
+    "While the setup window is open, hx-gatewayd (the internet-facing process) may ask privd to:
+  - build the host and create the desktop (SetupHost, CreateDesktop),
+  - enable Docker in the desktop, which lowers its isolation (EnableDocker),
+  - change the desktop user's password WITHOUT knowing the current one (SetUserPassword),
+  - mint verifier MACs at a higher rate (PepperEnrol), and close the window.
+A gateway that is compromised during that time can do all of it. Open the window only when you
+are about to run the setup, keep it short, and close it with: hx-agent setup finish";
+
+pub(super) fn begin(env: &mut Env<'_>, secs: u32, yes: bool) -> Result<Outcome, CliError> {
+    confirm(env, WINDOW_WARNING, "yes", yes)?;
     let mut p = privd(env)?;
     let expires = match p.simple(Command::BeginSetup(pb::BeginSetupRequest {
         expires_in_s: secs,

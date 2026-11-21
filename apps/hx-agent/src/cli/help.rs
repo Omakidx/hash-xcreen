@@ -47,7 +47,7 @@ const BLOCKS: &[(&str, &str)] = &[
     (
         "setup",
         "\
-  setup begin [--for 2h]          Open the setup window (privd and gatewayd).
+  setup begin [--for 2h] [--yes]  Open the setup window (privd and gatewayd); asks first.
   setup extend <time>             Extend it (24 h in total at most).
   setup finish [--force]          Close it.
 ",

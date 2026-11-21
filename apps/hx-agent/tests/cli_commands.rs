@@ -139,7 +139,12 @@ async fn status_shows_the_desktop_and_a_locked_pin() {
     let w = World::start().await;
     w.add_desktop();
     // Open the window so that the gateway role may call PepperVerify, then fail it into a lock.
-    assert_eq!(cli(&w.cfg, &["setup", "begin"], &[], &[]).await.code, 0);
+    assert_eq!(
+        cli(&w.cfg, &["setup", "begin", "--yes"], &[], &[])
+            .await
+            .code,
+        0
+    );
     for _ in 0..12 {
         let _ = daemon_call(
             &w,
@@ -499,7 +504,12 @@ async fn pin_set_refuses_differing_entries_and_bad_pins_without_changing_anythin
 #[tokio::test]
 async fn pin_reset_lockout_asks_clears_everything_and_is_audited() {
     let w = World::start().await;
-    assert_eq!(cli(&w.cfg, &["setup", "begin"], &[], &[]).await.code, 0);
+    assert_eq!(
+        cli(&w.cfg, &["setup", "begin", "--yes"], &[], &[])
+            .await
+            .code,
+        0
+    );
     for _ in 0..12 {
         let _ = daemon_call(
             &w,
@@ -574,7 +584,7 @@ async fn setup_window_is_driven_in_privd_and_mirrored_in_gatewayd() {
     let w = World::start().await;
     let r = cli(
         &w.cfg,
-        &["setup", "begin", "--for", "1h", "--json"],
+        &["setup", "begin", "--for", "1h", "--yes", "--json"],
         &[],
         &[],
     )
@@ -611,7 +621,12 @@ async fn setup_finish_force_closes_without_a_desktop_and_extend_needs_an_open_wi
     let w = World::start().await;
     let r = cli(&w.cfg, &["setup", "extend", "30m"], &[], &[]).await;
     assert_eq!(r.code, 4, "{r:?}");
-    assert_eq!(cli(&w.cfg, &["setup", "begin"], &[], &[]).await.code, 0);
+    assert_eq!(
+        cli(&w.cfg, &["setup", "begin", "--yes"], &[], &[])
+            .await
+            .code,
+        0
+    );
     assert_eq!(
         cli(&w.cfg, &["setup", "finish", "--force"], &[], &[])
             .await
@@ -642,7 +657,12 @@ async fn setup_finish_force_closes_without_a_desktop_and_extend_needs_an_open_wi
 async fn desktop_power_and_limits() {
     let w = World::start().await;
     w.add_desktop();
-    assert_eq!(cli(&w.cfg, &["setup", "begin"], &[], &[]).await.code, 0);
+    assert_eq!(
+        cli(&w.cfg, &["setup", "begin", "--yes"], &[], &[])
+            .await
+            .code,
+        0
+    );
     let r = cli(&w.cfg, &["desktop", "stop", "--json"], &[], &[]).await;
     assert_eq!(r.code, 0, "{r:?}");
     assert_eq!(r.json()["data"]["running"], false);
@@ -835,7 +855,12 @@ async fn docker_disable_calls_privd() {
 async fn snapshots_list_create_delete() {
     let w = World::start().await;
     w.add_desktop();
-    assert_eq!(cli(&w.cfg, &["setup", "begin"], &[], &[]).await.code, 0);
+    assert_eq!(
+        cli(&w.cfg, &["setup", "begin", "--yes"], &[], &[])
+            .await
+            .code,
+        0
+    );
     let r = cli(&w.cfg, &["snapshots", "list"], &[], &[]).await;
     assert!(r.stdout.contains("no snapshots"), "{}", r.stdout);
     let r = cli(&w.cfg, &["snapshots", "create", "--json"], &[], &[]).await;

@@ -49,7 +49,7 @@ pub enum Cmd {
     /// `pin reset-lockout`.
     PinResetLockout { purpose: LockoutPurpose, yes: bool },
     /// `setup begin`.
-    SetupBegin { secs: u32 },
+    SetupBegin { secs: u32, yes: bool },
     /// `setup extend`.
     SetupExtend { secs: u32 },
     /// `setup finish`.
@@ -396,7 +396,7 @@ fn parse_cmd(args: &[String], help: bool) -> Result<Cmd, CliError> {
             let (sub, r) = group(&["begin", "extend", "finish"])?;
             match sub.as_str() {
                 "begin" => {
-                    let o = opts(&r, &[], &["--for"])?;
+                    let o = opts(&r, &["--yes"], &["--for"])?;
                     o.positionals(0, "")?;
                     let secs = o
                         .value("--for")
@@ -406,7 +406,10 @@ fn parse_cmd(args: &[String], help: bool) -> Result<Cmd, CliError> {
                     if !(60..=86_400).contains(&secs) {
                         return Err(usage("--for must be between 60 s and 24 h"));
                     }
-                    Ok(Cmd::SetupBegin { secs })
+                    Ok(Cmd::SetupBegin {
+                        secs,
+                        yes: o.flag("--yes"),
+                    })
                 }
                 "extend" => {
                     let o = opts(&r, &[], &[])?;

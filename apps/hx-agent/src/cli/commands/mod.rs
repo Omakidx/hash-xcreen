@@ -101,7 +101,7 @@ pub(crate) fn dispatch(env: &mut Env<'_>, cmd: Cmd) -> Result<Option<Outcome>, C
         Cmd::PairingToken { source, ttl_s } => some(pairing::token(env, source, ttl_s)),
         Cmd::PinSet { device } => some(pin::set(env, device.as_deref())),
         Cmd::PinResetLockout { purpose, yes } => some(pin::reset_lockout(env, purpose, yes)),
-        Cmd::SetupBegin { secs } => some(setup::begin(env, secs)),
+        Cmd::SetupBegin { secs, yes } => some(setup::begin(env, secs, yes)),
         Cmd::SetupExtend { secs } => some(setup::extend(env, secs)),
         Cmd::SetupFinish { force } => some(setup::finish(env, force)),
         Cmd::DesktopPower { action, id, force } => some(desktop::power(env, action, &id, force)),

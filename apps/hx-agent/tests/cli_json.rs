@@ -406,7 +406,7 @@ async fn pairing_pin_and_setup_json_is_stable() {
     .await;
     golden(
         &cfg,
-        &["setup", "begin"],
+        &["setup", "begin", "--yes"],
         &[],
         &[],
         0,

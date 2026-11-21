@@ -474,3 +474,34 @@ async fn l6_usage_errors_never_echo_what_was_typed() {
         }
     }
 }
+
+// ----------------------------------------------------------------------------------------- L7
+
+#[tokio::test]
+async fn l7_opening_the_setup_window_lists_the_powers_and_needs_a_confirmation() {
+    let s = stack(None, false).await;
+    let r = cli(&s.cfg, &["setup", "begin"], &[], &[]).await;
+    assert_eq!(r.code, 8, "{r:?}");
+    assert!(
+        r.stderr.contains("SetUserPassword")
+            && r.stderr.contains("EnableDocker")
+            && r.stderr.contains("CreateDesktop"),
+        "{}",
+        r.stderr
+    );
+    let r = cli(&s.cfg, &["setup", "begin"], &[], &["no"]).await;
+    assert_eq!(r.code, 8, "{r:?}");
+    assert!(
+        s.p.commands().is_empty(),
+        "no BeginSetup was sent: {:?}",
+        s.p.commands()
+    );
+    assert!(s.a.commands().is_empty());
+    // Typed yes, or --yes.
+    let r = cli(&s.cfg, &["setup", "begin"], &[], &["yes"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let r = cli(&s.cfg, &["setup", "begin", "--yes"], &[], &[]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.asked.is_empty());
+    assert_eq!(s.p.commands(), ["BeginSetup", "BeginSetup"]);
+}

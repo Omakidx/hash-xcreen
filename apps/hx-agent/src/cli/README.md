@@ -24,7 +24,7 @@ pairing code [--ttl 15m]
 pairing token [--ttl 15m] [--generate | --token <t>]
 pin set [--device <id-prefix>]
 pin reset-lockout [--purpose pin|password] [--yes]
-setup begin [--for 2h] | extend <time> | finish [--force]
+setup begin [--for 2h] [--yes] | extend <time> | finish [--force]
 desktop start|stop|restart [--force] [--desktop main]
 desktop limits [--cpu N] [--memory-mib N] [--disk-gib N] [--desktop main]
 desktop password [--verifier-only] [--desktop main]
@@ -129,7 +129,7 @@ terminal escape sequence, bidi control or forged line can reach the operator's t
 
 ## Confirmations
 
-`devices reinstate` (of a revoked device), `pin reset-lockout`, `docker enable`, `update apply`, `update rollback` and `uninstall` ask the
+`devices reinstate` (of a revoked device), `setup begin`, `pin reset-lockout`, `docker enable`, `update apply`, `update rollback` and `uninstall` ask the
 operator to type a word (`yes`, `uninstall`, `destroy`) on the terminal, after printing what the
 action does. `--yes` answers for scripts; there is no other way around the question (no terminal and
 no `--yes` is exit 8). `pin reset-lockout` clears the **whole** failure history of the purpose, not
