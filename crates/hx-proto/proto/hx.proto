@@ -1,4 +1,5 @@
-// hash-xcreen wire protocol, version 1.0. Normative description: docs/protocol.md.
+// hash-xcreen wire protocol, version 1.2 (1.0 base, 1.1 and 1.2 additive). Normative description:
+// docs/protocol.md.
 // Field numbers are never reused; adding fields or messages is a minor-version change.
 syntax = "proto3";
 
@@ -122,6 +123,95 @@ message ServerStats {
   uint32 rtt_us = 11;
 }
 
+// ----- 1.2: device management (protocol 5.9) -----
+
+enum DeviceStatus {
+  DEVICE_STATUS_UNSPECIFIED = 0;
+  DEVICE_STATUS_ACTIVE = 1;
+  DEVICE_STATUS_REVOKED = 2;
+}
+
+enum DeviceRevokeReason {
+  DEVICE_REVOKE_REASON_UNSPECIFIED = 0;
+  // An operator or another paired device revoked it.
+  DEVICE_REVOKE_REASON_USER = 1;
+  // The PIN was wrong too many times.
+  DEVICE_REVOKE_REASON_TOO_MANY_PIN_FAILURES = 2;
+}
+
+message DeviceInfo {
+  // 16 bytes (protocol 11.1).
+  bytes device_id = 1;
+  // Sanitised label chosen by the device at pairing, at most 64 bytes. Display as plain text.
+  string name = 2;
+  uint64 created_unix = 3;
+  // 0 = never connected.
+  uint64 last_seen_unix = 4;
+  DeviceStatus status = 5;
+  // Set only when status is REVOKED.
+  DeviceRevokeReason revoke_reason = 6;
+  // Set only when status is REVOKED.
+  uint64 revoked_unix = 7;
+  // True for the device that asked (in DeviceList), so a client can mark "this device".
+  bool current = 8;
+}
+
+message ListDevices {}
+
+message DeviceList {
+  // At most 128, active devices first, then revoked ones, newest first within each.
+  repeated DeviceInfo devices = 1;
+  // True if there were more devices than fit.
+  bool truncated = 2;
+}
+
+message RevokeDevice {
+  bytes device_id = 1;
+}
+
+enum RevokeStatus {
+  REVOKE_STATUS_UNSPECIFIED = 0;
+  REVOKE_STATUS_OK = 1;
+  REVOKE_STATUS_NOT_FOUND = 2;
+  REVOKE_STATUS_ALREADY_REVOKED = 3;
+  // Would leave the server with no active device (only possible for a self-revoke).
+  REVOKE_STATUS_LAST_ACTIVE_DEVICE = 4;
+  REVOKE_STATUS_RATE_LIMITED = 5;
+  REVOKE_STATUS_FAILED = 6;
+}
+
+message RevokeResult {
+  RevokeStatus status = 1;
+}
+
+enum DeviceEventKind {
+  DEVICE_EVENT_KIND_UNSPECIFIED = 0;
+  DEVICE_EVENT_KIND_ADDED = 1;
+  DEVICE_EVENT_KIND_REVOKED = 2;
+  DEVICE_EVENT_KIND_REINSTATED = 3;
+}
+
+// Pushed to every live session that negotiated DEVICE_MANAGEMENT when the device registry
+// changes (request_id 0).
+message DeviceEvent {
+  DeviceEventKind kind = 1;
+  DeviceInfo device = 2;
+  // The device that caused it: empty (operator, PIN lockout, or the server), or 16 bytes.
+  bytes by_device_id = 3;
+}
+
+message DeviceMgmt {
+  // Non-zero in a request and in the response that answers it; 0 only in a DeviceEvent.
+  uint32 request_id = 1;
+  oneof body {
+    ListDevices list = 10;           // client to server
+    DeviceList device_list = 11;     // server to client
+    RevokeDevice revoke = 12;        // client to server
+    RevokeResult revoke_result = 13; // server to client
+    DeviceEvent event = 14;          // server to client
+  }
+}
+
 // Opaque carrier for messages owned by workstream 1B (pairing, PIN/auth).
 message Opaque {
   bytes data = 1;
@@ -140,6 +230,8 @@ message ControlMessage {
     ClientStats stats = 9;
     Goodbye goodbye = 10;
     ServerStats server_stats = 11;
+    // 1.2, feature DEVICE_MANAGEMENT: list and revoke paired devices (protocol 5.9).
+    DeviceMgmt device_mgmt = 12;
     Opaque pairing = 100;
     Opaque auth = 101;
   }

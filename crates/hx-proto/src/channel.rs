@@ -132,6 +132,8 @@ pub const MAX_DEVICE_NAME: usize = 64;
 pub const DEVICE_ID_LEN: usize = 16;
 /// Largest `ServerStats.interval_ms` (protocol §5.8).
 pub const MAX_STATS_INTERVAL_MS: u32 = 60_000;
+/// Most devices in one `DeviceList` (protocol §5.9).
+pub const MAX_DEVICE_LIST: usize = 128;
 /// Maximum WebSocket transfer chunk.
 pub const MAX_TRANSFER_CHUNK: usize = 65_536;
 /// Maximum cursor image edge in pixels.

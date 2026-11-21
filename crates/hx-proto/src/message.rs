@@ -10,8 +10,8 @@ use prost::Message;
 use crate::{
     channel::{
         DEVICE_ID_LEN, MAX_CLIPBOARD_SIZE, MAX_CONTROL_MESSAGE, MAX_CURSOR_EDGE,
-        MAX_CURSOR_MESSAGE, MAX_DEVICE_NAME, MAX_FILE_SIZE, MAX_INPUT_MESSAGE, MAX_OPAQUE,
-        MAX_STATS_INTERVAL_MS, MAX_TRANSFER_HEADER,
+        MAX_CURSOR_MESSAGE, MAX_DEVICE_LIST, MAX_DEVICE_NAME, MAX_FILE_SIZE, MAX_INPUT_MESSAGE,
+        MAX_OPAQUE, MAX_STATS_INTERVAL_MS, MAX_TRANSFER_HEADER,
     },
     error::ProtoError,
     pb::{
@@ -258,6 +258,7 @@ impl Wire for ControlMessage {
                     return Err(invalid("server_stats.fps_ceiling", "above 240"));
                 }
             }
+            Ctl::DeviceMgmt(d) => d.validate_body()?,
             Ctl::Pairing(o) | Ctl::Auth(o) => {
                 if o.data.len() > MAX_OPAQUE {
                     return Err(invalid("opaque.data", "too long"));
@@ -266,6 +267,123 @@ impl Wire for ControlMessage {
         }
         Ok(())
     }
+}
+
+/// Which way a `DeviceMgmt` body travels (protocol §5.9). One envelope carries both
+/// directions, so the transport cannot enforce the role from the variant alone: the receiving
+/// application checks it with [`pb::DeviceMgmt::direction`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MgmtDirection {
+    /// A request: only a client sends it.
+    ClientToServer,
+    /// A response or an event: only the server sends it.
+    ServerToClient,
+}
+
+impl pb::DeviceMgmt {
+    /// The direction this body may travel, or `None` if no body is set.
+    pub fn direction(&self) -> Option<MgmtDirection> {
+        use pb::device_mgmt::Body as B;
+        Some(match self.body.as_ref()? {
+            B::List(_) | B::Revoke(_) => MgmtDirection::ClientToServer,
+            B::DeviceList(_) | B::RevokeResult(_) | B::Event(_) => MgmtDirection::ServerToClient,
+        })
+    }
+
+    /// Structure and field rules (protocol §5.9), independent of direction.
+    fn validate_body(&self) -> Result<(), ProtoError> {
+        use pb::device_mgmt::Body as B;
+        let Some(body) = &self.body else {
+            return Err(invalid("device_mgmt", "no body set"));
+        };
+        // Requests and their answers carry the request id; a pushed event never does.
+        match (body, self.request_id) {
+            (B::Event(_), 0) => {}
+            (B::Event(_), _) => return Err(invalid("device_mgmt.request_id", "must be 0")),
+            (_, 0) => return Err(invalid("device_mgmt.request_id", "must not be 0")),
+            _ => {}
+        }
+        match body {
+            B::List(_) => Ok(()),
+            B::Revoke(r) => check_device_id("revoke.device_id", &r.device_id, false),
+            B::RevokeResult(r) => match pb::RevokeStatus::try_from(r.status) {
+                Ok(pb::RevokeStatus::Unspecified) | Err(_) => {
+                    Err(invalid("revoke_result.status", "unknown status"))
+                }
+                Ok(_) => Ok(()),
+            },
+            B::DeviceList(l) => {
+                if l.devices.len() > MAX_DEVICE_LIST {
+                    return Err(invalid("device_list.devices", "too many devices"));
+                }
+                let mut current = 0;
+                for d in &l.devices {
+                    check_device_info(d)?;
+                    current += usize::from(d.current);
+                }
+                if current > 1 {
+                    return Err(invalid(
+                        "device_list.devices",
+                        "more than one current device",
+                    ));
+                }
+                Ok(())
+            }
+            B::Event(e) => {
+                match pb::DeviceEventKind::try_from(e.kind) {
+                    Ok(pb::DeviceEventKind::Unspecified) | Err(_) => {
+                        return Err(invalid("device_event.kind", "unknown kind"));
+                    }
+                    Ok(_) => {}
+                }
+                match &e.device {
+                    Some(d) => check_device_info(d)?,
+                    None => return Err(invalid("device_event.device", "missing")),
+                }
+                check_device_id("device_event.by_device_id", &e.by_device_id, true)
+            }
+        }
+    }
+}
+
+fn check_device_id(field: &'static str, id: &[u8], allow_empty: bool) -> Result<(), ProtoError> {
+    if id.len() == DEVICE_ID_LEN || (allow_empty && id.is_empty()) {
+        Ok(())
+    } else if allow_empty {
+        Err(invalid(field, "must be empty or 16 bytes"))
+    } else {
+        Err(invalid(field, "must be 16 bytes"))
+    }
+}
+
+fn check_device_info(d: &pb::DeviceInfo) -> Result<(), ProtoError> {
+    check_device_id("device.device_id", &d.device_id, false)?;
+    check_str("device.name", &d.name, MAX_DEVICE_NAME)?;
+    device_name_problem(&d.name).map_or(Ok(()), |r| Err(invalid("device.name", r)))?;
+    let reason = pb::DeviceRevokeReason::try_from(d.revoke_reason)
+        .map_err(|_| invalid("device.revoke_reason", "unknown reason"))?;
+    match pb::DeviceStatus::try_from(d.status) {
+        Ok(pb::DeviceStatus::Active) => {
+            if reason != pb::DeviceRevokeReason::Unspecified || d.revoked_unix != 0 {
+                return Err(invalid(
+                    "device.status",
+                    "an active device has no revocation",
+                ));
+            }
+        }
+        Ok(pb::DeviceStatus::Revoked) => {
+            if reason == pb::DeviceRevokeReason::Unspecified {
+                return Err(invalid(
+                    "device.revoke_reason",
+                    "a revoked device needs a reason",
+                ));
+            }
+        }
+        Ok(pb::DeviceStatus::Unspecified) | Err(_) => {
+            return Err(invalid("device.status", "unknown status"));
+        }
+    }
+    Ok(())
 }
 
 impl Wire for InputEvent {
