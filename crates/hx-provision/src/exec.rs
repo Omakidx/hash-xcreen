@@ -73,6 +73,7 @@ pub enum SecretError {
 #[derive(Debug, Default)]
 pub struct Secrets {
     user_password: Option<Secret>,
+    current_password: Option<Secret>,
 }
 
 impl Secrets {
@@ -83,22 +84,38 @@ impl Secrets {
 
     /// The Linux password of the desktop user, needed by the post stage.
     pub fn with_user_password(mut self, password: &str) -> Result<Self, SecretError> {
-        if password.is_empty() {
-            return Err(SecretError::Empty);
-        }
-        if password.len() > MAX_PASSWORD_BYTES {
-            return Err(SecretError::TooLong);
-        }
-        if password.contains(['\n', '\r', '\0']) {
-            return Err(SecretError::BadCharacter);
-        }
-        self.user_password = Some(Secret::new(password.as_bytes().to_vec()));
+        self.user_password = Some(check_password(password)?);
+        Ok(self)
+    }
+
+    /// The password the desktop user has *now*, for
+    /// [`crate::password::change_user_password`] to check before it sets a new one (ipc.md 6.9).
+    /// Same rules as [`Secrets::with_user_password`].
+    pub fn with_current_password(mut self, password: &str) -> Result<Self, SecretError> {
+        self.current_password = Some(check_password(password)?);
         Ok(self)
     }
 
     pub(crate) fn user_password(&self) -> Option<&Secret> {
         self.user_password.as_ref()
     }
+
+    pub(crate) fn current_password(&self) -> Option<&Secret> {
+        self.current_password.as_ref()
+    }
+}
+
+fn check_password(password: &str) -> Result<Secret, SecretError> {
+    if password.is_empty() {
+        return Err(SecretError::Empty);
+    }
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Err(SecretError::TooLong);
+    }
+    if password.contains(['\n', '\r', '\0']) {
+        return Err(SecretError::BadCharacter);
+    }
+    Ok(Secret::new(password.as_bytes().to_vec()))
 }
 
 impl ZeroizeOnDrop for Secrets {}

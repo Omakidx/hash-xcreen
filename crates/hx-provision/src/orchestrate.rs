@@ -490,6 +490,12 @@ pub enum ProvisionError {
     /// Bad input.
     #[error("invalid request: {0}")]
     Invalid(String),
+    /// The operation needs a running desktop and it is not running (privd: `FAILED_PRECONDITION`).
+    #[error("the desktop is not running")]
+    NotRunning,
+    /// A shielded section's task died (panic or runtime shutdown) before it could report.
+    #[error("an internal task failed: {0}")]
+    Task(String),
 }
 
 /// What a provisioning run did.
