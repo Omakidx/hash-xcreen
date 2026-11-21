@@ -171,13 +171,7 @@ fn the_service_is_root_hardened_and_matches_the_daemons_paths() {
     assert!(!caps.is_empty());
     for c in &caps {
         assert!(
-            [
-                "CAP_NET_ADMIN",
-                "CAP_NET_RAW",
-                "CAP_DAC_OVERRIDE",
-                "CAP_IPC_LOCK"
-            ]
-            .contains(&c.as_str()),
+            ["CAP_NET_ADMIN", "CAP_NET_RAW", "CAP_IPC_LOCK"].contains(&c.as_str()),
             "{c}"
         );
     }
@@ -185,6 +179,11 @@ fn the_service_is_root_hardened_and_matches_the_daemons_paths() {
     assert_eq!(
         one(&u, "Service", "LoadCredentialEncrypted"),
         "pepper:/etc/hx/creds/pepper.cred"
+    );
+    // N10: no packet leaves or reaches the daemon itself, and DAC_OVERRIDE is gone.
+    assert_eq!(one(&u, "Service", "IPAddressDeny"), "any");
+    assert!(
+        !words(&u, "Service", "CapabilityBoundingSet").contains(&"CAP_DAC_OVERRIDE".to_string())
     );
     // No environment is passed and the command is not a shell line (ipc.md 5.2, 7 rule 3).
     assert!(!u["Service"].contains_key("Environment"));

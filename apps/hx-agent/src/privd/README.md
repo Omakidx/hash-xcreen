@@ -168,9 +168,11 @@ waiters and a 10 s wait). `Ping` is answered at once, at most 10 times a second.
 * `ProtectSystem=strict` with `ReadWritePaths=/etc/hx /etc/sysctl.d` and `-/run/xtables.lock`: the only
   host files it writes besides its own `StateDirectory` and `LogsDirectory`. `/etc/hx` and
   `/run/xtables.lock` are created by tmpfiles so that the namespace setup cannot fail.
-* `CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE CAP_IPC_LOCK`: nft and iptables;
-  blkid on a block device and root-owned files; `mlockall` as a second line next to
-  `LimitMEMLOCK=infinity`. `NoNewPrivileges`, `RestrictSUIDSGID`, `LockPersonality`,
+* `CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_IPC_LOCK` and `IPAddressDeny=any`: nft and
+  iptables; `mlockall` as a second line next to `LimitMEMLOCK=infinity`. `CAP_DAC_OVERRIDE` is gone:
+  every path privd touches (state, `/etc/hx`, `/etc/sysctl.d`, block device nodes `root:disk 0660`,
+  the Incus socket `root:incus-admin 0660`, `/proc`, `/sys`, the credential directory) is owned by
+  root or world-readable. The daemon sends no IP packet itself. `NoNewPrivileges`, `RestrictSUIDSGID`, `LockPersonality`,
   `MemoryDenyWriteExecute`, `RestrictRealtime`, `RestrictNamespaces`,
   `RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6` (iptables-legacy needs inet),
   `SystemCallFilter=@system-service`, `ProtectHome`, `PrivateTmp`, `ProtectKernelModules`,
@@ -180,6 +182,20 @@ waiters and a 10 s wait). `Ping` is answered at once, at most 10 times a second.
   `/proc/meminfo` and `/proc/self/mountinfo`), `PrivateNetwork` (nft and iptables act on the host
   network), `RuntimeDirectory` (it would delete `/run/hx` and the socket at stop).
 * `LimitCORE=0`, `UMask=0077`, `TimeoutStopSec=60s` (a cancel waits up to 30 s).
+
+## If `hx-host-firewall.service` fails
+
+The unit loads `/etc/hx/host-firewall.nft` before `incus.service` but is only ordered, not required:
+a failure (a bad ruleset file, `nft` missing, the kernel module not loadable) does **not** stop Incus,
+so desktops can start at boot without the host ruleset. The Incus network ACL on the desktop bridge
+still applies (it blocks the host's unicast addresses), but not the broadcast, multicast, link-local
+and forwarding rules of the ruleset (architecture 4.2). What privd does about it: at start it
+re-applies the ruleset (`refresh_host`, from what the last `SetupHost` recorded) and again after a
+host address change; `GetHostInfo.host_firewall_loaded` is `false` while the table is missing, which
+the installer's verification and `hx-agent status` surface; and `SetupHost` can be re-run at any
+time. It does not stop desktops on its own: failing closed there would take a user's desktop down
+for a host firewall fault. An administrator who wants that adds `Requires=hx-host-firewall.service`
+to `incus.service` through a drop-in.
 
 ## Deviations and follow-ups
 
