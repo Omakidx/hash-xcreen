@@ -481,7 +481,14 @@ async fn writer(
                 }
                 continue;
             }
-            _ = wait_closed(&mut closed) => break,
+            info = wait_closed(&mut closed) => {
+                // A local close normally reaches us as `Out::Close`; send its frame from the
+                // record if this branch won the race against it, or `hi` was full.
+                if let Some(c) = info.filter(|c| !c.by_peer) {
+                    put(&mut sink, close_frame(c.code, &c.reason), &mut failed).await;
+                }
+                break;
+            }
         };
         let sent = match out {
             Out::Binary(b) => put(&mut sink, Message::Binary(b), &mut failed).await,
