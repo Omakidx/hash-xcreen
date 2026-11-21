@@ -692,3 +692,51 @@ fn n4_argon2_wipes_its_memory_blocks() {
         .expect("argon2 dependency");
     assert!(line.contains("\"zeroize\""), "{line}");
 }
+
+// ----------------------------------------------------------------------------------------- N6
+
+#[tokio::test]
+async fn n6_verifier_only_says_the_password_is_not_checked_against_the_desktop() {
+    let s = stack(None, false).await;
+    let r = cli(
+        &s.cfg,
+        &["desktop", "password", "--verifier-only"],
+        &[PW, PW],
+        &[],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(
+        r.stderr.contains("NOT checked against the desktop"),
+        "{}",
+        r.stderr
+    );
+    assert!(
+        !s.p.commands().contains(&"SetUserPassword"),
+        "{:?}",
+        s.p.commands()
+    );
+    let j = cli(
+        &s.cfg,
+        &["desktop", "password", "--verifier-only", "--json"],
+        &[PW, PW],
+        &[],
+    )
+    .await;
+    assert_eq!(j.json()["data"]["verified_against_desktop"], false);
+    assert!(j.stderr.is_empty(), "{:?}", j.stderr);
+    // A mismatch between the two entries still stops it before anything is sent.
+    let before = s.a.commands().len();
+    let r = cli(
+        &s.cfg,
+        &["desktop", "password", "--verifier-only"],
+        &[PW, b"another-password-2"],
+        &[],
+    )
+    .await;
+    assert_eq!(r.code, 8, "{r:?}");
+    assert_eq!(s.a.commands().len(), before);
+    // The real change reports it was set by privd.
+    let r = cli(&s.cfg, &["desktop", "password", "--json"], &[PW, PW], &[]).await;
+    assert_eq!(r.json()["data"]["verified_against_desktop"], true);
+}

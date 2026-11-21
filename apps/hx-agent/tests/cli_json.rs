@@ -478,7 +478,7 @@ async fn desktop_docker_and_snapshot_json_is_stable() {
         &[b"A-long-password-1", b"A-long-password-1"],
         &[],
         0,
-        json!({"ok": true, "command": "desktop password", "data": {"desktop": "main", "password_changed": true, "verifier_refreshed": true}}),
+        json!({"ok": true, "command": "desktop password", "data": {"desktop": "main", "password_changed": true, "verifier_refreshed": true, "verified_against_desktop": true}}),
     )
     .await;
     golden(

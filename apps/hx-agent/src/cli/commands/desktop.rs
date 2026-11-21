@@ -114,6 +114,10 @@ pub(super) fn limits(
     ))
 }
 
+const VERIFIER_ONLY_WARNING: &str = "warning: this password is NOT checked against the desktop: privd has no check-only command. \
+The gateway will trust what you typed; if it is not the desktop user's real password, re-pairing by \
+password will fail until you run this again with the right one.";
+
 pub(super) fn password(
     env: &mut Env<'_>,
     id: &str,
@@ -130,6 +134,12 @@ pub(super) fn password(
         return Err(CliError::Usage(
             "a password is 1 to 1024 bytes with no newline or NUL".into(),
         ));
+    }
+    if verifier_only && !env.json {
+        // privd has no check-only path (SetUserPassword always sets, and its current-password
+        // check needs a helper that is not packaged yet), so the entry cannot be verified.
+        let _ = env.err.write_all(VERIFIER_ONLY_WARNING.as_bytes());
+        let _ = env.err.write_all(b"\n");
     }
     // Everything that can be checked or prepared comes BEFORE the Linux password changes:
     // gatewayd must be reachable (so the old password cannot stay valid for re-pairing because
@@ -191,7 +201,13 @@ pub(super) fn password(
                     "the Linux password of desktop {id} is changed and the gateway's verifier is refreshed\n"
                 )
             },
-            json!({"desktop": id, "password_changed": !verifier_only, "verifier_refreshed": true}),
+            json!({
+                "desktop": id,
+                "password_changed": !verifier_only,
+                "verifier_refreshed": true,
+                // Set by privd just now, or typed and trusted as it is.
+                "verified_against_desktop": !verifier_only,
+            }),
         )),
         Err(e) => Err(CliError::Failed(format!(
             "{}the gateway's password verifier was NOT refreshed ({}); the gateway still accepts the OLD password for re-pairing until you run: hx-agent desktop password --verifier-only",
