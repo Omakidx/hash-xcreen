@@ -50,6 +50,7 @@ fn require(cond: bool, what: &'static str) -> Check {
 pub fn decode(raw: RawFrame, side: Side) -> Result<Incoming, FrameError> {
     match raw.kind {
         KIND_MESSAGE => {
+            crate::prescan::check_admin_frame(&raw.body, 1)?;
             let frame = pb::Frame::decode(raw.body.as_ref())
                 .map_err(|e| FrameError::Decode(e.to_string()))?;
             validate_frame(&frame, side)?;

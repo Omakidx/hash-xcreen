@@ -114,6 +114,7 @@ pub fn parse(
     let RawFrame { kind, body } = raw;
     match kind {
         KIND_SESSION_TO_GATEWAY => {
+            crate::prescan::check_session_message(&body, super::validate::MAX_INFO_CODECS)?;
             let msg = pb::SessionToGateway::decode(body.as_ref())
                 .map_err(|e| FrameError::Decode(e.to_string()))?;
             if msg.message.is_none() {
@@ -123,6 +124,7 @@ pub fn parse(
             Ok(LinkFrame::FromSession(msg))
         }
         KIND_GATEWAY_TO_SESSION => {
+            crate::prescan::check_gateway_message(&body, super::validate::MAX_FEEDBACK_RESULTS)?;
             let msg = pb::GatewayToSession::decode(body.as_ref())
                 .map_err(|e| FrameError::Decode(e.to_string()))?;
             if msg.message.is_none() {

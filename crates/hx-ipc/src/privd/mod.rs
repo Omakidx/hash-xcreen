@@ -141,6 +141,8 @@ pub enum Incoming {
 pub fn decode(raw: RawFrame, side: Side) -> Result<Incoming, FrameError> {
     match raw.kind {
         KIND_MESSAGE => {
+            // Bound repeated-field counts before prost allocates an element per occurrence.
+            crate::prescan::check_privd_frame(&raw.body, MAX_SECRET_SLOTS)?;
             let frame = pb::Frame::decode(raw.body.as_ref())
                 .map_err(|e| FrameError::Decode(e.to_string()))?;
             validate_frame(&frame, side)?;

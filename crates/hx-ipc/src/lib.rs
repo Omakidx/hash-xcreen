@@ -62,6 +62,8 @@
 
 pub mod error;
 pub mod frame;
+#[cfg(any(feature = "privd", feature = "link"))]
+mod prescan;
 pub mod recv;
 pub mod text;
 
