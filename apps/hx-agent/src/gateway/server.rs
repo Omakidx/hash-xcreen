@@ -448,7 +448,9 @@ pub fn load_identity(path: &Path) -> Result<IdentityKey, String> {
     if !meta.is_file() || meta.permissions().mode() & 0o077 != 0 {
         return Err("the identity credential must be a private regular file".into());
     }
-    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    // Allocated once (the read is capped at 256 bytes): reading never regrows, so no copy of
+    // the key is left behind in an abandoned buffer.
+    let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(256));
     f.by_ref()
         .take(256)
         .read_to_end(&mut bytes)
@@ -459,9 +461,7 @@ pub fn load_identity(path: &Path) -> Result<IdentityKey, String> {
     } else {
         let text =
             std::str::from_utf8(&bytes).map_err(|_| "the identity credential is not a key")?;
-        let raw = zeroize::Zeroizing::new(
-            super::util::unhex(text.trim()).ok_or("the identity credential is not a key")?,
-        );
+        let raw = super::util::unhex(text.trim()).ok_or("the identity credential is not a key")?;
         if raw.len() != 32 {
             return Err("the identity credential is not a 32-byte key".into());
         }

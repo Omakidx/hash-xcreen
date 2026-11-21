@@ -374,16 +374,34 @@ async fn connection(mut stream: UnixStream, state: Arc<AdminState>) -> Result<()
             Ok(r) => r,
             Err(e) => pb::response::Result::Error(e),
         };
-        write(
-            &mut stream,
-            &pb::Frame {
-                frame: Some(pb::frame::Frame::Response(pb::Response {
-                    request_id: id,
-                    result: Some(result),
+        let mut frame = pb::Frame {
+            frame: Some(pb::frame::Frame::Response(pb::Response {
+                request_id: id,
+                result: Some(result),
+            })),
+        };
+        let sent = write(&mut stream, &frame).await;
+        // The reply's text of a pairing code is a protobuf `String`: wipe it once written.
+        if let pb::Frame {
+            frame:
+                Some(pb::frame::Frame::Response(pb::Response {
+                    result: Some(r), ..
                 })),
-            },
-        )
-        .await?;
+        } = &mut frame
+        {
+            scrub(r);
+        }
+        sent?;
+    }
+}
+
+/// Best-effort wiping of the secret text a reply carries (the pairing code of
+/// `CreatePairingCode`). The protobuf type is a plain `String`, so a copy is made when the
+/// frame is encoded; this wipes the one that we own.
+fn scrub(r: &mut pb::response::Result) {
+    use zeroize::Zeroize;
+    if let pb::response::Result::CreatePairingCode(c) = r {
+        c.code.zeroize();
     }
 }
 
@@ -617,6 +635,19 @@ mod tests {
     use super::*;
 
     const H: u64 = 3600;
+
+    #[test]
+    fn a_pairing_code_reply_is_wiped_after_it_is_written() {
+        let mut r = pb::response::Result::CreatePairingCode(pb::CreatePairingCodeResult {
+            code: "ABCD-EFGH".into(),
+            expires_at_unix_s: 1,
+        });
+        scrub(&mut r);
+        let pb::response::Result::CreatePairingCode(c) = r else {
+            panic!()
+        };
+        assert!(c.code.is_empty(), "the code text is gone");
+    }
 
     #[test]
     fn open_is_capped_at_24_hours_whatever_is_asked() {

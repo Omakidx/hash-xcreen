@@ -141,10 +141,10 @@ impl VerifierRecord {
         }
         params_ok(params)?;
         let salt: [u8; SALT_LEN] = unhex(salt_s)
-            .and_then(|b| b.try_into().ok())
+            .and_then(|b| b.as_slice().try_into().ok())
             .ok_or(bad("salt"))?;
         let mac: [u8; OUT_LEN] = unhex(mac_s)
-            .and_then(|b| b.try_into().ok())
+            .and_then(|b| b.as_slice().try_into().ok())
             .ok_or(bad("mac"))?;
         Ok(Self { params, salt, mac })
     }
