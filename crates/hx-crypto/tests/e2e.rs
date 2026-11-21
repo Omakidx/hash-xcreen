@@ -4,9 +4,9 @@ use std::{future::Future, sync::Arc, time::Duration};
 
 use hx_crypto::{
     Authenticator, AuthenticatorConfig, DeviceRegistry, Error, IdentityKey, ManualClock,
-    MemoryRegistry, Outcome, PairClientOptions, PairingCredential, PairingLimits, Pin, PinHash,
-    PinParams, PinReply, RevokeReason, SessionOptions, connect_session, connect_with_pin,
-    pair_device, tls,
+    MemoryRegistry, Outcome, PairClientOptions, PairingCredential, PairingLimits, PairingToken,
+    Pin, PinHash, PinParams, PinReply, RevokeReason, SessionOptions, connect_session,
+    connect_with_pin, pair_device, tls,
 };
 use hx_proto::{
     channel::CloseCode,
@@ -331,6 +331,74 @@ async fn expired_tokens_and_codes_are_refused() {
         }
         assert!(e.registry.list().expect("list").is_empty());
     }
+}
+
+#[tokio::test]
+async fn an_installed_token_pairs_once_and_a_wrong_one_fails_the_same_way() {
+    for pref in BOTH {
+        let mut e = env().await;
+        // The installer created this token; the server only installs it.
+        let token = PairingToken::generate().expect("token");
+        e.auth
+            .pairing()
+            .install_token(&token, Duration::from_secs(10 * 60))
+            .expect("install");
+        let cred = PairingCredential::parse(&token.to_text()).expect("parse");
+        let t = target(&e.server, pref);
+
+        // A different secret under the same id fails like any wrong token.
+        let mut forged = token.to_text().to_string();
+        forged.pop();
+        forged.push(if forged.ends_with('0') { '1' } else { '0' });
+        if let Ok(forged) = PairingCredential::parse(&forged) {
+            let r = within(pair_device(&t, &new_key(), &forged, &pair_opts(pref, "x"))).await;
+            assert!(matches!(r, Err(Error::PairingFailed)), "{pref:?}: {r:?}");
+            assert!(matches!(e.next().await, Err(Error::PairingFailed)));
+        }
+
+        let device = new_key();
+        let paired = within(pair_device(&t, &device, &cred, &pair_opts(pref, "laptop")))
+            .await
+            .unwrap_or_else(|e| panic!("{pref:?}: {e}"));
+        assert_eq!(paired.server_key, e.server_key.public());
+        let Outcome::Paired { connection, .. } = e.next().await.expect("outcome") else {
+            panic!("expected Paired");
+        };
+        paired.finish().await;
+        connection.close(CloseCode::NoError, "done").await;
+
+        // Single use.
+        let r = within(pair_device(
+            &t,
+            &new_key(),
+            &cred,
+            &pair_opts(pref, "again"),
+        ))
+        .await;
+        assert!(matches!(r, Err(Error::PairingClosed)), "{pref:?}: {r:?}");
+        let _ = e.next().await;
+        assert_eq!(e.registry.list().expect("list").len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn an_installed_token_expires_at_its_ttl() {
+    let pref = TransportPreference::Quic;
+    let mut e = env().await;
+    let token = PairingToken::generate().expect("token");
+    e.auth
+        .pairing()
+        .install_token(&token, Duration::from_secs(60))
+        .expect("install");
+    let cred = PairingCredential::parse(&token.to_text()).expect("parse");
+    e.clock.advance(Duration::from_secs(61));
+    let t = target(&e.server, pref);
+    let r = within(pair_device(&t, &new_key(), &cred, &pair_opts(pref, "x"))).await;
+    assert!(matches!(r, Err(Error::PairingClosed)), "{r:?}");
+    assert!(matches!(
+        e.next().await,
+        Ok(Outcome::Refused(RefuseReason::PairingClosed))
+    ));
 }
 
 #[tokio::test]
