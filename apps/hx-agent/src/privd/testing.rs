@@ -6,7 +6,6 @@
 //! the constructors that inject a gateway uid live only here and in `PrivdConfig::for_tests`.
 
 use std::collections::BTreeMap;
-use std::future::Future;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -176,10 +175,19 @@ pub struct FakeState {
     pub exec_rules: Vec<ExecRule>,
     /// Files in instances by path.
     pub files: BTreeMap<String, Vec<u8>>,
+    /// `(type, mode)` of every path in `files` and every directory made with `push_dir`.
+    pub file_meta: BTreeMap<String, (String, u32)>,
     /// Commands passed to `exec`, joined, in order.
     pub execs: Vec<String>,
     /// Push bodies by path (first 64 bytes only; for assertions about secrets never leaking).
     pub pushed: Vec<(String, usize)>,
+    /// Bodies of every `PATCH` and `PUT` of an instance, in order (what privd writes to Incus).
+    pub writes: Vec<Value>,
+    /// Every Incus request fails to connect (Incus is down).
+    pub down: bool,
+    /// Objects of the generic collections (`storage-pools`, `networks`, `network-acls`,
+    /// `profiles`) by `collection/name`.
+    pub objects: BTreeMap<String, Value>,
     ops: BTreeMap<String, FakeOp>,
     next_op: u64,
 }
@@ -234,8 +242,12 @@ impl FakeIncus {
                     delay: Some(Duration::ZERO),
                 }],
                 files: BTreeMap::new(),
+                file_meta: BTreeMap::new(),
                 execs: Vec::new(),
                 pushed: Vec::new(),
+                writes: Vec::new(),
+                down: false,
+                objects: BTreeMap::new(),
                 ops: BTreeMap::new(),
                 next_op: 1,
             })),
@@ -360,7 +372,75 @@ impl FakeIncus {
 
         let mut s = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         s.log.push(format!("{method} {path}"));
+        if s.down {
+            return Err(IncusError::Connect {
+                path: "fake".into(),
+                message: "Incus is down".into(),
+            });
+        }
         let segs = segs.as_slice();
+        // Generic collections: POST creates, GET reads, PATCH merges config, PUT replaces, DELETE
+        // removes. A new bridge gets an address as Incus would pick one.
+        if let [
+            "1.0",
+            coll @ ("storage-pools" | "networks" | "network-acls" | "profiles"),
+        ] = segs
+            && method == "POST"
+        {
+            let name = body["name"].as_str().unwrap_or_default().to_string();
+            let mut obj = body.clone();
+            if *coll == "networks" {
+                obj["type"] = json!("bridge");
+                let mut cfg = obj["config"].as_object().cloned().unwrap_or_default();
+                if cfg.get("ipv4.address").and_then(Value::as_str) == Some("auto") {
+                    cfg.insert("ipv4.address".into(), json!("10.99.0.1/24"));
+                }
+                obj["config"] = Value::Object(cfg);
+            }
+            s.objects.insert(format!("{coll}/{name}"), obj);
+            return Ok(ok_sync(Value::Null));
+        }
+        if let [
+            "1.0",
+            coll @ ("storage-pools" | "networks" | "network-acls" | "profiles"),
+            name,
+        ] = segs
+        {
+            let key = format!("{coll}/{name}");
+            match method.as_str() {
+                "GET" => {
+                    let found = s.objects.get(&key).cloned().or_else(|| {
+                        (*coll == "storage-pools" && s.pool_exists).then(|| {
+                            json!({"name": name, "driver": "btrfs", "config": {},
+                                "status": "Created",
+                                "description": "hash-xcreen: storage pool for desktops"})
+                        })
+                    });
+                    return Ok(match found {
+                        Some(v) => ok_sync(v),
+                        None => err_response(404, "not found"),
+                    });
+                }
+                "PATCH" | "PUT" => {
+                    if let Some(obj) = s.objects.get_mut(&key) {
+                        if method == "PUT" {
+                            *obj = body.clone();
+                        } else if let Some(c) = body["config"].as_object() {
+                            let mut cfg = obj["config"].as_object().cloned().unwrap_or_default();
+                            cfg.extend(c.clone());
+                            obj["config"] = Value::Object(cfg);
+                        }
+                        return Ok(ok_sync(Value::Null));
+                    }
+                    return Ok(err_response(404, "not found"));
+                }
+                "DELETE" => {
+                    s.objects.remove(&key);
+                    return Ok(ok_sync(Value::Null));
+                }
+                _ => {}
+            }
+        }
         Ok(match (method.as_str(), segs) {
             ("GET", ["1.0"]) => ok_sync(json!({
                 "api_version": "1.0", "auth": "trusted",
@@ -423,6 +503,7 @@ impl FakeIncus {
             },
             ("PATCH", ["1.0", "instances", name]) | ("PUT", ["1.0", "instances", name]) => {
                 let replace = method == "PUT";
+                s.writes.push(body.clone());
                 let Some(i) = s.instances.get_mut(*name) else {
                     return Ok(err_response(404, "Instance not found"));
                 };
@@ -526,11 +607,29 @@ impl FakeIncus {
                     String::new(),
                     Some(Duration::ZERO),
                 ));
+                // The container side effects the tests rely on: the sweep deletes the work
+                // directory's contents, and the capture wrapper deletes its stdin file.
+                if command.first().map(String::as_str) == Some("find")
+                    && command.iter().any(|a| a == "-delete")
+                    && let Some(dir) = command.get(1)
+                {
+                    let prefix = format!("{dir}/");
+                    s.files.retain(|k, _| !k.starts_with(&prefix));
+                    s.file_meta.retain(|k, _| !k.starts_with(&prefix));
+                }
+                if command.first().map(String::as_str) == Some("sh")
+                    && let Some(stdin) = command.get(5).filter(|p| !p.is_empty())
+                {
+                    s.files.remove(stdin);
+                    s.file_meta.remove(stdin);
+                }
                 // The capture wrapper: `sh -c SCRIPT sh <base> <stdin> timeout ...`.
                 if command.first().map(String::as_str) == Some("sh")
                     && let Some(base) = command.get(4)
                 {
-                    s.files.insert(format!("{base}.out"), stdout.into_bytes());
+                    let out = format!("{base}.out");
+                    s.file_meta.insert(out.clone(), ("file".into(), 0o600));
+                    s.files.insert(out, stdout.into_bytes());
                 }
                 let id = format!("op-{}", s.next_op);
                 s.next_op += 1;
@@ -555,32 +654,49 @@ impl FakeIncus {
                     err_response(404, "not found")
                 }
             }
-            ("GET", ["1.0", "instances", _, "files"]) => match s.files.get(&query_path()) {
-                Some(b) => {
-                    let mut r = Response {
-                        status: 200,
-                        body: Bytes::from(b.clone()),
-                        headers: BTreeMap::new(),
-                    };
-                    r.headers.insert("x-incus-type".into(), "file".into());
-                    r
+            ("GET", ["1.0", "instances", _, "files"]) => {
+                let p = query_path();
+                match s.file_meta.get(&p).cloned() {
+                    Some((kind, mode)) => {
+                        let body = s.files.get(&p).cloned().unwrap_or_default();
+                        let mut r = Response {
+                            status: 200,
+                            body: Bytes::from(body),
+                            headers: BTreeMap::new(),
+                        };
+                        r.headers.insert("x-incus-type".into(), kind);
+                        r.headers.insert("x-incus-uid".into(), "0".into());
+                        r.headers.insert("x-incus-gid".into(), "0".into());
+                        r.headers
+                            .insert("x-incus-mode".into(), format!("{mode:04o}"));
+                        r
+                    }
+                    None => err_response(404, "not found"),
                 }
-                None => err_response(404, "not found"),
-            },
+            }
             ("POST", ["1.0", "instances", _, "files"]) => {
                 let p = query_path();
                 s.pushed.push((p.clone(), req.body.len()));
-                if req
-                    .headers
-                    .iter()
-                    .any(|(k, v)| k.eq_ignore_ascii_case("x-incus-type") && v == "file")
-                {
-                    s.files.insert(p, req.body.to_vec());
+                let header = |name: &str| {
+                    req.headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                        .map(|(_, v)| v.clone())
+                };
+                let kind = header("x-incus-type").unwrap_or_else(|| "file".into());
+                let mode = header("x-incus-mode")
+                    .and_then(|m| u32::from_str_radix(&m, 8).ok())
+                    .unwrap_or(0o644);
+                if kind == "file" {
+                    s.files.insert(p.clone(), req.body.to_vec());
                 }
+                s.file_meta.insert(p, (kind, mode));
                 ok_sync(Value::Null)
             }
             ("DELETE", ["1.0", "instances", _, "files"]) => {
-                s.files.remove(&query_path());
+                let p = query_path();
+                s.files.remove(&p);
+                s.file_meta.remove(&p);
                 ok_sync(Value::Null)
             }
             _ => err_response(404, "the fake daemon does not implement this"),
@@ -589,8 +705,8 @@ impl FakeIncus {
 }
 
 impl Transport for FakeIncus {
-    fn send(&self, request: Request) -> impl Future<Output = Result<Response, IncusError>> + Send {
-        async move { self.handle(request).await }
+    async fn send(&self, request: Request) -> Result<Response, IncusError> {
+        self.handle(request).await
     }
 }
 
@@ -662,6 +778,12 @@ impl Harness {
         )
         .expect("daemon");
         let listener = super::activation::bind_path(&socket).expect("bind");
+        {
+            // The self-check compares the socket's mode with `PrivdConfig::for_tests`.
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let d = daemon.clone();
         tokio::spawn(async move {
@@ -688,6 +810,22 @@ impl Harness {
             gateway_uid,
             shutdown: Some(tx),
         }
+    }
+
+    /// A second daemon over the same state directory, as after a restart of privd: nothing is
+    /// carried over in memory, so whatever it knows came from disk.
+    pub fn restart_daemon(&self) -> Arc<Daemon<FakeIncus>> {
+        Daemon::new(
+            self.daemon.cfg.clone(),
+            self.incus.client(),
+            Deps {
+                runner: self.runner.clone(),
+                probe: Arc::new(FakeProbe::default()),
+                clock: self.clock.clone(),
+                audit: self.audit.clone(),
+            },
+        )
+        .expect("restart")
     }
 
     /// Connects a raw client.

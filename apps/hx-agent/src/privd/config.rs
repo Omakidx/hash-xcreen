@@ -11,6 +11,17 @@ use hx_provision::host::Naming;
 
 use super::identity::{FileMeta, GatewayIdentity, IdentityError, resolve_gateway_from};
 
+/// The privd socket (ipc.md 3).
+pub const SOCKET_PATH: &str = "/run/hx/privd.sock";
+/// privd's root-only state directory (the unit's `StateDirectory=hx`).
+pub const STATE_DIR: &str = "/var/lib/hx";
+/// The persisted host ruleset that `hx-host-firewall.service` loads at boot.
+pub const FIREWALL_FILE: &str = "/etc/hx/host-firewall.nft";
+/// The sysctl drop-in (ipc.md 6.4).
+pub const SYSCTL_FILE: &str = "/etc/sysctl.d/90-hx-incus.conf";
+/// The audit log (the unit's `LogsDirectory=hx`).
+pub const AUDIT_LOG: &str = "/var/log/hx/audit.log";
+
 /// uid and gid of the desktop user inside the container, from the recipe (ipc.md 6.11).
 pub const DESKTOP_IDS: (u32, u32) = (1000, 1000);
 
@@ -58,16 +69,16 @@ impl PrivdConfig {
         let passwd_file = PathBuf::from("/etc/passwd");
         let gateway = resolve_gateway_from(&passwd_file)?;
         Ok(Self {
-            socket_path: "/run/hx/privd.sock".into(),
+            socket_path: SOCKET_PATH.into(),
             expected_socket: FileMeta {
                 mode: 0o660,
                 uid: 0,
                 gid: gateway.gid,
             },
-            state_dir: "/var/lib/hx".into(),
-            firewall_file: "/etc/hx/host-firewall.nft".into(),
-            sysctl_file: "/etc/sysctl.d/90-hx-incus.conf".into(),
-            audit_log: "/var/log/hx/audit.log".into(),
+            state_dir: STATE_DIR.into(),
+            firewall_file: FIREWALL_FILE.into(),
+            sysctl_file: SYSCTL_FILE.into(),
+            audit_log: AUDIT_LOG.into(),
             incus_socket: "/var/lib/incus/unix.socket".into(),
             incus_dir: "/var/lib/incus".into(),
             session_store: "/usr/lib/hx/session".into(),

@@ -744,6 +744,7 @@ dependencies = [
  "hx-proto",
  "hx-provision",
  "hx-transport",
+ "prost",
  "rustix",
  "serde",
  "serde_json",

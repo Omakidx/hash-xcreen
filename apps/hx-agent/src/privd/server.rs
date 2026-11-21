@@ -37,6 +37,27 @@ use super::error::CmdError;
 use super::log;
 use super::progress::{MIN_INTERVAL_MS, ProgressSender};
 
+/// What a successful read produced.
+#[allow(clippy::large_enum_variant)] // one value per received frame; boxing only adds an allocation
+enum Item {
+    /// A decoded and validated frame.
+    Frame(Incoming),
+    /// A `Request` that decoded but broke a validation rule of the contract (a field rule, a wrong
+    /// secret kind, no command): answered with `INVALID_ARGUMENT` instead of closing, as ipc.md 4
+    /// says. `secrets` is how many secret frames it announced.
+    Invalid {
+        request_id: u64,
+        secrets: usize,
+        what: String,
+    },
+}
+
+/// Largest body for which a rejected request is decoded again to find its `request_id`. The
+/// normal path runs `hx_ipc`'s pre-scan before decoding (a body of empty repeated elements decodes
+/// to far more memory than its size); this second decode skips that scan, so it is limited to
+/// bodies small enough that the worst case is negligible.
+const RECOVER_MAX_BODY: usize = 4096;
+
 /// How a read ended badly.
 #[derive(Debug)]
 enum ConnError {
@@ -69,7 +90,7 @@ impl FrameReader {
         &mut self,
         stream: &UnixStream,
         idle: Duration,
-    ) -> Result<Option<Incoming>, ConnError> {
+    ) -> Result<Option<Item>, ConnError> {
         loop {
             let (wait, in_body) = if self.decoder.at_boundary() {
                 self.body_deadline = None;
@@ -104,8 +125,19 @@ impl FrameReader {
             match outcome {
                 Some(Ok(Some(raw))) => {
                     self.body_deadline = None;
+                    let keep = (raw.kind == privd::KIND_MESSAGE
+                        && raw.body.len() <= RECOVER_MAX_BODY)
+                        .then(|| raw.body.to_vec());
                     return match privd::decode(raw, Side::Server) {
-                        Ok(i) => Ok(Some(i)),
+                        Ok(i) => Ok(Some(Item::Frame(i))),
+                        Err(hx_ipc::FrameError::Invalid(what)) => match recover_request(keep) {
+                            Some((request_id, secrets)) => Ok(Some(Item::Invalid {
+                                request_id,
+                                secrets,
+                                what: what.to_string(),
+                            })),
+                            None => Err(ConnError::Violation(what.to_string())),
+                        },
                         Err(e) => Err(ConnError::Violation(e.to_string())),
                     };
                 }
@@ -116,6 +148,17 @@ impl FrameReader {
                 _ => return Err(ConnError::Io),
             }
         }
+    }
+}
+
+/// The `request_id` and the number of announced secret slots of a body that failed validation, if
+/// it is a `Request` with a non-zero id.
+fn recover_request(body: Option<Vec<u8>>) -> Option<(u64, usize)> {
+    use prost::Message;
+    let frame = pb::Frame::decode(body?.as_slice()).ok()?;
+    match frame.frame? {
+        F::Request(r) if r.request_id != 0 => Some((r.request_id, r.secret_slots.len())),
+        _ => None,
     }
 }
 
@@ -289,9 +332,9 @@ impl<T: Transport + Clone + 'static> Conn<T> {
     async fn run(&mut self) -> Result<(), String> {
         // Hello within 5 s.
         let hello = match self.reader.next(&self.stream, HELLO_TIMEOUT).await {
-            Ok(Some(Incoming::Message(pb::Frame {
+            Ok(Some(Item::Frame(Incoming::Message(pb::Frame {
                 frame: Some(F::Hello(h)),
-            }))) => h,
+            })))) => h,
             Ok(Some(_)) => return Err("the first frame is not Hello".into()),
             Ok(None) => return Ok(()),
             Err(e) => return Err(format!("no valid Hello: {e:?}")),
@@ -317,7 +360,15 @@ impl<T: Transport + Clone + 'static> Conn<T> {
 
         loop {
             let incoming = match self.reader.next(&self.stream, IDLE_TIMEOUT).await {
-                Ok(Some(i)) => i,
+                Ok(Some(Item::Frame(i))) => i,
+                Ok(Some(Item::Invalid {
+                    request_id,
+                    secrets,
+                    what,
+                })) => {
+                    self.reject(request_id, secrets, &what).await?;
+                    continue;
+                }
                 Ok(None) => return Ok(()),
                 Err(ConnError::Idle) => return Ok(()),
                 Err(ConnError::Violation(why)) => {
@@ -356,6 +407,30 @@ impl<T: Transport + Clone + 'static> Conn<T> {
         send(&self.stream, F::Pong(pb::Pong { nonce }))
             .await
             .map_err(|()| "cannot send Pong".into())
+    }
+
+    /// Answers a request that failed validation with `INVALID_ARGUMENT` and swallows the secret
+    /// frames it announced (zeroized on drop), so the stream stays in sync. More than the
+    /// contract's maximum of announced slots, or anything but secret frames, closes the connection.
+    async fn reject(&mut self, request_id: u64, secrets: usize, what: &str) -> Result<(), String> {
+        let e = CmdError::invalid(format!("invalid request: {what}"));
+        send_error(&self.stream, request_id, &e)
+            .await
+            .map_err(|()| "cannot send an error".to_string())?;
+        self.d
+            .audit_notice(&format!("a request failed validation: {what}"));
+        if secrets > privd::MAX_SECRET_SLOTS {
+            return Err("too many secret slots announced".into());
+        }
+        let deadline = Instant::now() + BODY_TIMEOUT;
+        for _ in 0..secrets {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.reader.next(&self.stream, left).await {
+                Ok(Some(Item::Frame(Incoming::Secret(_)))) => {}
+                _ => return Err("the secret frames of a rejected request did not follow".into()),
+            }
+        }
+        Ok(())
     }
 
     /// One request: its secret frames, then the command while watching for `Cancel`.
@@ -430,7 +505,14 @@ impl<T: Transport + Clone + 'static> Conn<T> {
                 }
                 frame = self.reader.next(&self.stream, IDLE_TIMEOUT), if !closed => {
                     match frame {
-                        Ok(Some(Incoming::Message(pb::Frame { frame: Some(f) }))) => match f {
+                        Ok(Some(Item::Invalid { request_id, secrets, what })) => {
+                            // A second, invalid request while one runs: answer it, stay in sync.
+                            if self.reject(request_id, secrets, &what).await.is_err() {
+                                closed = true;
+                                cancel.cancel(CancelReason::Closed);
+                            }
+                        }
+                        Ok(Some(Item::Frame(Incoming::Message(pb::Frame { frame: Some(f) })))) => match f {
                             F::Cancel(c) if c.request_id == id => cancel.cancel(CancelReason::Cancelled),
                             F::Cancel(_) | F::Pong(_) => {}
                             F::Ping(p) => {
@@ -488,7 +570,7 @@ impl<T: Transport + Clone + 'static> Conn<T> {
         for _ in 0..slots.len() {
             let left = deadline.saturating_duration_since(Instant::now());
             let frame = match self.reader.next(&self.stream, left).await {
-                Ok(Some(Incoming::Secret(f))) => f,
+                Ok(Some(Item::Frame(Incoming::Secret(f)))) => f,
                 Ok(Some(_)) => return Err("a secret frame was expected"),
                 Err(ConnError::Idle) => return Err("the secret frame is late"),
                 _ => return Err("the secret frame did not arrive"),

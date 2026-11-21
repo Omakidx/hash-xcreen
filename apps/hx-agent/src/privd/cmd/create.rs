@@ -321,7 +321,7 @@ pub async fn create_desktop<T: Transport + Clone + 'static>(
             docker,
         })
     };
-    tokio::pin!(work);
+    let mut work = Box::pin(work);
     let outcome = tokio::select! {
         r = &mut work => r,
         reason = ctx.cancel.cancelled() => Err(reason.error()),

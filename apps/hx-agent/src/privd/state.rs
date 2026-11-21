@@ -260,12 +260,14 @@ mod tests {
 
     #[test]
     fn window_expiry_returns_to_the_phase_it_was_opened_from() {
-        let mut s = PrivdState::default();
-        s.phase = PhaseRecord {
-            phase: PhaseKind::SetupOpen,
-            return_to: PhaseKind::Ready,
-            window_started: 100,
-            window_expires: 200,
+        let mut s = PrivdState {
+            phase: PhaseRecord {
+                phase: PhaseKind::SetupOpen,
+                return_to: PhaseKind::Ready,
+                window_started: 100,
+                window_expires: 200,
+            },
+            ..PrivdState::default()
         };
         assert!(!s.expire_window(199));
         assert_eq!(s.phase.phase, PhaseKind::SetupOpen);

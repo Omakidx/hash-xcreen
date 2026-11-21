@@ -385,10 +385,15 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
         F: Future<Output = Result<R, E>>,
         E: Into<CmdError>,
     {
-        tokio::pin!(fut);
-        tokio::select! {
-            r = &mut fut => r.map_err(Into::into),
-            reason = ctx.cancel.cancelled() => {
+        let mut fut = Box::pin(fut);
+        let outcome = tokio::select! {
+            r = &mut fut => Ok(r),
+            reason = ctx.cancel.cancelled() => Err(reason),
+        };
+        match outcome {
+            Ok(r) => r.map_err(Into::into),
+            Err(reason) => {
+                // Really drop the future (and its connection to Incus) before cleaning up.
                 drop(fut);
                 self.end_operations(client, desktop).await?;
                 Err(reason.error())
