@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use hx_provision::host::Naming;
 
 use super::identity::{FileMeta, GatewayIdentity, IdentityError, resolve_gateway_from};
+use super::update::UpdateConfig;
 
 /// The privd socket (ipc.md 3).
 pub const SOCKET_PATH: &str = "/run/hx/privd.sock";
@@ -57,7 +58,8 @@ pub struct PrivdConfig {
     pub incus_socket: PathBuf,
     /// Incus's data directory (pool free space is read from it).
     pub incus_dir: PathBuf,
-    /// privd's verified `hx-session` packages (`/usr/lib/hx/session/<distro>/`).
+    /// privd's verified `hx-session` packages: the `session/<distro>/` directories of the current
+    /// release (`/usr/lib/hx/current/session`, ipc.md 6.12 layout).
     pub session_store: PathBuf,
     /// Time zone database for `Settings::with_timezone_in`.
     pub zoneinfo_dir: PathBuf,
@@ -79,6 +81,8 @@ pub struct PrivdConfig {
     pub gateway: GatewayIdentity,
     /// Most desktops that may exist (v1: 1).
     pub max_desktops: usize,
+    /// Paths and policy of self-update (ipc.md 6.12).
+    pub update: UpdateConfig,
 }
 
 impl PrivdConfig {
@@ -100,7 +104,7 @@ impl PrivdConfig {
             audit_log: AUDIT_LOG.into(),
             incus_socket: "/var/lib/incus/unix.socket".into(),
             incus_dir: "/var/lib/incus".into(),
-            session_store: "/usr/lib/hx/session".into(),
+            session_store: "/usr/lib/hx/current/session".into(),
             zoneinfo_dir: "/usr/share/zoneinfo".into(),
             passwd_file,
             group_file: "/etc/group".into(),
@@ -114,6 +118,7 @@ impl PrivdConfig {
             instance_prefix: "hx-".into(),
             gateway,
             max_desktops: 1,
+            update: UpdateConfig::production(std::path::Path::new(STATE_DIR)),
         })
     }
 
@@ -146,6 +151,7 @@ impl PrivdConfig {
             instance_prefix: "hx-".into(),
             gateway,
             max_desktops: 1,
+            update: UpdateConfig::for_tests(dir),
         }
     }
 

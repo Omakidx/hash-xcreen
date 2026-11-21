@@ -1,0 +1,3 @@
+UNPROVISIONED
+# Replace this file with the minisign public key of the NEXT release signing key (rotation:
+# docs/architecture.md 5.5). It may stay UNPROVISIONED until a rotation is planned.

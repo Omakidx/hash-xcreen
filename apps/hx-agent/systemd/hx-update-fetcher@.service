@@ -1,0 +1,78 @@
+# hx-update-fetcher@<job>.service: the only part of self-update that speaks HTTP (docs/ipc.md 6.12).
+#
+# Started by hx-privd (`systemctl start hx-update-fetcher@manifest-stable.service`, or
+# `@artifact-1.4.2.service`); the instance is the whole argument vector, which the binary parses
+# strictly. It downloads bytes into /var/lib/hx-update (privd's /var/lib/hx/updates, bind-mounted)
+# and exits. It verifies nothing: root hx-privd treats the directory as hostile and verifies it
+# (apps/hx-agent/src/privd/update). Each choice and what was left out is in the privd README
+# ("Self-update"); tests/privd_update_units.rs asserts the hardening below.
+
+[Unit]
+Description=hash-xcreen update fetcher (%i)
+Documentation=https://github.com/Omakidx/hash-xcreen/blob/main/docs/ipc.md
+# Do not race the network at boot; privd only starts it on demand.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/hx/current/hx-update-fetcher %i
+
+# Identity: a dynamic user, no groups, nothing it could keep between runs. (The names it creates
+# are mode 0644 so that root privd can read them without CAP_DAC_OVERRIDE.)
+DynamicUser=yes
+User=hx-update-fetcher
+SupplementaryGroups=
+UMask=0022
+
+# The one place it writes: privd's directory, root-owned mode 1733 inside the 0700 state
+# directory, reachable only through this bind mount. It cannot list it, remove other users'
+# files or reach anything above it.
+BindPaths=/var/lib/hx/updates:/var/lib/hx-update
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RemoveIPC=yes
+
+# No privilege at all.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+
+# The network, and nothing else: no AF_UNIX, so it cannot reach privd's, Incus's or gatewayd's
+# sockets (ipc.md 6.12). IPAddressDeny is deliberately NOT used: a resolver on the LAN or
+# systemd-resolved's stub on 127.0.0.53 would stop working, and the release hosts sit behind a
+# CDN with no stable addresses. The fetcher itself connects only to the release host names and
+# only to global unicast addresses (apps/hx-agent/src/fetcher).
+RestrictAddressFamilies=AF_INET AF_INET6
+
+# System calls: the common service set without anything privileged or resource-changing.
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @debug @module @reboot @swap @raw-io @obsolete @cpu-emulation
+SystemCallErrorNumber=EPERM
+
+# Bounds (ipc.md 6.12): at most 256 MiB per file (the agent release), no core files, a few
+# descriptors and tasks, a memory cap, and a hard stop a little after the 10 minute artifact
+# timeout the binary enforces itself.
+LimitFSIZE=268435456
+LimitCORE=0
+LimitNOFILE=64
+TasksMax=16
+MemoryMax=256M
+RuntimeMaxSec=660
+TimeoutStartSec=660

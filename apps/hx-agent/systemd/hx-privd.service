@@ -46,6 +46,9 @@ LogsDirectoryMode=0750
 ProtectSystem=strict
 ReadWritePaths=/etc/hx /etc/sysctl.d
 ReadWritePaths=-/run/xtables.lock
+# Self-update (ipc.md 6.12): privd unpacks releases into /usr/lib/hx/<version>/ and switches the
+# `current` and `previous` links there. Nothing else under /usr is writable.
+ReadWritePaths=-/usr/lib/hx
 ProtectHome=yes
 PrivateTmp=yes
 
