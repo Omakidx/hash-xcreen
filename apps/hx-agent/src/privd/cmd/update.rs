@@ -111,6 +111,15 @@ fn ensure_dirs<T: Transport + Clone + 'static>(d: &Daemon<T>) -> Result<FetchDir
     dir.sweep(&[MANIFEST_FILE, MANIFEST_SIG_FILE, ARTIFACT_FILE])
         .map_err(|e| {
             log::error(&format!("fetch directory: {e}"));
+            if e.kind() == std::io::ErrorKind::DirectoryNotEmpty {
+                // Something the fetcher left is beyond privd's reach (it holds no
+                // CAP_DAC_OVERRIDE): say so, instead of failing obscurely on every fetch.
+                d.audit_notice("update directory holds entries privd cannot remove");
+                return refused(format!(
+                    "the fetch directory holds entries that cannot be removed; an administrator must clear {}",
+                    u.fetch_dir.display()
+                ));
+            }
             CmdError::internal("the fetch directory cannot be cleared")
         })?;
     Ok(dir)

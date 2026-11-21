@@ -13,6 +13,9 @@ Documentation=https://github.com/Omakidx/hash-xcreen/blob/main/docs/ipc.md
 # Do not race the network at boot; privd only starts it on demand.
 After=network-online.target
 Wants=network-online.target
+# The directory it writes is a size-capped tmpfs (var-lib-hx-updates.mount): the quota is the
+# kernel's, not the fetcher's own.
+RequiresMountsFor=/var/lib/hx/updates
 
 [Service]
 Type=oneshot
@@ -29,6 +32,9 @@ UMask=0022
 # directory, reachable only through this bind mount. It cannot list it, remove other users'
 # files or reach anything above it.
 BindPaths=/var/lib/hx/updates:/var/lib/hx-update
+# Nothing else of the agent's is visible to it. (/var/lib/hx, the bind mount's source, is root 0700
+# and stays unreachable by permission; masking it here would hide the source of the bind.)
+InaccessiblePaths=/etc/hx /var/log /var/lib/hx-gatewayd /var/lib/private
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
@@ -54,19 +60,33 @@ RestrictRealtime=yes
 RestrictNamespaces=yes
 
 # The network, and nothing else: no AF_UNIX, so it cannot reach privd's, Incus's or gatewayd's
-# sockets (ipc.md 6.12). IPAddressDeny is deliberately NOT used: a resolver on the LAN or
-# systemd-resolved's stub on 127.0.0.53 would stop working, and the release hosts sit behind a
-# CDN with no stable addresses. The fetcher itself connects only to the release host names and
-# only to global unicast addresses (apps/hx-agent/src/fetcher).
+# sockets (ipc.md 6.12). Egress is limited in the kernel as well as in the binary: loopback,
+# link-local, multicast and the private and shared ranges are denied; only systemd-resolved's
+# stubs stay reachable (allow wins over deny). A host whose resolvers are on a LAN needs a drop-in
+# written by the installer that allows them, for example
+#   /etc/systemd/system/hx-update-fetcher@.service.d/resolvers.conf
+#   [Service]
+#   IPAddressAllow=192.168.1.1/32
+# with the addresses of /etc/resolv.conf (or of systemd-resolved's upstreams). On Google Cloud the
+# metadata resolver 169.254.169.254 is link-local: it needs that drop-in too. The release hosts
+# sit behind a CDN with no stable addresses, so the public ranges are not listed. The binary also
+# connects only to the release host names and to global unicast addresses (src/fetcher).
 RestrictAddressFamilies=AF_INET AF_INET6
+IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
+IPAddressAllow=127.0.0.53/32 127.0.0.54/32
 
 # System calls: the common service set without anything privileged or resource-changing.
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources @mount @debug @module @reboot @swap @raw-io @obsolete @cpu-emulation
+# The fetcher creates files (openat with O_CREAT|O_EXCL), writes, fsyncs and unlinks; it needs no
+# directory creation, links, renames, nodes or mode changes, and a compromised one must not be
+# able to plant a directory privd cannot remove (privd has no CAP_DAC_OVERRIDE or CAP_FOWNER).
+SystemCallFilter=~mkdir mkdirat symlink symlinkat link linkat rename renameat renameat2 mknod mknodat chmod fchmod fchmodat fchmodat2
 SystemCallErrorNumber=EPERM
 
-# Bounds (ipc.md 6.12): at most 256 MiB per file (the agent release), no core files, a few
+# Bounds (ipc.md 6.12): at most 256 MiB per file (the agent release), the directory a tmpfs of
+# 300 MiB with 64 inodes (var-lib-hx-updates.mount), no core files, a few
 # descriptors and tasks, a memory cap, and a hard stop a little after the 10 minute artifact
 # timeout the binary enforces itself.
 LimitFSIZE=268435456

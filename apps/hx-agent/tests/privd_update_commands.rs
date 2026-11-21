@@ -1302,3 +1302,24 @@ async fn freshness_is_tracked_per_channel() {
     env.publish("1.1.0", T0 - 10);
     assert_eq!(err(&env.check().await).0, ErrorCode::FailedPrecondition);
 }
+
+#[tokio::test]
+async fn entries_privd_cannot_remove_are_reported_not_hidden_behind_internal() {
+    let env = Env::new();
+    env.publish("1.1.0", T0);
+    check_result(env.check().await);
+    // A directory with content that the sweep cannot empty (stands for a chmod-ed one).
+    let dir = env.h.daemon.cfg.update.fetch_dir.clone();
+    std::fs::create_dir_all(dir.join("trap")).unwrap();
+    std::fs::write(dir.join("trap/inner"), b"x").unwrap();
+    let (code, msg) = err(&env.check().await);
+    assert_eq!(code, ErrorCode::FailedPrecondition);
+    assert!(msg.contains("administrator must clear"), "{msg}");
+    assert!(
+        env.h.audit.lines().iter().any(|l| l.contains("entries privd cannot remove")),
+        "audited"
+    );
+    // Cleared by hand, it works again.
+    std::fs::remove_dir_all(dir.join("trap")).unwrap();
+    assert!(check_result(env.check().await).available.is_some());
+}

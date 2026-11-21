@@ -97,7 +97,21 @@ fn the_fetcher_can_reach_the_internet_and_no_unix_socket() {
     );
     // Not a private network (it has to reach the release hosts), and no wide-open exceptions.
     assert!(!u["Service"].contains_key("PrivateNetwork"));
-    assert!(!u["Service"].contains_key("IPAddressAllow"));
+    // Kernel-level egress limits: the denied ranges, with only the resolver stubs allowed back.
+    let deny = words(&u, "IPAddressDeny");
+    for r in [
+        "localhost",
+        "link-local",
+        "multicast",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "100.64.0.0/10",
+        "fc00::/7",
+    ] {
+        assert!(deny.iter().any(|d| d == r), "{r} is denied");
+    }
+    assert_eq!(words(&u, "IPAddressAllow"), ["127.0.0.53/32", "127.0.0.54/32"]);
 }
 
 #[test]
@@ -230,4 +244,63 @@ fn the_fetchers_mount_point_exists_before_it_starts() {
         }),
         "{t}"
     );
+}
+
+#[test]
+fn the_fetcher_cannot_create_directories_links_or_change_modes() {
+    // A compromised fetcher must not be able to plant what root privd cannot remove.
+    let u = fetcher_unit();
+    let denied: Vec<String> = u["Service"]["SystemCallFilter"]
+        .iter()
+        .filter_map(|f| f.strip_prefix('~'))
+        .flat_map(|f| f.split_whitespace().map(str::to_string))
+        .collect();
+    for call in [
+        "mkdir", "mkdirat", "symlink", "symlinkat", "link", "linkat", "rename", "renameat",
+        "renameat2", "mknod", "mknodat", "chmod", "fchmod", "fchmodat", "fchmodat2",
+    ] {
+        assert!(denied.iter().any(|d| d == call), "{call} is denied");
+    }
+    // What it does need is not on the list.
+    for call in ["openat", "write", "fsync", "unlink", "unlinkat", "read", "connect"] {
+        assert!(!denied.iter().any(|d| d == call), "{call} stays allowed");
+    }
+}
+
+#[test]
+fn the_fetcher_sees_none_of_the_agents_other_state() {
+    let u = fetcher_unit();
+    let hidden = words(&u, "InaccessiblePaths");
+    for p in ["/etc/hx", "/var/log", "/var/lib/hx-gatewayd", "/var/lib/private"] {
+        assert!(hidden.iter().any(|h| h == p), "{p}");
+    }
+    assert!(!hidden.iter().any(|h| h == "/var/lib/hx"), "the bind mount's source stays reachable");
+}
+
+#[test]
+fn the_fetchers_directory_is_a_size_capped_tmpfs() {
+    let m = parse(&read("var-lib-hx-updates.mount"));
+    let get = |k: &str| m["Mount"][k][0].clone();
+    assert_eq!(get("Type"), "tmpfs");
+    assert_eq!(get("Where"), "/var/lib/hx/updates");
+    let opts: Vec<String> = get("Options").split(',').map(str::to_string).collect();
+    let size = opts.iter().find_map(|o| o.strip_prefix("size=")).unwrap();
+    assert_eq!(size, "300M");
+    // At least the artifact quota, and not unbounded.
+    assert!(300 * 1024 * 1024 >= fetcher::MAX_ARTIFACT_BYTES + 2 * fetcher::MAX_MANIFEST_BYTES);
+    assert!(opts.iter().any(|o| o == "nr_inodes=64"));
+    for o in ["mode=1733", "nosuid", "nodev", "noexec", "uid=0"] {
+        assert!(opts.iter().any(|x| x == o), "{o}");
+    }
+    // Both units that touch it require the mount.
+    for unit in ["hx-privd.service", "hx-update-fetcher@.service"] {
+        let u = parse(&read(unit));
+        assert!(
+            u["Unit"]["RequiresMountsFor"].iter().any(|v| v == "/var/lib/hx/updates"),
+            "{unit}"
+        );
+    }
+    // The mount point exists before the mount.
+    let t = read("tmpfiles.d/hx.conf");
+    assert!(t.lines().any(|l| l.split_whitespace().take(3).collect::<Vec<_>>() == ["d", "/var/lib/hx/updates", "1733"]));
 }

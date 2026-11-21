@@ -98,26 +98,41 @@ impl FetchDir {
     /// that the names privd reads are gone. A subdirectory the fetcher made (and that privd,
     /// holding no `CAP_DAC_OVERRIDE`, cannot empty) is left alone: privd never reads anything but
     /// the three fixed names.
+    ///
+    /// Names are handled as raw bytes (`CStr`), so a name that is not UTF-8 is removed like any
+    /// other. If anything is left after the sweep (a directory the fetcher filled and chmod-ed
+    /// beyond privd's reach), the error kind is `DirectoryNotEmpty`: the caller reports that an
+    /// administrator must clear the directory, instead of failing obscurely on every fetch.
     pub fn sweep(&self, known: &[&str]) -> io::Result<()> {
-        let names: Vec<String> = rustix::fs::Dir::read_from(&self.fd)?
+        let names: Vec<std::ffi::CString> = rustix::fs::Dir::read_from(&self.fd)?
             .filter_map(Result::ok)
-            .filter_map(|e| e.file_name().to_str().ok().map(str::to_string))
-            .filter(|n| n != "." && n != "..")
+            .map(|e| e.file_name().to_owned())
+            .filter(|n| n.to_bytes() != b"." && n.to_bytes() != b"..")
             .collect();
         for n in names {
-            if rustix::fs::unlinkat(&self.fd, n.as_str(), AtFlags::empty()).is_err() {
-                let _ = rustix::fs::unlinkat(&self.fd, n.as_str(), AtFlags::REMOVEDIR);
+            if rustix::fs::unlinkat(&self.fd, n.as_c_str(), AtFlags::empty()).is_err() {
+                let _ = rustix::fs::unlinkat(&self.fd, n.as_c_str(), AtFlags::REMOVEDIR);
             }
         }
         for k in known {
-            match rustix::fs::statat(&self.fd, *k, AtFlags::SYMLINK_NOFOLLOW) {
-                Err(rustix::io::Errno::NOENT) => {}
-                _ => {
-                    return Err(io::Error::other(format!(
-                        "cannot clear `{k}` from the fetch directory"
-                    )));
-                }
+            if !matches!(
+                rustix::fs::statat(&self.fd, *k, AtFlags::SYMLINK_NOFOLLOW),
+                Err(rustix::io::Errno::NOENT)
+            ) {
+                return Err(io::Error::other(format!(
+                    "cannot clear `{k}` from the fetch directory"
+                )));
             }
+        }
+        let left = rustix::fs::Dir::read_from(&self.fd)?
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_bytes() != b"." && e.file_name().to_bytes() != b"..")
+            .count();
+        if left > 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::DirectoryNotEmpty,
+                format!("{left} entries in the fetch directory could not be removed"),
+            ));
         }
         Ok(())
     }
@@ -390,6 +405,25 @@ mod tests {
             Err(ReadError::Short(_))
         ));
         assert!(d.stage_large("big", 1000, &staging).is_ok());
+    }
+
+    #[test]
+    fn sweep_removes_names_that_are_not_utf8_and_reports_what_it_cannot_remove() {
+        use std::os::unix::ffi::OsStrExt;
+        let (_t, d, fetch, _s) = setup();
+        for raw in [&b"\xff\xfe"[..], b"caf\xe9", b"a\x80b.tar.gz"] {
+            std::fs::write(fetch.join(std::ffi::OsStr::from_bytes(raw)), b"x").unwrap();
+        }
+        std::os::unix::fs::symlink("/etc", fetch.join(std::ffi::OsStr::from_bytes(b"\xc3\x28")))
+            .unwrap();
+        d.sweep(&["manifest.json"]).unwrap();
+        assert_eq!(std::fs::read_dir(&fetch).unwrap().count(), 0);
+        // A non-empty sub-directory cannot be removed (in production: one the fetcher made and
+        // chmod-ed beyond privd's reach). That is reported, not silently ignored.
+        std::fs::create_dir(fetch.join("trap")).unwrap();
+        std::fs::write(fetch.join("trap/inner"), b"x").unwrap();
+        let e = d.sweep(&["manifest.json"]).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::DirectoryNotEmpty, "{e}");
     }
 
     #[test]
