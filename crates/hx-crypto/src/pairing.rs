@@ -214,10 +214,46 @@ impl PairingWindow {
 
     /// Create a token (for the one-liner or the app). Valid for `token_ttl`, single use.
     pub fn issue_token(&self) -> Result<PairingToken> {
+        self.issue_token_with_ttl(self.limits.token_ttl)
+    }
+
+    /// Like [`issue_token`](Self::issue_token) with a shorter lifetime. `ttl` is capped at the
+    /// configured `token_ttl` (a caller can shorten a token, never lengthen it) and must not
+    /// be zero.
+    pub fn issue_token_with_ttl(&self, ttl: Duration) -> Result<PairingToken> {
+        let ttl = Self::checked_ttl(ttl, self.limits.token_ttl)?;
         let token = PairingToken::generate()?;
+        self.insert_token(&token, ttl);
+        Ok(token)
+    }
+
+    /// Install a token that was created elsewhere (the installer prompts for it and hands it
+    /// to the server, which never generated it). It follows exactly the rules of an issued
+    /// token: single use, `token_attempts` attempts, the oldest token is evicted beyond
+    /// `max_tokens`, and `ttl` is capped at the configured `token_ttl` (it must not be zero).
+    /// Installing a token whose id is already in the window replaces that entry (a fresh
+    /// attempt budget; attempts started against the old entry can no longer spend it).
+    ///
+    /// The token's secret stays in memory only, like every other entry.
+    pub fn install_token(&self, token: &PairingToken, ttl: Duration) -> Result<()> {
+        let ttl = Self::checked_ttl(ttl, self.limits.token_ttl)?;
+        self.insert_token(token, ttl);
+        Ok(())
+    }
+
+    fn checked_ttl(ttl: Duration, max: Duration) -> Result<Duration> {
+        if ttl.is_zero() {
+            return Err(Error::Protocol("pairing ttl must not be zero"));
+        }
+        Ok(ttl.min(max))
+    }
+
+    fn insert_token(&self, token: &PairingToken, ttl: Duration) {
         let mut s = self.lock();
         self.prune(&mut s);
-        if s.tokens.len() >= self.limits.max_tokens
+        // Evict only when the id is new: replacing an entry does not grow the map.
+        if !s.tokens.contains_key(&token.id())
+            && s.tokens.len() >= self.limits.max_tokens
             && let Some(oldest) = s
                 .tokens
                 .iter()
@@ -226,27 +262,23 @@ impl PairingWindow {
         {
             s.tokens.remove(&oldest);
         }
-        let e = self.entry(
-            &mut s,
-            token.password(),
-            self.limits.token_ttl,
-            self.limits.token_attempts,
-        );
+        let e = self.entry(&mut s, token.password(), ttl, self.limits.token_attempts);
         s.tokens.insert(token.id(), e);
-        Ok(token)
     }
 
     /// Create the short code (interactive install), replacing any earlier one.
     pub fn issue_code(&self) -> Result<PairingCode> {
+        self.issue_code_with_ttl(self.limits.code_ttl)
+    }
+
+    /// Like [`issue_code`](Self::issue_code) with a shorter lifetime, capped at `code_ttl`
+    /// (must not be zero).
+    pub fn issue_code_with_ttl(&self, ttl: Duration) -> Result<PairingCode> {
+        let ttl = Self::checked_ttl(ttl, self.limits.code_ttl)?;
         let code = PairingCode::generate()?;
         let mut s = self.lock();
         self.prune(&mut s);
-        let e = self.entry(
-            &mut s,
-            code.password(),
-            self.limits.code_ttl,
-            self.limits.code_attempts,
-        );
+        let e = self.entry(&mut s, code.password(), ttl, self.limits.code_attempts);
         s.code = Some(e);
         Ok(code)
     }
@@ -824,6 +856,120 @@ mod tests {
         let _b = w.issue_token().unwrap();
         let _c = w.issue_token().unwrap();
         assert!(w.begin(PairMode::Token, &a.id()).is_none());
+    }
+
+    #[test]
+    fn an_installed_token_is_single_use_and_follows_the_attempt_rules() {
+        let (w, _) = window(PairingLimits::default());
+        // Created elsewhere: the window never generated it.
+        let t = PairingToken::generate().unwrap();
+        assert!(w.begin(PairMode::Token, &t.id()).is_none());
+        w.install_token(&t, Duration::from_secs(60)).unwrap();
+        assert!(w.is_open());
+        let a = w.begin(PairMode::Token, &t.id()).unwrap();
+        assert_eq!(a.password.as_slice(), t.password().as_slice());
+        let b = w.begin(PairMode::Token, &t.id()).unwrap();
+        assert!(w.consume(&a));
+        assert!(!w.consume(&b), "single use");
+        assert!(w.begin(PairMode::Token, &t.id()).is_none());
+        assert!(!w.is_open());
+
+        // Five attempts, then it is deleted once the last one ends.
+        let t = PairingToken::generate().unwrap();
+        w.install_token(&t, Duration::from_secs(60)).unwrap();
+        let attempts: Vec<_> = (0..5)
+            .map(|_| w.begin(PairMode::Token, &t.id()).unwrap())
+            .collect();
+        assert!(w.begin(PairMode::Token, &t.id()).is_none());
+        assert!(!w.is_open());
+        for a in &attempts {
+            w.finish(a);
+        }
+        assert!(!w.lock().tokens.contains_key(&t.id()));
+    }
+
+    #[test]
+    fn ttls_are_capped_and_installed_tokens_expire() {
+        let (w, clock) = window(PairingLimits::default());
+        // Longer than the configured ttl: capped at 15 minutes.
+        let long = PairingToken::generate().unwrap();
+        w.install_token(&long, Duration::from_secs(24 * 3600))
+            .unwrap();
+        clock.advance(Duration::from_secs(15 * 60 + 1));
+        assert!(w.begin(PairMode::Token, &long.id()).is_none());
+
+        // Shorter than the configured ttl: honoured, for installed and issued tokens and codes.
+        let short = PairingToken::generate().unwrap();
+        w.install_token(&short, Duration::from_secs(30)).unwrap();
+        let issued = w.issue_token_with_ttl(Duration::from_secs(30)).unwrap();
+        let code = w.issue_code_with_ttl(Duration::from_secs(30)).unwrap();
+        let capped = w
+            .issue_token_with_ttl(Duration::from_secs(u64::MAX / 4))
+            .unwrap();
+        let capped_code = w.issue_code_with_ttl(Duration::MAX / 2);
+        assert!(capped_code.is_ok());
+        clock.advance(Duration::from_secs(29));
+        assert!(w.begin(PairMode::Token, &short.id()).is_some());
+        assert!(w.begin(PairMode::Token, &issued.id()).is_some());
+        clock.advance(Duration::from_secs(2));
+        assert!(w.begin(PairMode::Token, &short.id()).is_none());
+        assert!(w.begin(PairMode::Token, &issued.id()).is_none());
+        assert!(w.begin(PairMode::Token, &capped.id()).is_some());
+        let _ = code;
+        clock.advance(Duration::from_secs(15 * 60));
+        assert!(w.begin(PairMode::Token, &capped.id()).is_none());
+        assert!(!w.is_open(), "the capped code expired with it");
+    }
+
+    #[test]
+    fn a_zero_ttl_is_rejected() {
+        let (w, _) = window(PairingLimits::default());
+        let t = PairingToken::generate().unwrap();
+        assert!(w.install_token(&t, Duration::ZERO).is_err());
+        assert!(w.issue_token_with_ttl(Duration::ZERO).is_err());
+        assert!(w.issue_code_with_ttl(Duration::ZERO).is_err());
+        assert!(!w.is_open());
+    }
+
+    #[test]
+    fn installed_tokens_are_evicted_oldest_first_with_issued_ones() {
+        let (w, _) = window(PairingLimits {
+            max_tokens: 2,
+            ..Default::default()
+        });
+        let a = PairingToken::generate().unwrap();
+        w.install_token(&a, Duration::from_secs(60)).unwrap();
+        let b = w.issue_token().unwrap();
+        let c = PairingToken::generate().unwrap();
+        w.install_token(&c, Duration::from_secs(60)).unwrap();
+        assert!(
+            w.begin(PairMode::Token, &a.id()).is_none(),
+            "oldest evicted"
+        );
+        assert!(w.begin(PairMode::Token, &b.id()).is_some());
+        assert!(w.begin(PairMode::Token, &c.id()).is_some());
+    }
+
+    #[test]
+    fn reinstalling_a_token_replaces_it_without_evicting_others() {
+        let (w, _) = window(PairingLimits {
+            max_tokens: 2,
+            ..Default::default()
+        });
+        let a = PairingToken::generate().unwrap();
+        let b = w.issue_token().unwrap();
+        w.install_token(&a, Duration::from_secs(60)).unwrap();
+        let stale = w.begin(PairMode::Token, &a.id()).unwrap();
+        w.install_token(&a, Duration::from_secs(60)).unwrap();
+        assert!(
+            !w.consume(&stale),
+            "an attempt on the old entry cannot spend the new one"
+        );
+        assert!(
+            w.begin(PairMode::Token, &b.id()).is_some(),
+            "b was not evicted"
+        );
+        assert!(w.begin(PairMode::Token, &a.id()).is_some());
     }
 
     fn transcript<'a>(cs: &PublicKey, ss: &PublicKey, name: &'a str) -> Transcript<'a> {

@@ -111,6 +111,25 @@ pub trait DeviceRegistry: Send + Sync + 'static {
     /// [`record_pin_success`](Self::record_pin_success).
     fn begin_pin_attempt(&self, id: &DeviceId) -> Result<u32>;
 
+    /// Undo one [`begin_pin_attempt`](Self::begin_pin_attempt) because the attempt was never
+    /// judged (the verifier could not answer): a saturating decrement of the failure counter,
+    /// which never goes below 0. Returns the counter afterwards. It does not touch
+    /// `last_seen` or a revocation.
+    ///
+    /// The default fails, so an implementation written before this method existed keeps
+    /// compiling and, when a refund is needed, leaves the attempt counted (the safe side).
+    fn refund_pin_attempt(&self, _id: &DeviceId) -> Result<u32> {
+        Err(Error::Protocol("this registry cannot refund a PIN attempt"))
+    }
+
+    /// Reset the failure counter to 0 without stamping `last_seen` (an operator's lockout
+    /// reset; a revocation is left as it is, use [`reinstate`](Self::reinstate) for that).
+    /// Fails with [`Error::UnknownDevice`] for an unknown id. The default fails like
+    /// [`refund_pin_attempt`](Self::refund_pin_attempt).
+    fn reset_pin_failures(&self, _id: &DeviceId) -> Result<()> {
+        Err(Error::Protocol("this registry cannot reset PIN failures"))
+    }
+
     /// After a wrong verdict: revoke the device if its counter reached `max_failures`.
     /// Returns true if the device is revoked afterwards.
     fn revoke_if_failed(&self, id: &DeviceId, max_failures: u32, now_unix: u64) -> Result<bool>;
@@ -205,6 +224,28 @@ impl Store {
         })?
     }
 
+    fn refund_pin_attempt(&self, id: &DeviceId) -> Result<u32> {
+        self.mutate(|s| match s.get_mut(id) {
+            None => (Err(Error::UnknownDevice), false),
+            Some(rec) => {
+                let changed = rec.failed_pins > 0;
+                rec.failed_pins = rec.failed_pins.saturating_sub(1);
+                (Ok(rec.failed_pins), changed)
+            }
+        })?
+    }
+
+    fn reset_pin_failures(&self, id: &DeviceId) -> Result<()> {
+        self.mutate(|s| match s.get_mut(id) {
+            None => (Err(Error::UnknownDevice), false),
+            Some(rec) => {
+                let changed = rec.failed_pins != 0;
+                rec.failed_pins = 0;
+                (Ok(()), changed)
+            }
+        })?
+    }
+
     fn revoke_if_failed(&self, id: &DeviceId, max: u32, now: u64) -> Result<bool> {
         self.mutate(|s| match s.get_mut(id) {
             None => (Err(Error::UnknownDevice), false),
@@ -284,6 +325,12 @@ macro_rules! delegate_registry {
             }
             fn begin_pin_attempt(&self, id: &DeviceId) -> Result<u32> {
                 self.0.begin_pin_attempt(id)
+            }
+            fn refund_pin_attempt(&self, id: &DeviceId) -> Result<u32> {
+                self.0.refund_pin_attempt(id)
+            }
+            fn reset_pin_failures(&self, id: &DeviceId) -> Result<()> {
+                self.0.reset_pin_failures(id)
             }
             fn revoke_if_failed(
                 &self,
@@ -634,6 +681,87 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn refund_undoes_one_attempt_and_never_goes_below_zero() {
+        let r = MemoryRegistry::new();
+        let k = key();
+        let id = r.upsert_paired(&k, "laptop", 10).unwrap().id;
+        assert_eq!(r.refund_pin_attempt(&id).unwrap(), 0, "saturates at 0");
+        assert_eq!(r.get(&id).unwrap().unwrap().failed_pins, 0);
+        assert_eq!(r.begin_pin_attempt(&id).unwrap(), 1);
+        assert_eq!(r.begin_pin_attempt(&id).unwrap(), 2);
+        assert_eq!(r.refund_pin_attempt(&id).unwrap(), 1);
+        assert_eq!(
+            r.begin_pin_attempt(&id).unwrap(),
+            2,
+            "counts again from there"
+        );
+        assert_eq!(r.refund_pin_attempt(&id).unwrap(), 1);
+        assert_eq!(r.refund_pin_attempt(&id).unwrap(), 0);
+        assert_eq!(r.refund_pin_attempt(&id).unwrap(), 0);
+        // It leaves last_seen and a revocation alone.
+        r.record_pin_success(&id, 77).unwrap();
+        r.begin_pin_attempt(&id).unwrap();
+        r.revoke(&id, RevokeReason::User, 80).unwrap();
+        r.refund_pin_attempt(&id).unwrap();
+        let rec = r.get(&id).unwrap().unwrap();
+        assert_eq!((rec.failed_pins, rec.last_seen_unix), (0, 77));
+        assert!(rec.is_revoked());
+        assert!(matches!(
+            r.refund_pin_attempt(&key().device_id()),
+            Err(Error::UnknownDevice)
+        ));
+    }
+
+    #[test]
+    fn reset_zeroes_the_counter_without_stamping_last_seen() {
+        let r = MemoryRegistry::new();
+        let id = r.upsert_paired(&key(), "laptop", 10).unwrap().id;
+        r.record_pin_success(&id, 55).unwrap();
+        for _ in 0..3 {
+            r.begin_pin_attempt(&id).unwrap();
+        }
+        r.reset_pin_failures(&id).unwrap();
+        let rec = r.get(&id).unwrap().unwrap();
+        assert_eq!((rec.failed_pins, rec.last_seen_unix), (0, 55));
+        // Idempotent, and a revocation stays.
+        r.reset_pin_failures(&id).unwrap();
+        r.revoke(&id, RevokeReason::User, 60).unwrap();
+        r.reset_pin_failures(&id).unwrap();
+        assert!(r.get(&id).unwrap().unwrap().is_revoked());
+        assert!(matches!(
+            r.reset_pin_failures(&key().device_id()),
+            Err(Error::UnknownDevice)
+        ));
+    }
+
+    #[test]
+    fn refund_and_reset_persist_through_the_file_registry() {
+        let dir = tmp_dir("refund");
+        let path = dir.join("devices.pb");
+        let k = key();
+        let id = k.device_id();
+        {
+            let r = FileRegistry::open(&path).unwrap();
+            r.upsert_paired(&k, "phone", 5).unwrap();
+            for _ in 0..3 {
+                r.begin_pin_attempt(&id).unwrap();
+            }
+            assert_eq!(r.refund_pin_attempt(&id).unwrap(), 2);
+        }
+        {
+            let r = FileRegistry::open(&path).unwrap();
+            assert_eq!(r.get(&id).unwrap().unwrap().failed_pins, 2);
+            r.reset_pin_failures(&id).unwrap();
+        }
+        let r = FileRegistry::open(&path).unwrap();
+        let rec = r.get(&id).unwrap().unwrap();
+        assert_eq!((rec.failed_pins, rec.last_seen_unix), (0, 0));
+        // At 0 a refund writes nothing and stays at 0.
+        assert_eq!(r.refund_pin_attempt(&id).unwrap(), 0);
         fs::remove_dir_all(&dir).unwrap();
     }
 
