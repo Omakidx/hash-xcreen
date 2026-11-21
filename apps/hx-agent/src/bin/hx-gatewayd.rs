@@ -79,7 +79,11 @@ fn notify_ready() {
 }
 
 async fn run(args: Args) -> Result<(), String> {
-    let config = GatewayConfig::load(&args.config).map_err(|e| e.to_string())?;
+    let mut config = GatewayConfig::load(&args.config).map_err(|e| e.to_string())?;
+    if let Some(path) = &args.link_socket {
+        tracing::warn!(path = %path.display(), "DEBUG BUILD: dialling this link socket");
+        config.link_socket = Some(path.clone());
+    }
     let creds = std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from);
     let identity = load_identity(
         &config
