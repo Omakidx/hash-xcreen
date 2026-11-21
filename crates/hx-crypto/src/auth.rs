@@ -35,7 +35,7 @@
 //!             // 1. Argon2id(pin) on a blocking thread.
 //!             // 2. `PepperVerify` to privd, bounded by a timeout.
 //!             //    yes -> Right, no -> Wrong, privd down or timed out -> Unavailable,
-//!             //    PIN purpose locked -> Locked.
+//!             //    PIN purpose locked -> Locked { retry_after: privd's wait }.
 //!             PinVerdict::Unavailable
 //!         })
 //!     }
@@ -148,8 +148,27 @@ pub enum PinVerdict {
     Unavailable,
     /// The verifier refuses to check PINs at all (for example `hx-privd` locked the PIN
     /// purpose after its global failure cap). Not a wrong PIN: the attempt is refunded, the
-    /// client gets `NOT_AVAILABLE` and the connection ends.
-    Locked,
+    /// client gets `NOT_AVAILABLE` (with the wait in `retry_after_ms`) and the connection
+    /// ends. The device is held for the wait before its guard is released: attempts that
+    /// arrive earlier get `BACKOFF`, are not verified and are not counted.
+    Locked {
+        /// How long to hold the device (for example privd's `retry_after`). `None` or zero
+        /// means [`DEFAULT_LOCKED_WAIT`]; anything above [`MAX_LOCKED_WAIT`] is capped.
+        retry_after: Option<Duration>,
+    },
+}
+
+/// The wait applied after [`PinVerdict::Locked`] when the verifier names none.
+pub const DEFAULT_LOCKED_WAIT: Duration = Duration::from_secs(60);
+
+/// The longest wait a verifier can impose with [`PinVerdict::Locked`].
+pub const MAX_LOCKED_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn locked_wait(retry_after: Option<Duration>) -> Duration {
+    retry_after
+        .filter(|d| !d.is_zero())
+        .unwrap_or(DEFAULT_LOCKED_WAIT)
+        .min(MAX_LOCKED_WAIT)
 }
 
 /// Decides whether a PIN is right. The authenticator calls it **inside** the per-device guard
@@ -208,7 +227,10 @@ enum Judged {
     Unavailable {
         failed: u32,
     },
-    Locked,
+    /// Refunded and the device held for `wait`.
+    Locked {
+        wait: Duration,
+    },
 }
 
 /// What [`Authenticator::authenticate`] did with a session.
@@ -767,10 +789,10 @@ impl Authenticator {
 
             match self.check_pin(device.id, verifier, pin, guard).await? {
                 Judged::Right => return Ok(()),
-                Judged::Locked => {
-                    tracing::error!(device = %device.id, "the PIN verifier is locked; PIN logins are refused");
+                Judged::Locked { wait } => {
+                    tracing::error!(device = %device.id, ?wait, "the PIN verifier is locked; PIN logins are refused");
                     let _ = self
-                        .send_result(conn, AuthStatus::NotAvailable, left, Duration::ZERO)
+                        .send_result(conn, AuthStatus::NotAvailable, left, wait)
                         .await;
                     return Err(Error::PinNotAvailable);
                 }
@@ -841,7 +863,7 @@ impl Authenticator {
                     this.set_not_before(&id, None);
                     return Ok(Judged::Right);
                 }
-                PinVerdict::Unavailable | PinVerdict::Locked => {
+                PinVerdict::Unavailable | PinVerdict::Locked { .. } => {
                     // Not judged, so not a failure: give the attempt back. If that write
                     // fails the attempt stays counted, which errs on the safe side.
                     let failed = match this.reg(move |r| r.refund_pin_attempt(&id)).await {
@@ -851,8 +873,12 @@ impl Authenticator {
                             counted
                         }
                     };
-                    if verdict == PinVerdict::Locked {
-                        return Ok(Judged::Locked);
+                    if let PinVerdict::Locked { retry_after } = verdict {
+                        // Same unit, still under the device guard: the next connection to
+                        // take the lock sees the wait.
+                        let wait = locked_wait(retry_after);
+                        this.set_not_before(&id, Some(wait));
+                        return Ok(Judged::Locked { wait });
                     }
                     // Hold the device for the wait the client is told, before the guard is
                     // released, so retries do not hammer the verifier.

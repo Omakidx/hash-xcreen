@@ -25,6 +25,7 @@ use zeroize::Zeroizing;
 
 const PREF: TransportPreference = TransportPreference::Quic;
 const PIN: &str = "482913";
+const LOCKED: PinVerdict = PinVerdict::Locked { retry_after: None };
 const WAIT: Duration = Duration::from_secs(20);
 
 async fn within<T>(f: impl Future<Output = T>) -> T {
@@ -390,7 +391,7 @@ async fn unavailable_is_refunded_exactly_once_never_revokes_and_holds_the_device
 
 #[tokio::test]
 async fn locked_refuses_with_not_available_and_refunds() {
-    let v = Scripted::new(PinVerdict::Locked, Duration::from_millis(10));
+    let v = Scripted::new(LOCKED, Duration::from_millis(10));
     let e = env(AuthenticatorConfig::default(), &v).await;
     e.registry.begin_pin_attempt(&e.id()).expect("count");
     let mut c = e.open().await;
@@ -400,6 +401,72 @@ async fn locked_refuses_with_not_available_and_refunds() {
     assert_eq!(rec.failed_pins, 1, "back to the earlier count");
     assert!(!rec.is_revoked());
     assert_eq!(v.calls(), 1);
+}
+
+#[tokio::test]
+async fn locked_sets_the_verifiers_wait_and_attempts_during_it_are_not_counted() {
+    let v = Scripted::new(
+        PinVerdict::Locked {
+            retry_after: Some(Duration::from_secs(7)),
+        },
+        Duration::from_millis(10),
+    );
+    let e = env(AuthenticatorConfig::default(), &v).await;
+    e.registry.begin_pin_attempt(&e.id()).expect("count");
+    let r = within(e.open().await.submit(&pin("000000"))).await;
+    assert!(matches!(r, Err(Error::PinNotAvailable)), "{r:?}");
+    assert_eq!((v.calls(), e.failed()), (1, 1));
+
+    // Parallel attempts during the wait: BACKOFF with what is left, never verified, never
+    // counted, never revoking.
+    e.clock.advance(Duration::from_secs(2));
+    let mut conns = vec![e.open().await, e.open().await, e.open().await];
+    let replies = within(join_all(
+        conns
+            .iter_mut()
+            .map(|c| async move { c.submit(&pin("000000")).await })
+            .collect(),
+    ))
+    .await;
+    for r in replies {
+        assert_eq!(
+            r.expect("reply"),
+            PinReply::Backoff {
+                retry_after: Duration::from_secs(5)
+            }
+        );
+    }
+    assert_eq!((v.calls(), e.failed()), (1, 1));
+    assert!(
+        !e.registry
+            .get(&e.id())
+            .expect("reg")
+            .expect("dev")
+            .is_revoked()
+    );
+
+    // After the wait the verifier is asked again (and is still locked).
+    e.clock.advance(Duration::from_secs(5));
+    let r = within(e.open().await.submit(&pin("000000"))).await;
+    assert!(matches!(r, Err(Error::PinNotAvailable)), "{r:?}");
+    assert_eq!((v.calls(), e.failed()), (2, 1));
+}
+
+#[tokio::test]
+async fn locked_without_a_wait_holds_the_device_for_the_default() {
+    let v = Scripted::new(LOCKED, Duration::ZERO);
+    let e = env(AuthenticatorConfig::default(), &v).await;
+    let r = within(e.open().await.submit(&pin("000000"))).await;
+    assert!(matches!(r, Err(Error::PinNotAvailable)), "{r:?}");
+    let r = within(e.open().await.submit(&pin("000000"))).await;
+    assert_eq!(
+        r.expect("reply"),
+        PinReply::Backoff {
+            retry_after: hx_crypto::DEFAULT_LOCKED_WAIT
+        }
+    );
+    assert_eq!(v.calls(), 1);
+    assert_eq!(e.failed(), 0);
 }
 
 #[tokio::test]
