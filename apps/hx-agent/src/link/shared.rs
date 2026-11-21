@@ -24,7 +24,7 @@ use hx_ipc::link::pb;
 use hx_proto::datagram::{MouseCoalescer, MouseMove};
 use hx_proto::order::serial_gt;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc, watch};
@@ -37,18 +37,41 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// Unread incoming transfer bytes. The `bulk` reader stops reading while the consumer holds
 /// 1 MiB for any transfer or 4 MiB in all (`docs/ipc.md` section 16).
+///
+/// `room()` is lock-free (two atomics); the per-transfer map is only touched, for O(1) work,
+/// when a chunk is handed out or returned. An entry lives only while its transfer has unread
+/// bytes or has not ended, so the map is bounded by the transfers in flight (at most 4) plus the
+/// ones whose chunks the consumer still holds.
 #[derive(Debug, Default)]
 pub(crate) struct Credits {
     link: AtomicU64,
-    per: Mutex<HashMap<u32, u64>>,
+    /// Transfers whose unread bytes are at the per-transfer limit.
+    at_limit: AtomicUsize,
+    per: Mutex<HashMap<u32, Entry>>,
     wake: Notify,
+}
+
+#[derive(Debug, Default)]
+struct Entry {
+    unread: u64,
+    /// The transfer ended or was aborted: the entry goes when its last chunk is returned.
+    ended: bool,
 }
 
 impl Credits {
     pub(crate) fn acquire(self: &Arc<Self>, id: u32, n: usize) -> Credit {
         let n = n as u64;
         self.link.fetch_add(n, Relaxed);
-        *lock(&self.per).entry(id).or_default() += n;
+        {
+            let mut per = lock(&self.per);
+            let e = per.entry(id).or_default();
+            let before = e.unread >= TRANSFER_UNREAD_LIMIT;
+            e.unread += n;
+            e.ended = false;
+            if !before && e.unread >= TRANSFER_UNREAD_LIMIT {
+                self.at_limit.fetch_add(1, Relaxed);
+            }
+        }
         Credit {
             credits: self.clone(),
             id,
@@ -56,9 +79,9 @@ impl Credits {
         }
     }
 
+    /// O(1) and lock-free.
     fn room(&self) -> bool {
-        self.link.load(Relaxed) < LINK_UNREAD_LIMIT
-            && lock(&self.per).values().all(|v| *v < TRANSFER_UNREAD_LIMIT)
+        self.link.load(Relaxed) < LINK_UNREAD_LIMIT && self.at_limit.load(Relaxed) == 0
     }
 
     /// Returns once the reader may read another frame.
@@ -74,12 +97,23 @@ impl Credits {
         }
     }
 
-    /// Forget a transfer's accounting (it ended).
+    /// The transfer ended (or was aborted): its entry is removed now if nothing is unread, else
+    /// when the consumer returns the last chunk.
     pub(crate) fn forget(&self, id: u32) {
         let mut per = lock(&self.per);
-        if per.get(&id) == Some(&0) {
-            per.remove(&id);
+        if let Some(e) = per.get_mut(&id) {
+            if e.unread == 0 {
+                per.remove(&id);
+            } else {
+                e.ended = true;
+            }
         }
+    }
+
+    /// Entries in the per-transfer map (tests and metrics).
+    #[cfg(test)]
+    pub(crate) fn entries(&self) -> usize {
+        lock(&self.per).len()
     }
 }
 
@@ -101,13 +135,23 @@ impl std::fmt::Debug for Credit {
 
 impl Drop for Credit {
     fn drop(&mut self) {
-        self.credits.link.fetch_sub(self.n, Relaxed);
-        let mut per = lock(&self.credits.per);
-        if let Some(v) = per.get_mut(&self.id) {
-            *v = v.saturating_sub(self.n);
+        let c = &self.credits;
+        c.link.fetch_sub(self.n, Relaxed);
+        {
+            // A short critical section: two hash operations, never anything slow.
+            let mut per = lock(&c.per);
+            if let Some(e) = per.get_mut(&self.id) {
+                let before = e.unread >= TRANSFER_UNREAD_LIMIT;
+                e.unread = e.unread.saturating_sub(self.n);
+                if before && e.unread < TRANSFER_UNREAD_LIMIT {
+                    c.at_limit.fetch_sub(1, Relaxed);
+                }
+                if e.unread == 0 && e.ended {
+                    per.remove(&self.id);
+                }
+            }
         }
-        drop(per);
-        self.credits.wake.notify_waiters();
+        c.wake.notify_waiters();
     }
 }
 
@@ -679,5 +723,74 @@ impl Shared {
                 },
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod credit_tests {
+    use super::*;
+
+    #[test]
+    fn the_per_transfer_map_is_bounded_when_data_and_end_arrive_back_to_back() {
+        // Review M3: 10 000 tiny transfers, each `Data` then `End`, while the consumer holds the
+        // chunks of the last 8. Before the fix every ended transfer with unread bytes leaked its
+        // entry for ever.
+        let credits = Arc::new(Credits::default());
+        let mut held = VecDeque::new();
+        for id in 1..=10_000u32 {
+            let id = id * 2;
+            held.push_back(credits.acquire(id, 100));
+            credits.forget(id); // the End frame
+            if held.len() > 8 {
+                held.pop_front();
+            }
+            assert!(
+                credits.entries() <= 9,
+                "{} entries at {id}",
+                credits.entries()
+            );
+        }
+        held.clear();
+        assert_eq!(
+            credits.entries(),
+            0,
+            "everything is released with the chunks"
+        );
+        assert_eq!(credits.link.load(Relaxed), 0);
+        assert_eq!(credits.at_limit.load(Relaxed), 0);
+        // An abort of a transfer that never delivered data leaves nothing either.
+        credits.forget(4);
+        assert_eq!(credits.entries(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_limits_are_tracked_without_scanning() {
+        let credits = Arc::new(Credits::default());
+        credits.wait_room().await;
+        // One transfer at 1 MiB pauses the lane; so does 4 MiB spread over transfers.
+        let big = credits.acquire(2, TRANSFER_UNREAD_LIMIT as usize);
+        assert!(!credits.room());
+        assert_eq!(credits.at_limit.load(Relaxed), 1);
+        let waiter = {
+            let c = credits.clone();
+            tokio::spawn(async move { c.wait_room().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        drop(big);
+        waiter.await.unwrap();
+        assert!(credits.room());
+        let held: Vec<_> = (0..4u32)
+            .map(|i| credits.acquire(2 * (i + 1), (LINK_UNREAD_LIMIT / 4) as usize - 1))
+            .collect();
+        // Each is just under the per-transfer limit, together they are just under the link's;
+        // one more byte anywhere crosses the link limit.
+        assert!(credits.room());
+        let more = credits.acquire(100, 8);
+        assert!(!credits.room());
+        drop(more);
+        drop(held);
+        assert!(credits.room());
+        assert_eq!(credits.at_limit.load(Relaxed), 0);
     }
 }
