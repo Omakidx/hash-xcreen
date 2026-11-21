@@ -29,5 +29,9 @@ incus_config security.syscalls.intercept.setxattr=true
 02 ensure-user desk uid=1000 groups=sudo,audio,video,docker
 03 set-password desk
 04 security-updates
-05 command claude-code as=desk optional
-06 command codex-cli as=desk optional
+05 command settings-hostname
+06 command settings-timezone
+07 command settings-locale
+08 command settings-keyboard
+09 command claude-code as=desk optional
+10 command codex-cli as=desk optional

@@ -39,6 +39,11 @@ recipes root directory, may not be absolute, may not form a cycle and may nest a
 is replaced; an unknown name is an error that names the key. `{{` is reserved for this; `user` and `uid` are filled from `[user]` (the validated account, see below) and cannot be defined in `[vars]`; `[vars]`
 values themselves are not expanded.
 
+**Desktop settings.** `hostname`, `timezone`, `locale` and `keyboard` are also reserved: they come
+only from the caller's validated `hx_provision::Settings` (the wizard's choices, ipc.md 6.5), are the
+empty string when unset, and are used by `fragments/settings.toml`, whose post steps do nothing
+for an empty value. Always single-quote them in a script.
+
 **Unknown keys are errors**, everywhere, so typos fail loudly.
 
 | Section | Meaning |

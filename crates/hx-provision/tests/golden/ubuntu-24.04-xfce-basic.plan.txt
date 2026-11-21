@@ -24,3 +24,7 @@ var user=desk
 02 ensure-user desk uid=1000 groups=sudo,audio,video
 03 set-password desk
 04 security-updates
+05 command settings-hostname
+06 command settings-timezone
+07 command settings-locale
+08 command settings-keyboard

@@ -14,6 +14,7 @@ use toml::{Table, Value};
 
 use crate::error::RecipeError;
 use crate::plan::{AptRepo, CommandSpec, FileSpec, ImageRef, Plan, ServiceSpec, Step, UserSpec};
+use crate::settings::Settings;
 use crate::user::Username;
 
 /// Deepest allowed `include` nesting.
@@ -552,7 +553,11 @@ fn dedup(v: Vec<String>) -> Vec<String> {
 }
 
 /// Expand variables in a merged table and turn it into a validated plan.
-fn table_to_plan(mut t: Table, base_user: Option<String>) -> Result<Plan, RecipeError> {
+fn table_to_plan(
+    mut t: Table,
+    base_user: Option<String>,
+    settings: &Settings,
+) -> Result<Plan, RecipeError> {
     // Variables: [vars] plus `user` from [user].name. [vars] values are not themselves expanded.
     let raw_vars: BTreeMap<String, String> = match t.get("vars") {
         Some(v) => v
@@ -578,18 +583,35 @@ fn table_to_plan(mut t: Table, base_user: Option<String>) -> Result<Plan, Recipe
             ));
         }
     }
+    // The settings variables come only from the caller's validated `Settings`.
+    for reserved in crate::settings::RESERVED_VARS {
+        if raw_vars.contains_key(reserved) {
+            return Err(RecipeError::invalid(
+                format!("vars.{reserved}"),
+                "is set from the desktop settings chosen by the caller; remove it from [vars]",
+            ));
+        }
+    }
     let mut vars = raw_vars;
+    // Substituted into the recipe but not part of `Plan::vars` (they describe a request, not the
+    // recipe), so `Plan::manifest()` does not depend on them.
+    let mut expansion_vars = vars.clone();
+    for (k, v) in settings.vars() {
+        expansion_vars.insert(k.to_string(), v);
+    }
     if let Some(Value::String(n)) = t.get("user").and_then(|u| u.get("name")) {
         // Validated before substitution: a username is user input.
         Username::new(n).map_err(|e| RecipeError::invalid("user.name", e.to_string()))?;
         vars.insert("user".to_string(), n.clone());
+        expansion_vars.insert("user".to_string(), n.clone());
     }
     if let Some(Value::Integer(i)) = t.get("user").and_then(|u| u.get("uid")) {
         vars.insert("uid".to_string(), i.to_string());
+        expansion_vars.insert("uid".to_string(), i.to_string());
     }
     let vars_table = t.remove("vars");
     let mut tv = Value::Table(t);
-    expand_value(&mut tv, &vars, "")?;
+    expand_value(&mut tv, &expansion_vars, "")?;
     let Value::Table(mut t) = tv else {
         return Err(RecipeError::invalid(
             "<root>",
@@ -884,6 +906,18 @@ pub fn resolve_as(
     addon_paths: &[&str],
     username: Option<&Username>,
 ) -> Result<Plan, RecipeError> {
+    resolve_with_settings(src, recipe_path, addon_paths, username, &Settings::none())
+}
+
+/// Like [`resolve_as`], with the desktop [`Settings`] (hostname, timezone, locale, keyboard) the
+/// caller chose, substituted into the recipe's post stage.
+pub fn resolve_with_settings(
+    src: &dyn RecipeSource,
+    recipe_path: &str,
+    addon_paths: &[&str],
+    username: Option<&Username>,
+    settings: &Settings,
+) -> Result<Plan, RecipeError> {
     let mut t = load_file(src, recipe_path, &mut Vec::new())?;
     for a in addon_paths {
         let at = load_file(src, a, &mut Vec::new())?;
@@ -898,7 +932,7 @@ pub fn resolve_as(
     if let Some(u) = username {
         set_user_name(&mut t, u);
     }
-    table_to_plan(t, base_user)
+    table_to_plan(t, base_user, settings)
 }
 
 fn set_user_name(t: &mut Table, u: &Username) {
@@ -953,7 +987,7 @@ pub fn resolve_addon_only_as(
     if let Some(u) = username {
         set_user_name(&mut addon, u);
     }
-    let mut plan = table_to_plan(addon, None)?;
+    let mut plan = table_to_plan(addon, None, &Settings::none())?;
     plan.post.clear();
     Ok(plan)
 }

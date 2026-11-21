@@ -112,6 +112,10 @@
     "security.syscalls.intercept.setxattr": "true"
   },
   "post_commands": [
+    "settings-hostname",
+    "settings-timezone",
+    "settings-locale",
+    "settings-keyboard",
     "claude-code",
     "codex-cli"
   ]

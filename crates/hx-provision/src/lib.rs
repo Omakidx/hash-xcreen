@@ -30,6 +30,7 @@ pub mod password;
 pub mod plan;
 pub mod recipe;
 pub mod session;
+pub mod settings;
 pub mod teardown;
 pub mod user;
 
@@ -50,4 +51,5 @@ pub use orchestrate::{
 };
 pub use plan::{ImageRef, Plan, Stage, Step};
 pub use recipe::{DirSource, MemSource, RecipeSource};
+pub use settings::{Settings, SettingsError};
 pub use user::{DEFAULT_USERNAME, Username, UsernameError};

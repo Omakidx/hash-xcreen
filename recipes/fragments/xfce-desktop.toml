@@ -5,6 +5,9 @@
 # Distro-independent. Included by every recipe in the recipes/ directory.
 # See recipes/README.md for the format.
 
+# Desktop settings (hostname, timezone, locale, keyboard): post-stage steps.
+include = ["settings.toml"]
+
 [vars]
 desktop = "xfce"
 

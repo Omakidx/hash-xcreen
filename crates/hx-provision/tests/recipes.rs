@@ -108,10 +108,23 @@ fn every_shipped_recipe_resolves() {
             assert_eq!(m.packages.contains(&"code".to_string()), dev);
             assert_eq!(
                 m.post_commands,
+                // The settings steps (hostname, timezone, locale, keyboard) come first.
                 if dev {
-                    vec!["claude-code", "codex-cli"]
+                    vec![
+                        "settings-hostname",
+                        "settings-timezone",
+                        "settings-locale",
+                        "settings-keyboard",
+                        "claude-code",
+                        "codex-cli",
+                    ]
                 } else {
-                    Vec::<&str>::new()
+                    vec![
+                        "settings-hostname",
+                        "settings-timezone",
+                        "settings-locale",
+                        "settings-keyboard",
+                    ]
                 }
             );
         }
@@ -255,8 +268,13 @@ fn developer_post_steps_run_as_the_user_and_are_optional() {
             _ => None,
         })
         .collect();
-    assert_eq!(cmds.len(), 2);
-    for c in cmds {
+    assert_eq!(cmds.len(), 6);
+    // The four settings steps run as root and are not optional; the vendor installers run as the
+    // user and are optional.
+    for c in &cmds[..4] {
+        assert!(c.name.starts_with("settings-") && c.as_user.is_none() && !c.optional);
+    }
+    for c in &cmds[4..] {
         assert_eq!(c.as_user.as_deref(), Some("desk"));
         assert!(c.optional);
         assert!(c.timeout_secs <= 7200);
@@ -274,6 +292,10 @@ fn developer_post_steps_run_as_the_user_and_are_optional() {
             "ensure-user",
             "set-password",
             "security-updates",
+            "command",
+            "command",
+            "command",
+            "command",
             "command",
             "command"
         ]

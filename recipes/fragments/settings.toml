@@ -1,0 +1,59 @@
+# Desktop settings the setup wizard lets the user choose (ipc.md 6.5): hostname, timezone, locale,
+# keyboard. They run in the post stage so that they apply to a prebuilt image and to a build on
+# the server alike.
+#
+# {{hostname}}, {{timezone}}, {{locale}} and {{keyboard}} are not defined in [vars]: they are
+# reserved and come only from the caller's validated `hx_provision::Settings` (strict alphabets,
+# no shell metacharacters; see crates/hx-provision/src/settings.rs). Unset settings are the empty
+# string, and each step below does nothing for an empty value. Every substitution is also
+# single-quoted.
+
+[[post_step]]
+name = "settings-hostname"
+run = '''
+h='{{hostname}}'
+if [ -n "$h" ]; then
+  printf '%s\n' "$h" > /etc/hostname
+  hostname "$h" || true
+  sed -i '/^127\.0\.1\.1[[:space:]]/d' /etc/hosts
+  printf '127.0.1.1 %s\n' "$h" >> /etc/hosts
+fi
+'''
+timeout_secs = 60
+
+[[post_step]]
+name = "settings-timezone"
+run = '''
+tz='{{timezone}}'
+if [ -n "$tz" ]; then
+  if [ ! -f "/usr/share/zoneinfo/$tz" ]; then echo "unknown time zone $tz" >&2; exit 1; fi
+  ln -sf "/usr/share/zoneinfo/$tz" /etc/localtime
+  printf '%s\n' "$tz" > /etc/timezone
+fi
+'''
+timeout_secs = 60
+
+[[post_step]]
+name = "settings-locale"
+run = '''
+l='{{locale}}'
+if [ -n "$l" ]; then
+  sed -i "s/^# *\($l UTF-8\)/\1/" /etc/locale.gen
+  grep -qxF "$l UTF-8" /etc/locale.gen || printf '%s UTF-8\n' "$l" >> /etc/locale.gen
+  locale-gen
+  update-locale "LANG=$l"
+fi
+'''
+timeout_secs = 600
+
+[[post_step]]
+name = "settings-keyboard"
+run = '''
+k='{{keyboard}}'
+if [ -n "$k" ]; then
+  layout="${k%%+*}"; variant=""
+  case "$k" in *+*) variant="${k#*+}";; esac
+  printf 'XKBMODEL="pc105"\nXKBLAYOUT="%s"\nXKBVARIANT="%s"\nXKBOPTIONS=""\nBACKSPACE="guess"\n' "$layout" "$variant" > /etc/default/keyboard
+fi
+'''
+timeout_secs = 60
