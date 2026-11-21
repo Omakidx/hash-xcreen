@@ -70,7 +70,10 @@ pub struct ClipboardSettings {
     /// Also share PRIMARY (select-to-copy). Off by default.
     pub primary: bool,
     pub display: Option<String>,
-    /// Where pasted client files are staged; `None` uses `$XDG_RUNTIME_DIR` or the temp dir.
+    /// The directory under which each manager makes a staging directory of its own for pasted
+    /// client files. It must exist, be owned by this user and not be a symlink; there is no
+    /// fallback (not `$XDG_RUNTIME_DIR`, which `ProtectSystem=strict` makes read-only, and not
+    /// the shared temp dir): `None` makes [`ClipboardManager::start`] fail.
     pub staging_base: Option<PathBuf>,
     pub step_timeout: Duration,
 }
@@ -85,6 +88,14 @@ impl Default for ClipboardSettings {
             step_timeout: Duration::from_secs(5),
         }
     }
+}
+
+/// A file the client already sent: it is in the received-files directory under `name`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReceivedEntry {
+    /// The name the file was given in the directory (the session's choice, not the wire's).
+    pub name: String,
+    pub size: u64,
 }
 
 /// A file the client offers: only a display name and a size; contents arrive later.
@@ -133,14 +144,44 @@ pub struct StagingDir {
     next: AtomicU64,
 }
 
+/// Staging directories made by this process so far (the name of the next one).
+static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
+const STAGING_PREFIX: &str = "clip-";
+
+fn staging_err(why: &str) -> std::io::Error {
+    std::io::Error::other(why.to_owned())
+}
+
 impl StagingDir {
-    /// Create `<base>/hx-clipboard-<pid>` with mode 0700.
+    /// Creates a staging directory of its own under `base`: `<base>/clip-<pid>-<n>`, mode 0700,
+    /// created with `mkdir` (so an existing path, a symlink included, is refused, never reused)
+    /// and checked to be owned by this user. `base` must be an existing directory that is not a
+    /// symlink, owned by this user and not world-writable. Directories left by
+    /// processes that no longer run are removed; a live manager's directory is never touched
+    /// by another.
     pub fn create(base: &Path) -> std::io::Result<Self> {
-        let root = base.join(format!("hx-clipboard-{}", std::process::id()));
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&root)?;
+        let me = rustix::process::geteuid().as_raw();
+        let md = std::fs::symlink_metadata(base)?;
+        if md.file_type().is_symlink() || !md.is_dir() {
+            return Err(staging_err("the staging base is not a plain directory"));
+        }
+        if md.uid() != me || md.mode() & 0o002 != 0 {
+            return Err(staging_err(
+                "the staging base is not owned by this user or is world-writable",
+            ));
+        }
+        sweep_stale(base);
+        let root = base.join(format!(
+            "{STAGING_PREFIX}{}-{}",
+            std::process::id(),
+            STAGING_SEQ.fetch_add(1, Relaxed)
+        ));
+        DirBuilder::new().mode(0o700).create(&root)?;
+        let md = std::fs::symlink_metadata(&root)?;
+        if md.file_type().is_symlink() || md.uid() != me {
+            let _ = std::fs::remove_dir(&root);
+            return Err(staging_err("the staging directory is not ours"));
+        }
         Ok(Self {
             root,
             generation: AtomicU64::new(0),
@@ -180,6 +221,36 @@ impl StagingDir {
 impl Drop for StagingDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// Removes `clip-<pid>-<n>` directories of other processes that are gone (a crash leaves them).
+/// Only plain directories owned by this user are touched; the pid of a live process never is.
+fn sweep_stale(base: &Path) {
+    let me = rustix::process::geteuid().as_raw();
+    let Ok(rd) = std::fs::read_dir(base) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(STAGING_PREFIX))
+            .and_then(|n| n.split('-').next())
+            .and_then(|p| p.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == std::process::id() || Path::new("/proc").join(pid.to_string()).exists() {
+            continue;
+        }
+        let path = e.path();
+        if let Ok(md) = std::fs::symlink_metadata(&path)
+            && md.is_dir()
+            && md.uid() == me
+        {
+            let _ = std::fs::remove_dir_all(&path);
+        }
     }
 }
 
@@ -375,6 +446,49 @@ struct Provider {
     offer: ClientOffer,
     source: Arc<dyn ClientSource>,
     staging: Arc<StagingDir>,
+    /// A second directory whose files may be handed to applications: the received-files
+    /// directory, for files the client sent before anything was pasted.
+    trusted_root: Option<PathBuf>,
+}
+
+impl Provider {
+    fn inside(&self, canonical: &Path) -> bool {
+        canonical.starts_with(self.staging.path())
+            || self
+                .trusted_root
+                .as_deref()
+                .is_some_and(|r| canonical.starts_with(r))
+    }
+}
+
+/// Files that were already received: pasting hands out their paths in the received directory.
+struct ReceivedFiles {
+    paths: Vec<PathBuf>,
+}
+
+impl ClientSource for ReceivedFiles {
+    fn fetch(&self, _mime: &str, _max: u64) -> Result<Vec<u8>, SourceError> {
+        Err(SourceError("only files are offered".into()))
+    }
+
+    fn stage_files(
+        &self,
+        files: &[RemoteFile],
+        _staging: &StagingDir,
+    ) -> Result<Vec<PathBuf>, SourceError> {
+        if files.len() != self.paths.len() {
+            return Err(SourceError("the offer changed".into()));
+        }
+        // Each must still be the regular file that was received (not replaced by a link).
+        for (p, f) in self.paths.iter().zip(files) {
+            let md = std::fs::symlink_metadata(p)
+                .map_err(|_| SourceError("a received file is gone".into()))?;
+            if !md.is_file() || md.len() != f.size {
+                return Err(SourceError("a received file changed".into()));
+            }
+        }
+        Ok(self.paths.clone())
+    }
 }
 
 impl RemoteProvider for Provider {
@@ -404,10 +518,10 @@ impl RemoteProvider for Provider {
                 }
                 let mut out = String::new();
                 for p in paths {
-                    // Only paths inside our staging directory may be handed to applications.
+                    // Only paths inside our own directories may be handed to applications.
                     let inside = std::fs::canonicalize(&p)
                         .ok()
-                        .is_some_and(|c| c.starts_with(self.staging.path()));
+                        .is_some_and(|c| self.inside(&c));
                     if !inside {
                         return None;
                     }
@@ -438,8 +552,7 @@ impl ClipboardManager {
         let base = settings
             .staging_base
             .clone()
-            .or_else(|| std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from))
-            .unwrap_or_else(std::env::temp_dir);
+            .ok_or_else(|| staging_err("no staging directory is configured"))?;
         let staging = Arc::new(StagingDir::create(&base)?);
         let engine = Clipboard::start(ClipboardConfig {
             display: settings.display,
@@ -547,9 +660,58 @@ impl ClipboardManager {
                 offer,
                 source,
                 staging,
+                trusted_root: None,
             }),
         )?;
         Ok(formats)
+    }
+
+    /// Offers files the client already sent as a file-list clipboard (`text/uri-list`, and the
+    /// GNOME/XFCE copied-files target the engine derives from it), pointing into `root`, the
+    /// received-files directory: a user can paste them in the file manager. The names are the
+    /// ones the files have in `root`. Replaces the current offer.
+    pub fn offer_received_files(
+        &self,
+        selection: Selection,
+        root: &Path,
+        files: &[ReceivedEntry],
+    ) -> Result<(), ClipboardPolicyError> {
+        let engine = self.engine()?;
+        let staging = self.staging.clone().ok_or(ClipboardPolicyError::Disabled)?;
+        if files.is_empty() || files.len() > MAX_FILES {
+            return Err(invalid("files", "no files, or too many"));
+        }
+        let root = std::fs::canonicalize(root)?;
+        let mut remote = Vec::with_capacity(files.len());
+        let mut paths = Vec::with_capacity(files.len());
+        for f in files {
+            if f.name.is_empty() || f.name.contains(['/', '\\', '\0']) || f.name.len() > 255 {
+                return Err(invalid("file name", "not a plain name"));
+            }
+            if let Some(reason) = file_name_problem(&f.name) {
+                return Err(invalid("file name", reason));
+            }
+            paths.push(root.join(&f.name));
+            remote.push(RemoteFile {
+                name: f.name.clone(),
+                size: f.size,
+            });
+        }
+        staging.clear();
+        engine.offer_remote(
+            selection,
+            vec![MIME_URI_LIST.to_owned()],
+            Arc::new(Provider {
+                offer: ClientOffer {
+                    formats: Vec::new(),
+                    files: remote,
+                },
+                source: Arc::new(ReceivedFiles { paths }),
+                staging,
+                trusted_root: Some(root),
+            }),
+        )?;
+        Ok(())
     }
 
     /// The client's clipboard is gone (or the client disconnected): stop offering it and
@@ -628,6 +790,79 @@ mod tests {
             assert!(s.alloc("y").unwrap().starts_with(s.path()));
         }
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    fn base(tag: &str) -> PathBuf {
+        let b = std::env::temp_dir().join(format!("hx-stage-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&b);
+        std::fs::create_dir_all(&b).unwrap();
+        b
+    }
+
+    #[test]
+    fn every_manager_gets_a_staging_directory_of_its_own_and_never_removes_another() {
+        let b = base("own");
+        let one = StagingDir::create(&b).unwrap();
+        let two = StagingDir::create(&b).unwrap();
+        assert_ne!(one.path(), two.path());
+        assert!(one.path().starts_with(&b) && two.path().starts_with(&b));
+        let mode = std::fs::metadata(one.path()).unwrap().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        let staged = two.alloc("f.txt").unwrap();
+        std::fs::write(&staged, b"x").unwrap();
+        // An older manager going away (a superseded link) leaves the newer one's files alone.
+        drop(one);
+        assert!(staged.exists());
+        drop(two);
+        assert!(!staged.exists());
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    #[test]
+    fn the_staging_base_is_checked_and_there_is_no_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+        let b = base("sym");
+        // Missing.
+        assert!(StagingDir::create(&b.join("missing")).is_err());
+        // A symlink.
+        let link = b.join("link");
+        std::os::unix::fs::symlink(&b, &link).unwrap();
+        assert!(StagingDir::create(&link).is_err());
+        // Writable by others.
+        let open = b.join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(StagingDir::create(&open).is_err());
+        // Read-only (what ProtectSystem=strict makes of /run/user/<uid>): fails.
+        let ro = b.join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if rustix::process::geteuid().as_raw() != 0 {
+            assert!(StagingDir::create(&ro).is_err());
+        }
+        // No base configured: the manager does not start (nothing falls back to the temp dir).
+        let r = ClipboardManager::start(ClipboardSettings {
+            staging_base: None,
+            ..ClipboardSettings::default()
+        });
+        assert!(matches!(r, Err(ClipboardPolicyError::Staging(_))));
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    #[test]
+    fn directories_of_dead_processes_are_swept_and_live_ones_are_not() {
+        let b = base("sweep");
+        let dead = b.join("clip-4000000000-0");
+        let live = b.join("clip-1-0"); // pid 1 runs
+        let other = b.join("keep-me");
+        for d in [&dead, &live, &other] {
+            std::fs::create_dir(d).unwrap();
+        }
+        let _s = StagingDir::create(&b).unwrap();
+        assert!(!dead.exists(), "a dead process's directory goes");
+        assert!(live.exists() && other.exists());
+        let _ = std::fs::remove_dir_all(&b);
     }
 
     #[test]

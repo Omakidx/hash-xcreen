@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use hx_crypto::auth::{BoxFuture, RevocationGuard, RevocationPermit};
 use hx_crypto::{Authenticator, Clock, DeviceId, DeviceRecord, RevokeReason};
 use hx_ipc::privd::pb::AuditEvent;
 use hx_proto::channel::MAX_DEVICE_LIST;
@@ -38,6 +39,20 @@ pub struct DeviceNotice {
     pub device: pb::DeviceInfo,
     /// The paired device that caused it, if one did.
     pub by: Option<DeviceId>,
+}
+
+/// The authenticator's hook around a PIN-lockout revocation (the 5th wrong PIN): it takes the
+/// gateway's revocation lock, the one under which device and operator revocations enforce "never
+/// zero active devices" and "requester still active", so that a lockout revocation is
+/// persisted and announced atomically with respect to them. The lock is taken last and only
+/// here and in [`DeviceService`]'s own paths: never while waiting for a PIN check (protocol.md
+/// 11.6).
+struct LockoutGuard(Arc<tokio::sync::Mutex<()>>);
+
+impl RevocationGuard for LockoutGuard {
+    fn enter<'a>(&'a self, _device: &'a DeviceId) -> BoxFuture<'a, RevocationPermit> {
+        Box::pin(async move { Box::new(self.0.clone().lock_owned().await) as RevocationPermit })
+    }
 }
 
 /// The device service. Create it once per gateway.
@@ -168,6 +183,8 @@ impl DeviceService {
             recent: Mutex::new(HashMap::new()),
             version: AtomicU64::new(1),
         });
+        // A lockout revocation is serialized with the others by the same lock.
+        auth.set_revocation_guard(Arc::new(LockoutGuard(svc.revoke_lock.clone())));
         // Every revocation wakes the lockout scan; a lag only means "scan again".
         let weak = std::sync::Arc::downgrade(&svc);
         let mut rx = auth.subscribe_revocations();
@@ -333,6 +350,9 @@ impl DeviceService {
                 .unwrap_or_else(|p| p.into_inner())
                 .insert(r.id);
             if fresh {
+                // Recorded under the revocation lock like the other paths (audit, closing the
+                // sessions, notice and the cooling-off rule see a consistent registry).
+                let _serial = self.revoke_lock.lock().await;
                 self.record_revoked(r.id, None).await;
             }
         }

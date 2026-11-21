@@ -131,10 +131,13 @@ path = "/etc/tmpfiles.d/hx-session.conf"
 content = '''
 # Root-owned directory for the session socket; the unprivileged user cannot replace entries in it.
 d /run/hx-session 0755 root root -
-# Where hx-session may write received files (the only ReadWritePaths of hx-session.service).
+# Where hx-session may write received files (one of the two ReadWritePaths of hx-session.service).
 # Owned by the desktop user; ~/Received links here.
 d /var/lib/hx-session 0755 root root -
 d /var/lib/hx-session/received 0700 {{uid}} - -
+# Where the clipboard stages files that the user pastes (the second ReadWritePaths of the unit;
+# /run/user/<uid> is read-only under ProtectSystem=strict). Owned by the desktop user.
+d /var/lib/hx-session/clipboard 0700 {{uid}} - -
 '''
 
 [[file]]
@@ -197,6 +200,7 @@ RestrictAddressFamilies=AF_UNIX
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/var/lib/hx-session/received
+ReadWritePaths=/var/lib/hx-session/clipboard
 LockPersonality=yes
 SystemCallFilter=@system-service
 SystemCallArchitectures=native

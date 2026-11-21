@@ -48,8 +48,12 @@ use crate::clipboard::ClipboardSettings;
 use crate::input::InputLimits;
 use crate::pipeline::PipelineConfig;
 
-/// Where received files go (`docs/ipc.md` 21 item 3: the one writable path of the unit).
+/// Where received files go (`docs/ipc.md` 21 item 3: a writable path of the unit).
 pub const DEFAULT_RECEIVED_DIR: &str = "/var/lib/hx-session/received";
+/// Where the clipboard stages pasted files (the unit's second writable path; each clipboard
+/// manager makes a directory of its own inside it). Same value as
+/// `hx_provision::session::SESSION_CLIPBOARD_DIR`, which the recipe's unit file spells out.
+pub const DEFAULT_STAGING_DIR: &str = "/var/lib/hx-session/clipboard";
 
 /// Settings of the link end. The defaults are the contract's numbers.
 #[derive(Clone, Debug)]
@@ -95,6 +99,7 @@ impl SessionConfig {
     pub fn new(display: Option<String>) -> Self {
         let clipboard = ClipboardSettings {
             display: display.clone(),
+            staging_base: Some(PathBuf::from(DEFAULT_STAGING_DIR)),
             ..ClipboardSettings::default()
         };
         Self {

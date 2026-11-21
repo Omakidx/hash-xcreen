@@ -10,6 +10,7 @@
 // (adopting the socket-activation descriptor); everything else is safe code.
 #![deny(unsafe_code)]
 
+pub mod cli;
 pub mod fetcher;
 pub mod gateway;
 pub mod link;

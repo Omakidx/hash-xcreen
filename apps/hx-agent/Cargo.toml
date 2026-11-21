@@ -20,7 +20,7 @@ test-support = ["dep:tempfile"]
 gateway-test-hooks = []
 
 [dependencies]
-argon2 = "0.6.0"
+argon2 = { version = "0.6.0", features = ["zeroize"] } # wipes its memory blocks (the CLI hashes typed secrets)
 bytes.workspace = true
 flate2 = { version = "1.1.11", default-features = false, features = ["rust_backend"] }
 getrandom = "0.4"
@@ -35,7 +35,7 @@ libc = "0.2" # seccomp numbers (gateway) and SO_PEERGROUPS (privd::peergroups)
 listenfd = "1.0.2"
 minisign-verify = "0.3.0"
 prost.workspace = true
-rustix = { workspace = true, features = ["fs", "mm", "process", "net", "rand"] }
+rustix = { workspace = true, features = ["fs", "mm", "process", "net", "rand", "termios"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-native-certs = "0.8.5"
 seccompiler = "0.5"
@@ -53,6 +53,7 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 zeroize.workspace = true
 
 [dev-dependencies]
+rustix = { workspace = true, features = ["pty", "termios", "fs"] } # a pseudo-terminal for the hidden-prompt test
 crossbeam-channel.workspace = true
 hx-capture.workspace = true
 hx-session.workspace = true

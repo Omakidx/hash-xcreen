@@ -44,6 +44,14 @@ pub const PWCHECK_MISMATCH: i32 = 1;
 pub const SESSION_SOCKET_DIR: &str = "/run/hx-session";
 /// The socket `hx-session.socket` creates (owned by the desktop user, mode 0600).
 pub const SESSION_SOCKET: &str = "/run/hx-session/link.sock";
+/// The one place `hx-session` may write received files (`ReadWritePaths=`, owned by the desktop
+/// user, mode 0700; `~/Received` links here).
+pub const SESSION_RECEIVED_DIR: &str = "/var/lib/hx-session/received";
+/// The second writable path of `hx-session.service` (owned by the desktop user, mode 0700): the
+/// clipboard stages files the user pastes here, in a directory of its own per clipboard manager.
+/// It is not under `/run/user/<uid>` because the unit's `ProtectSystem=strict` makes that
+/// read-only, and not under `/tmp` because that is shared.
+pub const SESSION_CLIPBOARD_DIR: &str = "/var/lib/hx-session/clipboard";
 /// The system socket unit.
 pub const SESSION_SOCKET_UNIT: &str = "hx-session.socket";
 /// The system service unit that runs [`SESSION_BINARY`] as the desktop user.
