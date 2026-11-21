@@ -32,7 +32,9 @@ pub mod text;
 pub mod tls;
 pub mod wire;
 
-pub use auth::{Authenticator, AuthenticatorConfig, Outcome, RegistryView};
+pub use auth::{
+    Authenticator, AuthenticatorConfig, BoxFuture, Outcome, PinVerdict, PinVerifier, RegistryView,
+};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use error::{Error, Result};
 pub use keys::{DeviceId, Fingerprint, IdentityKey, PublicKey};
