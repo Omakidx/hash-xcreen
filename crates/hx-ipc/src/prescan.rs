@@ -176,8 +176,16 @@ mod tests {
     #[test]
     fn counts_elements_and_rejects_malformed_input() {
         assert_eq!(count(&[0x1a, 0, 0x1a, 0], 3, false).unwrap(), 2);
-        assert_eq!(count(&[0x1a, 3, 1, 1, 1], 3, true).unwrap(), 3, "packed varints");
-        assert_eq!(count(&[0x18, 1, 0x18, 1], 3, true).unwrap(), 2, "unpacked varints");
+        assert_eq!(
+            count(&[0x1a, 3, 1, 1, 1], 3, true).unwrap(),
+            3,
+            "packed varints"
+        );
+        assert_eq!(
+            count(&[0x18, 1, 0x18, 1], 3, true).unwrap(),
+            2,
+            "unpacked varints"
+        );
         assert!(count(&[0x1a, 5, 1], 3, false).is_err(), "length overruns");
         assert!(count(&[0x80], 3, false).is_err(), "truncated tag");
         assert!(count(&[0x0b], 1, false).is_err(), "group");

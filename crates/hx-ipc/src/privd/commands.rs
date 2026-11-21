@@ -27,19 +27,24 @@ pub struct CommandInfo {
     /// True for commands that are named but not implemented in Phase 1: privd answers
     /// `UNIMPLEMENTED` (sections 6.5, 6.9, 6.13, 6.14).
     pub reserved: bool,
-    /// The command's maximum deadline in milliseconds where section 8 gives one.
+    /// The command's maximum deadline in milliseconds: the value of section 8 where it gives
+    /// one, otherwise the value chosen in this table (also listed in section 8). `None` only
+    /// for reserved commands, which answer `UNIMPLEMENTED` at once and use
+    /// [`DEFAULT_DEADLINE_MS`].
     pub max_deadline_ms: Option<u32>,
 }
 
 impl CommandInfo {
-    /// The deadline to enforce: the request's `deadline_ms` may only shorten the maximum, and 0
-    /// means the maximum. Returns `None` when neither the command nor the request has one.
-    pub fn effective_deadline_ms(&self, requested: u32) -> Option<u32> {
-        match (self.max_deadline_ms, requested) {
-            (Some(max), 0) => Some(max),
-            (Some(max), r) => Some(r.min(max)),
-            (None, 0) => None,
-            (None, r) => Some(r),
+    /// The deadline to enforce, never unbounded (privd has one request in flight per
+    /// connection, so a command without a deadline could hold the slot forever): the request's
+    /// `deadline_ms` may only shorten the command's maximum, and 0 means the maximum. A command
+    /// without a maximum uses [`DEFAULT_DEADLINE_MS`] as its maximum.
+    pub fn effective_deadline_ms(&self, requested: u32) -> u32 {
+        let max = self.max_deadline_ms.unwrap_or(DEFAULT_DEADLINE_MS);
+        if requested == 0 {
+            max
+        } else {
+            requested.min(max)
         }
     }
 }
@@ -57,6 +62,9 @@ const fn info(
         max_deadline_ms,
     }
 }
+
+/// Maximum deadline of a command that has no specific one (the reserved commands): 60 s.
+pub const DEFAULT_DEADLINE_MS: u32 = 60_000;
 
 const S10: Option<u32> = Some(10_000);
 const S30: Option<u32> = Some(30_000);
@@ -81,20 +89,20 @@ pub fn command_info(cmd: &Command) -> CommandInfo {
         Command::StopDesktop(_) => info("StopDesktop", A, false, M2),
         Command::RestartDesktop(_) => info("RestartDesktop", A, false, M2),
         Command::SetLimits(_) => info("SetLimits", A, false, S30),
-        Command::SetUserPassword(_) => info("SetUserPassword", A, false, None),
+        Command::SetUserPassword(_) => info("SetUserPassword", A, false, S60),
         Command::EnableDocker(_) => info("EnableDocker", S, false, Some(15 * 60_000)),
-        Command::DisableDocker(_) => info("DisableDocker", A, false, None),
+        Command::DisableDocker(_) => info("DisableDocker", A, false, M2),
         Command::CreateSnapshot(_) => info("CreateSnapshot", A, false, S60),
         Command::ListSnapshots(_) => info("ListSnapshots", R, false, S60),
         Command::DeleteSnapshot(_) => info("DeleteSnapshot", A, false, S60),
-        Command::ProvisionSessionLink(_) => info("ProvisionSessionLink", A, false, None),
+        Command::ProvisionSessionLink(_) => info("ProvisionSessionLink", A, false, S60),
         Command::InstallSession(_) => info("InstallSession", A, false, M5),
-        Command::RestartSession(_) => info("RestartSession", A, false, None),
+        Command::RestartSession(_) => info("RestartSession", A, false, S60),
         Command::CheckUpdate(_) => info("CheckUpdate", A, false, S60),
         Command::ApplyUpdate(_) => info("ApplyUpdate", A, false, Some(10 * 60_000)),
-        Command::RollbackUpdate(_) => info("RollbackUpdate", X, false, None),
-        Command::DestroyDesktop(_) => info("DestroyDesktop", X, false, None),
-        Command::Uninstall(_) => info("Uninstall", X, false, None),
+        Command::RollbackUpdate(_) => info("RollbackUpdate", X, false, M2),
+        Command::DestroyDesktop(_) => info("DestroyDesktop", X, false, M5),
+        Command::Uninstall(_) => info("Uninstall", X, false, Some(10 * 60_000)),
         Command::ResetLockout(_) => info("ResetLockout", X, false, S30),
         Command::EnrolOwnerKey(_) => info("EnrolOwnerKey", X, false, S30),
         Command::UpgradeIncus(_) => info("UpgradeIncus", X, true, None),
@@ -351,12 +359,11 @@ mod tests {
     #[test]
     fn deadlines_only_shorten() {
         let i = info("x", CommandClass::R, false, Some(10_000));
-        assert_eq!(i.effective_deadline_ms(0), Some(10_000));
-        assert_eq!(i.effective_deadline_ms(500), Some(500));
-        assert_eq!(i.effective_deadline_ms(60_000), Some(10_000));
-        assert_eq!(
-            info("x", CommandClass::R, false, None).effective_deadline_ms(0),
-            None
-        );
+        assert_eq!(i.effective_deadline_ms(0), 10_000);
+        assert_eq!(i.effective_deadline_ms(500), 500);
+        assert_eq!(i.effective_deadline_ms(60_000), 10_000);
+        let none = info("x", CommandClass::R, true, None);
+        assert_eq!(none.effective_deadline_ms(0), DEFAULT_DEADLINE_MS);
+        assert_eq!(none.effective_deadline_ms(1_000_000), DEFAULT_DEADLINE_MS);
     }
 }

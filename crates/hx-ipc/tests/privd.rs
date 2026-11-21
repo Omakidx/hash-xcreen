@@ -1351,3 +1351,23 @@ proptest! {
         let _ = d.feed(&data);
     }
 }
+
+#[test]
+fn no_command_can_run_without_a_deadline() {
+    for c in every_command() {
+        let info = command_info(&c);
+        for requested in [0, 1, 1_000, u32::MAX] {
+            let d = info.effective_deadline_ms(requested);
+            assert!(
+                (1..=45 * 60_000).contains(&d),
+                "{} with {requested}: {d}",
+                info.name
+            );
+        }
+        assert!(
+            info.reserved || info.max_deadline_ms.is_some(),
+            "{} has no explicit maximum",
+            info.name
+        );
+    }
+}

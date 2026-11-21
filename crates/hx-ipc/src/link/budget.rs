@@ -311,7 +311,9 @@ mod tests {
         let t0 = Instant::now();
         // A flood of 5-byte TransferEnd frames: 10 000 within one second.
         let mut w = RateWindow::per_second(lane_frame_limit(Role::Gateway, Lane::Bulk).unwrap());
-        let allowed = (0..10_000).filter(|i| w.allow(at(t0, (*i as u64) / 10))).count();
+        let allowed = (0..10_000)
+            .filter(|i| w.allow(at(t0, (*i as u64) / 10)))
+            .count();
         assert_eq!(allowed, limits::BULK_FRAMES);
         // A legitimate full-speed transfer (1 024 data frames per second) is never refused.
         let mut w = RateWindow::per_second(limits::BULK_FRAMES);

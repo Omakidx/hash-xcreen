@@ -54,7 +54,10 @@ mod tests {
     fn strips_controls_line_separators_zero_width_bidi_and_tags() {
         assert_eq!(sanitize_text("a\x1b[31mb\u{202E}c\n", 64), "a[31mbc");
         assert_eq!(sanitize_text("a\u{2028}b\u{2029}c", 64), "abc");
-        assert_eq!(sanitize_text("a\u{200B}b\u{200D}c\u{2060}d\u{FEFF}e\u{180E}f", 64), "abcdef");
+        assert_eq!(
+            sanitize_text("a\u{200B}b\u{200D}c\u{2060}d\u{FEFF}e\u{180E}f", 64),
+            "abcdef"
+        );
         assert_eq!(sanitize_text("x\u{E0041}y\u{E007F}z", 64), "xyz");
         assert_eq!(sanitize_text("a\u{206A}b\u{00AD}c\u{061C}d", 64), "abcd");
     }

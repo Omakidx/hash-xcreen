@@ -91,21 +91,35 @@ fn worst_case_bodies_are_rejected_without_amplification() {
     let request = repeated(3, &[], 65_000);
     let body = field(3, 2, &request);
     assert!(body.len() <= 65_535);
-    let raw = RawFrame { kind: privd::KIND_MESSAGE, body: BytesMut::from(&body[..]) };
+    let raw = RawFrame {
+        kind: privd::KIND_MESSAGE,
+        body: BytesMut::from(&body[..]),
+    };
     let (r, peak) = peak_during(|| privd::decode(raw, Side::Server));
     assert!(r.is_err());
-    assert!(peak <= SLACK, "privd request: {peak} bytes for a {} byte body", body.len());
+    assert!(
+        peak <= SLACK,
+        "privd request: {peak} bytes for a {} byte body",
+        body.len()
+    );
     // Sensitivity: the same body decoded by prost alone is a large multiple of its size.
     use prost::Message;
-    let (_, unguarded) = peak_during(|| privd::pb::Frame::decode(&body[..]).map(|f| f.encoded_len()));
-    assert!(unguarded > 10 * body.len(), "prost alone allocates {unguarded}");
+    let (_, unguarded) =
+        peak_during(|| privd::pb::Frame::decode(&body[..]).map(|f| f.encoded_len()));
+    assert!(
+        unguarded > 10 * body.len(),
+        "prost alone allocates {unguarded}"
+    );
 
     // setup_host.extra_host_addresses full of empty strings (Request 15 -> 4 -> repeated 1).
     let addrs = repeated(1, &[], 65_000);
     let host = field(4, 2, &addrs);
     let request = field(15, 2, &host);
     let body = field(3, 2, &request);
-    let raw = RawFrame { kind: privd::KIND_MESSAGE, body: BytesMut::from(&body[..]) };
+    let raw = RawFrame {
+        kind: privd::KIND_MESSAGE,
+        body: BytesMut::from(&body[..]),
+    };
     let (r, peak) = peak_during(|| privd::decode(raw, Side::Server));
     assert!(r.is_err());
     assert!(peak <= SLACK, "extra_host_addresses: {peak}");
@@ -113,7 +127,10 @@ fn worst_case_bodies_are_rejected_without_amplification() {
     // admin Request with many slots.
     let request = repeated(3, &[], 65_000);
     let body = field(3, 2, &request);
-    let raw = RawFrame { kind: privd::KIND_MESSAGE, body: BytesMut::from(&body[..]) };
+    let raw = RawFrame {
+        kind: privd::KIND_MESSAGE,
+        body: BytesMut::from(&body[..]),
+    };
     let (r, peak) = peak_during(|| admin::decode(raw, Side::Server));
     assert!(r.is_err());
     assert!(peak <= SLACK, "admin: {peak}");
@@ -124,7 +141,10 @@ fn worst_case_bodies_are_rejected_without_amplification() {
     let packed = field(3, 2, &vec![1u8; 320_000]);
     for (label, info) in [("unpacked", unpacked), ("packed", packed)] {
         let body = field(1, 2, &info);
-        let raw = RawFrame { kind: link::KIND_SESSION_TO_GATEWAY, body: BytesMut::from(&body[..]) };
+        let raw = RawFrame {
+            kind: link::KIND_SESSION_TO_GATEWAY,
+            body: BytesMut::from(&body[..]),
+        };
         let (r, peak) = peak_during(|| frames::parse(&p, raw, 1 << 30));
         assert!(r.is_err(), "{label}");
         assert!(peak <= SLACK, "info codecs {label}: {peak}");
@@ -134,7 +154,10 @@ fn worst_case_bodies_are_rejected_without_amplification() {
     let p = LinkPolicy::new(Role::Session, Lane::Ctl);
     let feedback = repeated(1, &[], 16_000);
     let body = field(7, 2, &feedback);
-    let raw = RawFrame { kind: link::KIND_GATEWAY_TO_SESSION, body: BytesMut::from(&body[..]) };
+    let raw = RawFrame {
+        kind: link::KIND_GATEWAY_TO_SESSION,
+        body: BytesMut::from(&body[..]),
+    };
     let (r, peak) = peak_during(|| frames::parse(&p, raw, 1 << 30));
     assert!(r.is_err());
     assert!(peak <= SLACK, "frame_feedback: {peak}");
