@@ -85,7 +85,7 @@ follow; `hx-gatewayd` and everything else unprivileged is never allowed to influ
   `Clone` and `Secret` zeroizes on drop. Build `Secrets` from the secret frames
   (`with_user_password`, `with_current_password`), hand them over by value.
 - **Set a password: `password::change_user_password(&client, instance, &username, secrets,
-  require_current)`.** Outside the setup window always `require_current = true`. The whole
+  require_current)`.** Outside the setup window `require_current = true` for every caller except `Admin`, which may omit the current password (ipc.md 6.9: root can run `chpasswd` in the container anyway); an Admin that does send it is checked like the gateway. The whole
   sequence (sweep, check, `chpasswd`, sweep) runs as one detached task, so dropping the future
   (cancel, deadline) cannot leave the 0600 file behind. **On `Cancel`, keep polling the future
   until it resolves, hold the `desktop:<id>` lock until then, and only then answer `CANCELLED`**
@@ -130,7 +130,7 @@ follow; `hx-gatewayd` and everything else unprivileged is never allowed to influ
   (`/usr/lib/hx-session/hx-session`), the password helper at `session::PASSWORD_CHECK_HELPER`; the
   recipes' units use exactly these.
 - **Checklist for every call site in privd** (from the security review):
-  - `require_current = true` outside `SETUP_OPEN`, and charge **every** `CurrentPasswordWrong`
+  - `require_current = true` outside `SETUP_OPEN` (except for `Admin`, ipc.md 6.9), and charge **every** `CurrentPasswordWrong`
     to the shared `PASSWORD` failure budget (the helper's exit 1 is the only "wrong").
   - On `Cancel` keep polling `change_user_password` / `check_user_password` until they resolve and
     hold the `desktop:<id>` lock meanwhile; answer `CANCELLED` afterwards.
