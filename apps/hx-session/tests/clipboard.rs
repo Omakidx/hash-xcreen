@@ -11,7 +11,7 @@ use hx_capture::clipboard::{
 };
 use hx_session::clipboard::{
     ClientOffer, ClientSource, ClipboardManager, ClipboardPolicyError, ClipboardSettings,
-    RemoteFile, SourceError, StagingDir,
+    ReceivedEntry, RemoteFile, SourceError, StagingDir,
 };
 use std::collections::HashMap;
 use std::io::Read;
@@ -410,4 +410,66 @@ fn switching_the_clipboard_off_makes_no_x_connection() {
         m.offer(SEL, ClientOffer::default(), client()),
         Err(ClipboardPolicyError::Disabled)
     ));
+}
+
+#[test]
+fn received_files_are_offered_as_a_file_list_pointing_into_the_received_directory() {
+    let Some(x) = Xvfb::start(320, 200) else {
+        return;
+    };
+    let m = manager(&x);
+    let a = app(&x);
+    let dir = std::env::temp_dir().join(format!("hx-recv-offer-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.txt"), b"alpha").unwrap();
+    std::fs::write(dir.join("b c.txt"), b"bravo!").unwrap();
+    let files = [
+        ReceivedEntry {
+            name: "a.txt".into(),
+            size: 5,
+        },
+        ReceivedEntry {
+            name: "b c.txt".into(),
+            size: 6,
+        },
+    ];
+    m.offer_received_files(SEL, &dir, &files).unwrap();
+    assert_eq!(app_offer(&a), vec![MIME_URI_LIST.to_owned()]);
+    // Pasting: file URIs of the files themselves, not a copy.
+    let list = String::from_utf8(a.fetch_local(SEL, MIME_URI_LIST).unwrap()).unwrap();
+    let root = std::fs::canonicalize(&dir).unwrap();
+    let uris: Vec<&str> = list.lines().collect();
+    assert_eq!(
+        uris,
+        [
+            format!("file://{}/a.txt", root.display()),
+            format!("file://{}/b%20c.txt", root.display()),
+        ]
+    );
+    assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"alpha");
+
+    // A received file replaced by a symlink (or resized) before the paste is not handed out.
+    // (The engine keeps the answer of one offer, so a new offer is made first.)
+    m.offer_received_files(SEL, &dir, &files).unwrap();
+    std::fs::remove_file(dir.join("a.txt")).unwrap();
+    std::os::unix::fs::symlink("/etc/hostname", dir.join("a.txt")).unwrap();
+    assert!(a.fetch_local(SEL, MIME_URI_LIST).is_err());
+
+    // Names that are not plain names are refused before anything is offered.
+    for bad in ["", "../x", "a/b", "CON", "x\0y"] {
+        let e = [ReceivedEntry {
+            name: bad.into(),
+            size: 1,
+        }];
+        assert!(
+            matches!(
+                m.offer_received_files(SEL, &dir, &e),
+                Err(ClipboardPolicyError::Invalid { .. })
+            ),
+            "{bad:?}"
+        );
+    }
+    assert!(m.offer_received_files(SEL, &dir, &[]).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
 }

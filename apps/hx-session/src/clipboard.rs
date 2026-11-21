@@ -87,6 +87,14 @@ impl Default for ClipboardSettings {
     }
 }
 
+/// A file the client already sent: it is in the received-files directory under `name`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReceivedEntry {
+    /// The name the file was given in the directory (the session's choice, not the wire's).
+    pub name: String,
+    pub size: u64,
+}
+
 /// A file the client offers: only a display name and a size; contents arrive later.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteFile {
@@ -375,6 +383,49 @@ struct Provider {
     offer: ClientOffer,
     source: Arc<dyn ClientSource>,
     staging: Arc<StagingDir>,
+    /// A second directory whose files may be handed to applications: the received-files
+    /// directory, for files the client sent before anything was pasted.
+    trusted_root: Option<PathBuf>,
+}
+
+impl Provider {
+    fn inside(&self, canonical: &Path) -> bool {
+        canonical.starts_with(self.staging.path())
+            || self
+                .trusted_root
+                .as_deref()
+                .is_some_and(|r| canonical.starts_with(r))
+    }
+}
+
+/// Files that were already received: pasting hands out their paths in the received directory.
+struct ReceivedFiles {
+    paths: Vec<PathBuf>,
+}
+
+impl ClientSource for ReceivedFiles {
+    fn fetch(&self, _mime: &str, _max: u64) -> Result<Vec<u8>, SourceError> {
+        Err(SourceError("only files are offered".into()))
+    }
+
+    fn stage_files(
+        &self,
+        files: &[RemoteFile],
+        _staging: &StagingDir,
+    ) -> Result<Vec<PathBuf>, SourceError> {
+        if files.len() != self.paths.len() {
+            return Err(SourceError("the offer changed".into()));
+        }
+        // Each must still be the regular file that was received (not replaced by a link).
+        for (p, f) in self.paths.iter().zip(files) {
+            let md = std::fs::symlink_metadata(p)
+                .map_err(|_| SourceError("a received file is gone".into()))?;
+            if !md.is_file() || md.len() != f.size {
+                return Err(SourceError("a received file changed".into()));
+            }
+        }
+        Ok(self.paths.clone())
+    }
 }
 
 impl RemoteProvider for Provider {
@@ -404,10 +455,10 @@ impl RemoteProvider for Provider {
                 }
                 let mut out = String::new();
                 for p in paths {
-                    // Only paths inside our staging directory may be handed to applications.
+                    // Only paths inside our own directories may be handed to applications.
                     let inside = std::fs::canonicalize(&p)
                         .ok()
-                        .is_some_and(|c| c.starts_with(self.staging.path()));
+                        .is_some_and(|c| self.inside(&c));
                     if !inside {
                         return None;
                     }
@@ -547,9 +598,58 @@ impl ClipboardManager {
                 offer,
                 source,
                 staging,
+                trusted_root: None,
             }),
         )?;
         Ok(formats)
+    }
+
+    /// Offers files the client already sent as a file-list clipboard (`text/uri-list`, and the
+    /// GNOME/XFCE copied-files target the engine derives from it), pointing into `root`, the
+    /// received-files directory: a user can paste them in the file manager. The names are the
+    /// ones the files have in `root`. Replaces the current offer.
+    pub fn offer_received_files(
+        &self,
+        selection: Selection,
+        root: &Path,
+        files: &[ReceivedEntry],
+    ) -> Result<(), ClipboardPolicyError> {
+        let engine = self.engine()?;
+        let staging = self.staging.clone().ok_or(ClipboardPolicyError::Disabled)?;
+        if files.is_empty() || files.len() > MAX_FILES {
+            return Err(invalid("files", "no files, or too many"));
+        }
+        let root = std::fs::canonicalize(root)?;
+        let mut remote = Vec::with_capacity(files.len());
+        let mut paths = Vec::with_capacity(files.len());
+        for f in files {
+            if f.name.is_empty() || f.name.contains(['/', '\\', '\0']) || f.name.len() > 255 {
+                return Err(invalid("file name", "not a plain name"));
+            }
+            if let Some(reason) = file_name_problem(&f.name) {
+                return Err(invalid("file name", reason));
+            }
+            paths.push(root.join(&f.name));
+            remote.push(RemoteFile {
+                name: f.name.clone(),
+                size: f.size,
+            });
+        }
+        staging.clear();
+        engine.offer_remote(
+            selection,
+            vec![MIME_URI_LIST.to_owned()],
+            Arc::new(Provider {
+                offer: ClientOffer {
+                    formats: Vec::new(),
+                    files: remote,
+                },
+                source: Arc::new(ReceivedFiles { paths }),
+                staging,
+                trusted_root: Some(root),
+            }),
+        )?;
+        Ok(())
     }
 
     /// The client's clipboard is gone (or the client disconnected): stop offering it and
