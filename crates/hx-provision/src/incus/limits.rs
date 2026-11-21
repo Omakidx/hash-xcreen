@@ -61,9 +61,10 @@ impl LimitsUpdate {
 pub struct LimitsApplied {
     /// The Incus keys that were written (`limits.cpu`, `limits.memory`, `devices.root.size`).
     pub changed: Vec<&'static str>,
-    /// Whether the instance must be restarted for the change to take effect. Incus applies CPU,
-    /// memory and root-disk limits to a running container immediately and fails the call when a
-    /// storage driver cannot resize live, so this is `false` for every successful call; the field
-    /// exists so that callers need not change if that ever differs.
+    /// Whether the instance must be restarted for the change to take effect: `true` when the CPU
+    /// count was changed on a running instance. Memory and the root disk quota apply immediately
+    /// (Incus fails the call when the storage driver cannot resize live). On Incus 6.0.0 a
+    /// changed `limits.cpu` did not alter a running container's cpuset (checked in a real
+    /// container), so the CPU count is only guaranteed after the next start.
     pub restart_required: bool,
 }

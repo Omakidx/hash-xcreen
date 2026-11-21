@@ -44,7 +44,8 @@ async fn cpu_memory_and_disk_are_applied_in_one_patch() {
         applied.changed,
         ["limits.cpu", "limits.memory", "devices.root.size"]
     );
-    assert!(!applied.restart_required);
+    // A CPU count change on a running instance needs a restart (Incus 6.0.0 behaviour).
+    assert!(applied.restart_required);
     let patch = fake
         .log()
         .into_iter()
@@ -58,6 +59,43 @@ async fn cpu_memory_and_disk_are_applied_in_one_patch() {
             "config": {"limits.cpu": "4", "limits.memory": "8192MiB"},
             "devices": {"root": {"type":"disk","path":"/","pool":"hx-pool","size":"60GiB"}},
         })
+    );
+}
+
+#[tokio::test]
+async fn restart_is_needed_only_for_a_cpu_change_on_a_running_instance() {
+    let fake = Fake::start().await;
+    with_instance(&fake);
+    let c = fake.client();
+    let mem_disk = LimitsUpdate {
+        memory_mib: Some(2048),
+        disk_gib: Some(20),
+        ..Default::default()
+    };
+    assert!(
+        !c.set_limits("hx-main", &mem_disk)
+            .await
+            .unwrap()
+            .restart_required
+    );
+    let cpu = LimitsUpdate {
+        cpu: Some(2),
+        ..Default::default()
+    };
+    assert!(
+        c.set_limits("hx-main", &cpu)
+            .await
+            .unwrap()
+            .restart_required
+    );
+    fake.with(|s| {
+        s.instances.insert("hx-main".into(), "Stopped".into());
+    });
+    assert!(
+        !c.set_limits("hx-main", &cpu)
+            .await
+            .unwrap()
+            .restart_required
     );
 }
 

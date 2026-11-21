@@ -174,13 +174,24 @@ async fn check<T: Transport>(
             stdin: Some(Secret::from_slice(current.expose())),
             timeout: CHECK_TIMEOUT,
         })
-        .await
-        .map_err(|e| ApplyError::Step {
-            stage: Stage::Post,
-            index: 1,
-            step: "check-current-password".into(),
-            failure: StepFailure::Exec(e),
-        })?;
+        .await;
+    let out = match out {
+        Ok(o) => o,
+        // Incus refuses to start a command whose binary does not exist (400 "Command not found",
+        // seen on a real daemon): that is "no helper installed", which fails closed like exit 127.
+        Err(crate::exec::ExecError::Backend(m)) if m.contains("Command not found") => {
+            return Ok(CurrentPassword::Unavailable { exit_code: 127 });
+        }
+        Err(e) => {
+            return Err(ApplyError::Step {
+                stage: Stage::Post,
+                index: 1,
+                step: "check-current-password".into(),
+                failure: StepFailure::Exec(e),
+            }
+            .into());
+        }
+    };
     // Only the exit status is used; the output is dropped unread.
     Ok(match out.exit_code {
         PWCHECK_MATCH => CurrentPassword::Matches,

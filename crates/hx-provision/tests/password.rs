@@ -161,6 +161,26 @@ async fn an_unavailable_helper_fails_closed() {
 }
 
 #[tokio::test]
+async fn a_helper_binary_that_does_not_exist_fails_closed() {
+    // A real Incus refuses to start a missing command with `400 Command not found`.
+    let fake = fake_with_running_c1().await;
+    fake.with(|s| {
+        s.overrides.insert(
+            "POST /1.0/instances/c1/exec".into(),
+            (
+                400,
+                r#"{"type":"error","error_code":400,"error":"Command not found"}"#.into(),
+            ),
+        );
+    });
+    let out = change_user_password(&fake.client(), "c1", &user(), secrets(), true)
+        .await
+        .unwrap();
+    assert_eq!(out, PasswordChange::CheckUnavailable { exit_code: 127 });
+    assert!(fake.with(|s| s.files.keys().all(|k| !k.contains("/stdin-"))));
+}
+
+#[tokio::test]
 async fn without_require_current_there_is_no_check() {
     let fake = fake_with_running_c1().await;
     let new_only = Secrets::none().with_user_password(NEW).unwrap();

@@ -23,8 +23,9 @@
 //! **Why a host proxy.** On a host that runs Docker, forwarded traffic from an Incus bridge is
 //! dropped by Docker's FORWARD policy unless `DOCKER-USER` accepts it (README, "Tests against a
 //! real Incus"), and this test must not change host firewall rules. So the test starts a small
-//! forward proxy bound **only to the test bridge's gateway address**, opens exactly that TCP port
-//! in the *test bridge's* ACL, and points apt and curl in the container at it (before the build
+//! forward proxy bound **only to the test bridge's gateway address**, detaches the *test bridge's*
+//! ACL while packages are installed (Incus drops before it allows, so one port cannot be opened
+//! while the gateway is dropped), re-attaches it afterwards, and points apt and curl in the container at it (before the build
 //! stage; nothing else about the build differs from `build_on_server`). The proxy refuses every
 //! port except 80 and 443.
 
@@ -47,7 +48,7 @@ use hx_provision::teardown::{Teardown, destroy_desktop, teardown_host};
 use hx_provision::{
     Catalog, Distro, RecipeId, Secrets, Settings, Stage, Username, apply_stage, disable_docker,
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -285,11 +286,11 @@ out=/var/lib/hx-session/received/stub.out
   echo "XAUTHORITY=$XAUTHORITY"
   echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
   echo "LISTEN_FDS=$LISTEN_FDS"
-  echo "$(grep -E '^(NoNewPrivs|CapEff|CapBnd|Seccomp):' /proc/self/status | tr '\n' ' ')"
+  echo "$(grep -E '^(NoNewPrivs|CapEff|CapBnd|Seccomp):' /proc/$$/status | tr '\n' ' ')"
   if (echo x > /etc/hx-stub-test) 2>/dev/null; then echo "write_etc=ALLOWED"; else echo "write_etc=DENIED"; fi
   if (echo x > /home/desk/hx-stub-test) 2>/dev/null; then echo "write_home=ALLOWED"; else echo "write_home=DENIED"; fi
   if (echo x > /var/lib/hx-session/received/rw-test) 2>/dev/null; then echo "write_received=ALLOWED"; else echo "write_received=DENIED"; fi
-  if (exec 3<>/dev/tcp/127.0.0.1/9) 2>/tmp/inet.err; then echo "inet=ALLOWED"; else echo "inet=DENIED"; fi
+  if (exec 3<>/dev/tcp/127.0.0.1/9) 2>/dev/null; then echo "inet=ALLOWED"; else echo "inet=DENIED"; fi
   if xset q >/dev/null 2>&1; then echo "x11=REACHABLE"; else echo "x11=UNREACHABLE"; fi
   if ls /tmp/.X11-unix/X0 >/dev/null 2>&1; then echo "x11_socket_visible=yes"; else echo "x11_socket_visible=no"; fi
 } > "$out" 2>&1
@@ -334,6 +335,10 @@ async fn real_session_units_in_an_unprivileged_container() {
         }
     })
     .await;
+    if std::env::var("HX3B_KEEP").as_deref() == Ok("1") {
+        eprintln!("HX3B_KEEP=1: leaving the hx3b-* objects in place; delete them by hand");
+        return result.unwrap();
+    }
     cleanup(&c).await;
 
     // Everything of ours is gone again.
@@ -369,25 +374,15 @@ async fn run_one(c: &Client<UnixTransport>, recipe: &str, full: bool) {
     if use_proxy {
         let (port, handle) = start_proxy(gateway).await;
         proxy = Some((port, handle));
-        // Open exactly this TCP port to the gateway in the test bridge's ACL, ahead of the drops.
-        let t = UnixTransport::new(socket());
-        let mut acl = serde_json::to_value(hx_provision::host::isolation_acl(
-            &n.acl,
-            Some(gateway),
-            &spec.host_addresses,
-        ))
-        .unwrap();
-        let rule = json!({"action":"allow","destination":format!("{gateway}/32"),
-            "protocol":"tcp","destination_port":port.to_string(),"state":"enabled",
-            "description":"hx3b test: host proxy for package downloads"});
-        acl["egress"].as_array_mut().unwrap().insert(0, rule);
-        raw(
-            &t,
-            hyper::Method::PUT,
-            &format!("/1.0/network-acls/{}", n.acl),
-            acl,
+        // Incus evaluates drop rules before allow rules, so the gateway cannot be opened for one
+        // port while it is dropped. The test bridge's ACL is therefore detached while packages
+        // are installed and attached again afterwards (it is the test's own bridge).
+        c.patch_network_config(
+            &n.bridge,
+            &[("security.acls".to_string(), String::new())].into(),
         )
-        .await;
+        .await
+        .unwrap();
         evidence!(
             "proxy",
             "listening on {gateway}:{port} (bridge gateway only)"
@@ -510,6 +505,13 @@ async fn run_one(c: &Client<UnixTransport>, recipe: &str, full: bool) {
     .await
     .unwrap_or_else(|e| panic!("post stage failed: {e}"));
     evidence!("post", "done; warnings: {:?}", post.warnings);
+    if proxy.is_some() {
+        c.patch_network_config(&n.bridge, &hx_provision::host::acl_attachment(&n.acl))
+            .await
+            .unwrap();
+        let net = c.get_network(&n.bridge).await.unwrap().unwrap();
+        assert_eq!(net.config["security.acls"], n.acl, "ACL attached again");
+    }
 
     // --- settings took effect ---------------------------------------------------------------------
     let (_, s, _) = sh(
@@ -669,9 +671,15 @@ async fn run_one(c: &Client<UnixTransport>, recipe: &str, full: bool) {
     ] {
         assert!(stub.contains(want), "missing `{want}` in:\n{stub}");
     }
+    let (_, dropins, _) = sh(
+        c,
+        "systemctl cat hx-session.service --no-pager | grep -E '^# /|NoNewPriv|ProtectSystem|ProtectHome|PrivateNetwork' ; ls /etc/systemd/system/service.d /run/systemd/system/service.d /usr/lib/systemd/system/service.d 2>&1 | head",
+    )
+    .await;
+    evidence!("unit files and drop-ins", "{dropins}");
     let (_, show, _) = sh(
         c,
-        "systemctl show hx-session.service -p ActiveState -p SubState -p User -p MainPID -p KillMode -p Restart -p RestartUSec -p NoNewPrivileges -p CapabilityBoundingSet -p RestrictAddressFamilies -p ProtectSystem -p ProtectHome -p ReadWritePaths -p LockPersonality -p SystemCallFilter -p TasksMax -p MemoryMax -p PrivateNetwork -p PrivateTmp -p StartLimitIntervalUSec -p StartLimitBurst -p FragmentPath | cut -c1-150",
+        "systemctl show hx-session.service -p ActiveState -p SubState -p User -p MainPID -p KillMode -p Restart -p RestartUSec -p NoNewPrivileges -p CapabilityBoundingSet -p RestrictAddressFamilies -p ProtectSystem -p ProtectHome -p ProtectKernelTunables -p ProtectControlGroups -p ReadWritePaths -p LockPersonality -p SystemCallFilter -p TasksMax -p MemoryMax -p PrivateNetwork -p PrivateTmp -p StartLimitIntervalUSec -p StartLimitBurst -p FragmentPath | cut -c1-150",
     )
     .await;
     evidence!("systemctl show hx-session.service", "{show}");
@@ -683,6 +691,8 @@ async fn run_one(c: &Client<UnixTransport>, recipe: &str, full: bool) {
         "ProtectSystem=strict",
         "ProtectHome=read-only",
         "ReadWritePaths=/var/lib/hx-session/received",
+        "ProtectKernelTunables=yes",
+        "ProtectControlGroups=yes",
         "LockPersonality=yes",
         "PrivateNetwork=no",
         "PrivateTmp=no",
@@ -747,18 +757,61 @@ async fn api_checks(c: &Client<UnixTransport>) {
         .await
         .unwrap();
     evidence!("set_limits", "{applied:?}");
-    assert!(!applied.restart_required);
+    assert!(
+        applied.restart_required,
+        "a CPU count change on a running instance"
+    );
     let (_, lim, _) = sh(
         c,
-        "echo nproc=$(nproc); echo memory.max=$(cat /sys/fs/cgroup/memory.max); echo pids.max=$(cat /sys/fs/cgroup/pids.max); df -B1G --output=size / | tail -1",
+        "echo cpus=$(cat /sys/fs/cgroup/cpuset.cpus.effective); echo memory.max=$(cat /sys/fs/cgroup/memory.max); echo pids.max=$(cat /sys/fs/cgroup/pids.max); fallocate -l 13G /var/tmp/hx3b-quota-test 2>&1; echo fallocate13G_exit=$?; rm -f /var/tmp/hx3b-quota-test",
     )
     .await;
     evidence!("limits seen inside the running container", "{lim}");
-    assert!(lim.contains("nproc=2") && lim.contains(&format!("memory.max={}", 3072u64 << 20)));
+    // Memory and the disk quota apply at once; a 13 GiB allocation must hit the 12 GiB quota.
+    // The CPU count is still the old one on Incus 6.0.0 (hence `restart_required`): it is
+    // checked after the restart below.
+    let cpu_count = |lim: &str| -> u32 {
+        lim.lines()
+            .find_map(|l| l.strip_prefix("cpus="))
+            .unwrap()
+            .trim()
+            .split(',')
+            .map(|r| match r.split_once('-') {
+                Some((a, b)) => b.parse::<u32>().unwrap() - a.parse::<u32>().unwrap() + 1,
+                None => 1,
+            })
+            .sum()
+    };
+    evidence!("cpuset before the restart", "{} CPUs", cpu_count(&lim));
+    assert!(lim.contains(&format!("memory.max={}", 3072u64 << 20)));
+    assert!(
+        !lim.contains("fallocate13G_exit=0"),
+        "the 12 GiB quota must stop a 13 GiB allocation: {lim}"
+    );
     assert!(lim.contains("pids.max=8192"), "limits.processes untouched");
     let inst = c.get_instance(INSTANCE).await.unwrap().unwrap();
     assert_eq!(inst.devices["root"]["size"], "12GiB");
     assert_eq!(inst.devices["root"]["pool"], naming().pool);
+    // After a restart the new CPU count is in force and memory and quota survived.
+    c.set_state(
+        INSTANCE,
+        StateAction::Restart,
+        false,
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    wait_system_running(c, INSTANCE, ReadyOptions::default())
+        .await
+        .unwrap();
+    let (_, lim2, _) = sh(
+        c,
+        "echo cpus=$(cat /sys/fs/cgroup/cpuset.cpus.effective); echo memory.max=$(cat /sys/fs/cgroup/memory.max)",
+    )
+    .await;
+    evidence!("limits after the restart", "{lim2}");
+    assert_eq!(cpu_count(&lim2), 2);
+    assert!(lim2.contains(&format!("memory.max={}", 3072u64 << 20)));
     // Same call again converges.
     c.set_limits(
         INSTANCE,
@@ -803,7 +856,7 @@ async fn api_checks(c: &Client<UnixTransport>) {
     assert_eq!(r, PasswordChange::Changed);
     let h1 = hash(c.clone()).await;
     assert_ne!(h1, h0);
-    let (_, left, _) = sh(c, "ls -A /run/hx-provision | grep -c . || true; journalctl --no-pager 2>/dev/null | grep -c -F -e hx3b-Throwaway -e hx3b-Another || true").await;
+    let (_, left, _) = sh(c, "ls -A /run/hx-provision | grep -c stdin- || true; journalctl --no-pager 2>/dev/null | grep -c -F -e hx3b-Throwaway -e hx3b-Another || true").await;
     evidence!(
         "secret files left in /run/hx-provision, secret text in journal",
         "{left}"
@@ -875,12 +928,33 @@ async fn api_checks(c: &Client<UnixTransport>) {
         1,
         "the dropped future left it listed"
     );
-    let cancelled = scoped.cancel_in_flight(Duration::from_secs(30)).await;
-    evidence!("cancel_in_flight", "{cancelled:?}");
-    assert_eq!(cancelled, Ok(1));
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Found on Incus 6.0.0: a command started through the exec API cannot be cancelled ("This
+    // operation can't be cancelled", may_cancel=false), so cancel_in_flight reports it stuck. What
+    // ends it is stopping the instance (forced), which is what privd's STUCK_OPERATION handling
+    // has to do before it cleans up; the in-container `timeout` bounds it otherwise.
+    let cancelled = scoped.cancel_in_flight(Duration::from_secs(3)).await;
+    evidence!("cancel_in_flight on an exec operation", "{cancelled:?}");
+    assert_eq!(cancelled.as_ref().unwrap_err().len(), 1);
+    c.set_state(INSTANCE, StateAction::Stop, true, Duration::from_secs(30))
+        .await
+        .unwrap();
+    let ended = scoped.cancel_in_flight(Duration::from_secs(30)).await;
+    evidence!("cancel_in_flight after a forced stop", "{ended:?}");
+    assert_eq!(ended, Ok(1));
+    assert!(scoped.in_flight_operations().is_empty());
+    c.set_state(INSTANCE, StateAction::Start, false, Duration::from_secs(60))
+        .await
+        .unwrap();
+    wait_system_running(c, INSTANCE, ReadyOptions::default())
+        .await
+        .unwrap();
     let (_, sl, _) = sh(c, "pgrep -x -f 'sleep 300' | wc -l").await;
-    evidence!("`sleep 300` processes left after cancel", "{}", sl.trim());
+    evidence!(
+        "`sleep 300` processes left after the forced stop",
+        "{}",
+        sl.trim()
+    );
+    assert_eq!(sl.trim(), "0");
 
     // (e) already checked above (settings). (g) Docker disable on the real instance.
     let on: std::collections::BTreeMap<String, String> = [

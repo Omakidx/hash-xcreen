@@ -198,6 +198,22 @@ fn the_service_unit_is_as_specified() {
 
         // Things that must not be there: they break Xorg's abstract socket or hide the X11 socket
         // directory.
+        // Incus's own drop-in (`zzz-lxc-service.conf`, written at every boot) forces these off for
+        // all services; ours sorts after it and turns them back on.
+        let (dropin, _) = &f["/etc/systemd/system/hx-session.service.d/zzzz-hx-hardening.conf"];
+        let d = unit(dropin);
+        for k in [
+            "NoNewPrivileges",
+            "ProtectKernelTunables",
+            "ProtectControlGroups",
+        ] {
+            assert_eq!(get(&d, "Service", k), ["yes"], "{k}");
+            assert_eq!(get(&u, "Service", k), ["yes"], "{k} in the unit too");
+        }
+        assert!(
+            "zzzz-hx-hardening.conf" > "zzz-lxc-service.conf",
+            "the drop-in must sort after Incus's"
+        );
         assert!(!has_key(&u, "PrivateNetwork"));
         assert!(!has_key(&u, "PrivateTmp"));
         assert!(!has_key(&u, "PrivateDevices"));

@@ -774,6 +774,13 @@ impl<T: Transport> Client<T> {
             "applying limits",
         )
         .await?;
+        // Memory and the root disk quota take effect at once on a running container, verified on
+        // Incus 6.0.0 (cgroup memory.max changed, a 13 GiB allocation hit "Disk quota exceeded"
+        // under a 12 GiB quota). A changed CPU count did not change the running container's
+        // cpuset on that version: it applies at the next start.
+        if update.cpu.is_some() && self.instance_state(name).await?.is_running() {
+            applied.restart_required = true;
+        }
         Ok(applied)
     }
 

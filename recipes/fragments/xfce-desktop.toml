@@ -209,6 +209,22 @@ ProtectControlGroups=yes
 UMask=0077
 '''
 
+# Incus writes /run/systemd/system/service.d/zzz-lxc-service.conf into every container at boot. It
+# forces NoNewPrivileges=no, ProtectKernelTunables=no, ProtectControlGroups=no and a few other
+# sandbox options off for *all* services, and it sorts after a unit's own settings, so without
+# this drop-in those three lines of hx-session.service have no effect (found with the real
+# container test: the process ran with NoNewPrivs 0). Drop-ins are applied in file-name order
+# across directories, so a name that sorts after "zzz-lxc-service.conf" wins. Verified to work
+# and to leave the service startable in an unprivileged, isolated-idmap Incus 6.0.0 container.
+[[file]]
+path = "/etc/systemd/system/hx-session.service.d/zzzz-hx-hardening.conf"
+content = '''
+[Service]
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+'''
+
 # Virtual output so PipeWire has a sink to capture even without sound hardware.
 [[file]]
 path = "/etc/pipewire/pipewire.conf.d/10-hx-null-sink.conf"

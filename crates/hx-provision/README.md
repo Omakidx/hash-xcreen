@@ -96,7 +96,13 @@ follow; `hx-gatewayd` and everything else unprivileged is never allowed to influ
 - **Cancel an Incus operation.** Use one `client.scoped()` per request. After dropping the
   request's futures call `client.cancel_in_flight(Duration::from_secs(30))`: `Ok(n)` cancelled
   and ended, `Err(ids)` means set `STUCK_OPERATION`. (`in_flight_operations`, `cancel_operation`
-  and `wait_operation_end` are the pieces.) An operation the daemon created while a request was
+  and `wait_operation_end` are the pieces.) **Commands run through the exec API cannot be
+  cancelled on Incus 6.0.0** (`400 This operation can't be cancelled`, checked on a real daemon;
+  that covers every step of the build and post stages): `cancel_in_flight` then reports them
+  stuck, and what ends them is a forced stop of the instance (`set_state(.., Stop, force: true,
+  ..)`; `destroy_instance` does it). They are bounded in any case by the `timeout` that wraps each
+  command inside the container. Image import, instance creation and similar operations do
+  cancel. An operation the daemon created while a request was
   still on the wire is not known yet: check the instance during cleanup.
 - **Session link.** `incus::SessionLink::new(desktop_id, (gateway_uid, gateway_gid), (1000, 1000))`
   then `client.add_session_link(instance, &link)`; nothing else can be added as a device.
