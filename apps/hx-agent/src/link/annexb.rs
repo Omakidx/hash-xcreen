@@ -1,25 +1,37 @@
 //! The bounded H.264 Annex B sanity check of `docs/ipc.md` section 15.1 (decision 8, section 22).
 //!
 //! The gateway never decodes session video, but it refuses a payload that is not even shaped
-//! like H.264, and on a key frame it reads the coded picture size out of the SPS so a hostile
-//! session cannot announce one size in `stream_format` and ship another (or a size that would
-//! make the client's decoder allocate gigabytes).
+//! like H.264, and it reads the picture size out of **every** SPS so a hostile session cannot
+//! announce one size in `stream_format` and ship another (or a size that would make the client's
+//! decoder allocate gigabytes). The rules are strict on purpose, because a decoder allocates the
+//! *coded* size and a parser that disagrees with it is a hole (the reviewer's four bypasses):
 //!
 //! * The payload must begin with an Annex B start code (`00 00 01` or `00 00 00 01`).
-//! * At most the first [`SCAN_LIMIT`] bytes are scanned. Every NAL unit found there must have
-//!   `forbidden_zero_bit` 0 and a NAL type from the defined set ([`nal_type_is_valid`]).
-//! * A key frame must carry an SPS (type 7) inside the scanned window; it is parsed with a small
-//!   exp-Golomb reader (no allocation) and its coded size, after cropping, is returned.
+//! * The **whole** payload is scanned (at most [`SCAN_LIMIT`], the protocol's payload ceiling;
+//!   a longer one is refused). Every NAL header has `forbidden_zero_bit` 0 and a valid type; an
+//!   IDR slice (type 5) is only valid in a `KEY` frame.
+//! * **Every** SPS (type 7) is parsed, at most [`MAX_SPS_PER_FRAME`] of them, and they must all
+//!   announce the same size. [`check_frame`] returns that size; the caller compares it with the
+//!   `stream_format` in force on any frame, key or not.
+//! * Only the profiles x264 emits are accepted: 66, 77, 88 and 100. Every other profile is
+//!   refused, so the parser and the decoder cannot disagree about which profiles carry the
+//!   chroma fields.
+//! * The **coded** size (macroblocks times 16) is capped before cropping: at most 16 384 per
+//!   side and 7680 x 4320 pixels. Cropping may remove less than one macroblock per axis, so the
+//!   announced (cropped) size and the allocated (coded) size cannot drift apart.
 //!
 //! Everything here is total: no function panics or allocates, whatever the input.
 
 use thiserror::Error;
 
-/// How many leading bytes of a payload are inspected.
-pub const SCAN_LIMIT: usize = 64 * 1024;
-/// Largest picture side the link accepts (`hx_ipc::link::validate::MAX_DIMENSION`).
+/// The most bytes of a payload that are inspected: the protocol's 16 MiB payload ceiling. A
+/// longer payload is refused (it cannot be fully scanned).
+pub const SCAN_LIMIT: usize = 16 * 1024 * 1024;
+/// SPS NAL units parsed per frame; a frame carrying more is refused (each one costs a parse).
+pub const MAX_SPS_PER_FRAME: u32 = 8;
+/// Largest coded picture side the link accepts (`hx_ipc::link::validate::MAX_DIMENSION`).
 pub const MAX_SIDE: u32 = 16_384;
-/// Largest picture area the link accepts: 7680 x 4320.
+/// Largest coded picture area the link accepts: 7680 x 4320.
 pub const MAX_PIXELS: u64 = 33_177_600;
 
 /// Why a payload was refused. Every variant is a link violation (`docs/ipc.md` 15.1).
@@ -28,6 +40,9 @@ pub enum AnnexBError {
     /// The payload does not begin with a start code.
     #[error("payload does not start with an Annex B start code")]
     NoStartCode,
+    /// The payload is longer than can be scanned.
+    #[error("payload too long to scan")]
+    TooLong,
     /// A start code is followed by nothing.
     #[error("empty NAL unit")]
     EmptyNal,
@@ -37,23 +52,38 @@ pub enum AnnexBError {
     /// A NAL type outside the defined set.
     #[error("invalid NAL unit type {0}")]
     BadNalType(u8),
-    /// A key frame without an SPS in the scanned window.
+    /// An IDR slice in a frame that is not flagged `KEY`.
+    #[error("IDR slice in a frame that is not a key frame")]
+    IdrInNonKey,
+    /// A key frame without an SPS.
     #[error("key frame without a parsable SPS")]
     NoSps,
+    /// More SPS NAL units than [`MAX_SPS_PER_FRAME`].
+    #[error("too many SPS NAL units in one frame")]
+    TooManySps,
+    /// Two SPS NAL units of one frame announce different sizes.
+    #[error("SPS NAL units of one frame announce different sizes")]
+    SpsConflict,
     /// The SPS is malformed, truncated or uses a value outside the supported range.
     #[error("malformed SPS")]
     BadSps,
-    /// The SPS announces a picture larger than the link allows.
-    #[error("SPS picture size {width}x{height} exceeds the limit")]
+    /// A profile other than 66, 77, 88 or 100.
+    #[error("unsupported H.264 profile {0}")]
+    UnsupportedProfile(u8),
+    /// Cropping of a macroblock or more on one axis.
+    #[error("SPS crops a whole macroblock or more")]
+    CropTooLarge,
+    /// The SPS announces a coded picture larger than the link allows.
+    #[error("SPS coded picture size {width}x{height} exceeds the limit")]
     TooLarge {
-        /// Coded width after cropping.
+        /// Coded width (macroblocks times 16).
         width: u32,
-        /// Coded height after cropping.
+        /// Coded height.
         height: u32,
     },
 }
 
-/// The coded size an SPS announces, after cropping.
+/// The picture size an SPS announces, after cropping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpsInfo {
     /// Width in pixels.
@@ -65,10 +95,12 @@ pub struct SpsInfo {
 /// What a successful check found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Checked {
-    /// NAL units seen in the scanned window.
+    /// NAL units seen (saturating).
     pub nal_units: u32,
-    /// The first SPS in the window, if any.
+    /// The size every SPS of the frame announces (they all agree), if the frame has one.
     pub sps: Option<SpsInfo>,
+    /// How many SPS NAL units the frame carries.
+    pub sps_count: u32,
 }
 
 /// True for the NAL types an H.264 stream may carry: 1 to 15, 19 (auxiliary slice), 20 and 21
@@ -92,30 +124,27 @@ fn find_start_code(b: &[u8], from: usize) -> Option<usize> {
 }
 
 /// Checks `payload` (see the module docs). `key` says the frame is flagged `KEY`: it then must
-/// carry an SPS whose size is within the link's limits.
+/// carry an SPS, and only a key frame may carry an IDR slice.
 pub fn check_frame(payload: &[u8], key: bool) -> Result<Checked, AnnexBError> {
-    let truncated = payload.len() > SCAN_LIMIT;
-    let window = &payload[..payload.len().min(SCAN_LIMIT)];
-    let first = match window {
+    if payload.len() > SCAN_LIMIT {
+        return Err(AnnexBError::TooLong);
+    }
+    let first = match payload {
         [0, 0, 1, ..] => 0,
         [0, 0, 0, 1, ..] => 1,
         _ => return Err(AnnexBError::NoStartCode),
     };
     let mut nal_units = 0u32;
-    let mut sps = None;
+    let mut sps: Option<SpsInfo> = None;
+    let mut sps_count = 0u32;
     let mut at = Some(first);
     while let Some(start) = at {
         let header_at = start + 3;
-        let next = find_start_code(window, header_at);
+        let next = find_start_code(payload, header_at);
         // The NAL ends at the next start code (a leading zero_byte of a 4-byte code is trimmed
-        // by the parser, which stops reading well before it) or at the window's end.
-        let end = next.unwrap_or(window.len());
-        let Some(&header) = (header_at < end).then(|| &window[header_at]) else {
-            // A start code at the very end of a window that cut the payload short is only a
-            // truncated view; at the true end of the payload it is an empty NAL.
-            if next.is_none() && truncated {
-                break;
-            }
+        // by the parser, which stops reading well before it) or at the payload's end.
+        let end = next.unwrap_or(payload.len());
+        let Some(&header) = (header_at < end).then(|| &payload[header_at]) else {
             return Err(AnnexBError::EmptyNal);
         };
         if header & 0x80 != 0 {
@@ -125,20 +154,32 @@ pub fn check_frame(payload: &[u8], key: bool) -> Result<Checked, AnnexBError> {
         if !nal_type_is_valid(t) {
             return Err(AnnexBError::BadNalType(t));
         }
-        nal_units += 1;
-        if t == 7 && sps.is_none() {
-            // An SPS cut by the end of a truncated window cannot be trusted.
-            if next.is_none() && truncated {
-                return Err(AnnexBError::BadSps);
+        if t == 5 && !key {
+            return Err(AnnexBError::IdrInNonKey);
+        }
+        nal_units = nal_units.saturating_add(1);
+        if t == 7 {
+            if sps_count >= MAX_SPS_PER_FRAME {
+                return Err(AnnexBError::TooManySps);
             }
-            sps = Some(parse_sps(&window[header_at + 1..end])?);
+            sps_count += 1;
+            let info = parse_sps(&payload[header_at + 1..end])?;
+            match sps {
+                None => sps = Some(info),
+                Some(prev) if prev != info => return Err(AnnexBError::SpsConflict),
+                Some(_) => {}
+            }
         }
         at = next;
     }
     if key && sps.is_none() {
         return Err(AnnexBError::NoSps);
     }
-    Ok(Checked { nal_units, sps })
+    Ok(Checked {
+        nal_units,
+        sps,
+        sps_count,
+    })
 }
 
 /// RBSP bit reader that skips emulation-prevention bytes (`00 00 03`) on the fly.
@@ -244,7 +285,7 @@ fn skip_scaling_list(r: &mut Bits<'_>, size: u32) -> Option<()> {
     Some(())
 }
 
-/// Parses an SPS NAL unit body (after its one-byte NAL header) down to the coded size.
+/// Parses an SPS NAL unit body (after its one-byte NAL header) down to the picture size.
 fn parse_sps(rbsp: &[u8]) -> Result<SpsInfo, AnnexBError> {
     sps_inner(rbsp).ok_or(AnnexBError::BadSps).and_then(|r| r)
 }
@@ -252,15 +293,18 @@ fn parse_sps(rbsp: &[u8]) -> Result<SpsInfo, AnnexBError> {
 fn sps_inner(rbsp: &[u8]) -> Option<Result<SpsInfo, AnnexBError>> {
     let mut r = Bits::new(rbsp);
     let profile = r.bits(8)?;
+    // Only what x264 writes: baseline, main, extended and high. Every other profile (including
+    // the ones other decoders read chroma fields for) is refused, so no two parsers can disagree
+    // about the layout.
+    if !matches!(profile, 66 | 77 | 88 | 100) {
+        return Some(Err(AnnexBError::UnsupportedProfile(profile as u8)));
+    }
     let _constraints = r.bits(8)?;
     let _level = r.bits(8)?;
     let _sps_id = r.ue_max(31)?;
     let mut chroma_format_idc = 1u32;
     let mut separate_planes = false;
-    if matches!(
-        profile,
-        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
-    ) {
+    if profile == 100 {
         chroma_format_idc = r.ue_max(3)?;
         if chroma_format_idc == 3 {
             separate_planes = r.flag()?;
@@ -309,8 +353,18 @@ fn sps_inner(rbsp: &[u8]) -> Option<Result<SpsInfo, AnnexBError>> {
         crop_b = u64::from(r.ue()?);
     }
     let map_mult = if frame_mbs_only { 1 } else { 2 };
+    // The decoder allocates the CODED size, so that is what is capped, before any cropping.
     let coded_w = width_mbs * 16;
     let coded_h = height_map_units * 16 * map_mult;
+    if coded_w > u64::from(MAX_SIDE)
+        || coded_h > u64::from(MAX_SIDE)
+        || coded_w * coded_h > MAX_PIXELS
+    {
+        return Some(Err(AnnexBError::TooLarge {
+            width: u32::try_from(coded_w).unwrap_or(u32::MAX),
+            height: u32::try_from(coded_h).unwrap_or(u32::MAX),
+        }));
+    }
     // ChromaArrayType 0 (monochrome or separate planes) crops in single pixels.
     let chroma_array_type = if separate_planes {
         0
@@ -323,21 +377,15 @@ fn sps_inner(rbsp: &[u8]) -> Option<Result<SpsInfo, AnnexBError>> {
         2 => (2, map_mult),
         _ => (1, map_mult),
     };
+    // At most less than one macroblock (of the coded unit) may be cropped per axis: the announced
+    // size can then never be far from the allocated one.
     let (cut_x, cut_y) = ((crop_l + crop_r) * unit_x, (crop_t + crop_b) * unit_y);
-    if cut_x >= coded_w || cut_y >= coded_h {
-        return None;
-    }
-    let (w, h) = (coded_w - cut_x, coded_h - cut_y);
-    if w > u64::from(MAX_SIDE) || h > u64::from(MAX_SIDE) || w * h > MAX_PIXELS {
-        // Report the size honestly but saturated into u32 for the error value.
-        return Some(Err(AnnexBError::TooLarge {
-            width: u32::try_from(w).unwrap_or(u32::MAX),
-            height: u32::try_from(h).unwrap_or(u32::MAX),
-        }));
+    if cut_x >= 16 || cut_y >= 16 * map_mult {
+        return Some(Err(AnnexBError::CropTooLarge));
     }
     Some(Ok(SpsInfo {
-        width: w as u32,
-        height: h as u32,
+        width: (coded_w - cut_x) as u32,
+        height: (coded_h - cut_y) as u32,
     }))
 }
 
@@ -398,6 +446,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
     struct Sps {
         profile: u32,
         chroma: u32,
@@ -616,10 +665,195 @@ mod tests {
             check_frame(&frame(&s), true),
             Err(AnnexBError::TooLarge { .. })
         ));
-        // Cropping everything away is malformed.
+        // Cropping everything away is refused (more than a macroblock).
         let mut s = base();
         s.crop = Some((u32::MAX / 4, u32::MAX / 4, 0, 0));
-        assert_eq!(check_frame(&frame(&s), true), Err(AnnexBError::BadSps));
+        assert_eq!(
+            check_frame(&frame(&s), true),
+            Err(AnnexBError::CropTooLarge)
+        );
+    }
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// SPS, PPS and an IDR stub around a real SPS NAL given as hex (without start code).
+    fn with_sps(sps_hex: &str) -> Vec<u8> {
+        let mut f = vec![0, 0, 0, 1];
+        f.extend(hex(sps_hex));
+        f.extend([0, 0, 0, 1, 0x68, 0xCE, 0x0F, 0xC8]);
+        f.extend([0, 0, 1, 0x65, 0x88, 0x84, 0x3A]);
+        f
+    }
+
+    // The reviewer's streams (FFmpeg 6.1 confirmed each one in the 1C security review). Their SPS
+    // NAL units are embedded here; the slice data is irrelevant to this check.
+
+    #[test]
+    fn t0_the_real_x264_64x64_sps_is_accepted() {
+        let f = with_sps("6742c00ada109b011000000300100000030028f1226a");
+        let c = check_frame(&f, true).unwrap();
+        assert_eq!(
+            c.sps,
+            Some(SpsInfo {
+                width: 64,
+                height: 64
+            })
+        );
+        assert_eq!(c.sps_count, 1);
+    }
+
+    #[test]
+    fn t1_an_8000x8000_sps_cropped_to_64x64_is_refused() {
+        // FFmpeg reinitialised the decoder to 8000x8000 for this stream.
+        let f = with_sps("6742c00ada007d003e9e003e06003e07011000000300100000030028f1226a");
+        assert!(matches!(
+            check_frame(&f, true),
+            Err(AnnexBError::TooLarge {
+                width: 8000,
+                height: 8000
+            })
+        ));
+        // A smaller hidden size: 4096x4096 coded, cropped to 64x64, crops more than a macroblock.
+        let mut s = base();
+        s.profile = 66;
+        s.w_mbs = 256;
+        s.h_units = 256;
+        s.crop = Some((0, (4096 - 64) / 2, 0, (4096 - 64) / 2));
+        assert_eq!(
+            check_frame(&frame(&s), true),
+            Err(AnnexBError::CropTooLarge)
+        );
+        // Less than a macroblock of crop still passes (the honest 1080p crop is 8 rows).
+        let mut s = base();
+        s.crop = Some((0, 0, 0, 7));
+        assert_eq!(
+            check_frame(&frame(&s), true).unwrap().sps,
+            Some(SpsInfo {
+                width: 1920,
+                height: 1088 - 14
+            })
+        );
+    }
+
+    #[test]
+    fn t2_every_sps_counts_not_only_the_first() {
+        // The real 64x64 SPS first, then a second one with the same id announcing 8192x8192.
+        let mut f = vec![0, 0, 0, 1];
+        f.extend(hex("6742c00ada109b011000000300100000030028f1226a"));
+        f.extend([0, 0, 0, 1]);
+        f.extend(hex("6742c00ada0020000401b011000003000100000300028f1226a0"));
+        f.extend([0, 0, 0, 1, 0x68, 0xCE, 0x0F, 0xC8, 0, 0, 1, 0x65, 0x88]);
+        assert!(matches!(
+            check_frame(&f, true),
+            Err(AnnexBError::TooLarge { .. } | AnnexBError::SpsConflict)
+        ));
+        // Two legal SPS of different sizes in one frame conflict.
+        let mut a = base();
+        a.profile = 66;
+        a.crop = None;
+        a.w_mbs = 4;
+        a.h_units = 4;
+        let b = Sps {
+            w_mbs: 8,
+            h_units: 8,
+            ..a
+        };
+        let mut f = sps_nal(&a);
+        f.extend(sps_nal(&b));
+        f.extend([0, 0, 1, 0x65, 0x88]);
+        assert_eq!(check_frame(&f, true), Err(AnnexBError::SpsConflict));
+        // The same size twice is fine and counted.
+        let mut f = sps_nal(&a);
+        f.extend(sps_nal(&a));
+        f.extend([0, 0, 1, 0x65, 0x88]);
+        let c = check_frame(&f, true).unwrap();
+        assert_eq!(
+            (c.sps_count, c.sps),
+            (
+                2,
+                Some(SpsInfo {
+                    width: 64,
+                    height: 64
+                })
+            )
+        );
+        // An SPS after the old 64 KiB window is still read.
+        let mut f = vec![0, 0, 1, 0x41];
+        f.resize(70_000, 0xAA);
+        f.extend(sps_nal(&b));
+        assert_eq!(
+            check_frame(&f, false).unwrap().sps,
+            Some(SpsInfo {
+                width: 128,
+                height: 128
+            })
+        );
+        // A flood of SPS NAL units is refused.
+        let mut f = Vec::new();
+        for _ in 0..=MAX_SPS_PER_FRAME {
+            f.extend(sps_nal(&a));
+        }
+        assert_eq!(check_frame(&f, false), Err(AnnexBError::TooManySps));
+        // A payload that cannot be fully scanned is refused.
+        let mut f = vec![0, 0, 1, 0x41];
+        f.resize(SCAN_LIMIT + 1, 0xAA);
+        assert_eq!(check_frame(&f, false), Err(AnnexBError::TooLong));
+    }
+
+    #[test]
+    fn t3_an_idr_slice_outside_a_key_frame_is_refused_and_a_non_key_sps_is_reported() {
+        // SPS (1280x720) + IDR in a frame not flagged KEY: refused outright.
+        let mut s = base();
+        s.w_mbs = 80;
+        s.h_units = 45;
+        s.crop = None;
+        assert_eq!(
+            check_frame(&frame(&s), false),
+            Err(AnnexBError::IdrInNonKey)
+        );
+        // A non-key frame carrying only an SPS is parsed, and its size is returned so the caller
+        // can compare it with the format in force.
+        let f = sps_nal(&s);
+        assert_eq!(
+            check_frame(&f, false).unwrap().sps,
+            Some(SpsInfo {
+                width: 1280,
+                height: 720
+            })
+        );
+    }
+
+    #[test]
+    fn t4_only_the_profiles_x264_emits_are_accepted() {
+        // 144, 139, 134 and 135 made the old parser and FFmpeg disagree about the size.
+        for (p, sps) in [
+            (144, "67900028ac6c900c7006f320"),
+            (139, "678b0028b4f0074c037190"),
+            (134, "67860028aa1f00d3805772"),
+            (135, "67870028e43c028201edc8"),
+        ] {
+            assert_eq!(
+                check_frame(&with_sps(sps), true),
+                Err(AnnexBError::UnsupportedProfile(p)),
+                "profile {p}"
+            );
+        }
+        // Every profile number other than the four is refused; the four are parsed.
+        for p in 0..=255u8 {
+            let mut f = vec![0, 0, 0, 1, 0x67, p, 0, 40];
+            f.extend([0xAA; 12]);
+            let r = check_frame(&f, false);
+            if matches!(p, 66 | 77 | 88 | 100) {
+                assert!(!matches!(r, Err(AnnexBError::UnsupportedProfile(_))), "{p}");
+            } else {
+                assert_eq!(r, Err(AnnexBError::UnsupportedProfile(p)), "{p}");
+            }
+        }
     }
 
     #[test]
@@ -655,26 +889,6 @@ mod tests {
             check_frame(&[0, 0, 0, 1, 0x67, 0x64, 0x00], true),
             Err(AnnexBError::BadSps)
         );
-    }
-
-    #[test]
-    fn only_the_first_64_kib_are_scanned() {
-        // A bad NAL type after the window is not seen; inside the window it is.
-        let mut f = vec![0, 0, 1, 0x41];
-        f.resize(SCAN_LIMIT + 10, 0xAA);
-        f.extend([0, 0, 1, 0x1F, 1]);
-        assert!(check_frame(&f, false).is_ok());
-        let mut g = vec![0, 0, 1, 0x41];
-        g.resize(SCAN_LIMIT - 100, 0xAA);
-        g.extend([0, 0, 1, 0x1F, 1]);
-        g.resize(SCAN_LIMIT + 10, 0xAA);
-        assert_eq!(check_frame(&g, false), Err(AnnexBError::BadNalType(31)));
-        // A window that ends exactly after a start code is a cut view, not an empty NAL.
-        let mut h = vec![0, 0, 1, 0x41];
-        h.resize(SCAN_LIMIT - 3, 0xAA);
-        h.extend([0, 0, 1]);
-        h.extend([0xAA; 20]);
-        assert!(check_frame(&h, false).is_ok());
     }
 
     #[test]

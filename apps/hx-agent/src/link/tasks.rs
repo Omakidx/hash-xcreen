@@ -287,7 +287,11 @@ async fn format_for(
             ))
         };
         match (&found, key, sps) {
-            (Some(f), true, Some(d)) if (f.width, f.height) != d => {
+            (Some(f), _, Some(d)) if (f.width, f.height) != d => {
+                // An SPS in a frame that is not a key frame is never waited for.
+                if !key {
+                    return Err(mismatch(f, d));
+                }
                 // Possibly the announcement is still in flight on ctl.
                 if timeout(
                     deadline.saturating_duration_since(tokio::time::Instant::now()),
@@ -357,7 +361,7 @@ async fn on_video(sh: &Arc<Shared>, v: hx_ipc::link::frames::VideoFrame) -> Resu
         }
     }
     let fmt = format_for(sh, n, key, checked.sps.map(|s| (s.width, s.height))).await?;
-    if let (true, Some(sps)) = (key, checked.sps)
+    if let Some(sps) = checked.sps
         && (sps.width, sps.height) != (fmt.width, fmt.height)
     {
         return Err(violation(format!(

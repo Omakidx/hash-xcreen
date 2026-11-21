@@ -1464,3 +1464,49 @@ async fn a_key_frame_may_win_the_race_against_its_stream_format() {
     assert_eq!((second.format.width, second.format.height), (1280, 720));
     assert!(!link.is_closed());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sps_in_a_non_key_frame_is_compared_and_idr_outside_key_is_refused() {
+    // Review M1 (c): a frame not flagged KEY that carries an SPS of another size.
+    let mut other = sps_for(80, 45); // 1280 x 720
+    other.truncate(other.len() - 5); // without the IDR slice sps_for appends
+    let f = session(None, move |l| {
+        std::thread::sleep(Duration::from_millis(300));
+        l.ctl.write_all(&stream_format(1, 0)).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let mut w = video(0, 1 | 2, 1, &key_payload());
+        let mut p = other.clone();
+        p.extend([0, 0, 1, 0x41, 0x9A, 0x00]);
+        w.extend(video(1, 0, 1, &p));
+        l.media.write_all(&w).unwrap();
+    });
+    let (link, mut ev) = connect(&f).await;
+    link.start(1, start_config()).unwrap();
+    closed(
+        &mut ev,
+        FailureClass::Violation,
+        "stream_format says",
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // An IDR slice in a non-key frame (the reviewer's T3: SPS and IDR) is refused.
+    let idr = sps_for(80, 45);
+    let f = session(None, move |l| {
+        std::thread::sleep(Duration::from_millis(300));
+        l.ctl.write_all(&stream_format(1, 0)).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let mut w = video(0, 1 | 2, 1, &key_payload());
+        w.extend(video(1, 0, 1, &idr));
+        l.media.write_all(&w).unwrap();
+    });
+    let (link, mut ev) = connect(&f).await;
+    link.start(1, start_config()).unwrap();
+    closed(
+        &mut ev,
+        FailureClass::Violation,
+        "IDR slice",
+        Duration::from_secs(5),
+    )
+    .await;
+}
