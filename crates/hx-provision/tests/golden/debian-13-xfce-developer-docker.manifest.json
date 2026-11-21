@@ -79,7 +79,7 @@
       "path": "/etc/systemd/system/hx-session.service",
       "mode": "0644",
       "owner": "root:root",
-      "sha256": "ca3ddac5d4f56929aef87b4187f0c480af38b5a7445e28d115c4fde23a4fe97c"
+      "sha256": "ecf09de6a37de526457d36226cb6853b6f2c2890e89cd466488d51b95299c8d5"
     },
     {
       "path": "/etc/systemd/system/hx-session.service.d/zzzz-hx-hardening.conf",
@@ -109,7 +109,7 @@
       "path": "/etc/tmpfiles.d/hx-session.conf",
       "mode": "0644",
       "owner": "root:root",
-      "sha256": "0293eb4a9dadfe338a6eb91b802be6919cf0d0c8b081f3e39b912923d02fcdbc"
+      "sha256": "273346d3df42555169e3f8b957c3d1b6bc2f6afdace809c6401614d979fad93a"
     }
   ],
   "system_services": [

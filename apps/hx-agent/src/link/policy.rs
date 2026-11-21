@@ -1,5 +1,5 @@
 //! What the gateway does after a link ends or fails to start (`docs/ipc.md` sections 18 and
-//! 19.2): the reconnect policy, the 30 s keep after the last client, and [`DesktopLink`], which
+//! 19.2): the reconnect policy, the 30 s keep after the last client, and [`LinkKeeper`], which
 //! ties them to [`LinkClient::connect`].
 //!
 //! The policy is a pure state machine on an injected clock ([`ReconnectPolicy`]); the gateway
@@ -227,10 +227,10 @@ struct Inner {
 /// A link to one desktop, dialled on demand, kept 30 s after the last client and redialled
 /// under the [`ReconnectPolicy`].
 ///
-/// The gateway core calls [`attach`](DesktopLink::attach) when a client is authorized and
-/// [`detach`](DesktopLink::detach) when it leaves (after sending `stop`), and reports every
-/// [`LinkEvent::Closed`](super::LinkEvent::Closed) it sees to [`on_closed`](DesktopLink::on_closed).
-pub struct DesktopLink {
+/// The gateway core calls [`attach`](LinkKeeper::attach) when a client is authorized and
+/// [`detach`](LinkKeeper::detach) when it leaves (after sending `stop`), and reports every
+/// [`LinkEvent::Closed`](super::LinkEvent::Closed) it sees to [`on_closed`](LinkKeeper::on_closed).
+pub struct LinkKeeper {
     socket: PathBuf,
     cfg: LinkConfig,
     idle_keep: Duration,
@@ -238,7 +238,7 @@ pub struct DesktopLink {
     dial: tokio::sync::Mutex<()>,
 }
 
-/// A successful [`DesktopLink::attach`].
+/// A successful [`LinkKeeper::attach`].
 pub struct Attached {
     /// The command handle (a clone of the shared one).
     pub client: LinkClient,
@@ -247,7 +247,7 @@ pub struct Attached {
     pub events: Option<LinkEvents>,
 }
 
-/// Why [`DesktopLink::attach`] did not produce a link.
+/// Why [`LinkKeeper::attach`] did not produce a link.
 #[derive(Debug)]
 pub enum DialError {
     /// The policy says to wait; tell the client the desktop is starting.
@@ -261,7 +261,7 @@ pub enum DialError {
     },
 }
 
-impl DesktopLink {
+impl LinkKeeper {
     /// A link to the host socket `socket` with the default 30 s keep.
     pub fn new(socket: impl Into<PathBuf>, cfg: LinkConfig) -> Arc<Self> {
         Self::with_idle_keep(socket, cfg, IDLE_KEEP)
@@ -290,6 +290,14 @@ impl DesktopLink {
     /// The desktop state for status.
     pub fn state(&self) -> DesktopState {
         lock(&self.inner).policy.state()
+    }
+
+    /// True while a live link exists.
+    pub fn is_up(&self) -> bool {
+        lock(&self.inner)
+            .link
+            .as_ref()
+            .is_some_and(|l| !l.is_closed())
     }
 
     /// privd restarted the desktop or the session package changed: allow an immediate dial.
@@ -352,11 +360,18 @@ impl DesktopLink {
         }
     }
 
-    /// A client left. When none remain the link is closed after the keep time unless another
-    /// client attaches first. The core sends `stop` itself before calling this.
-    pub fn detach(self: &Arc<Self>) {
+    /// A client of `link` left. When none remain the link is closed after the keep time unless
+    /// another client attaches first. The core sends `stop` itself before calling this.
+    ///
+    /// A call for a link that is no longer the current one (it ended, or the keep timer closed
+    /// it and a newer one was dialled) changes nothing: a stale handle must never lower the
+    /// client count of the live link.
+    pub fn detach(self: &Arc<Self>, link: &LinkClient) {
         let generation = {
             let mut i = lock(&self.inner);
+            if !i.link.as_ref().is_some_and(|l| l.same_link(link)) {
+                return;
+            }
             i.clients = i.clients.saturating_sub(1);
             if i.clients > 0 {
                 return;
@@ -381,11 +396,15 @@ impl DesktopLink {
         });
     }
 
-    /// The core saw a link end: forget it and learn from the way it ended.
-    pub fn on_closed(&self, closed: &LinkClosed) -> Advice {
+    /// The core saw `link` end: forget it (if it is still the current one) and learn from the
+    /// way it ended. An owner's own close ([`FailureClass::Closed`], the keep timer) changes
+    /// nothing and needs no redial.
+    pub fn on_closed(&self, link: &LinkClient, closed: &LinkClosed) -> Advice {
         let mut i = lock(&self.inner);
-        i.link = None;
-        i.clients = 0;
+        if i.link.as_ref().is_some_and(|l| l.same_link(link)) {
+            i.link = None;
+            i.clients = 0;
+        }
         i.policy.on_failure(Instant::now(), closed.class)
     }
 }

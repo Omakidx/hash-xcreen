@@ -160,6 +160,12 @@ impl ReceivedStore {
         )))
     }
 
+    /// The directory's path (for the clipboard offer of received files; every write still goes
+    /// through the descriptor).
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     /// Announced bytes of transfers in flight (tests).
     #[cfg(test)]
     pub(crate) fn inflight(&self) -> u64 {
@@ -175,9 +181,11 @@ impl ReceivedFile {
         self.inflight.fetch_sub(self.reserved, Relaxed);
     }
 
-    /// The transfer completed: the file stays and counts as on-disk bytes from now on.
-    pub(crate) fn finish(self) {
+    /// The transfer completed: the file stays and counts as on-disk bytes from now on. Returns
+    /// the name it was given in the directory.
+    pub(crate) fn finish(self) -> String {
         self.inflight.fetch_sub(self.reserved, Relaxed);
+        self.name
     }
 }
 
