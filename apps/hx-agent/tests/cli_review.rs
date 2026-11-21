@@ -396,3 +396,43 @@ async fn l5_json_output_is_bounded_by_lines() {
     assert_eq!(r.code, 0, "{r:?}");
     assert!(r.json()["data"]["journal"].as_array().unwrap().len() <= 20_000);
 }
+
+// ----------------------------------------------------------------------------------------- N5
+
+#[tokio::test]
+async fn n5_a_rotation_does_not_lose_what_was_appended_to_the_old_file() {
+    let dir = private_tempdir();
+    let mut cfg = unreachable_config(dir.path());
+    // journalctl exists only to keep --follow alive for a while, then ends it.
+    cfg.journalctl = write_script(dir.path(), "journalctl", "sleep 2\n");
+    write_audit(&cfg.audit_log, "before-1\n");
+    let audit = cfg.audit_log.clone();
+    let rotator = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        use std::io::Write;
+        // Appended to the old file, then (at once) rotated away and replaced.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&audit)
+            .unwrap();
+        f.write_all(b"old-tail-2\nunterminated-3").unwrap();
+        drop(f);
+        let rotated = audit.with_extension("log.1");
+        std::fs::rename(&audit, &rotated).unwrap();
+        write_audit(&audit, "new-1\nnew-2\n");
+    });
+    let r = cli(&cfg, &["logs", "--follow", "-n", "5"], &[], &[]).await;
+    rotator.await.unwrap();
+    assert_eq!(r.code, 0, "{r:?}");
+    let lines: Vec<&str> = r.stdout.lines().collect();
+    let pos = |needle: &str| {
+        lines
+            .iter()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} missing from {}", r.stdout))
+    };
+    assert!(pos("before-1") < pos("old-tail-2"));
+    assert!(pos("old-tail-2") < pos("unterminated-3"));
+    assert!(pos("unterminated-3") < pos("new-1"));
+    assert!(pos("new-1") < pos("new-2"));
+}

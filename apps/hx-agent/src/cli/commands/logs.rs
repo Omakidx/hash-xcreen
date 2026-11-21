@@ -535,7 +535,8 @@ struct AuditFollow {
 }
 
 /// Emits lines appended to the audit log since the last poll, following a rotation. The file is
-/// always (re)opened relative to the directory descriptor held since the start.
+/// always (re)opened relative to the directory descriptor held since the start. On a rotation
+/// the old file is read to its end first, so what was appended just before the rename is not lost.
 fn poll_audit(env: &mut Env<'_>, st: &mut AuditFollow) -> Result<bool, CliError> {
     if st.dir.is_none() {
         // The directory did not exist when following began.
@@ -546,7 +547,21 @@ fn poll_audit(env: &mut Env<'_>, st: &mut AuditFollow) -> Result<bool, CliError>
     };
     // Look at the name (not the open file): a rotation replaces the file under the same name.
     if dir.ident() != st.ident {
-        st.file = dir.open()?;
+        let next = dir.open()?;
+        if st.file.is_some() {
+            if !drain(env, st)? {
+                return Ok(false);
+            }
+            // A last line without its newline is complete now: the file will not grow.
+            let rest = std::mem::take(&mut st.partial);
+            if !rest.is_empty() {
+                let text = peer(&String::from_utf8_lossy(&rest), MAX_LINE);
+                if !emit(env, "audit", &text) {
+                    return Ok(false);
+                }
+            }
+        }
+        st.file = next;
         st.offset = 0;
         st.partial.clear();
         st.ident = st
@@ -555,38 +570,42 @@ fn poll_audit(env: &mut Env<'_>, st: &mut AuditFollow) -> Result<bool, CliError>
             .and_then(|f| f.metadata().ok())
             .map(|m| (m.dev(), m.ino()));
     }
+    drain(env, st)
+}
+
+/// Reads the open audit file from the remembered offset to its end and emits the complete
+/// lines. False when the reader of our output is gone.
+fn drain(env: &mut Env<'_>, st: &mut AuditFollow) -> Result<bool, CliError> {
     let Some(f) = st.file.as_mut() else {
         return Ok(true);
     };
-    let len = f
-        .metadata()
-        .map_err(|e| CliError::Failed(format!("audit log: {}", e.kind())))?
-        .len();
+    let io = |e: std::io::Error| CliError::Failed(format!("audit log: {}", e.kind()));
+    let len = f.metadata().map_err(io)?.len();
     if len < st.offset {
         // Truncated in place.
         st.offset = 0;
         st.partial.clear();
     }
-    if len == st.offset {
-        return Ok(true);
-    }
-    let io = |e: std::io::Error| CliError::Failed(format!("audit log: {}", e.kind()));
-    f.seek(SeekFrom::Start(st.offset)).map_err(io)?;
-    let mut data = Vec::new();
-    f.take(TAIL_WINDOW).read_to_end(&mut data).map_err(io)?;
-    st.offset += data.len() as u64;
-    st.partial.extend_from_slice(&data);
-    while let Some(i) = st.partial.iter().position(|b| *b == b'\n') {
-        let rest = st.partial.split_off(i + 1);
-        let line = std::mem::replace(&mut st.partial, rest);
-        let text = peer(&String::from_utf8_lossy(&line[..line.len() - 1]), MAX_LINE);
-        if !emit(env, "audit", &text) {
-            return Ok(false);
+    loop {
+        f.seek(SeekFrom::Start(st.offset)).map_err(io)?;
+        let mut data = Vec::new();
+        f.take(TAIL_WINDOW).read_to_end(&mut data).map_err(io)?;
+        if data.is_empty() {
+            return Ok(true);
         }
+        st.offset += data.len() as u64;
+        st.partial.extend_from_slice(&data);
+        while let Some(i) = st.partial.iter().position(|b| *b == b'\n') {
+            let rest = st.partial.split_off(i + 1);
+            let line = std::mem::replace(&mut st.partial, rest);
+            let text = peer(&String::from_utf8_lossy(&line[..line.len() - 1]), MAX_LINE);
+            if !emit(env, "audit", &text) {
+                return Ok(false);
+            }
+        }
+        // A partial line that grows without a newline is cut, not accumulated.
+        st.partial.truncate(MAX_LINE);
     }
-    // A partial line that grows without a newline is cut, not accumulated.
-    st.partial.truncate(MAX_LINE);
-    Ok(true)
 }
 
 #[cfg(test)]
