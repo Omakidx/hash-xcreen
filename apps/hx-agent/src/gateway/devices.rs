@@ -172,14 +172,11 @@ impl DeviceService {
         let weak = std::sync::Arc::downgrade(&svc);
         let mut rx = auth.subscribe_revocations();
         tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let Some(svc) = weak.upgrade() else { break };
-                        svc.sweep_lockouts().await;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
+            // A closed channel ends the task; anything else (a revocation, or a lag) means
+            // "scan again".
+            while !matches!(rx.recv().await, Err(broadcast::error::RecvError::Closed)) {
+                let Some(svc) = weak.upgrade() else { break };
+                svc.sweep_lockouts().await;
             }
         });
         svc
