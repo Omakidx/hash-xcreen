@@ -179,19 +179,16 @@ async fn closed(ev: &mut LinkEvents, class: FailureClass, fragment: &str, within
     let end = Instant::now() + within;
     loop {
         let left = end.saturating_duration_since(Instant::now());
-        match timeout(left, ev.next()).await.expect("the link must end") {
-            LinkEvent::Closed(c) => {
-                assert_eq!(c.class, class, "{c:?}");
-                assert!(
-                    c.detail.contains(fragment),
-                    "reason {:?} should mention {fragment:?}",
-                    c.detail
-                );
-                // The reason is sanitised text: no control characters.
-                assert!(!c.detail.chars().any(char::is_control));
-                return;
-            }
-            _ => {}
+        if let LinkEvent::Closed(c) = timeout(left, ev.next()).await.expect("the link must end") {
+            assert_eq!(c.class, class, "{c:?}");
+            assert!(
+                c.detail.contains(fragment),
+                "reason {:?} should mention {fragment:?}",
+                c.detail
+            );
+            // The reason is sanitised text: no control characters.
+            assert!(!c.detail.chars().any(char::is_control));
+            return;
         }
     }
 }
@@ -732,7 +729,7 @@ fn sps_for(width_mbs: u32, height_units: u32) -> Vec<u8> {
     put(&mut bits, 0, 1); // no crop
     put(&mut bits, 0, 1); // no vui
     bits.push(1);
-    while bits.len() % 8 != 0 {
+    while !bits.len().is_multiple_of(8) {
         bits.push(0);
     }
     let mut out = vec![0, 0, 0, 1, 0x67];
@@ -867,7 +864,8 @@ async fn audio_a_codec_not_negotiated_and_a_missing_stream_format_are_violations
         l.media.write_all(&video(0, 0, 1, &p_payload(10))).unwrap();
     });
     let (link, mut ev) = connect(&f).await;
-    link.start(1, start_config()).unwrap();
+    // The fake writes at once, so the link may already be closed when this runs: both fine.
+    let _ = link.start(1, start_config());
     closed(
         &mut ev,
         FailureClass::Violation,

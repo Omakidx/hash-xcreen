@@ -22,6 +22,7 @@ use hx_proto::datagram::MouseMove;
 use hx_proto::pb::{ButtonEvent, KeyEvent, TransferHeader, input_event::Event};
 use hx_session::clipboard::ClipboardSettings;
 use hx_session::link::{Server, ServerHandle, SessionConfig};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
@@ -635,6 +636,21 @@ async fn input_reaches_the_display_and_link_loss_releases_everything() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     };
     assert_eq!(at, (149, 80));
+    // The cursor channel reports the new position (coalesced: the latest one wins).
+    let mut position = None;
+    let end = Instant::now() + Duration::from_secs(5);
+    while position.is_none() && Instant::now() < end {
+        if let Ok(LinkEvent::Cursor(CursorUpdate::Position(p))) =
+            timeout(Duration::from_millis(100), ev.next()).await
+            && (p.x, p.y) == (149, 80)
+        {
+            position = Some(p);
+        }
+    }
+    assert!(
+        position.is_some(),
+        "a cursor position event for the pointer"
+    );
 
     // Hold a modifier, then the link goes away: every held key is released.
     link.input(key(0xE0, true)).unwrap();
@@ -645,7 +661,13 @@ async fn input_reaches_the_display_and_link_loss_releases_everything() {
         vec![("kr", 37)],
         "release_all on link loss"
     );
-    assert!(matches!(ev.next().await, LinkEvent::Closed(c) if c.class == FailureClass::Closed));
+    // Events still queued (a stream format, a cursor shape) come out before the final one.
+    loop {
+        if let LinkEvent::Closed(c) = ev.next().await {
+            assert_eq!(c.class, FailureClass::Closed);
+            break;
+        }
+    }
 }
 
 /// A local application standing in for any X client that owns or reads the clipboard.
@@ -1100,11 +1122,7 @@ async fn a_restarted_session_serves_the_same_socket() {
     // A connection made while no daemon runs queues in the kernel; the new daemon serves it.
     let pending = tokio::spawn({
         let sock = sock.clone();
-        async move {
-            LinkClient::connect(&sock, LinkConfig::default())
-                .await
-                .map(|(c, e)| (c, e))
-        }
+        async move { LinkClient::connect(&sock, LinkConfig::default()).await }
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
     let s2 = mk(listener);
@@ -1118,4 +1136,113 @@ async fn a_restarted_session_serves_the_same_socket() {
     drop((link, ev));
     s2.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+struct Offered(HashMap<&'static str, Vec<u8>>);
+
+impl RemoteProvider for Offered {
+    fn fetch(&self, mime: &str, _max: u64) -> Option<Vec<u8>> {
+        self.0.get(mime).cloned()
+    }
+}
+
+/// Reads one incoming transfer to its end: (header, body).
+async fn one_transfer(
+    link: &LinkClient,
+    ev: &mut LinkEvents,
+) -> (TransferHeader, pb::TransferChannel, Vec<u8>) {
+    let mut open = None;
+    let mut body = Vec::new();
+    until(link, ev, Duration::from_secs(10), true, |e| {
+        match e {
+            LinkEvent::Transfer(TransferEvent::Open {
+                header, channel, ..
+            }) => open = Some((header.clone(), *channel)),
+            LinkEvent::Transfer(TransferEvent::Data(c)) => body.extend_from_slice(&c.data),
+            LinkEvent::Transfer(TransferEvent::End { .. }) => return true,
+            _ => {}
+        }
+        false
+    })
+    .await;
+    let (h, c) = open.expect("an open before the end");
+    (h, c, body)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn clipboard_images_and_copied_files_travel_to_the_gateway_and_images_back() {
+    let Some(env) = Env::start(|_| {}) else {
+        return;
+    };
+    let (link, mut ev) = env.connect().await;
+    link.start(1, stream_config()).unwrap();
+    let app = app(&env.x);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // A PNG from the gateway becomes the local image selection.
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png.extend((0..200_000u32).map(|i| (i * 31 % 251) as u8));
+    let mut s = link
+        .begin_transfer(
+            pb::TransferChannel::Clipboard,
+            TransferHeader {
+                mime: "image/png".into(),
+                name: String::new(),
+                size: png.len() as u64,
+            },
+        )
+        .await
+        .unwrap();
+    s.write(Bytes::from(png.clone())).await.unwrap();
+    s.finish().await.unwrap();
+    let rx = app.events().clone();
+    let end = Instant::now() + Duration::from_secs(5);
+    let mut offered = false;
+    while !offered && Instant::now() < end {
+        if let Ok(ClipboardEvent::LocalOffer { formats, .. }) =
+            rx.recv_timeout(Duration::from_millis(200))
+        {
+            offered = formats.iter().any(|f| f == "image/png");
+        }
+    }
+    assert!(offered);
+    assert_eq!(
+        app.fetch_local(Selection::Clipboard, "image/png").unwrap(),
+        png
+    );
+
+    // A PNG copied in the desktop reaches the gateway as an image/png clipboard transfer.
+    let mut local = b"\x89PNG\r\n\x1a\n".to_vec();
+    local.extend((0..70_000u32).map(|i| (i * 13 % 247) as u8));
+    app.offer_remote(
+        Selection::Clipboard,
+        vec!["image/png".to_owned()],
+        Arc::new(Offered(HashMap::from([("image/png", local.clone())]))),
+    )
+    .unwrap();
+    let (h, c, body) = one_transfer(&link, &mut ev).await;
+    assert_eq!(
+        (h.mime.as_str(), c),
+        ("image/png", pb::TransferChannel::Clipboard)
+    );
+    assert_eq!(body, local);
+
+    // Files copied in the desktop (a text/uri-list) are pushed as file transfers.
+    let file = env.dir.join("copied.bin");
+    let content: Vec<u8> = (0..5_000u32).map(|i| (i % 249) as u8).collect();
+    std::fs::write(&file, &content).unwrap();
+    let uri = format!("file://{}\r\n", file.display());
+    app.offer_remote(
+        Selection::Clipboard,
+        vec!["text/uri-list".to_owned()],
+        Arc::new(Offered(HashMap::from([(
+            "text/uri-list",
+            uri.into_bytes(),
+        )]))),
+    )
+    .unwrap();
+    let (h, c, body) = one_transfer(&link, &mut ev).await;
+    assert_eq!(c, pb::TransferChannel::File);
+    assert_eq!((h.name.as_str(), h.size), ("copied.bin", 5_000));
+    assert_eq!(body, content);
 }
