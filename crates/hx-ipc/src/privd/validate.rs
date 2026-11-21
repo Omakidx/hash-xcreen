@@ -202,16 +202,32 @@ fn validate_arguments(cmd: &Command) -> Check {
     }
 }
 
+/// An absolute path under `/dev/` with no empty, `.` or `..` component, no trailing slash and
+/// no NUL (privd still opens it with the checks of section 6.4; this keeps traversal text out).
+pub fn is_normalized_dev_path(p: &str) -> bool {
+    let Some(rest) = p.strip_prefix("/dev/") else {
+        return false;
+    };
+    p.len() <= 255
+        && !p.bytes().any(|b| b == 0)
+        && !rest.is_empty()
+        && rest
+            .split('/')
+            .all(|c| !c.is_empty() && c != "." && c != "..")
+}
+
+/// RFC 1918 space, the private ranges section 6.4 requires for `ipv4`.
+fn is_private_v4(a: Ipv4Addr) -> bool {
+    a.is_private()
+}
+
 fn validate_setup_host(r: &pb::SetupHostRequest) -> Check {
     require(
         r.pool_size_gib == 0 || (12..=200).contains(&r.pool_size_gib),
         "setup_host.pool_size_gib",
     )?;
     if let Some(dev) = &r.pool_device {
-        require(
-            dev.starts_with("/dev/") && dev.len() <= 255 && !dev.bytes().any(|b| b == 0),
-            "setup_host.pool_device",
-        )?;
+        require(is_normalized_dev_path(dev), "setup_host.pool_device")?;
     }
     if let Some(list) = &r.extra_host_addresses {
         require(
@@ -223,7 +239,7 @@ fn validate_setup_host(r: &pb::SetupHostRequest) -> Check {
     if let Some(v4) = &r.ipv4 {
         let ok = v4 == "auto"
             || v4.split_once('/').is_some_and(|(a, n)| {
-                a.parse::<Ipv4Addr>().is_ok()
+                a.parse::<Ipv4Addr>().is_ok_and(is_private_v4)
                     && n.len() <= 2
                     && n.parse::<u8>().is_ok_and(|n| (16..=29).contains(&n))
             });

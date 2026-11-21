@@ -979,6 +979,63 @@ fn request_validation_rules() {
         pool_device: Some("/etc/passwd".into()),
         ..Default::default()
     })));
+    for dev in [
+        "/dev/../etc/passwd",
+        "/dev/sdb/../sda",
+        "/dev/./sdb",
+        "/dev//sdb",
+        "/dev/sdb/",
+        "/dev/",
+        "dev/sdb",
+    ] {
+        assert!(
+            !ok(Command::SetupHost(pb::SetupHostRequest {
+                pool_device: Some(dev.into()),
+                ..Default::default()
+            })),
+            "{dev}"
+        );
+    }
+    for dev in ["/dev/sdb", "/dev/disk/by-id/nvme-x_1"] {
+        assert!(
+            ok(Command::SetupHost(pb::SetupHostRequest {
+                pool_device: Some(dev.into()),
+                ..Default::default()
+            })),
+            "{dev}"
+        );
+    }
+    for v4 in [
+        "8.8.8.0/24",
+        "100.64.0.0/24",
+        "172.32.0.0/24",
+        "11.0.0.1/24",
+        "169.254.0.1/24",
+        "192.169.0.1/24",
+    ] {
+        assert!(
+            !ok(Command::SetupHost(pb::SetupHostRequest {
+                ipv4: Some(v4.into()),
+                ..Default::default()
+            })),
+            "{v4}"
+        );
+    }
+    for v4 in [
+        "10.0.0.1/16",
+        "172.16.5.1/29",
+        "172.31.0.1/24",
+        "192.168.1.1/24",
+        "auto",
+    ] {
+        assert!(
+            ok(Command::SetupHost(pb::SetupHostRequest {
+                ipv4: Some(v4.into()),
+                ..Default::default()
+            })),
+            "{v4}"
+        );
+    }
     assert!(!ok(Command::SetupHost(pb::SetupHostRequest {
         extra_host_addresses: Some(pb::ExtraHostAddresses {
             addresses: vec!["not an ip".into()]
