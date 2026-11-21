@@ -202,27 +202,26 @@ SystemCallArchitectures=native
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
-ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
-ProtectControlGroups=yes
 UMask=0077
 '''
 
 # Incus writes /run/systemd/system/service.d/zzz-lxc-service.conf into every container at boot. It
 # forces NoNewPrivileges=no, ProtectKernelTunables=no, ProtectControlGroups=no and a few other
 # sandbox options off for *all* services, and it sorts after a unit's own settings, so without
-# this drop-in those three lines of hx-session.service have no effect (found with the real
+# this drop-in the NoNewPrivileges=yes of hx-session.service has no effect (found with the real
 # container test: the process ran with NoNewPrivs 0). Drop-ins are applied in file-name order
-# across directories, so a name that sorts after "zzz-lxc-service.conf" wins. Verified to work
-# and to leave the service startable in an unprivileged, isolated-idmap Incus 6.0.0 container.
+# across directories, so a name that sorts after "zzz-lxc-service.conf" wins.
+# Only NoNewPrivileges is turned back on. ProtectKernelTunables and ProtectControlGroups work on
+# Ubuntu 24.04 (systemd 255) but make the service fail with 226/NAMESPACE ("Failed to set up mount
+# namespacing: /run/systemd/unit-root/proc: Permission denied") on Debian 12 (systemd 252) in an
+# unprivileged container, which is why Incus switches them off; they are not used.
 [[file]]
 path = "/etc/systemd/system/hx-session.service.d/zzzz-hx-hardening.conf"
 content = '''
 [Service]
 NoNewPrivileges=yes
-ProtectKernelTunables=yes
-ProtectControlGroups=yes
 '''
 
 # Virtual output so PipeWire has a sink to capture even without sound hardware.

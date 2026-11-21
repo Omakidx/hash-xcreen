@@ -340,6 +340,9 @@ async fn real_session_units_in_an_unprivileged_container() {
             if outcome.is_err() {
                 failed.push(r.clone());
             }
+            if outcome.is_err() && std::env::var("HX3B_KEEP").as_deref() == Ok("1") {
+                break;
+            }
             // Next recipe starts from a fresh container (host objects stay).
             let _ = destroy_desktop(&c2, INSTANCE).await;
         }
@@ -690,7 +693,7 @@ async fn run_one(c: &Client<UnixTransport>, recipe: &str, full: bool) {
     evidence!("unit files and drop-ins", "{dropins}");
     let (_, show, _) = sh(
         c,
-        "systemctl show hx-session.service -p ActiveState -p SubState -p User -p MainPID -p KillMode -p Restart -p RestartUSec -p NoNewPrivileges -p CapabilityBoundingSet -p RestrictAddressFamilies -p ProtectSystem -p ProtectHome -p ProtectKernelTunables -p ProtectControlGroups -p ReadWritePaths -p LockPersonality -p SystemCallFilter -p TasksMax -p MemoryMax -p PrivateNetwork -p PrivateTmp -p StartLimitIntervalUSec -p StartLimitBurst -p FragmentPath | cut -c1-150",
+        "systemctl show hx-session.service -p ActiveState -p SubState -p User -p MainPID -p KillMode -p Restart -p RestartUSec -p NoNewPrivileges -p CapabilityBoundingSet -p RestrictAddressFamilies -p ProtectSystem -p ProtectHome -p ReadWritePaths -p LockPersonality -p SystemCallFilter -p TasksMax -p MemoryMax -p PrivateNetwork -p PrivateTmp -p StartLimitIntervalUSec -p StartLimitBurst -p FragmentPath | cut -c1-150",
     )
     .await;
     evidence!("systemctl show hx-session.service", "{show}");
@@ -702,8 +705,6 @@ async fn run_one(c: &Client<UnixTransport>, recipe: &str, full: bool) {
         "ProtectSystem=strict",
         "ProtectHome=read-only",
         "ReadWritePaths=/var/lib/hx-session/received",
-        "ProtectKernelTunables=yes",
-        "ProtectControlGroups=yes",
         "LockPersonality=yes",
         "PrivateNetwork=no",
         "PrivateTmp=no",

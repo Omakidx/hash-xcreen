@@ -202,13 +202,11 @@ fn the_service_unit_is_as_specified() {
         // all services; ours sorts after it and turns them back on.
         let (dropin, _) = &f["/etc/systemd/system/hx-session.service.d/zzzz-hx-hardening.conf"];
         let d = unit(dropin);
-        for k in [
-            "NoNewPrivileges",
-            "ProtectKernelTunables",
-            "ProtectControlGroups",
-        ] {
-            assert_eq!(get(&d, "Service", k), ["yes"], "{k}");
-            assert_eq!(get(&u, "Service", k), ["yes"], "{k} in the unit too");
+        assert_eq!(get(&d, "Service", "NoNewPrivileges"), ["yes"]);
+        assert_eq!(get(&u, "Service", "NoNewPrivileges"), ["yes"]);
+        // These two fail with 226/NAMESPACE on Debian 12 in an unprivileged container.
+        for k in ["ProtectKernelTunables", "ProtectControlGroups"] {
+            assert!(!has_key(&u, k) && !has_key(&d, k), "{k} must not be used");
         }
         assert!(
             "zzzz-hx-hardening.conf" > "zzz-lxc-service.conf",

@@ -79,13 +79,13 @@
       "path": "/etc/systemd/system/hx-session.service",
       "mode": "0644",
       "owner": "root:root",
-      "sha256": "786917b7797f200c20680ccb92d4c261c9e3a954e1aa15681cc6cdbcf23f0736"
+      "sha256": "ca3ddac5d4f56929aef87b4187f0c480af38b5a7445e28d115c4fde23a4fe97c"
     },
     {
       "path": "/etc/systemd/system/hx-session.service.d/zzzz-hx-hardening.conf",
       "mode": "0644",
       "owner": "root:root",
-      "sha256": "7461012ce3120d6e51a55eb5d2d83e865aa3ddd1f09a14dd1b86acb4b4e7591f"
+      "sha256": "b0d55083c0e6f97514a6d811e8324d31258a821c774095ba3c7f1df881a4bc6a"
     },
     {
       "path": "/etc/systemd/system/hx-session.socket",
