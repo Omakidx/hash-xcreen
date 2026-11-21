@@ -90,7 +90,7 @@ fn read_small(dir: &Path, name: &str, max: u64) -> Result<Vec<u8>> {
 }
 
 /// Checks the bootstrap directory itself: not a link, a directory, ours, mode 0700.
-fn check_dir(dir: &Path) -> Result<()> {
+pub(crate) fn check_dir(dir: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let m = std::fs::symlink_metadata(dir)
         .map_err(|_| InstallError::verify("the bootstrap directory does not exist"))?;

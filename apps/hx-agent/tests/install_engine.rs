@@ -222,6 +222,8 @@ fn resume_after_a_failure_at_every_stage() {
         }
         // Run the same command again: it resumes and finishes.
         m.runner.calls.clear();
+        // The bootstrap directory was removed on exit; install.sh makes a new one each run.
+        let dir = release(&mut m, &Tamper::default());
         let code = m.install(ssh_args(&dir, &[], &[]), Some(frames(None, None)));
         assert_eq!(code, 0, "{id}: {}", String::from_utf8_lossy(&m.err));
         assert!(m.state().unwrap().complete, "{id}");
@@ -280,6 +282,8 @@ fn a_real_failure_is_recorded_and_resumed() {
     assert_eq!(st.stages["packages"].error.as_ref().unwrap().code, "TOOL");
     assert!(!st.complete);
     assert!(String::from_utf8_lossy(&m.err).contains("stage 'packages' failed"));
+    // The bootstrap directory is removed on every exit; install.sh makes a new one each run.
+    let dir = release(&mut m, &Tamper::default());
     assert_eq!(
         m.install(ssh_args(&dir, &[], &[]), Some(frames(None, None))),
         0
@@ -685,6 +689,10 @@ fn preflight_fails(setup: impl FnOnce(&mut Machine), needle: &str) {
         r["message"]
     );
     assert!(m.state().is_none(), "preflight records nothing");
+    assert!(
+        !path(&m, "/run/hx-bootstrap.test").exists(),
+        "the bootstrap directory is removed"
+    );
     assert_eq!(
         m.runner.mutating(),
         Vec::<String>::new(),
@@ -1027,8 +1035,8 @@ fn release_fails(t: Tamper, needle: &str) {
         "no partial release is left: {versions:?}"
     );
     assert!(
-        dir.exists(),
-        "the bootstrap directory stays for the next try"
+        !dir.exists(),
+        "the bootstrap directory is removed on every exit"
     );
     assert_eq!(m.state().unwrap().stages["release"].state, "failed");
     assert_eq!(m.daemons.count("begin_setup"), 0);
@@ -1305,6 +1313,7 @@ fn the_lock_gives_exit_11() {
     assert!(m.state().is_none());
     assert!(m.runner.calls.is_empty());
     drop(held);
+    let dir = release(&mut m, &Tamper::default());
     assert_eq!(full_install(&mut m, &dir), 0);
 }
 
@@ -1938,5 +1947,71 @@ fn loopback_link_local_and_multicast_resolvers_are_never_allowed_and_the_install
         m2.json_lines()
             .iter()
             .any(|v| v["t"] == "warn" && v["id"] == "config")
+    );
+}
+
+#[test]
+fn a_bootstrap_directory_outside_run_or_with_dotdot_is_refused_and_nothing_is_deleted() {
+    // L2: the installer deletes its bootstrap directory, so it must not be talked into deleting
+    // another one.
+    let (mut m, dir) = fresh();
+    let victim = path(&m, "/victim");
+    std::fs::create_dir_all(&victim).unwrap();
+    std::fs::write(victim.join("precious"), b"x").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let elsewhere = m.dir.path().join("etc-hx-bootstrap.x");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for bad in [
+        path(&m, "/run/../victim"),
+        path(&m, "/run/hx-bootstrap.x/../../victim"),
+        path(&m, "/run/victim"),
+        path(&m, "/run/hx-bootstrap."),
+        path(&m, "/run/sub/hx-bootstrap.x"),
+        elsewhere.clone(),
+        path(&m, "/victim"),
+    ] {
+        let mut a = ssh_args(&dir, &[], &[]);
+        a.bootstrap_dir = Some(bad.to_string_lossy().into_owned());
+        assert_eq!(
+            m.install(a, Some(frames(None, None))),
+            10,
+            "{}",
+            bad.display()
+        );
+        assert!(
+            m.result()["message"]
+                .as_str()
+                .unwrap()
+                .contains("bootstrap directory")
+        );
+        assert!(
+            victim.join("precious").exists(),
+            "{} deleted the victim",
+            bad.display()
+        );
+        assert!(elsewhere.exists());
+        assert!(m.runner.mutating().is_empty());
+    }
+    assert!(
+        dir.exists(),
+        "the real bootstrap directory was not part of those runs"
+    );
+}
+
+#[test]
+fn the_bootstrap_directory_is_removed_when_the_lock_is_held_or_a_stage_fails() {
+    let (mut m, dir) = fresh();
+    let held = hx_agent::install::lock::acquire(&path(&m, paths::LOCK_FILE), None).unwrap();
+    assert_eq!(full_install(&mut m, &dir), 11);
+    assert!(!dir.exists());
+    drop(held);
+    let (mut m2, dir2) = fresh();
+    m2.runner.fail_on(Tool::AptGet, "install", 100, None);
+    assert_eq!(full_install(&mut m2, &dir2), 1);
+    assert!(
+        !dir2.exists(),
+        "removed although the install failed after the release"
     );
 }

@@ -159,6 +159,48 @@ fn needs_secrets(prior: Option<&InstallState>) -> bool {
     prior.is_none_or(|s| !(s.finished("desktop") && s.finished("verifiers")))
 }
 
+/// The only directories the installer will delete as a bootstrap directory: `/run/hx-bootstrap.*`
+/// directly below `/run` (below the root of the host in tests), with no `..` in the path.
+fn validate_bootstrap(paths: &Paths, dir: &Path) -> Result<(), InstallError> {
+    let bad = |why: &str| {
+        InstallError::verify(format!("the bootstrap directory is not acceptable: {why}"))
+    };
+    if dir.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    }) {
+        return Err(bad("it has a `.` or `..` component"));
+    }
+    let run = paths.at("/run");
+    if dir.parent() != Some(run.as_path()) {
+        return Err(bad("it must be directly below /run"));
+    }
+    let prefix = paths::BOOTSTRAP_PREFIX.trim_start_matches("/run/");
+    match dir.file_name().and_then(|n| n.to_str()) {
+        Some(n) if n.starts_with(prefix) && n.len() > prefix.len() => Ok(()),
+        _ => Err(bad("its name must start with hx-bootstrap.")),
+    }
+}
+
+/// Removes the bootstrap directory when the run ends, however it ends (a failed preflight, a
+/// failed stage, success). It removes only a real directory that is ours.
+struct BootstrapGuard(std::path::PathBuf);
+
+impl Drop for BootstrapGuard {
+    fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+        // A real directory (never a link) owned by this user: whatever its mode, it is ours.
+        let ours = std::fs::symlink_metadata(&self.0).is_ok_and(|m| {
+            m.file_type().is_dir() && m.uid() == rustix::process::geteuid().as_raw()
+        });
+        if ours {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
 /// Runs `hx-agent install`. Returns the process exit code; everything is reported through
 /// `deps.out` and `deps.err`.
 pub fn run(args: InstallArgs, deps: Deps<'_>) -> u8 {
@@ -187,6 +229,14 @@ pub fn run(args: InstallArgs, deps: Deps<'_>) -> u8 {
     if euid != 0 {
         return early(&mut progress, &InstallError::not_root());
     }
+    // The bootstrap directory is checked before anything else and removed on every exit.
+    let _bootstrap = match args.bootstrap_dir.as_deref().map(Path::new) {
+        Some(d) => match validate_bootstrap(&paths, d) {
+            Ok(()) => Some(BootstrapGuard(d.to_path_buf())),
+            Err(e) => return early(&mut progress, &e),
+        },
+        None => None,
+    };
     let _lock = match lock::acquire(&paths.at(paths::LOCK_FILE), args.lock_fd) {
         Ok(l) => l,
         Err(e) => return early(&mut progress, &e),
