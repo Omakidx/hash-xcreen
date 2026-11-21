@@ -9,8 +9,9 @@ use prost::Message;
 
 use crate::{
     channel::{
-        MAX_CLIPBOARD_SIZE, MAX_CONTROL_MESSAGE, MAX_CURSOR_EDGE, MAX_CURSOR_MESSAGE,
-        MAX_INPUT_MESSAGE, MAX_OPAQUE, MAX_TRANSFER_HEADER,
+        DEVICE_ID_LEN, MAX_CLIPBOARD_SIZE, MAX_CONTROL_MESSAGE, MAX_CURSOR_EDGE,
+        MAX_CURSOR_MESSAGE, MAX_DEVICE_NAME, MAX_FILE_SIZE, MAX_INPUT_MESSAGE, MAX_OPAQUE,
+        MAX_STATS_INTERVAL_MS, MAX_TRANSFER_HEADER,
     },
     error::ProtoError,
     pb::{
@@ -134,6 +135,9 @@ fn check_codec(field: &'static str, v: i32, allow_unspecified: bool) -> Result<(
 }
 
 fn check_caps(c: &pb::Capabilities) -> Result<(), ProtoError> {
+    if c.max_file_bytes > MAX_FILE_SIZE {
+        return Err(invalid("capabilities.max_file_bytes", "above 4 GiB"));
+    }
     if c.video_codecs.len() > 16 {
         return Err(invalid("capabilities.video_codecs", "too many codecs"));
     }
@@ -230,7 +234,30 @@ impl Wire for ControlMessage {
                 }
             }
             Ctl::RequestKeyframe(_) | Ctl::Ping(_) | Ctl::Pong(_) | Ctl::Stats(_) => {}
-            Ctl::Goodbye(g) => check_str("goodbye.message", &g.message, 256)?,
+            Ctl::Goodbye(g) => {
+                check_str("goodbye.message", &g.message, 256)?;
+                check_str(
+                    "goodbye.peer_device_name",
+                    &g.peer_device_name,
+                    MAX_DEVICE_NAME,
+                )?;
+                device_name_problem(&g.peer_device_name)
+                    .map_or(Ok(()), |r| Err(invalid("goodbye.peer_device_name", r)))?;
+                if !g.peer_device_id.is_empty() && g.peer_device_id.len() != DEVICE_ID_LEN {
+                    return Err(invalid(
+                        "goodbye.peer_device_id",
+                        "must be empty or 16 bytes",
+                    ));
+                }
+            }
+            Ctl::ServerStats(s) => {
+                if !(1..=MAX_STATS_INTERVAL_MS).contains(&s.interval_ms) {
+                    return Err(invalid("server_stats.interval_ms", "must be 1..=60000"));
+                }
+                if s.fps_ceiling > 240 {
+                    return Err(invalid("server_stats.fps_ceiling", "above 240"));
+                }
+            }
             Ctl::Pairing(o) | Ctl::Auth(o) => {
                 if o.data.len() > MAX_OPAQUE {
                     return Err(invalid("opaque.data", "too long"));
@@ -300,6 +327,51 @@ impl Wire for TransferHeader {
         }
         Ok(())
     }
+}
+
+/// True for characters that must never appear in a device name shown to a user: control
+/// characters (C0, C1, DEL), bidirectional controls and invisible characters (the same sets
+/// that file names reject, protocol §3.1).
+fn is_unsafe_display_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{061C}'
+            | '\u{200B}'..='\u{200D}'
+            | '\u{2060}'
+            | '\u{FEFF}'
+            | '\u{180E}'
+    ) || c.is_control()
+}
+
+/// Why `name` is not an acceptable sanitised device name, or `None` if it is: control, bidi
+/// and invisible characters are rejected; length is checked separately (protocol §5.7).
+pub fn device_name_problem(name: &str) -> Option<&'static str> {
+    name.chars()
+        .any(is_unsafe_display_char)
+        .then_some("contains a control, bidirectional or invisible character")
+}
+
+/// Sanitise a peer-supplied device name for display or for `Goodbye.peer_device_name`:
+/// drop control, bidirectional and invisible characters, trim surrounding whitespace and cut
+/// to at most [`MAX_DEVICE_NAME`] bytes on a character boundary (protocol §5.7). The result
+/// always passes the receiver's validation.
+pub fn sanitize_device_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| !is_unsafe_display_char(*c))
+        .collect();
+    let mut out = String::new();
+    for c in cleaned.trim().chars() {
+        if out.len() + c.len_utf8() > MAX_DEVICE_NAME {
+            break;
+        }
+        out.push(c);
+    }
+    out.trim_end().to_owned()
 }
 
 /// Why `name` is not an acceptable file-name hint, or `None` if it is.
@@ -376,6 +448,17 @@ pub fn mime_problem(mime: &str) -> Option<&'static str> {
 }
 
 impl TransferHeader {
+    /// File-specific rule (protocol §5.6): `size` must not exceed `limit`, the effective limit
+    /// (`Negotiated::max_file_bytes`), itself never above [`MAX_FILE_SIZE`]. Call after
+    /// [`Wire::validate`]. A failure means refuse the transfer (`TRANSFER_REJECTED`), not a
+    /// protocol error.
+    pub fn validate_file(&self, limit: u64) -> Result<(), ProtoError> {
+        if self.size > limit.min(MAX_FILE_SIZE) {
+            return Err(invalid("transfer.size", "above the file size limit"));
+        }
+        Ok(())
+    }
+
     /// Clipboard-specific rule: no name, size within [`MAX_CLIPBOARD_SIZE`].
     pub fn validate_clipboard(&self) -> Result<(), ProtoError> {
         if !self.name.is_empty() {

@@ -66,6 +66,8 @@ pub enum CloseCode {
     Shutdown = 7,
     /// Server fault.
     InternalError = 8,
+    /// Another device took over this desktop (protocol 1.1, §5.7).
+    TakenOver = 9,
 }
 
 impl CloseCode {
@@ -85,6 +87,7 @@ impl CloseCode {
             5 => Self::Busy,
             6 => Self::PairingClosed,
             7 => Self::Shutdown,
+            9 => Self::TakenOver,
             _ => Self::InternalError,
         }
     }
@@ -121,6 +124,14 @@ pub const MAX_CURSOR_MESSAGE: usize = 327_680;
 pub const MAX_TRANSFER_HEADER: usize = 4_096;
 /// Maximum clipboard transfer body.
 pub const MAX_CLIPBOARD_SIZE: u64 = 64 * 1024 * 1024;
+/// Maximum file transfer body and the default limit: 4 GiB (protocol §5.6).
+pub const MAX_FILE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+/// Maximum sanitised device name in `Goodbye.peer_device_name` (protocol §5.7).
+pub const MAX_DEVICE_NAME: usize = 64;
+/// Length of a device id (protocol §11.1).
+pub const DEVICE_ID_LEN: usize = 16;
+/// Largest `ServerStats.interval_ms` (protocol §5.8).
+pub const MAX_STATS_INTERVAL_MS: u32 = 60_000;
 /// Maximum WebSocket transfer chunk.
 pub const MAX_TRANSFER_CHUNK: usize = 65_536;
 /// Maximum cursor image edge in pixels.
