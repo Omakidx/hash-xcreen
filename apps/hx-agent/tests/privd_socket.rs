@@ -844,3 +844,70 @@ async fn a_connection_stays_usable_after_a_request_that_streamed_progress() {
         ok_or_panic(&r);
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn l1_a_cancel_during_the_create_post_stage_waits_for_the_sweep_before_the_destroy() {
+    let h = Harness::start(me());
+    open_window(&h).await;
+    // The password step takes a while (and so is cancellable-looking for a long time).
+    h.incus.with(|s| {
+        s.exec_rules.insert(
+            0,
+            ExecRule {
+                needle: "chpasswd".into(),
+                exit: 0,
+                stdout: String::new(),
+                delay: Some(Duration::from_millis(800)),
+            },
+        );
+    });
+    let mut c = h.connect();
+    c.hello();
+    let id = c.fresh_id();
+    c.send_request(
+        id,
+        Command::CreateDesktop(pb::CreateDesktopRequest {
+            desktop_id: "main".into(),
+            distro: pb::Distro::Ubuntu2404 as i32,
+            desktop: pb::DesktopKind::Xfce as i32,
+            preset: pb::Preset::Basic as i32,
+            username: "alice".into(),
+            ..Default::default()
+        }),
+        &[(pb::SecretKind::UserPassword, b"Correct-Horse-Battery-9")],
+        0,
+    );
+    let started = Instant::now();
+    while !h
+        .incus
+        .with(|s| s.execs.iter().any(|e| e.contains("chpasswd")))
+    {
+        assert!(started.elapsed() < Duration::from_secs(10));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    c.send(F::Cancel(pb::Cancel { request_id: id }));
+    let r = c.wait_response(id);
+    assert_eq!(err_of(&r).0, ErrorCode::Cancelled);
+    let log = h.incus.log();
+    let chpasswd = log
+        .iter()
+        .position(|l| l.starts_with("EXEC") && l.contains("chpasswd"))
+        .unwrap();
+    let sweep_after = log
+        .iter()
+        .rposition(|l| l.starts_with("EXEC find /run/hx-provision"))
+        .unwrap();
+    let delete = log
+        .iter()
+        .position(|l| l == "DELETE /1.0/instances/hx-main")
+        .unwrap();
+    assert!(
+        chpasswd < sweep_after,
+        "the sweep after the password step ran"
+    );
+    assert!(
+        sweep_after < delete,
+        "and it ran before the instance was destroyed"
+    );
+    assert!(h.incus.instance_names().is_empty());
+}

@@ -597,6 +597,10 @@ impl FakeIncus {
                     .unwrap_or_default();
                 let joined = command.join(" ");
                 s.execs.push(joined.clone());
+                // Short commands whole, long ones (the capture wrapper) by their tail, where the argv is.
+                let n = joined.chars().count();
+                let short: String = joined.chars().skip(n.saturating_sub(60)).collect();
+                s.log.push(format!("EXEC {short}"));
                 let rule = s
                     .exec_rules
                     .iter()

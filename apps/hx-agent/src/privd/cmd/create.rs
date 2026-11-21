@@ -244,8 +244,20 @@ pub async fn create_desktop<T: Transport + Clone + 'static>(
     };
     let progress = ctx.progress.clone();
     let started = Instant::now();
+    // Set once the post stage (the one that handles the password) has begun.
+    let in_post = std::sync::atomic::AtomicBool::new(false);
     let work = async {
-        let mut cb = |p: &hx_provision::Progress| progress.from_provision(p);
+        let mut cb = |p: &hx_provision::Progress| {
+            // From the first post-stage step on, the password is in play: see below.
+            if let hx_provision::Progress::Started {
+                stage: hx_provision::Stage::Post,
+                ..
+            } = p
+            {
+                in_post.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            progress.from_provision(p)
+        };
         progress.stage(ProgressStage::Build, "building the desktop");
         let report = build_on_server(&client, &plan, &spec, &secrets, &mut cb)
             .await
@@ -324,7 +336,15 @@ pub async fn create_desktop<T: Transport + Clone + 'static>(
     let mut work = Box::pin(work);
     let outcome = tokio::select! {
         r = &mut work => r,
-        reason = ctx.cancel.cancelled() => Err(reason.error()),
+        reason = ctx.cancel.cancelled() => {
+            if in_post.load(std::sync::atomic::Ordering::SeqCst) {
+                // The post stage is a secret-carrying section and is shielded (ipc.md 4): keep
+                // polling it to its end, so that its sweep of the work directory runs, and only
+                // then clean up and answer. Its own timeouts bound it.
+                let _ = (&mut work).await;
+            }
+            Err(reason.error())
+        },
     };
     match outcome {
         Ok(res) => Ok(response::Result::CreateDesktop(res)),
