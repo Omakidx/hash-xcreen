@@ -205,22 +205,7 @@ impl Server {
         tls: Arc<rustls::ServerConfig>,
         opts: ServerOptions,
     ) -> Result<Self> {
-        if !opts.quic && !opts.websocket {
-            return Err(Error::Config(
-                "enable at least one of quic and websocket".into(),
-            ));
-        }
-        let (tx, rx) = mpsc::channel(16);
-        let ctx = Arc::new(ServerCtx {
-            sem: Arc::new(Semaphore::new(opts.max_pending.max(1))),
-            ips: Arc::new(StdMutex::new(HashMap::new())),
-            tx,
-            ws_tls: RwLock::new(Arc::new(alpn_config(
-                &tls,
-                &[hx_proto::version::ALPN_WEBSOCKET],
-            ))),
-            opts: opts.clone(),
-        });
+        let (ctx, rx) = Self::new_ctx(&tls, opts.clone())?;
 
         // Bind UDP first so port 0 resolves, then TCP on the same number (retry on a collision).
         let mut attempts = if addr.port() == 0 { 16 } else { 1 };
@@ -263,6 +248,83 @@ impl Server {
                 unstarted: StdMutex::new(Some(Unstarted { endpoint, listener })),
             });
         }
+    }
+
+    /// The shared state and the pending-session channel (both constructors).
+    fn new_ctx(
+        tls: &rustls::ServerConfig,
+        opts: ServerOptions,
+    ) -> Result<(Arc<ServerCtx>, mpsc::Receiver<PendingSession>)> {
+        if !opts.quic && !opts.websocket {
+            return Err(Error::Config(
+                "enable at least one of quic and websocket".into(),
+            ));
+        }
+        let (tx, rx) = mpsc::channel(16);
+        let ctx = Arc::new(ServerCtx {
+            sem: Arc::new(Semaphore::new(opts.max_pending.max(1))),
+            ips: Arc::new(StdMutex::new(HashMap::new())),
+            tx,
+            ws_tls: RwLock::new(Arc::new(alpn_config(
+                tls,
+                &[hx_proto::version::ALPN_WEBSOCKET],
+            ))),
+            opts,
+        });
+        Ok((ctx, rx))
+    }
+
+    /// Like [`bind_paused`](Self::bind_paused), but on sockets somebody else created and
+    /// bound: a service manager's socket activation (systemd hands the process a listening
+    /// TCP socket and a bound UDP socket) or a test. Nothing is read until
+    /// [`start`](Self::start).
+    ///
+    /// The caller has already checked what the sockets are (type, family, listening); this
+    /// takes them as given. Both sockets are switched to non-blocking mode. A socket whose
+    /// transport `opts` disables is dropped (closed). Because it registers the sockets with
+    /// the reactor, it must be called inside a Tokio runtime.
+    pub fn from_listeners_paused(
+        udp: std::net::UdpSocket,
+        tcp: std::net::TcpListener,
+        tls: Arc<rustls::ServerConfig>,
+        opts: ServerOptions,
+    ) -> Result<Self> {
+        let (ctx, rx) = Self::new_ctx(&tls, opts.clone())?;
+        let endpoint = if opts.quic {
+            let runtime = quinn::default_runtime()
+                .ok_or_else(|| Error::Transport("no async runtime found".into()))?;
+            Some(quinn::Endpoint::new(
+                quinn::EndpointConfig::default(),
+                Some(quic_server_config(&tls, opts.h3.is_some())?),
+                udp,
+                runtime,
+            )?)
+        } else {
+            None
+        };
+        let listener = if opts.websocket {
+            tcp.set_nonblocking(true)?;
+            Some(tokio::net::TcpListener::from_std(tcp)?)
+        } else {
+            None
+        };
+        let quic_addr = endpoint
+            .as_ref()
+            .map(quinn::Endpoint::local_addr)
+            .transpose()?;
+        let tcp_addr = listener
+            .as_ref()
+            .map(tokio::net::TcpListener::local_addr)
+            .transpose()?;
+        Ok(Self {
+            quic_addr,
+            tcp_addr,
+            endpoint: endpoint.clone(),
+            pending: Mutex::new(rx),
+            ctx,
+            tasks: StdMutex::new(Vec::new()),
+            unstarted: StdMutex::new(Some(Unstarted { endpoint, listener })),
+        })
     }
 
     /// Starts the accept loops of a server made with [`bind_paused`](Self::bind_paused). Does
