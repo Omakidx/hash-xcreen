@@ -26,7 +26,7 @@ Every language, library, tool and external service hash-xcreen uses, and why. It
 | Firewall | ufw or nftables, whichever the host uses | Avoid fighting the host's existing setup |
 | Async runtime | **tokio** (networking only) | Standard for quinn and HTTP; kept out of the media hot path |
 | Incus API client | Incus REST API over its unix socket (`hyper` 1.x with `hyper-util`, `http-body-util` and `bytes`; `serde` + `serde_json`; `tokio` for the socket and timeouts) | No CLI scraping; typed requests from `hx-privd` |
-| Recipe engine | `toml` 0.8 + `serde` (unknown keys rejected), `sha2` (file hashes in the equivalence manifest), `thiserror` (typed errors) | Pure, deterministic parsing and resolution in `hx-provision` |
+| Recipe engine | `toml` 0.8 + `serde` (unknown keys rejected), `sha2` (file hashes in the equivalence manifest), `thiserror` (typed errors), `zeroize` (the desktop password in `hx_provision::Secret` is zeroized on drop and not `Clone`) | Pure, deterministic parsing and resolution in `hx-provision` |
 
 ## Streaming
 

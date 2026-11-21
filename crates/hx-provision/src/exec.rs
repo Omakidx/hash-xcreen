@@ -13,16 +13,27 @@
 use std::future::Future;
 use std::time::{Duration, Instant};
 
+use zeroize::{ZeroizeOnDrop, Zeroizing};
+
 use crate::lower::lower;
 use crate::plan::{Plan, Stage, Step};
 
-/// A secret byte string. Redacted in `Debug`; zeroed on drop (best effort, no `unsafe`).
-#[derive(Clone, PartialEq, Eq)]
-pub struct Secret(Vec<u8>);
+/// A secret byte string. Redacted in `Debug`, **not `Clone`**, and zeroized on drop (the whole
+/// allocation, spare capacity included, through the `zeroize` crate's volatile writes).
+///
+/// There is deliberately no way to copy one: a secret that is handed over is moved. The types that
+/// hold secrets ([`Secrets`], [`ExecRequest`], [`Action`]) are therefore not `Clone` either.
+pub struct Secret(Zeroizing<Vec<u8>>);
 
 impl Secret {
     pub(crate) fn new(bytes: Vec<u8>) -> Self {
-        Self(bytes)
+        Self(Zeroizing::new(bytes))
+    }
+
+    /// A secret holding a copy of `bytes`. The caller remains responsible for zeroizing its own
+    /// buffer.
+    pub fn from_slice(bytes: &[u8]) -> Self {
+        Self::new(bytes.to_vec())
     }
 
     /// The secret bytes. Callers must not log them.
@@ -37,11 +48,23 @@ impl std::fmt::Debug for Secret {
     }
 }
 
-impl Drop for Secret {
-    fn drop(&mut self) {
-        self.0.iter_mut().for_each(|b| *b = 0);
+impl ZeroizeOnDrop for Secret {}
+
+/// Equality without an early exit: the comparison time does not depend on where two secrets of
+/// the same length first differ (only the length is visible). There is no derived `PartialEq`.
+impl PartialEq for Secret {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self
+                .0
+                .iter()
+                .zip(other.0.iter())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0
     }
 }
+
+impl Eq for Secret {}
 
 /// Longest accepted password, in bytes.
 pub const MAX_PASSWORD_BYTES: usize = 1024;
@@ -60,10 +83,12 @@ pub enum SecretError {
     BadCharacter,
 }
 
-/// Run-time secrets handed over by the caller. None of it is ever written to a recipe.
-#[derive(Debug, Clone, Default)]
+/// Run-time secrets handed over by the caller. None of it is ever written to a recipe. Not
+/// `Clone`; the secrets inside are zeroized when this is dropped.
+#[derive(Debug, Default)]
 pub struct Secrets {
     user_password: Option<Secret>,
+    current_password: Option<Secret>,
 }
 
 impl Secrets {
@@ -74,26 +99,44 @@ impl Secrets {
 
     /// The Linux password of the desktop user, needed by the post stage.
     pub fn with_user_password(mut self, password: &str) -> Result<Self, SecretError> {
-        if password.is_empty() {
-            return Err(SecretError::Empty);
-        }
-        if password.len() > MAX_PASSWORD_BYTES {
-            return Err(SecretError::TooLong);
-        }
-        if password.contains(['\n', '\r', '\0']) {
-            return Err(SecretError::BadCharacter);
-        }
-        self.user_password = Some(Secret::new(password.as_bytes().to_vec()));
+        self.user_password = Some(check_password(password)?);
+        Ok(self)
+    }
+
+    /// The password the desktop user has *now*, for
+    /// [`crate::password::change_user_password`] to check before it sets a new one (ipc.md 6.9).
+    /// Same rules as [`Secrets::with_user_password`].
+    pub fn with_current_password(mut self, password: &str) -> Result<Self, SecretError> {
+        self.current_password = Some(check_password(password)?);
         Ok(self)
     }
 
     pub(crate) fn user_password(&self) -> Option<&Secret> {
         self.user_password.as_ref()
     }
+
+    pub(crate) fn current_password(&self) -> Option<&Secret> {
+        self.current_password.as_ref()
+    }
 }
 
-/// One command to run in the container.
-#[derive(Clone, PartialEq, Eq)]
+fn check_password(password: &str) -> Result<Secret, SecretError> {
+    if password.is_empty() {
+        return Err(SecretError::Empty);
+    }
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Err(SecretError::TooLong);
+    }
+    if password.contains(['\n', '\r', '\0']) {
+        return Err(SecretError::BadCharacter);
+    }
+    Ok(Secret::new(password.as_bytes().to_vec()))
+}
+
+impl ZeroizeOnDrop for Secrets {}
+
+/// One command to run in the container. Not `Clone` (it may carry a [`Secret`]).
+#[derive(PartialEq, Eq)]
 pub struct ExecRequest {
     /// Short label for progress and errors (never contains secrets).
     pub label: String,
@@ -141,7 +184,7 @@ pub struct FilePush {
 }
 
 /// What the runner asks the executor to do.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Action {
     /// Run a command.
     Exec(ExecRequest),
@@ -321,6 +364,9 @@ pub fn sanitize(s: &str, max: usize) -> String {
     format!("...{}", &t[start..])
 }
 
+/// Stands in for the output of a command that carries a secret.
+pub const WITHHELD: &str = "(output withheld: the command carries a secret)";
+
 fn tail(s: &str, max: usize) -> String {
     sanitize(s, max)
 }
@@ -361,14 +407,20 @@ pub async fn apply_stage<E: Executor>(
                     Ok(out) if out.exit_code == 0 => Ok(()),
                     Ok(out) => Err(StepFailure::ExitCode {
                         code: out.exit_code,
-                        tail: tail(
-                            if out.stderr.trim().is_empty() {
-                                &out.stdout
-                            } else {
-                                &out.stderr
-                            },
-                            2000,
-                        ),
+                        // A command that carries a secret on stdin must not put its output into an
+                        // error: a tool can echo what it was given.
+                        tail: if req.stdin.is_some() {
+                            WITHHELD.to_string()
+                        } else {
+                            tail(
+                                if out.stderr.trim().is_empty() {
+                                    &out.stdout
+                                } else {
+                                    &out.stderr
+                                },
+                                2000,
+                            )
+                        },
                     }),
                     Err(e) => Err(StepFailure::Exec(e)),
                 },

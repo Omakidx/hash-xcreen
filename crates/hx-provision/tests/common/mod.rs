@@ -76,6 +76,30 @@ pub struct State {
     /// Type answered for any other path, when set.
     pub default_file_type: Option<String>,
     pub instance_patches: u32,
+    /// Purge the operation of every `PATCH /1.0/instances/<n>` (its `/wait` answers 404).
+    pub purge_patch_ops: bool,
+    /// Directories pushed (or preset), by path: (uid, gid, mode). An existing one is kept.
+    pub dirs: HashMap<String, (u32, u32, u32)>,
+    /// Extra headers for the response being built.
+    pub last_headers: Vec<(String, String)>,
+    /// Bodies of accepted `PUT /1.0/instances/<n>`.
+    pub put_bodies: Vec<Value>,
+    /// Accept (and purge, if `purge_patch_ops`) but do not apply `PATCH`es after this many.
+    pub drop_patches_after: Option<u32>,
+    /// Version of each instance definition, answered as `ETag` and checked on `PUT`.
+    pub versions: HashMap<String, u64>,
+    /// `ETag` to put on the response being built.
+    pub last_etag: Option<String>,
+    /// Answer the next conditional `PUT` with 412 after bumping the version (a concurrent change).
+    pub conflict_once: bool,
+    /// Descriptions of networks, by name (set from the create request).
+    pub descriptions: HashMap<String, String>,
+    /// Instance-local devices by instance name, as `PATCH`/`PUT` set them.
+    pub devices: HashMap<String, BTreeMap<String, BTreeMap<String, String>>>,
+    /// Instance-local config by instance name, as `PATCH` sets it.
+    pub config: HashMap<String, BTreeMap<String, String>>,
+    /// Expanded (profile) devices answered for every instance.
+    pub expanded_devices: BTreeMap<String, BTreeMap<String, String>>,
     /// Waits that answer `Running` before an operation completes.
     pub pending_waits: HashMap<String, u32>,
     pub next: u64,
@@ -83,6 +107,14 @@ pub struct State {
     pub overrides: HashMap<String, (u16, String)>,
     /// Never complete operations.
     pub stuck_ops: bool,
+    /// Operations a `DELETE` has been received for (they then wait as `Cancelled`).
+    pub cancelled_ops: std::collections::HashSet<String>,
+    /// Operations the daemon has purged (404).
+    pub forgotten_ops: std::collections::HashSet<String>,
+    /// Accept `DELETE /operations/<id>` but never end the operation.
+    pub refuse_cancel: bool,
+    /// Answer this many `/wait` calls with Incus 6.0.0's `500 context deadline exceeded`.
+    pub wait_timeouts: u32,
 }
 
 impl State {
@@ -105,10 +137,26 @@ impl State {
             file_types: HashMap::new(),
             default_file_type: None,
             instance_patches: 0,
+            purge_patch_ops: false,
+            dirs: HashMap::new(),
+            last_headers: Vec::new(),
+            put_bodies: Vec::new(),
+            drop_patches_after: None,
+            versions: HashMap::new(),
+            last_etag: None,
+            conflict_once: false,
+            descriptions: HashMap::new(),
+            devices: HashMap::new(),
+            config: HashMap::new(),
+            expanded_devices: BTreeMap::new(),
             pending_waits: HashMap::new(),
             next: 0,
             overrides: HashMap::new(),
             stuck_ops: false,
+            cancelled_ops: Default::default(),
+            forgotten_ops: Default::default(),
+            refuse_cancel: false,
+            wait_timeouts: 0,
         }
     }
 }
@@ -187,11 +235,17 @@ impl State {
             },
             ("POST", ["1.0", "storage-pools"]) => {
                 let n = body["name"].as_str().unwrap_or_default().to_string();
-                self.pools.insert(n.clone(), json!({"name":n,"driver":body["driver"],"config":body["config"],"status":"Created"}));
+                self.pools.insert(n.clone(), json!({"name":n,"driver":body["driver"],"config":body["config"],"status":"Created","description":body["description"]}));
                 sync(Value::Null)
             }
+            ("DELETE", ["1.0", "storage-pools", n]) => match self.pools.remove(*n) {
+                Some(_) => sync(Value::Null),
+                None => not_found("pool"),
+            },
             ("GET", ["1.0", "networks", n]) => match self.networks.get(*n) {
-                Some(c) => sync(json!({"name":n,"type":"bridge","config":c,"status":"Created"})),
+                Some(c) => sync(
+                    json!({"name":n,"type":"bridge","config":c,"status":"Created","description":self.descriptions.get(*n).cloned().unwrap_or_default()}),
+                ),
                 None => not_found("network"),
             },
             ("POST", ["1.0", "networks"]) => {
@@ -201,9 +255,25 @@ impl State {
                 if cfg.get("ipv4.address").map(String::as_str) == Some("auto") {
                     cfg.insert("ipv4.address".into(), "10.99.1.1/24".into());
                 }
+                self.descriptions.insert(
+                    n.clone(),
+                    body["description"].as_str().unwrap_or_default().to_string(),
+                );
                 self.networks.insert(n, cfg);
                 sync(Value::Null)
             }
+            ("DELETE", ["1.0", "networks", n]) => match self.networks.remove(*n) {
+                Some(_) => sync(Value::Null),
+                None => not_found("network"),
+            },
+            ("DELETE", ["1.0", "network-acls", n]) => match self.acls.remove(*n) {
+                Some(_) => sync(Value::Null),
+                None => not_found("acl"),
+            },
+            ("DELETE", ["1.0", "profiles", n]) => match self.profiles.remove(*n) {
+                Some(_) => sync(Value::Null),
+                None => not_found("profile"),
+            },
             ("PATCH", ["1.0", "networks", n]) => {
                 let add: BTreeMap<String, String> =
                     serde_json::from_value(body["config"].clone()).unwrap_or_default();
@@ -245,24 +315,92 @@ impl State {
                 self.new_op(Value::Null, 1)
             }
             ("GET", ["1.0", "instances", n]) => match self.instances.get(*n) {
-                Some(s) => sync(
-                    json!({"name":n,"status":s,"type":"container","profiles":["p"],"config":{}}),
-                ),
+                Some(s) => {
+                    let v = *self.versions.entry(n.to_string()).or_insert(1);
+                    self.last_etag = Some(format!("\"{v}\""));
+                    let devices = self.devices.get(*n).cloned().unwrap_or_default();
+                    let mut expanded = self.expanded_devices.clone();
+                    expanded.extend(devices.clone());
+                    sync(json!({
+                        "name":n,"status":s,"type":"container","profiles":["p"],
+                        "architecture":"x86_64",
+                        "config":self.config.get(*n).cloned().unwrap_or_default(),
+                        "devices":devices,"expanded_devices":expanded,
+                    }))
+                }
                 None => not_found("instance"),
             },
+            ("PUT", ["1.0", "instances", n]) => {
+                if !self.instances.contains_key(*n) {
+                    return not_found("instance");
+                }
+                let v = *self.versions.entry(n.to_string()).or_insert(1);
+                if self.conflict_once {
+                    self.conflict_once = false;
+                    self.versions.insert(n.to_string(), v + 1);
+                    return (
+                        412,
+                        json!({"type":"error","error_code":412,"error":"ETag doesn't match"})
+                            .to_string(),
+                    );
+                }
+                if let Some(m) = r.headers.get("if-match")
+                    && *m != format!("\"{v}\"")
+                {
+                    return (
+                        412,
+                        json!({"type":"error","error_code":412,"error":"ETag doesn't match"})
+                            .to_string(),
+                    );
+                }
+                self.versions.insert(n.to_string(), v + 1);
+                self.put_bodies.push(body.clone());
+                let devs: BTreeMap<String, BTreeMap<String, String>> =
+                    serde_json::from_value(body["devices"].clone()).unwrap_or_default();
+                self.devices.insert(n.to_string(), devs);
+                self.new_op(Value::Null, 0)
+            }
             ("DELETE", ["1.0", "instances", n]) => {
                 self.instances.remove(*n);
                 self.new_op(Value::Null, 0)
             }
-            ("PATCH", ["1.0", "instances", _]) => {
+            ("PATCH", ["1.0", "instances", n]) => {
                 self.instance_patches += 1;
+                let dropped = self
+                    .drop_patches_after
+                    .is_some_and(|k| self.instance_patches > k);
+                if !dropped
+                    && let Ok(devs) = serde_json::from_value::<
+                        BTreeMap<String, BTreeMap<String, String>>,
+                    >(body["devices"].clone())
+                {
+                    self.devices.entry(n.to_string()).or_default().extend(devs);
+                }
+                if !dropped
+                    && let Ok(cfg) =
+                        serde_json::from_value::<BTreeMap<String, String>>(body["config"].clone())
+                {
+                    self.config.entry(n.to_string()).or_default().extend(cfg);
+                }
+                if !dropped {
+                    *self.versions.entry(n.to_string()).or_insert(1) += 1;
+                }
                 if self.fail_second_instance_patch && self.instance_patches == 2 {
                     return (
                         500,
                         json!({"type":"error","error_code":500,"error":"busy"}).to_string(),
                     );
                 }
-                self.new_op(Value::Null, 0)
+                let out = self.new_op(Value::Null, 0);
+                if self.purge_patch_ops {
+                    let id = if self.next == 1 {
+                        OP_ID.to_string()
+                    } else {
+                        format!("00000000-0000-4000-8000-{:012}", self.next)
+                    };
+                    self.forgotten_ops.insert(id);
+                }
+                out
             }
             ("PUT", ["1.0", "instances", n, "state"]) => {
                 let st = match body["action"].as_str() {
@@ -282,6 +420,18 @@ impl State {
                 let p = query_path(&r.path);
                 if r.headers.get("x-incus-type").map(String::as_str) != Some("directory") {
                     self.files.insert(p.clone(), r.body.clone());
+                } else {
+                    let num = |k: &str| r.headers.get(k).and_then(|v| v.parse::<u32>().ok());
+                    let mode = r
+                        .headers
+                        .get("x-incus-mode")
+                        .and_then(|v| u32::from_str_radix(v, 8).ok())
+                        .unwrap_or(0o755);
+                    self.dirs.entry(p.clone()).or_insert((
+                        num("x-incus-uid").unwrap_or(0),
+                        num("x-incus-gid").unwrap_or(0),
+                        mode,
+                    ));
                 }
                 if self.fail_stdin_push_after_store && p.contains("/stdin-") {
                     return (
@@ -290,6 +440,18 @@ impl State {
                     );
                 }
                 sync(Value::Null)
+            }
+            ("GET", ["1.0", "instances", _, "files"])
+                if self.dirs.contains_key(&query_path(&r.path))
+                    && !self.files.contains_key(&query_path(&r.path)) =>
+            {
+                let (u, g, m) = self.dirs[&query_path(&r.path)];
+                self.last_headers = vec![
+                    ("X-Incus-uid".into(), u.to_string()),
+                    ("X-Incus-gid".into(), g.to_string()),
+                    ("X-Incus-mode".into(), format!("{m:04o}")),
+                ];
+                (200, "[]".to_string())
             }
             ("GET", ["1.0", "instances", _, "files"]) => match self.files.get(&query_path(&r.path))
             {
@@ -321,6 +483,22 @@ impl State {
                 sync(Value::Array(items))
             }
             ("GET", ["1.0", "operations", id, "wait"]) => {
+                if self.wait_timeouts > 0 {
+                    self.wait_timeouts -= 1;
+                    return (
+                        500,
+                        json!({"type":"error","error_code":500,"error":"context deadline exceeded"})
+                            .to_string(),
+                    );
+                }
+                if self.forgotten_ops.contains(*id) {
+                    return not_found("operation");
+                }
+                if self.cancelled_ops.contains(*id) {
+                    return sync(
+                        json!({"id":id,"status":"Cancelled","status_code":401,"metadata":null,"err":""}),
+                    );
+                }
                 if self.stuck_ops {
                     return sync(
                         json!({"id":id,"status":"Running","status_code":103,"metadata":null,"err":""}),
@@ -338,7 +516,15 @@ impl State {
                     None => not_found("operation"),
                 }
             }
-            ("DELETE", ["1.0", "operations", _]) => sync(Value::Null),
+            ("DELETE", ["1.0", "operations", id]) => {
+                if self.forgotten_ops.contains(*id) {
+                    return not_found("operation");
+                }
+                if !self.refuse_cancel {
+                    self.cancelled_ops.insert(id.to_string());
+                }
+                sync(Value::Null)
+            }
             _ => (
                 599,
                 format!("fake incus: unhandled {} {}", r.method, r.path),
@@ -460,25 +646,42 @@ impl Fake {
                                 headers,
                                 body,
                             };
-                            let (status, text, ftype) = {
+                            let (status, text, ftype, etag, extra) = {
                                 let mut s = st.lock().unwrap();
                                 s.log.push(rec.clone());
                                 let ft = (rec.method == "GET" && rec.path.contains("/files?path="))
                                     .then(|| {
+                                        if s.dirs.contains_key(&query_path(&rec.path))
+                                            && !s.files.contains_key(&query_path(&rec.path))
+                                        {
+                                            return "directory".to_string();
+                                        }
                                         s.file_types
                                             .get(&query_path(&rec.path))
                                             .cloned()
                                             .or_else(|| s.default_file_type.clone())
                                             .unwrap_or_else(|| "file".to_string())
                                     });
+                                s.last_etag = None;
+                                s.last_headers.clear();
                                 let (status, text) = s.handle(&rec);
-                                (status, text, ft)
+                                (
+                                    status,
+                                    text,
+                                    ft,
+                                    s.last_etag.take(),
+                                    std::mem::take(&mut s.last_headers),
+                                )
                             };
+                            let mut builder = Response::builder().status(status);
+                            for (k, v) in &extra {
+                                builder = builder.header(k.as_str(), v.as_str());
+                            }
                             Ok::<_, std::convert::Infallible>(
-                                Response::builder()
-                                    .status(status)
+                                builder
                                     .header("X-Incus-Type", ftype.unwrap_or_default())
                                     .header("Content-Type", "application/json")
+                                    .header("ETag", etag.unwrap_or_default())
                                     .body(Full::new(Bytes::from(text)))
                                     .unwrap(),
                             )

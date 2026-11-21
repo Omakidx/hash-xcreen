@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crate::exec::{ExecRequest, Executor, Progress, Secrets, apply_stage};
-use crate::incus::{Client, DOCKER_MIN_INCUS, IncusVersion, StateAction, Transport};
+use crate::incus::{Client, DOCKER_MIN_INCUS, IncusError, IncusVersion, StateAction, Transport};
 use crate::orchestrate::{IncusExecutor, ProvisionError, ReadyOptions, wait_system_running};
 use crate::plan::{Plan, Stage};
 
@@ -71,6 +71,18 @@ pub enum DockerOutcome {
     },
 }
 
+/// How Docker is set up (ipc.md 6.9, `EnableDocker.mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DockerMode {
+    /// Docker on its default bridge, with nesting and syscall interception.
+    #[default]
+    Standard,
+    /// Docker with `--network host` only. **Not implemented**: it is named so that the fallback
+    /// stays in the contract, and [`enable_docker`] answers [`ProvisionError::Unimplemented`]
+    /// before it changes anything.
+    HostNetworkOnly,
+}
+
 /// Options for [`enable_docker`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DockerOptions {
@@ -78,6 +90,8 @@ pub struct DockerOptions {
     pub allow_old_incus: bool,
     /// Time allowed for `docker run` including the pull.
     pub selftest_timeout: Duration,
+    /// [`DockerMode::Standard`] unless the caller asks for a fallback.
+    pub mode: DockerMode,
 }
 
 impl Default for DockerOptions {
@@ -85,8 +99,52 @@ impl Default for DockerOptions {
         Self {
             allow_old_incus: false,
             selftest_timeout: Duration::from_secs(300),
+            mode: DockerMode::Standard,
         }
     }
+}
+
+/// What [`disable_docker`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisableOutcome {
+    /// Whether the desktop was restarted (it is not when the three keys were already off).
+    pub restarted: bool,
+}
+
+/// Switch the Docker add-on's instance configuration off and restart the desktop (ipc.md 6.9,
+/// `DisableDocker`).
+///
+/// Sets exactly the three keys the recipe allowlist permits
+/// ([`crate::plan::ALLOWED_INSTANCE_CONFIG`]: `security.nesting` and the `mknod` and `setxattr`
+/// syscall intercepts) to `false` and nothing else, then restarts and waits for `running`. Docker
+/// Engine and its data inside the desktop are not touched (the daemon will not start without
+/// nesting; enabling again converges). Open applications close with the restart, which the caller
+/// should have warned about. Converges: when the keys are already off nothing is changed and
+/// `restarted` is `false`. Does not need a plan, so it cannot be steered by one.
+pub async fn disable_docker<T: Transport>(
+    client: &Client<T>,
+    instance: &str,
+) -> Result<DisableOutcome, ProvisionError> {
+    let current = client
+        .get_instance(instance)
+        .await?
+        .ok_or_else(|| IncusError::Api {
+            code: 404,
+            message: format!("instance `{instance}` not found"),
+        })?;
+    let off: BTreeMap<String, String> = crate::plan::ALLOWED_INSTANCE_CONFIG
+        .iter()
+        .map(|k| (k.to_string(), "false".to_string()))
+        .collect();
+    let already_off = off
+        .keys()
+        .all(|k| current.config.get(k).is_none_or(|v| v == "false"));
+    if already_off {
+        return Ok(DisableOutcome { restarted: false });
+    }
+    client.patch_instance_config(instance, &off).await?;
+    restart(client, instance).await?;
+    Ok(DisableOutcome { restarted: true })
 }
 
 /// The fallbacks, most preferred first.
@@ -160,6 +218,11 @@ pub async fn enable_docker<T: Transport>(
     opts: DockerOptions,
     on_progress: &mut (dyn FnMut(&Progress) + Send),
 ) -> Result<DockerOutcome, ProvisionError> {
+    if opts.mode == DockerMode::HostNetworkOnly {
+        return Err(ProvisionError::Unimplemented(
+            "Docker in host-network-only mode".into(),
+        ));
+    }
     if addon_plan.incus_config.is_empty() {
         return Err(ProvisionError::Invalid(
             "the plan has no incus_config: it is not the Docker add-on".into(),

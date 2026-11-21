@@ -15,7 +15,8 @@ getting a desktop (architecture section 4.3):
 ```
 recipes/
   <distro>-<desktop>-<preset>.toml     one file per shipped combination (the "recipes")
-  fragments/xfce-desktop.toml          headless Xorg + XFCE + PipeWire (distro independent)
+  fragments/xfce-desktop.toml          headless Xorg + XFCE + PipeWire + the hx-session units (distro independent)
+  fragments/settings.toml              post steps for hostname, timezone, locale, keyboard
   fragments/distro-<distro>.toml       base image, vars, browser, per-distro apt repositories
   fragments/preset-<preset>.toml       basic, developer
   addons/docker.toml                   opt-in add-ons, chosen at resolve time
@@ -38,6 +39,11 @@ recipes root directory, may not be absolute, may not form a cycle and may nest a
 `preset`; `user` is added from `[user].name`). `{{name}}` in any string value of the merged recipe
 is replaced; an unknown name is an error that names the key. `{{` is reserved for this; `user` and `uid` are filled from `[user]` (the validated account, see below) and cannot be defined in `[vars]`; `[vars]`
 values themselves are not expanded.
+
+**Desktop settings.** `hostname`, `timezone`, `locale` and `keyboard` are also reserved: they come
+only from the caller's validated `hx_provision::Settings` (the wizard's choices, ipc.md 6.5), are the
+empty string when unset, and are used by `fragments/settings.toml`, whose post steps do nothing
+for an empty value. Always single-quote them in a script.
 
 **Unknown keys are errors**, everywhere, so typos fail loudly.
 
@@ -81,6 +87,20 @@ the vendor installers in `post_step` do not.
 
 An escaped `\{{` produces a literal `{{` (for example in a Go template inside a script).
 
+## Units inside the desktop
+
+| Unit | Kind | Runs | Notes |
+|---|---|---|---|
+| `hx-xorg.service` | system | headless Xorg on `:0` | cookie in `/run/hx-xorg/Xauthority`, owned by the desktop uid |
+| `hx-xsession.service` | user (lingering manager) | `xfce4-session` | formerly `hx-session.service`; renamed when that name went to the streaming daemon |
+| `hx-session.socket` | system | creates `/run/hx-session/link.sock` | owner = desktop uid, mode 0600; the directory is root:root 0755 (tmpfiles), so the user cannot replace the path |
+| `hx-session.service` | system, `User=1000`, started by the socket | `/usr/lib/hx-session/hx-session` | hardened (`NoNewPrivileges`, empty capability set, `AF_UNIX` only, `ProtectSystem=strict`, the only writable path is `/var/lib/hx-session/received`, `KillMode=control-group`); **no** `PrivateNetwork`, `PrivateTmp` or `PrivateDevices` |
+
+The binary is not in the image: the `hx-session` package installs it at
+`/usr/lib/hx-session/hx-session` (the `hx_provision::session` constants are the source of truth and
+a test keeps the units in step). The same package ships `/usr/lib/hx-session/hx-pwcheck`, the
+current-password checker. `~/Received` links to `/var/lib/hx-session/received`.
+
 ## Adding a recipe
 
 1. New distro: add `fragments/distro-<name>.toml` with `base_image` and the vars, and one recipe
@@ -92,6 +112,14 @@ An escaped `\{{` produces a literal `{{` (for example in a Go template inside a 
 
 ## Status
 
-Verified on a real VPS in S3: Ubuntu 24.04 and Debian 13 with the Docker add-on. Ubuntu 26.04 and
-Debian 12 recipes are derived from them; repository suites were confirmed to exist, but a full
-build of those two has not been run yet.
+Verified on a real VPS in S3: Ubuntu 24.04 and Debian 13 with the Docker add-on. All eight recipes
+(four distros x basic and developer) were then built through `hx-provision` into an unprivileged,
+isolated-idmap Incus 6.0.0 container (`crates/hx-provision/tests/incus_real_session.rs`), booted
+into the XFCE session, and passed the `hx-session` socket and service checks. Not covered by a real
+build: the Docker add-on on these (needs Incus 6.0.5), and the developer recipes' vendor installers
+(optional steps, which need direct internet and were not given it by the test's proxy).
+
+The mozillateam PPA is signed by two keys. Ubuntu 26.04 pins the current one
+(`738BEB93...1867`, from the Launchpad API); Ubuntu 24.04 still pins the older `0AB21567...EC21`,
+which the PPA's noble Release file still carries a signature from. A recipe can pin only one
+fingerprint, so if Launchpad drops the old signature the 24.04 recipe needs the new key too.

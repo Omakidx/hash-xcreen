@@ -648,6 +648,7 @@ async fn lifecycle(c: Client<UnixTransport>) {
         let opts = DockerOptions {
             allow_old_incus: true,
             selftest_timeout: Duration::from_secs(300),
+            ..DockerOptions::default()
         };
         let mut lines = Vec::new();
         let out = enable_docker(&c, "hx1d-test-c1", &docker_plan, opts, &mut |p| {

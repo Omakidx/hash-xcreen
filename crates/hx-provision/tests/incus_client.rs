@@ -174,9 +174,17 @@ async fn pool_network_acl_profile_request_bodies() {
     let log = fake.log();
     assert_eq!(
         log[0].json(),
-        json!({"name":"hx1d-test-pool","driver":"btrfs","config":{"size":"4GiB"}})
+        json!({"name":"hx1d-test-pool","driver":"btrfs","config":{"size":"4GiB"},
+               "description":"hash-xcreen: storage pool for desktops"})
     );
     assert_eq!(log[1].json()["type"], "bridge");
+    // Pools and networks carry the hash-xcreen marker (teardown deletes only marked objects).
+    assert!(
+        log[1].json()["description"]
+            .as_str()
+            .unwrap()
+            .starts_with("hash-xcreen")
+    );
     let acl_body = log[2].json();
     let egress = acl_body["egress"].as_array().unwrap();
     let dests: Vec<_> = egress
@@ -202,16 +210,16 @@ async fn pool_network_acl_profile_request_bodies() {
         ]
     );
     assert!(egress.iter().all(|r| r["state"] == "enabled"));
-    assert_eq!(log[3].method, "PATCH");
+    assert_eq!(log[4].method, "PATCH");
     assert_eq!(
-        log[3].json()["config"]["security.acls"],
+        log[4].json()["config"]["security.acls"],
         "hx1d-test-isolate"
     );
     assert_eq!(
-        log[3].json()["config"]["security.acls.default.egress.action"],
+        log[4].json()["config"]["security.acls.default.egress.action"],
         "allow"
     );
-    assert_eq!(log[4].json()["config"]["raw.apparmor"], "signal,");
+    assert_eq!(log[5].json()["config"]["raw.apparmor"], "signal,");
     let _ = AclAction::Allow;
 }
 

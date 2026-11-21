@@ -5,7 +5,10 @@ use std::str::FromStr;
 
 use crate::error::RecipeError;
 use crate::plan::Plan;
-use crate::recipe::{DirSource, MemSource, RecipeSource, resolve_addon_only_as, resolve_as};
+use crate::recipe::{
+    DirSource, MemSource, RecipeSource, resolve_addon_only_as, resolve_with_settings,
+};
+use crate::settings::Settings;
 use crate::user::Username;
 
 /// Guest distro.
@@ -173,6 +176,7 @@ macro_rules! embed {
 pub fn embedded_source() -> MemSource {
     embed!(
         "fragments/xfce-desktop.toml",
+        "fragments/settings.toml",
         "fragments/distro-ubuntu-24.04.toml",
         "fragments/distro-ubuntu-26.04.toml",
         "fragments/distro-debian-12.toml",
@@ -232,9 +236,27 @@ impl Catalog {
         addons: &[Addon],
         username: Option<&Username>,
     ) -> Result<Plan, RecipeError> {
+        self.resolve_with(id, addons, username, &Settings::none())
+    }
+
+    /// Like [`Catalog::resolve_for`], with the validated desktop [`Settings`] (hostname,
+    /// timezone, locale, keyboard) applied in the post stage (ipc.md 6.5, `CreateDesktop`).
+    pub fn resolve_with(
+        &self,
+        id: RecipeId,
+        addons: &[Addon],
+        username: Option<&Username>,
+        settings: &Settings,
+    ) -> Result<Plan, RecipeError> {
         let paths: Vec<String> = addons.iter().map(|a| a.path()).collect();
         let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-        resolve_as(self.source.as_ref(), &id.file_name(), &refs, username)
+        resolve_with_settings(
+            self.source.as_ref(),
+            &id.file_name(),
+            &refs,
+            username,
+            settings,
+        )
     }
 
     /// Resolve only the steps of an add-on, for a desktop that already exists.

@@ -15,12 +15,21 @@ var user=desk
 05 ensure-user desk uid=1000 groups=sudo,audio,video
 06 write-file /etc/hx/xorg-dummy.conf mode=0644 owner=root:root sha256=2c4b8728bcb56ee0e5912d9b5abdfa1adad51a881454ac38436890fb918ff6ae
 07 write-file /etc/systemd/system/hx-xorg.service mode=0644 owner=root:root sha256=0caac8be5bb8177bafdf5cdd717441d5b2ea264fc46416ff801f27dc5aebfd39
-08 write-file /etc/systemd/user/hx-session.service mode=0644 owner=root:root sha256=135b8be531e2a9aad302ce1c783ac5280866dec13c5239964ed229c5f5e0be01
-09 write-file /etc/pipewire/pipewire.conf.d/10-hx-null-sink.conf mode=0644 owner=root:root sha256=52ad58b48e93d328a25ee4c93b8da6e31d2b21d61adf7f83f806d94d3607c93f
-10 enable-services system=[hx-xorg.service] user-global=[hx-session.service,pipewire.socket,pipewire-pulse.socket,wireplumber.service] linger=desk
-11 command apt-cleanup
+08 write-file /etc/systemd/user/hx-xsession.service mode=0644 owner=root:root sha256=135b8be531e2a9aad302ce1c783ac5280866dec13c5239964ed229c5f5e0be01
+09 write-file /etc/tmpfiles.d/hx-session.conf mode=0644 owner=root:root sha256=0293eb4a9dadfe338a6eb91b802be6919cf0d0c8b081f3e39b912923d02fcdbc
+10 write-file /etc/systemd/system/hx-session.socket mode=0644 owner=root:root sha256=203c766b12a31049417884b6af57d2aee07952d69cf04e1a25608b1fd30a6ab9
+11 write-file /etc/systemd/system/hx-session.service mode=0644 owner=root:root sha256=ca3ddac5d4f56929aef87b4187f0c480af38b5a7445e28d115c4fde23a4fe97c
+12 write-file /etc/systemd/system/hx-session.service.d/zzzz-hx-hardening.conf mode=0644 owner=root:root sha256=b0d55083c0e6f97514a6d811e8324d31258a821c774095ba3c7f1df881a4bc6a
+13 write-file /etc/pipewire/pipewire.conf.d/10-hx-null-sink.conf mode=0644 owner=root:root sha256=52ad58b48e93d328a25ee4c93b8da6e31d2b21d61adf7f83f806d94d3607c93f
+14 enable-services system=[hx-xorg.service,hx-session.socket] user-global=[hx-xsession.service,pipewire.socket,pipewire-pulse.socket,wireplumber.service] linger=desk
+15 command received-link as=desk
+16 command apt-cleanup
 [post]
 01 wait-network
 02 ensure-user desk uid=1000 groups=sudo,audio,video
 03 set-password desk
 04 security-updates
+05 command settings-hostname
+06 command settings-timezone
+07 command settings-locale
+08 command settings-keyboard

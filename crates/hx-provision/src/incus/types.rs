@@ -91,6 +91,12 @@ pub struct StoragePool {
     /// Pool status (`Created`).
     #[serde(default)]
     pub status: String,
+    /// Description (carries the hash-xcreen marker on pools we created).
+    #[serde(default)]
+    pub description: String,
+    /// API paths of the objects that use it.
+    #[serde(default)]
+    pub used_by: Vec<String>,
 }
 
 /// A network as reported by the daemon.
@@ -108,6 +114,26 @@ pub struct Network {
     /// Network status.
     #[serde(default)]
     pub status: String,
+    /// Description (carries the hash-xcreen marker on networks we created).
+    #[serde(default)]
+    pub description: String,
+    /// API paths of the objects that use it.
+    #[serde(default)]
+    pub used_by: Vec<String>,
+}
+
+/// A profile or network ACL as reported by the daemon (the parts teardown needs).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+pub struct ObjectInfo {
+    /// Name.
+    #[serde(default)]
+    pub name: String,
+    /// Description (carries the hash-xcreen marker on objects we created).
+    #[serde(default)]
+    pub description: String,
+    /// API paths of the objects that use it.
+    #[serde(default)]
+    pub used_by: Vec<String>,
 }
 
 /// An instance as reported by the daemon.
@@ -128,6 +154,18 @@ pub struct Instance {
     /// Instance-level configuration.
     #[serde(default)]
     pub config: BTreeMap<String, String>,
+    /// Free-text description (kept when an instance's definition is replaced).
+    #[serde(default)]
+    pub description: String,
+    /// CPU architecture (needed to replace an instance's definition).
+    #[serde(default)]
+    pub architecture: String,
+    /// Devices defined on the instance itself (not those that come from profiles).
+    #[serde(default)]
+    pub devices: BTreeMap<String, BTreeMap<String, String>>,
+    /// Devices after profiles are applied.
+    #[serde(default)]
+    pub expanded_devices: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 /// Run state of an instance (`GET /1.0/instances/<name>/state`).

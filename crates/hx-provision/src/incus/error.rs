@@ -44,6 +44,13 @@ pub enum IncusError {
     /// A background operation finished unsuccessfully.
     #[error("Incus operation failed: {0}")]
     Operation(String),
+    /// The daemon had already purged the operation when its result was asked for, so whether it
+    /// succeeded is unknown. Mutating calls re-read the state and only report this when the
+    /// intended result is not there.
+    #[error(
+        "the result of {0} is unknown (the operation was purged) and the intended state is not in place"
+    )]
+    Purged(String),
     /// A name that would not be a valid single path segment or Incus name.
     #[error("invalid {what} name `{name}`")]
     InvalidName {

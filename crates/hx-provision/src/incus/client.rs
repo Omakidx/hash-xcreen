@@ -4,6 +4,8 @@
 //! an operation, which the client waits for (`GET /1.0/operations/<id>/wait`) up to a deadline and
 //! cancels when the deadline passes.
 
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -12,10 +14,14 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::error::IncusError;
+use super::limits::{LimitsApplied, LimitsUpdate};
+use super::link::{LinkOutcome, SESSION_LINK_DEVICE, SessionLink};
+use super::marker::{NETWORK_DESCRIPTION, POOL_DESCRIPTION};
+use super::operation::{OperationEnd, OperationId};
 use super::transport::{Request, Response, Transport, UnixTransport};
 use super::types::{
-    Acl, ExecResult, ExecSpec, Instance, InstanceCreate, InstanceState, Network, Operation,
-    ProfileSpec, ServerInfo, Snapshot, StateAction, StoragePool,
+    Acl, ExecResult, ExecSpec, Instance, InstanceCreate, InstanceState, Network, ObjectInfo,
+    Operation, ProfileSpec, ServerInfo, Snapshot, StateAction, StoragePool,
 };
 
 /// Default timeout of a plain request.
@@ -42,6 +48,13 @@ fn checked<'a>(what: &'static str, name: &'a str) -> Result<&'a str, IncusError>
             name: name.to_string(),
         })
     }
+}
+
+/// Incus 6.0.0 answers a `/wait?timeout=N` that runs out with `500 context deadline exceeded`
+/// instead of the still-running operation (found with the real-container test, which is the first
+/// to wait longer than one slice). That means "not finished yet", not a failure.
+pub(crate) fn is_wait_timeout(e: &IncusError) -> bool {
+    matches!(e, IncusError::Api { code: 500, message } if message.contains("context deadline exceeded"))
 }
 
 /// Percent-encode a query value (keeps `/` readable).
@@ -146,17 +159,19 @@ fn op_path(env: &Envelope) -> Result<String, IncusError> {
 }
 
 /// Typed client for the parts of the Incus API that provisioning uses.
+///
+/// A client remembers the background operations it is currently waiting for (see
+/// [`Client::in_flight_operations`]); clones share that memory, [`Client::scoped`] starts a new one.
 #[derive(Debug, Clone)]
 pub struct Client<T: Transport> {
     transport: T,
+    in_flight: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl Client<UnixTransport> {
     /// Connect to the daemon's unix socket (default `/var/lib/incus/unix.socket`).
     pub fn unix(path: impl Into<std::path::PathBuf>) -> Self {
-        Self {
-            transport: UnixTransport::new(path),
-        }
+        Self::new(UnixTransport::new(path))
     }
 
     /// Connect to the default socket.
@@ -168,7 +183,143 @@ impl Client<UnixTransport> {
 impl<T: Transport> Client<T> {
     /// Use any transport (tests).
     pub fn new(transport: T) -> Self {
-        Self { transport }
+        Self {
+            transport,
+            in_flight: Arc::default(),
+        }
+    }
+
+    /// A client for the same daemon with its **own** set of in-flight operations. `hx-privd`
+    /// makes one per request, so that cancelling a request cancels only the operations that
+    /// request started.
+    pub fn scoped(&self) -> Self
+    where
+        T: Clone,
+    {
+        Self::new(self.transport.clone())
+    }
+
+    // --- operations (cancel and wait; ipc.md 4) ------------------------------------------------
+
+    fn track(&self, id: &str) {
+        if let Ok(mut s) = self.in_flight.lock() {
+            s.insert(id.to_string());
+        }
+    }
+
+    fn untrack(&self, id: &str) {
+        if let Ok(mut s) = self.in_flight.lock() {
+            s.remove(id);
+        }
+    }
+
+    /// The background operations this client (and its clones) started and has not seen end.
+    ///
+    /// Dropping a future from this crate does **not** stop its Incus operation, and does not
+    /// remove it from this list: that is the point. After a cancel, call
+    /// [`Client::cancel_in_flight`] (or [`Client::cancel_operation`] and
+    /// [`Client::wait_operation_end`] per id). An operation is listed from the moment its id is
+    /// known; one that the daemon created while the request was still on the wire when the future
+    /// was dropped is not known to the client (check the instance state during cleanup).
+    pub fn in_flight_operations(&self) -> Vec<OperationId> {
+        self.in_flight
+            .lock()
+            .map(|s| s.iter().cloned().map(OperationId).collect())
+            .unwrap_or_default()
+    }
+
+    /// Ask the daemon to cancel an operation (`DELETE /1.0/operations/<id>`). `Ok(false)`: it no
+    /// longer exists (already finished). The operation may take a moment to end; follow with
+    /// [`Client::wait_operation_end`].
+    pub async fn cancel_operation(&self, id: &OperationId) -> Result<bool, IncusError> {
+        match self
+            .envelope(
+                Method::DELETE,
+                format!("/1.0/operations/{}", id.0),
+                None::<&Value>,
+                Duration::from_secs(10),
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) if e.is_not_found() => {
+                self.untrack(&id.0);
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Wait until an operation has ended, for at most `timeout` (`IncusError::Timeout` if it has
+    /// not). An operation the daemon no longer knows has ended ([`OperationEnd::Gone`]).
+    pub async fn wait_operation_end(
+        &self,
+        id: &OperationId,
+        timeout: Duration,
+    ) -> Result<OperationEnd, IncusError> {
+        let started = Instant::now();
+        loop {
+            let left = timeout.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                return Err(IncusError::Timeout {
+                    what: format!("operation {} to end", id.0),
+                    after: timeout,
+                });
+            }
+            let secs = (left.as_secs_f64().ceil() as u64).clamp(1, WAIT_SLICE.as_secs());
+            match self
+                .envelope(
+                    Method::GET,
+                    format!("/1.0/operations/{}/wait?timeout={secs}", id.0),
+                    None::<&Value>,
+                    Duration::from_secs(secs) + Duration::from_secs(20),
+                )
+                .await
+            {
+                Ok(env) => {
+                    let op = Operation::from_value(&env.metadata)?;
+                    if op.is_terminal() {
+                        self.untrack(&id.0);
+                        return Ok(match op.status_code {
+                            200 => OperationEnd::Success,
+                            401 => OperationEnd::Cancelled,
+                            _ => OperationEnd::Failed(op.err),
+                        });
+                    }
+                }
+                Err(e) if is_wait_timeout(&e) => {}
+                Err(e) if e.is_not_found() => {
+                    self.untrack(&id.0);
+                    return Ok(OperationEnd::Gone);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Cancel every in-flight operation of this client and wait until all have ended, for at most
+    /// `wait` in total (ipc.md 4 uses 30 s). Returns how many were cancelled. `Err` carries the
+    /// operations that did not end in time: the caller must not start new work on the same
+    /// instance (`STUCK_OPERATION`).
+    pub async fn cancel_in_flight(&self, wait: Duration) -> Result<usize, Vec<OperationId>> {
+        let ids = self.in_flight_operations();
+        let deadline = Instant::now() + wait;
+        for id in &ids {
+            // An operation that cannot be cancelled is still waited for below.
+            let _ = self.cancel_operation(id).await;
+        }
+        let mut stuck = Vec::new();
+        for id in &ids {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if self.wait_operation_end(id, left).await.is_err() {
+                stuck.push(id.clone());
+            }
+        }
+        if stuck.is_empty() {
+            Ok(ids.len())
+        } else {
+            Err(stuck)
+        }
     }
 
     // --- plumbing ------------------------------------------------------------------------
@@ -179,6 +330,7 @@ impl<T: Transport> Client<T> {
         path: String,
         body: Option<&impl Serialize>,
         timeout: Duration,
+        headers: Vec<(&'static str, String)>,
     ) -> Result<Response, IncusError> {
         let (body, content_type) = match body {
             Some(b) => (
@@ -194,7 +346,7 @@ impl<T: Transport> Client<T> {
             .send(Request {
                 method,
                 path,
-                headers: Vec::new(),
+                headers,
                 body,
                 content_type,
                 max_response: None,
@@ -210,8 +362,99 @@ impl<T: Transport> Client<T> {
         body: Option<&impl Serialize>,
         timeout: Duration,
     ) -> Result<Envelope, IncusError> {
-        let r = self.send_json(method, path, body, timeout).await?;
+        let r = self
+            .send_json(method, path, body, timeout, Vec::new())
+            .await?;
         parse_envelope(r.status, &r.body)
+    }
+
+    /// The instance and its `ETag`, for a conditional write (`If-Match`).
+    async fn instance_with_etag(
+        &self,
+        name: &str,
+    ) -> Result<Option<(Instance, Option<String>)>, IncusError> {
+        let r = self
+            .send_json(
+                Method::GET,
+                format!("/1.0/instances/{name}"),
+                None::<&Value>,
+                REQUEST_TIMEOUT,
+                Vec::new(),
+            )
+            .await?;
+        match parse_envelope(r.status, &r.body) {
+            Ok(env) => Ok(Some((
+                decode("instance", env.metadata)?,
+                r.headers.get("etag").cloned(),
+            ))),
+            Err(e) if e.is_not_found() => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Replace an instance's device set (`PUT` of the whole definition, which is the only way to
+    /// delete or fully replace a device: `PATCH` merges device options key by key). The write is
+    /// conditional on the `ETag` of the definition it was computed from, so a concurrent change
+    /// (for example `disable_docker`) is not overwritten: on `412` the definition is read again and
+    /// `edit` re-applied, up to three times.
+    async fn put_instance_devices(
+        &self,
+        name: &str,
+        what: &str,
+        edit: impl Fn(
+            &mut std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+        ) -> bool,
+    ) -> Result<bool, IncusError> {
+        for _ in 0..3 {
+            let Some((inst, etag)) = self.instance_with_etag(name).await? else {
+                return Err(IncusError::Api {
+                    code: 404,
+                    message: format!("instance `{name}` not found"),
+                });
+            };
+            let mut devices = inst.devices.clone();
+            if !edit(&mut devices) {
+                return Ok(false);
+            }
+            let body = json!({
+                "architecture": inst.architecture,
+                "config": inst.config,
+                "description": inst.description,
+                "devices": devices,
+                "profiles": inst.profiles,
+                "ephemeral": false,
+            });
+            let headers: Vec<(&'static str, String)> =
+                etag.into_iter().map(|e| ("If-Match", e)).collect();
+            let r = self
+                .send_json(
+                    Method::PUT,
+                    format!("/1.0/instances/{name}"),
+                    Some(&body),
+                    REQUEST_TIMEOUT,
+                    headers,
+                )
+                .await?;
+            match parse_envelope(r.status, &r.body) {
+                Ok(env) if env.kind == "async" => {
+                    match self
+                        .wait_operation(&op_path(&env)?, Duration::from_secs(60), what)
+                        .await
+                    {
+                        Ok(_) => return Ok(true),
+                        // Settled by the caller's re-read.
+                        Err(IncusError::Purged(_)) => return Ok(true),
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(_) => return Ok(true),
+                Err(IncusError::Api { code: 412, .. }) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(IncusError::Operation(format!(
+            "{what}: the instance kept changing underneath (412 three times)"
+        )))
     }
 
     /// A call whose answer is the metadata itself.
@@ -261,6 +504,32 @@ impl<T: Transport> Client<T> {
         self.wait_operation(&op_path(&env)?, deadline, what).await
     }
 
+    /// [`Client::run`] for a call whose intended result can be read back. When the daemon has
+    /// already purged the operation ([`IncusError::Purged`]) its outcome is unknown, so `verify`
+    /// re-reads the state and says whether the intended result is in place; if not, the call is
+    /// an error. Nothing is ever assumed to have succeeded.
+    async fn run_verified(
+        &self,
+        method: Method,
+        path: String,
+        body: Option<&Value>,
+        deadline: Duration,
+        what: &str,
+        verify: impl AsyncFnOnce() -> Result<bool, IncusError>,
+    ) -> Result<(), IncusError> {
+        match self.run(method, path, body, deadline, what).await {
+            Ok(_) => Ok(()),
+            Err(IncusError::Purged(w)) => {
+                if verify().await? {
+                    Ok(())
+                } else {
+                    Err(IncusError::Purged(w))
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Wait for an operation to finish. On timeout the operation is cancelled (best effort).
     pub(crate) async fn wait_operation(
         &self,
@@ -269,6 +538,10 @@ impl<T: Transport> Client<T> {
         what: &str,
     ) -> Result<Operation, IncusError> {
         let started = Instant::now();
+        let tracked = path.strip_prefix("/1.0/operations/").unwrap_or_default();
+        if !tracked.is_empty() {
+            self.track(tracked);
+        }
         loop {
             let elapsed = started.elapsed();
             if elapsed >= deadline {
@@ -298,9 +571,25 @@ impl<T: Transport> Client<T> {
                     None::<&Value>,
                     Duration::from_secs(secs) + Duration::from_secs(20),
                 )
-                .await?;
+                .await;
+            let env = match env {
+                Ok(e) => e,
+                Err(e) if is_wait_timeout(&e) => continue,
+                Err(e) if e.is_not_found() => {
+                    // The daemon no longer knows the operation: it ended and was purged before we
+                    // asked (seen on a real daemon for an instance restart), or it failed and was
+                    // purged. Its result is gone and is NOT assumed to be success: this is a
+                    // distinct error, and every mutating call re-reads the state it changed
+                    // (`run_verified`).
+                    self.untrack(tracked);
+                    return Err(IncusError::Purged(what.to_string()));
+                }
+                // Other errors keep the operation tracked.
+                Err(e) => return Err(e),
+            };
             let op = Operation::from_value(&env.metadata)?;
             if op.is_terminal() {
+                self.untrack(tracked);
                 return match op.status_code {
                     200 => Ok(op),
                     401 => Err(IncusError::Operation(format!("{what}: cancelled"))),
@@ -340,7 +629,7 @@ impl<T: Transport> Client<T> {
         config: &std::collections::BTreeMap<String, String>,
     ) -> Result<(), IncusError> {
         checked("storage pool", name)?;
-        let body = json!({"name": name, "driver": driver, "config": config});
+        let body = json!({"name": name, "driver": driver, "config": config, "description": POOL_DESCRIPTION});
         self.sync(Method::POST, "/1.0/storage-pools".into(), Some(&body))
             .await
             .map(drop)
@@ -372,7 +661,7 @@ impl<T: Transport> Client<T> {
         config: &std::collections::BTreeMap<String, String>,
     ) -> Result<(), IncusError> {
         checked("network", name)?;
-        let body = json!({"name": name, "type": "bridge", "config": config});
+        let body = json!({"name": name, "type": "bridge", "config": config, "description": NETWORK_DESCRIPTION});
         self.sync(Method::POST, "/1.0/networks".into(), Some(&body))
             .await
             .map(drop)
@@ -385,10 +674,17 @@ impl<T: Transport> Client<T> {
         config: &std::collections::BTreeMap<String, String>,
     ) -> Result<(), IncusError> {
         let name = checked("network", name)?;
+        // Incus 6.0.0 resets the description to empty on a PATCH that does not repeat it, which
+        // would drop the hash-xcreen marker: send the current one back.
+        let description = self
+            .get_network(name)
+            .await?
+            .map(|n| n.description)
+            .unwrap_or_default();
         self.sync(
             Method::PATCH,
             format!("/1.0/networks/{name}"),
-            Some(&json!({"config": config})),
+            Some(&json!({"config": config, "description": description})),
         )
         .await
         .map(drop)
@@ -400,6 +696,15 @@ impl<T: Transport> Client<T> {
         self.sync(Method::DELETE, format!("/1.0/networks/{name}"), None)
             .await
             .map(drop)
+    }
+
+    /// The ACL (name, description, users), or `None`.
+    pub async fn get_acl(&self, name: &str) -> Result<Option<ObjectInfo>, IncusError> {
+        let name = checked("network ACL", name)?;
+        self.get_optional(format!("/1.0/network-acls/{name}"))
+            .await?
+            .map(|v| decode("network ACL", v))
+            .transpose()
     }
 
     /// Whether the ACL exists.
@@ -444,6 +749,15 @@ impl<T: Transport> Client<T> {
     }
 
     // --- profiles --------------------------------------------------------------------------
+
+    /// The profile (name, description, users), or `None`.
+    pub async fn get_profile(&self, name: &str) -> Result<Option<ObjectInfo>, IncusError> {
+        let name = checked("profile", name)?;
+        self.get_optional(format!("/1.0/profiles/{name}"))
+            .await?
+            .map(|v| decode("profile", v))
+            .transpose()
+    }
 
     /// Whether the profile exists.
     pub async fn profile_exists(&self, name: &str) -> Result<bool, IncusError> {
@@ -490,15 +804,15 @@ impl<T: Transport> Client<T> {
         deadline: Duration,
     ) -> Result<(), IncusError> {
         checked("instance", &spec.name)?;
-        self.run(
+        self.run_verified(
             Method::POST,
             "/1.0/instances".into(),
             Some(&spec.to_json()),
             deadline,
             "instance creation",
+            async || Ok(self.get_instance(&spec.name).await?.is_some()),
         )
         .await
-        .map(drop)
     }
 
     /// Merge keys into an instance's configuration (`PATCH`). Some keys need a restart.
@@ -508,15 +822,200 @@ impl<T: Transport> Client<T> {
         config: &std::collections::BTreeMap<String, String>,
     ) -> Result<(), IncusError> {
         let name = checked("instance", name)?;
-        self.run(
+        self.run_verified(
             Method::PATCH,
             format!("/1.0/instances/{name}"),
             Some(&json!({"config": config})),
             Duration::from_secs(60),
             "instance update",
+            async || {
+                Ok(self
+                    .get_instance(name)
+                    .await?
+                    .is_some_and(|i| config.iter().all(|(k, v)| i.config.get(k) == Some(v))))
+            },
         )
         .await
-        .map(drop)
+    }
+
+    /// Change CPU, memory and root-disk limits of an instance, running or not (ipc.md 6.8).
+    ///
+    /// Only `limits.cpu`, `limits.memory` and the `size` of the instance's root disk are written.
+    /// The root device is taken from the instance's effective devices and written back with the
+    /// new `size` as an instance-level override, so the pool, path and any other option stay as
+    /// they are; an instance without a root disk device is refused. Idempotent (same values, same
+    /// result). Host-dependent bounds are the caller's job, see [`LimitsUpdate`].
+    pub async fn set_limits(
+        &self,
+        instance: &str,
+        update: &LimitsUpdate,
+    ) -> Result<LimitsApplied, IncusError> {
+        let name = checked("instance", instance)?;
+        update.validate()?;
+        let mut applied = LimitsApplied::default();
+        let mut config = std::collections::BTreeMap::new();
+        if let Some(c) = update.cpu {
+            config.insert("limits.cpu".to_string(), c.to_string());
+            applied.changed.push("limits.cpu");
+        }
+        if let Some(m) = update.memory_mib {
+            config.insert("limits.memory".to_string(), format!("{m}MiB"));
+            applied.changed.push("limits.memory");
+        }
+        let mut body = json!({});
+        if !config.is_empty() {
+            body["config"] = json!(config);
+        }
+        if let Some(d) = update.disk_gib {
+            let inst = self
+                .get_instance(name)
+                .await?
+                .ok_or_else(|| IncusError::Api {
+                    code: 404,
+                    message: format!("instance `{name}` not found"),
+                })?;
+            let mut root = inst
+                .devices
+                .get("root")
+                .or_else(|| inst.expanded_devices.get("root"))
+                .cloned()
+                .ok_or_else(|| {
+                    IncusError::InvalidArgument("the instance has no root disk device".into())
+                })?;
+            if root.get("type").map(String::as_str) != Some("disk")
+                || root.get("path").map(String::as_str) != Some("/")
+            {
+                return Err(IncusError::InvalidArgument(
+                    "the `root` device is not the root disk".into(),
+                ));
+            }
+            root.insert("size".into(), format!("{d}GiB"));
+            body["devices"] = json!({"root": root});
+            applied.changed.push("devices.root.size");
+        }
+        let want_root_size = update.disk_gib.map(|d| format!("{d}GiB"));
+        self.run_verified(
+            Method::PATCH,
+            format!("/1.0/instances/{name}"),
+            Some(&body),
+            Duration::from_secs(120),
+            "applying limits",
+            async || {
+                Ok(self.get_instance(name).await?.is_some_and(|i| {
+                    config.iter().all(|(k, v)| i.config.get(k) == Some(v))
+                        && want_root_size.as_ref().is_none_or(|s| {
+                            i.devices.get("root").and_then(|r| r.get("size")) == Some(s)
+                        })
+                }))
+            },
+        )
+        .await?;
+        // Memory and the root disk quota take effect at once on a running container, verified on
+        // Incus 6.0.0 (cgroup memory.max changed, a 13 GiB allocation hit "Disk quota exceeded"
+        // under a 12 GiB quota). A changed CPU count did not change the running container's
+        // cpuset on that version: it applies at the next start.
+        if update.cpu.is_some() && self.instance_state(name).await?.is_running() {
+            applied.restart_required = true;
+        }
+        Ok(applied)
+    }
+
+    /// Add the session-link proxy device ([`SessionLink`], ipc.md 6.11) to an instance.
+    ///
+    /// This is the only device-add call of the client and it takes only a [`SessionLink`], whose
+    /// constructor validates its inputs and fixes every other property, so the caller cannot add
+    /// anything else (a disk, a nic, another proxy, a unix socket pass-through).
+    ///
+    /// Converges: an identical device is left alone ([`LinkOutcome::Unchanged`]); a proxy device
+    /// of the same name with other options is replaced ([`LinkOutcome::Replaced`]); a device of
+    /// that name that is not a proxy device is refused rather than overwritten. The device
+    /// persists across restarts; Incus starts the proxy with the instance.
+    pub async fn add_session_link(
+        &self,
+        instance: &str,
+        link: &SessionLink,
+    ) -> Result<LinkOutcome, IncusError> {
+        let name = checked("instance", instance)?;
+        let want = link.device();
+        let current = self
+            .get_instance(name)
+            .await?
+            .ok_or_else(|| IncusError::Api {
+                code: 404,
+                message: format!("instance `{name}` not found"),
+            })?;
+        let outcome = match current.devices.get(SESSION_LINK_DEVICE) {
+            Some(d) if *d == want => return Ok(LinkOutcome::Unchanged),
+            Some(d) if d.get("type").map(String::as_str) != Some("proxy") => {
+                return Err(IncusError::InvalidArgument(format!(
+                    "device `{SESSION_LINK_DEVICE}` exists and is not a proxy device"
+                )));
+            }
+            Some(_) => LinkOutcome::Replaced,
+            None => LinkOutcome::Added,
+        };
+        let in_place = async || {
+            Ok(self
+                .get_instance(name)
+                .await?
+                .is_some_and(|i| i.devices.get(SESSION_LINK_DEVICE) == Some(&want)))
+        };
+        if outcome == LinkOutcome::Replaced {
+            // Replace the whole device: a PATCH merges option by option and would keep a stale
+            // key (say `proxy_protocol`) of the old device.
+            self.put_instance_devices(name, "replacing the session link device", |d| {
+                d.insert(SESSION_LINK_DEVICE.to_string(), want.clone());
+                true
+            })
+            .await?;
+            if !in_place().await? {
+                return Err(IncusError::Purged(
+                    "replacing the session link device".into(),
+                ));
+            }
+        } else {
+            self.run_verified(
+                Method::PATCH,
+                format!("/1.0/instances/{name}"),
+                Some(&json!({"devices": {SESSION_LINK_DEVICE: want}})),
+                Duration::from_secs(60),
+                "adding the session link device",
+                in_place,
+            )
+            .await?;
+        }
+        Ok(outcome)
+    }
+
+    /// Remove the session-link device if present (teardown). Returns whether it was removed.
+    /// Nothing else on the instance is touched.
+    pub async fn remove_session_link(&self, instance: &str) -> Result<bool, IncusError> {
+        let name = checked("instance", instance)?;
+        let Some(current) = self.get_instance(name).await? else {
+            return Ok(false);
+        };
+        if !current.devices.contains_key(SESSION_LINK_DEVICE) {
+            return Ok(false);
+        }
+        // PATCH merges device maps and cannot delete a key, so write the instance's definition
+        // back with the device left out (what `incus config device remove` does), conditional on
+        // its ETag so that a concurrent change is not lost.
+        let wrote = self
+            .put_instance_devices(name, "removing the session link device", |d| {
+                d.remove(SESSION_LINK_DEVICE).is_some()
+            })
+            .await?;
+        if wrote
+            && self
+                .get_instance(name)
+                .await?
+                .is_some_and(|i| i.devices.contains_key(SESSION_LINK_DEVICE))
+        {
+            return Err(IncusError::Purged(
+                "removing the session link device".into(),
+            ));
+        }
+        Ok(wrote)
     }
 
     /// Start, stop or restart. `force` kills instead of asking init to shut down.
@@ -529,15 +1028,21 @@ impl<T: Transport> Client<T> {
     ) -> Result<(), IncusError> {
         let name = checked("instance", name)?;
         let body = json!({"action": action.as_str(), "timeout": timeout.as_secs(), "force": force, "stateful": false});
-        self.run(
+        self.run_verified(
             Method::PUT,
             format!("/1.0/instances/{name}/state"),
             Some(&body),
             timeout + Duration::from_secs(60),
             action.as_str(),
+            async || {
+                let running = self.instance_state(name).await?.is_running();
+                Ok(match action {
+                    StateAction::Start | StateAction::Restart => running,
+                    StateAction::Stop => !running,
+                })
+            },
         )
         .await
-        .map(drop)
     }
 
     /// Run state of an instance.
@@ -553,15 +1058,15 @@ impl<T: Transport> Client<T> {
     /// Delete a stopped instance.
     pub async fn delete_instance(&self, name: &str) -> Result<(), IncusError> {
         let name = checked("instance", name)?;
-        self.run(
+        self.run_verified(
             Method::DELETE,
             format!("/1.0/instances/{name}"),
             None,
             Duration::from_secs(180),
             "instance deletion",
+            async || Ok(self.get_instance(name).await?.is_none()),
         )
         .await
-        .map(drop)
     }
 
     // --- files -----------------------------------------------------------------------------
@@ -621,6 +1126,22 @@ impl<T: Transport> Client<T> {
         .await
     }
 
+    /// [`Client::push_file`] for a secret. The request body is held by a zeroizing owner
+    /// (`Bytes::from_owner`), so the one copy this makes is wiped when the body is dropped, instead
+    /// of leaving an ordinary heap copy of the password behind. (The socket and hyper's write
+    /// buffer still see the bytes in transit; that is unavoidable, and why the file is 0600 in a
+    /// 0700 directory and deleted at once.)
+    pub async fn push_secret_file(
+        &self,
+        instance: &str,
+        path: &str,
+        content: &crate::exec::Secret,
+        mode: u32,
+    ) -> Result<(), IncusError> {
+        self.file_request(instance, path, "file", mode, secret_body(content))
+            .await
+    }
+
     /// Create a directory owned by root with `mode` (existing directories are left alone).
     pub async fn push_dir(&self, instance: &str, path: &str, mode: u32) -> Result<(), IncusError> {
         self.file_request(instance, path, "directory", mode, Bytes::new())
@@ -674,6 +1195,75 @@ impl<T: Transport> Client<T> {
                 other.unwrap_or("missing")
             ))),
         }
+    }
+
+    /// Owner, mode and type of a path in an instance (`GET .../files`, the `X-Incus-*` headers),
+    /// without reading its content. `Ok(None)` when it does not exist.
+    pub async fn stat_path(
+        &self,
+        instance: &str,
+        path: &str,
+    ) -> Result<Option<PathStat>, IncusError> {
+        let name = checked("instance", instance)?;
+        if !path.starts_with('/') || path.contains('\0') {
+            return Err(IncusError::InvalidArgument(format!(
+                "file path `{path}` must be absolute"
+            )));
+        }
+        let r = self
+            .transport
+            .send(Request {
+                method: Method::GET,
+                path: format!("/1.0/instances/{name}/files?path={}", encode_query(path)),
+                headers: Vec::new(),
+                body: Bytes::new(),
+                content_type: None,
+                // Only the headers matter, but for a directory the body is its listing: allow a
+                // modest one. Anything larger is reported as `kind: "unknown"` (fail closed for
+                // the caller that wants a private directory).
+                max_response: Some(64 * 1024),
+                timeout: READ_FILE_TIMEOUT,
+            })
+            .await;
+        let r = match r {
+            Ok(r) => r,
+            Err(IncusError::TooLarge { .. }) => {
+                return Ok(Some(PathStat {
+                    kind: "unknown".into(),
+                    uid: u32::MAX,
+                    gid: u32::MAX,
+                    mode: 0,
+                }));
+            }
+            Err(e) => return Err(e),
+        };
+        if r.status >= 400 {
+            return match parse_envelope(r.status, &r.body) {
+                Err(e) if e.is_not_found() => Ok(None),
+                Err(e) => Err(e),
+                Ok(_) => Err(IncusError::Protocol(
+                    "error status with a success body".into(),
+                )),
+            };
+        }
+        let num = |k: &str| r.headers.get(k).and_then(|v| v.trim().parse::<u32>().ok());
+        let (Some(uid), Some(gid), Some(mode)) = (
+            num("x-incus-uid"),
+            num("x-incus-gid"),
+            r.headers
+                .get("x-incus-mode")
+                .and_then(|v| u32::from_str_radix(v.trim(), 8).ok()),
+        ) else {
+            return Err(IncusError::Protocol(format!(
+                "no owner or mode headers for `{path}`"
+            )));
+        };
+        Ok(Some(PathStat {
+            kind: r.headers.get("x-incus-type").cloned().unwrap_or_default(),
+            uid,
+            gid,
+            mode: mode & 0o7777,
+        }))
     }
 
     /// Delete a file in an instance (a missing file is not an error).
@@ -739,30 +1329,42 @@ impl<T: Transport> Client<T> {
         let name = checked("instance", instance)?;
         checked("snapshot", snapshot)?;
         let body = json!({"name": snapshot, "stateful": false});
-        self.run(
+        self.run_verified(
             Method::POST,
             format!("/1.0/instances/{name}/snapshots"),
             Some(&body),
             Duration::from_secs(300),
             "snapshot creation",
+            async || {
+                Ok(self
+                    .list_snapshots(name)
+                    .await?
+                    .iter()
+                    .any(|s| s.name == snapshot))
+            },
         )
         .await
-        .map(drop)
     }
 
     /// Delete a snapshot.
     pub async fn delete_snapshot(&self, instance: &str, snapshot: &str) -> Result<(), IncusError> {
         let name = checked("instance", instance)?;
         let snap = checked("snapshot", snapshot)?;
-        self.run(
+        self.run_verified(
             Method::DELETE,
             format!("/1.0/instances/{name}/snapshots/{snap}"),
             None,
             Duration::from_secs(300),
             "snapshot deletion",
+            async || {
+                Ok(!self
+                    .list_snapshots(name)
+                    .await?
+                    .iter()
+                    .any(|s| s.name == snap))
+            },
         )
         .await
-        .map(drop)
     }
 
     /// List an instance's snapshots.
@@ -793,6 +1395,54 @@ impl<T: Transport> Client<T> {
     }
 }
 
+/// Owner, mode and type of a path in an instance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathStat {
+    /// `file`, `directory` or `symlink`.
+    pub kind: String,
+    /// Owner uid as seen inside the instance (`u32::MAX` when not read).
+    pub uid: u32,
+    /// Owner gid as seen inside the instance (`u32::MAX` when not read).
+    pub gid: u32,
+    /// Permission bits (`0o7777` mask).
+    pub mode: u32,
+}
+
+/// Owner of a secret request body: zeroized when the last `Bytes` that refers to it is dropped.
+pub(crate) struct SecretBody(zeroize::Zeroizing<Vec<u8>>);
+
+impl AsRef<[u8]> for SecretBody {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for SecretBody {}
+
+pub(crate) fn secret_body(secret: &crate::exec::Secret) -> Bytes {
+    Bytes::from_owner(SecretBody(zeroize::Zeroizing::new(
+        secret.expose().to_vec(),
+    )))
+}
+
 fn decode<D: serde::de::DeserializeOwned>(what: &str, v: Value) -> Result<D, IncusError> {
     serde_json::from_value(v).map_err(|e| IncusError::Protocol(format!("cannot read {what}: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+
+    #[test]
+    fn a_secret_body_is_zeroized_on_drop_and_carries_the_bytes() {
+        assert_zeroize_on_drop::<SecretBody>();
+        let s = crate::exec::Secret::from_slice(b"user:pw\n");
+        let b = secret_body(&s);
+        assert_eq!(&b[..], b"user:pw\n");
+        // A clone shares the same owner (no second, unwiped copy), and the owner outlives both.
+        let c = b.clone();
+        assert_eq!(b.as_ptr(), c.as_ptr());
+    }
 }

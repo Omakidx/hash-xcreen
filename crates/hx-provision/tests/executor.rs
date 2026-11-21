@@ -5,7 +5,8 @@ use std::sync::Mutex;
 use hx_provision::lower::lower;
 use hx_provision::{
     Action, Addon, ApplyError, Catalog, Desktop, Distro, ExecError, ExecOutput, ExecRequest,
-    Executor, FilePush, Preset, Progress, RecipeId, Secrets, Stage, Step, StepFailure, apply_stage,
+    Executor, FilePush, Preset, Progress, RecipeId, Secret, Secrets, Stage, Step, StepFailure,
+    apply_stage,
 };
 
 const PASSWORD: &str = "correct horse battery staple 9!";
@@ -19,7 +20,19 @@ struct Recorder {
 
 impl Executor for Recorder {
     async fn exec(&self, request: &ExecRequest) -> Result<ExecOutput, ExecError> {
-        self.log.lock().unwrap().push(Action::Exec(request.clone()));
+        // `ExecRequest` is deliberately not `Clone`: rebuild it, copying the secret explicitly.
+        let copy = ExecRequest {
+            label: request.label.clone(),
+            argv: request.argv.clone(),
+            env: request.env.clone(),
+            cwd: request.cwd.clone(),
+            stdin: request
+                .stdin
+                .as_ref()
+                .map(|s| Secret::from_slice(s.expose())),
+            timeout: request.timeout,
+        };
+        self.log.lock().unwrap().push(Action::Exec(copy));
         let code = self
             .fail
             .iter()
@@ -143,7 +156,9 @@ async fn a_failing_step_reports_no_secret() {
         .unwrap_err();
     let msg = e.to_string();
     assert!(
-        msg.contains("set-password desk") && msg.contains("boom on stderr"),
+        msg.contains("set-password desk")
+            && msg.contains("withheld")
+            && !msg.contains("boom on stderr"),
         "{msg}"
     );
     assert!(!msg.contains(PASSWORD) && !format!("{e:?}").contains(PASSWORD));
@@ -395,7 +410,7 @@ fn file_and_user_steps_lower_to_quoted_commands() {
     let s = script_of(&lower(svc, &Secrets::none()).unwrap()[0]).to_string();
     assert!(
         s.contains("systemctl enable 'docker.service'")
-            && s.contains("systemctl --global enable 'hx-session.service'")
+            && s.contains("systemctl --global enable 'hx-xsession.service'")
     );
     assert!(s.contains("loginctl enable-linger 'desk'"));
 }
@@ -406,7 +421,7 @@ fn user_commands_run_through_runuser_with_a_home_directory() {
     let cmd = p
         .post
         .iter()
-        .find(|s| matches!(s, Step::Command(_)))
+        .find(|s| matches!(s, Step::Command(c) if c.as_user.is_some()))
         .unwrap();
     let Action::Exec(r) = &lower(cmd, &Secrets::none()).unwrap()[0] else {
         panic!()

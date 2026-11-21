@@ -26,12 +26,18 @@ pub mod incus;
 pub mod lower;
 pub mod manifest;
 pub mod orchestrate;
+pub mod password;
 pub mod plan;
 pub mod recipe;
+pub mod session;
+pub mod settings;
+pub mod teardown;
 pub mod user;
 
 pub use catalog::{Addon, Catalog, Desktop, Distro, Preset, RecipeId};
-pub use docker::{DockerOptions, DockerOutcome, enable_docker};
+pub use docker::{
+    DisableOutcome, DockerMode, DockerOptions, DockerOutcome, disable_docker, enable_docker,
+};
 pub use error::RecipeError;
 pub use exec::{
     Action, ApplyError, ExecError, ExecOutput, ExecRequest, Executor, FilePush, Progress, Secret,
@@ -45,4 +51,5 @@ pub use orchestrate::{
 };
 pub use plan::{ImageRef, Plan, Stage, Step};
 pub use recipe::{DirSource, MemSource, RecipeSource};
+pub use settings::{Settings, SettingsError};
 pub use user::{DEFAULT_USERNAME, Username, UsernameError};

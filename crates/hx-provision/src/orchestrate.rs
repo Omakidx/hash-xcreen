@@ -169,10 +169,30 @@ impl<T: Transport> Executor for IncusExecutor<'_, T> {
                     .push_dir(&self.instance, WORK_DIR, 0o700)
                     .await
                     .map_err(backend)?;
+                // `push_dir` leaves an existing directory alone, so check what is there: a
+                // secret goes only into a real directory that is root-owned and 0700 (a container
+                // that ran user code could have pre-created it with other owner or mode).
+                match self
+                    .client
+                    .stat_path(&self.instance, WORK_DIR)
+                    .await
+                    .map_err(backend)?
+                {
+                    Some(st) if st.kind == "directory" && st.uid == 0 && st.mode == 0o700 => {}
+                    other => {
+                        return Err(ExecError::Backend(format!(
+                            "{WORK_DIR} is not a root-owned 0700 directory ({}); refusing to write a secret into it",
+                            other.map_or("missing".to_string(), |s| format!(
+                                "{} uid {} mode {:o}",
+                                s.kind, s.uid, s.mode
+                            ))
+                        )));
+                    }
+                }
                 let path = format!("{WORK_DIR}/{}", unique_name("stdin"));
                 if let Err(e) = self
                     .client
-                    .push_file(&self.instance, &path, secret.expose(), 0o600)
+                    .push_secret_file(&self.instance, &path, secret, 0o600)
                     .await
                 {
                     // The daemon may have stored the file before failing: remove it.
@@ -432,6 +452,9 @@ impl DesktopSpec {
         config.insert("security.guestapi".into(), "false".into());
         config.insert("security.idmap.isolated".into(), "true".into());
         config.insert("boot.autostart".into(), "true".into());
+        // The hash-xcreen marker (ipc.md 7, rule 8): teardown deletes only instances that have a
+        // `user.hx.*` key. `hx-privd` moves the state on to `ready` (or `failed`) later.
+        config.insert(crate::incus::INSTANCE_STATE_KEY.into(), "creating".into());
         config.insert(
             "limits.processes".into(),
             self.limits
@@ -490,6 +513,19 @@ pub enum ProvisionError {
     /// Bad input.
     #[error("invalid request: {0}")]
     Invalid(String),
+    /// A destructive call was refused because the object does not carry the hash-xcreen marker
+    /// (privd: `PERMISSION_DENIED` or `FAILED_PRECONDITION`).
+    #[error("`{0}` does not carry the hash-xcreen marker; refusing to delete it")]
+    NotOurs(String),
+    /// The requested mode or feature is named but not implemented (privd: `UNIMPLEMENTED`).
+    #[error("not implemented: {0}")]
+    Unimplemented(String),
+    /// The operation needs a running desktop and it is not running (privd: `FAILED_PRECONDITION`).
+    #[error("the desktop is not running")]
+    NotRunning,
+    /// A shielded section's task died (panic or runtime shutdown) before it could report.
+    #[error("an internal task failed: {0}")]
+    Task(String),
 }
 
 /// What a provisioning run did.

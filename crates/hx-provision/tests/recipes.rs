@@ -108,10 +108,23 @@ fn every_shipped_recipe_resolves() {
             assert_eq!(m.packages.contains(&"code".to_string()), dev);
             assert_eq!(
                 m.post_commands,
+                // The settings steps (hostname, timezone, locale, keyboard) come first.
                 if dev {
-                    vec!["claude-code", "codex-cli"]
+                    vec![
+                        "settings-hostname",
+                        "settings-timezone",
+                        "settings-locale",
+                        "settings-keyboard",
+                        "claude-code",
+                        "codex-cli",
+                    ]
                 } else {
-                    Vec::<&str>::new()
+                    vec![
+                        "settings-hostname",
+                        "settings-timezone",
+                        "settings-locale",
+                        "settings-keyboard",
+                    ]
                 }
             );
         }
@@ -205,6 +218,15 @@ fn embedded_recipes_equal_the_files_on_disk_and_none_is_missing() {
     let mut emb: Vec<&str> = embedded.paths().collect();
     emb.sort();
     assert_eq!(on_disk.iter().map(String::as_str).collect::<Vec<_>>(), emb);
+    // ...byte for byte (a stale build cache cannot hide an edit: this reads the files fresh)...
+    for rel in &on_disk {
+        let disk_text = std::fs::read_to_string(recipes_dir().join(rel)).unwrap();
+        assert_eq!(
+            hx_provision::RecipeSource::read(&embedded, rel).unwrap(),
+            disk_text,
+            "embedded `{rel}` differs from recipes/{rel}"
+        );
+    }
     // ...and resolving from disk gives the same plan.
     let disk = Catalog::from_dir(recipes_dir());
     for rid in RecipeId::all() {
@@ -246,8 +268,13 @@ fn developer_post_steps_run_as_the_user_and_are_optional() {
             _ => None,
         })
         .collect();
-    assert_eq!(cmds.len(), 2);
-    for c in cmds {
+    assert_eq!(cmds.len(), 6);
+    // The four settings steps run as root and are not optional; the vendor installers run as the
+    // user and are optional.
+    for c in &cmds[..4] {
+        assert!(c.name.starts_with("settings-") && c.as_user.is_none() && !c.optional);
+    }
+    for c in &cmds[4..] {
         assert_eq!(c.as_user.as_deref(), Some("desk"));
         assert!(c.optional);
         assert!(c.timeout_secs <= 7200);
@@ -265,6 +292,10 @@ fn developer_post_steps_run_as_the_user_and_are_optional() {
             "ensure-user",
             "set-password",
             "security-updates",
+            "command",
+            "command",
+            "command",
+            "command",
             "command",
             "command"
         ]
