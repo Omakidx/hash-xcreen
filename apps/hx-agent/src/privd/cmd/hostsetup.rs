@@ -133,15 +133,30 @@ pub async fn setup_host<T: Transport + Clone + 'static>(
         }
         PoolSource::LoopFile { size_gib: size }
     };
-    let extra = r
-        .extra_host_addresses
-        .as_ref()
-        .map(|l| l.addresses.iter().filter_map(|a| a.parse().ok()).collect())
-        .unwrap_or_default();
+    // Only Admin may change `allow_private_networks` and `extra_host_addresses`. A Gateway call
+    // (which cannot carry them) keeps what Admin last set, so it can neither drop the Admin's
+    // /32 rules from the ACL nor reset the private-network option (ipc.md 1.2).
+    let stored = d.read_state(|s| s.host.clone()).unwrap_or_default();
+    let parse = |v: &[String]| -> Vec<IpAddr> { v.iter().filter_map(|a| a.parse().ok()).collect() };
+    let (allow_private_networks, extra): (bool, Vec<IpAddr>) = if ctx.role == Role::Admin {
+        (
+            r.allow_private_networks
+                .unwrap_or(stored.allow_private_networks),
+            match &r.extra_host_addresses {
+                Some(l) => parse(&l.addresses),
+                None => parse(&stored.extra_host_addresses),
+            },
+        )
+    } else {
+        (
+            stored.allow_private_networks,
+            parse(&stored.extra_host_addresses),
+        )
+    };
     let params = HostParams {
         pool,
         ipv4: r.ipv4.clone().unwrap_or_else(|| "auto".into()),
-        allow_private_networks: r.allow_private_networks.unwrap_or(false),
+        allow_private_networks,
         extra,
     };
     let result = d.apply_host(ctx, &params).await?;

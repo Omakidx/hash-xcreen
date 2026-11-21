@@ -2032,3 +2032,46 @@ async fn the_host_ruleset_is_re_applied_after_an_address_change_from_what_setup_
         .count();
     assert_eq!(nft_loads, 2);
 }
+
+#[tokio::test]
+async fn a_gateway_setup_host_keeps_the_admins_extra_addresses_and_private_network_option() {
+    let runner = host_runner();
+    let h = Harness::start_with(GW, FakeProbe::default(), FakeIncus::new(), runner.clone());
+    ok(run(
+        &h,
+        Role::Admin,
+        Command::SetupHost(pb::SetupHostRequest {
+            allow_private_networks: Some(true),
+            extra_host_addresses: Some(pb::ExtraHostAddresses {
+                addresses: vec!["198.51.100.7".into()],
+            }),
+            ..Default::default()
+        }),
+    )
+    .await);
+    // A Gateway call inside the window, without those fields.
+    open_window(&h).await;
+    ok(run(&h, Role::Gateway, Command::SetupHost(Default::default())).await);
+    let acl = h
+        .incus
+        .with(|s| s.objects.get("network-acls/hx-isolate").cloned())
+        .unwrap()
+        .to_string();
+    assert!(acl.contains("198.51.100.7"), "the /32 drop was lost: {acl}");
+    let rec = h.daemon.read_state(|s| s.host.clone()).unwrap();
+    assert_eq!(rec.extra_host_addresses, ["198.51.100.7"]);
+    assert!(rec.allow_private_networks);
+    // The automatic re-run keeps it too.
+    assert!(h.daemon.refresh_host().await.unwrap());
+    let acl = h
+        .incus
+        .with(|s| s.objects.get("network-acls/hx-isolate").cloned())
+        .unwrap()
+        .to_string();
+    assert!(acl.contains("198.51.100.7"));
+    let text = std::fs::read_to_string(&h.daemon.cfg.firewall_file).unwrap();
+    assert!(
+        !text.contains("172.16.0.0/12"),
+        "private networks stay allowed"
+    );
+}
