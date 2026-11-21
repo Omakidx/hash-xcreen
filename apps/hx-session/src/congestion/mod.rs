@@ -68,6 +68,9 @@ pub enum BandwidthCap {
     Mbps10,
     Mbps25,
     Mbps50,
+    /// An exact ceiling in kbit/s (the session link's `StreamConfig.bitrate_cap_kbps`, 100 to
+    /// 100 000).
+    Custom(u32),
 }
 
 impl BandwidthCap {
@@ -79,6 +82,7 @@ impl BandwidthCap {
             Self::Mbps10 => 10_000,
             Self::Mbps25 => 25_000,
             Self::Mbps50 => 50_000,
+            Self::Custom(k) => k.clamp(100, 100_000),
         }
     }
 

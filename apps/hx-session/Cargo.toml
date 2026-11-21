@@ -20,11 +20,14 @@ name = "hx-session-bench"
 path = "src/bin/bench/main.rs"
 
 [dependencies]
+bytes.workspace = true
 crossbeam-channel.workspace = true
 hx-capture.workspace = true
 hx-codec.workspace = true
+# Only the session link feature: no privd messages and nothing that pulls in quinn.
+hx-ipc = { workspace = true, features = ["link"] }
 hx-proto.workspace = true
-rustix = { workspace = true, features = ["fs", "time"] }
+rustix = { workspace = true, features = ["event", "fs", "net", "process", "time"] }
 thiserror.workspace = true
 x11rb.workspace = true
 
