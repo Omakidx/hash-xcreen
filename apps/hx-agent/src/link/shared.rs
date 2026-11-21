@@ -498,6 +498,13 @@ impl OutQ {
     }
 
     /// Latest-wins pointer motion; absolute and relative are merged (protocol.md 7.1).
+    /// Forgets pointer motion that was queued for an earlier client (a new epoch starts).
+    pub(crate) fn clear_mouse(&self) {
+        let mut s = lock(&self.st);
+        s.mouse = MouseCoalescer::new();
+        s.mouse_out.clear();
+    }
+
     pub(crate) fn push_mouse(&self, m: MouseMove) {
         lock(&self.st).mouse.push(m);
         self.wake.notify_one();
@@ -949,6 +956,32 @@ mod credit_tests {
         drop(held);
         assert!(credits.room());
         assert_eq!(credits.at_limit.load(Relaxed), 0);
+    }
+}
+
+#[cfg(test)]
+mod out_queue_tests {
+    use super::*;
+
+    #[test]
+    fn a_new_epoch_forgets_queued_motion_and_start_keeps_its_place_among_input() {
+        let q = OutQ::new();
+        q.push_mouse(MouseMove {
+            relative: true,
+            seq: 1,
+            x: 5,
+            y: 5,
+        });
+        q.clear_mouse();
+        assert!(
+            matches!(q.pop(Instant::now()), Pop::Empty),
+            "motion of the old client is gone"
+        );
+        // P0 is FIFO: a start pushed there goes out before input queued after it.
+        assert!(q.push_p0(vec![1]));
+        assert!(q.push_p0(vec![2]));
+        assert!(matches!(q.pop(Instant::now()), Pop::Frame(f) if f == [1]));
+        assert!(matches!(q.pop(Instant::now()), Pop::Frame(f) if f == [2]));
     }
 }
 

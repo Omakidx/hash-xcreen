@@ -293,6 +293,8 @@ Each transfer is its own unidirectional QUIC stream, opened by whichever side se
 
 The receiver enforces `size` (more or fewer bytes than announced is a protocol error for that stream, which is reset with `TRANSFER_ERROR`; the connection continues) and the clipboard limit of §3.1. A receiver MAY abort a transfer at any time with `STOP_SENDING` (`TRANSFER_REJECTED`). Progress is the bytes received so far over `size`. Transfers only occur if the matching feature was negotiated and the user has not disabled it (`clipboard_enabled`).
 
+A small transfer can be fully delivered before the receiver's refusal arrives (the whole body and the end of the stream are already acknowledged when `STOP_SENDING` reaches the sender), so a sender may see a refused transfer complete without error. The refusal is still enforced by the receiver: nothing is stored or made the clipboard. The receiver, not the sender's result, is authoritative.
+
 On WebSocket the same content is carried in messages tagged with a transfer id (§9.4).
 
 ### 5.6 Maximum file size (1.1)

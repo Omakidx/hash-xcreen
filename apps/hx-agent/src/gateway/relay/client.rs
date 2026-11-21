@@ -51,6 +51,8 @@ pub(super) struct ClientRelay {
     core: Arc<Core>,
     pub(super) link: LinkClient,
     pub(super) epoch: u32,
+    /// The codec chosen for this client: frames of any other are dropped.
+    codec: std::sync::atomic::AtomicI32,
     name: String,
     conn: Connection,
     features: Features,
@@ -81,6 +83,7 @@ impl ClientRelay {
         link: LinkClient,
         request: &AttachRequest,
         epoch: u32,
+        codec: VideoCodec,
     ) -> Arc<Self> {
         let features = request.connection.enabled_features();
         let display = link.info().display;
@@ -113,6 +116,7 @@ impl ClientRelay {
             features,
             link,
             epoch,
+            codec: std::sync::atomic::AtomicI32::new(codec as i32),
             core,
             shutdown,
             abort,
@@ -127,6 +131,7 @@ impl ClientRelay {
     /// Applies what a `ViewConfig` changes in the relay itself (policies, the stats switch) and
     /// returns the `StreamConfig` for the session.
     pub(super) fn apply_view(&self, view: &ViewConfig, codec: VideoCodec) -> pb::StreamConfig {
+        self.codec.store(codec as i32, Relaxed);
         let clipboard = view.clipboard_enabled && self.features.contains(Features::CLIPBOARD);
         let files = self.features.contains(Features::FILE_TRANSFER);
         // A policy that turns off ends what runs under it, in both directions.
@@ -259,11 +264,21 @@ impl ClientRelay {
         }
         match ev {
             LinkEvent::Frame(f) => {
+                // Only this client's epoch and codec (a frame of a previous client, or of a
+                // codec nobody here asked for, never reaches the client's decoder).
+                if f.format.epoch != self.epoch || f.header.codec as i32 != self.codec.load(Relaxed)
+                {
+                    return;
+                }
                 for old in self.video.queue.push(f) {
                     self.video.report_dropped(&old);
                 }
             }
-            LinkEvent::StreamFormat(f) => self.input.set_display(f.width, f.height),
+            LinkEvent::StreamFormat(f) => {
+                if f.epoch == self.epoch {
+                    self.input.set_display(f.width, f.height);
+                }
+            }
             LinkEvent::Cursor(CursorUpdate::Shape(s)) => self.cursor.push(CursorUpdate::Shape(s)),
             LinkEvent::Cursor(CursorUpdate::Position(p)) => {
                 self.cursor.push(CursorUpdate::Position(p));
@@ -306,6 +321,8 @@ impl ClientRelay {
         }
         self.input.release();
         self.stop_tasks();
+        // The replaced client no longer counts for the link's keep.
+        self.core.keeper.detach(&self.link);
     }
 
     fn stop_tasks(&self) {

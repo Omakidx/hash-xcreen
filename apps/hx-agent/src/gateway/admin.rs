@@ -13,11 +13,9 @@
 //! * Every reply is sanitized text or numbers; device names are cleaned again before they leave.
 //!
 //! The pairing token of decision 14 arrives as a kind-2 secret frame (never an environment
-//! variable or file). **Installing a caller-supplied token needs a method that hx-crypto's
-//! `PairingWindow` does not have yet** (it can only generate tokens): the secret is read,
-//! validated and wiped, and the command answers `UNIMPLEMENTED` until
-//! `PairingWindow::install_token` exists (exact diff in the round report). `CreatePairingCode`
-//! works today and is the documented fallback for the interactive install.
+//! variable or file): `CreatePairingToken` reads it, validates it, installs it with
+//! `PairingWindow::install_token` and wipes it. `CreatePairingCode` issues a short code
+//! instead, the interactive install's alternative.
 
 use std::collections::HashSet;
 use std::os::unix::fs::PermissionsExt;

@@ -81,6 +81,9 @@ impl TransferCtx {
 pub(super) struct Inbox {
     q: Mutex<VecDeque<TransferEvent>>,
     notify: Notify,
+    /// A control entry (`End`, `Aborted`) did not fit: a transfer may now wait for an event that
+    /// will not come, so the outbound task aborts everything it is running.
+    lost: std::sync::atomic::AtomicBool,
 }
 
 impl Inbox {
@@ -103,8 +106,15 @@ impl Inbox {
             None => self.notify.notify_one(),
             Some(TransferEvent::Open { id, .. }) => link.abort_transfer(id, STOP_TRANSFER_REJECTED),
             Some(TransferEvent::Data(chunk)) => link.abort_transfer(chunk.id, RESET_TRANSFER_ERROR),
-            Some(_) => {}
+            Some(_) => {
+                self.lost.store(true, Relaxed);
+                self.notify.notify_one();
+            }
         }
+    }
+
+    fn take_lost(&self) -> bool {
+        self.lost.swap(false, Relaxed)
     }
 
     fn pop(&self) -> Option<TransferEvent> {
@@ -217,6 +227,17 @@ async fn run_inbound(
                 t.reject();
                 return;
             }
+            Step::Chunk(Ok(Some(_))) | Step::Chunk(Ok(None))
+                if abort.has_changed().unwrap_or(true)
+                    || kind_abort.has_changed().unwrap_or(true)
+                    || *shutdown.borrow() =>
+            {
+                // A takeover or a policy change that arrived while this chunk was being read:
+                // it belongs to a client that is gone, and the link is the next one's now.
+                sender.abort(RESET_TRANSFER_ERROR);
+                t.reject();
+                return;
+            }
             Step::Chunk(Ok(Some(chunk))) => {
                 match tokio::time::timeout(IDLE, sender.write(chunk)).await {
                     Ok(Ok(())) => {}
@@ -263,6 +284,9 @@ pub(super) async fn outbound(
         file: TokenBucket::with_rate(1.6, 16),
     };
     loop {
+        if inbox.take_lost() {
+            abort_all(&cx, &mut active);
+        }
         while let Some(ev) = inbox.pop() {
             enum Sig {
                 Shutdown,

@@ -69,6 +69,8 @@ mod cursor;
 mod input;
 mod reconf;
 mod stats;
+#[cfg(test)]
+mod tests;
 mod transfer;
 mod util;
 mod video;
@@ -296,6 +298,13 @@ impl Core {
         if request.connection.close_info().is_some() {
             return Err(LinkError::Unavailable);
         }
+        // What the gateway dials must be the proxy device's socket (ipc.md 11): a socket that
+        // belongs to this user. Anything else at the path (a regular file, a link, another
+        // owner) is not dialled.
+        if let Err(why) = check_socket(&self.cfg.socket) {
+            tracing::warn!(%why, "the link socket is not what privd makes; not dialling it");
+            return Err(LinkError::Unavailable);
+        }
         let attached = match tokio::time::timeout(ATTACH_TIMEOUT, self.keeper.attach()).await {
             Ok(Ok(a)) => a,
             Ok(Err(DialError::Wait(w))) => {
@@ -334,7 +343,7 @@ impl Core {
             return Err(LinkError::Unavailable);
         };
         let epoch = self.epoch.fetch_add(1, Relaxed).wrapping_add(1);
-        let relay = ClientRelay::new(self.clone(), link.clone(), &request, epoch);
+        let relay = ClientRelay::new(self.clone(), link.clone(), &request, epoch, codec);
         let config = relay.apply_view(&request.view, codec);
         // The relay is the active one before `start`, so no frame or cursor update of the new
         // epoch can find nobody.
@@ -352,6 +361,8 @@ impl Core {
             self.abandon(&relay).await;
             return Err(LinkError::Unavailable);
         }
+        // The start is queued ahead of anything this client sends from here on.
+        relay.input.open_now();
         Ok(relay)
     }
 
@@ -402,6 +413,17 @@ impl Core {
                 },
             }
         }
+    }
+}
+
+/// A link socket that exists must be a socket (not a symlink or a file) owned by this user; one
+/// that does not exist is left to the dial, which classifies it as "desktop unavailable".
+fn check_socket(path: &std::path::Path) -> Result<(), &'static str> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    match std::fs::symlink_metadata(path) {
+        Ok(md) if !md.file_type().is_socket() => Err("not a socket"),
+        Ok(md) if md.uid() != rustix::process::geteuid().as_raw() => Err("not owned by this user"),
+        _ => Ok(()),
     }
 }
 

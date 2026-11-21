@@ -528,6 +528,11 @@ pub(super) async fn feedback_task(
         // second reach the session's ctl budget (ipc.md 13).
         tokio::time::sleep(Duration::from_millis(10)).await;
         loop {
+            // After the client was detached nothing more goes out: feedback of an old client
+            // must not reach the session's controller after the next client's start.
+            if *shutdown.borrow() {
+                return;
+            }
             let batch = video.feedback.take();
             if batch.is_empty() {
                 break;

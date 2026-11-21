@@ -52,6 +52,8 @@ pub(super) struct InputPath {
     open: Mutex<bool>,
     display: AtomicU64,
     seq: AtomicU32,
+    /// `release` was called: `open_now` must not reopen the path.
+    released: std::sync::atomic::AtomicBool,
     /// Events refused because the path was closed or the epoch was not current.
     pub(super) refused: AtomicU64,
 }
@@ -69,13 +71,25 @@ impl InputPath {
             conn,
             epoch,
             current,
-            open: Mutex::new(true),
+            // Closed until the session's `start` for this client is queued (`open_now`): the
+            // client's first input can never come before it.
+            open: Mutex::new(false),
             display: AtomicU64::new(0),
             seq: AtomicU32::new(0),
+            released: std::sync::atomic::AtomicBool::new(false),
             refused: AtomicU64::new(0),
         };
         p.set_display(display.0, display.1);
         p
+    }
+
+    /// The `start` of this client is queued: its input is accepted from now on (unless it was
+    /// released meanwhile).
+    pub(super) fn open_now(&self) {
+        let mut open = lock(&self.open);
+        if !self.released.load(Relaxed) {
+            *open = true;
+        }
     }
 
     /// The display size of the stream in force (coordinates are clamped to it).
@@ -94,6 +108,7 @@ impl InputPath {
     /// button in the session. Idempotent.
     pub(super) fn release(&self) {
         let mut open = lock(&self.open);
+        self.released.store(true, Relaxed);
         if std::mem::replace(&mut *open, false) {
             let _ = self.link.input(InputEvent {
                 event: Some(Event::ReleaseAll(Default::default())),

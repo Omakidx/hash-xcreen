@@ -31,6 +31,10 @@ use serde::Deserialize;
 
 use super::takeover::TakeoverPolicy;
 
+/// The directory privd makes for the link sockets (`docs/ipc.md` section 11): root:`hx-gatewayd`
+/// 0750, so nothing the container or another user does can place a socket in it.
+pub const LINK_DIR: &str = "/run/hx/link";
+
 /// Which seccomp action the binary installs for syscalls outside its allowlist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -185,7 +189,7 @@ impl GatewayConfig {
     pub fn link_socket_path(&self) -> PathBuf {
         self.link_socket
             .clone()
-            .unwrap_or_else(|| Path::new("/run/hx/link").join(format!("{}.sock", self.desktop_id)))
+            .unwrap_or_else(|| Path::new(LINK_DIR).join(format!("{}.sock", self.desktop_id)))
     }
 
     /// Range checks.
@@ -207,6 +211,13 @@ impl GatewayConfig {
         }
         if !(10..=3600).contains(&self.manage_idle_s) {
             return Err(ConfigError::Invalid("manage_idle_s must be 10 to 3600"));
+        }
+        if let Some(l) = &self.link_socket
+            && (!l.starts_with(LINK_DIR) || l.components().any(|c| c.as_os_str() == ".."))
+        {
+            return Err(ConfigError::Invalid(
+                "link_socket must be a socket under /run/hx/link/",
+            ));
         }
         let link = self.link_socket.iter();
         for p in [&self.state_dir, &self.privd_socket, &self.admin_socket]
@@ -261,6 +272,10 @@ mod tests {
             "listen = \"127.0.0.1:1\"\npairing_ttl_s = 5",
             "listen = \"127.0.0.1:1\"\nstate_dir = \"relative\"",
             "listen = \"127.0.0.1:1\"\nseccomp = \"off\"",
+            // The link socket is privd's: only under its own directory.
+            "listen = \"127.0.0.1:1\"\nlink_socket = \"/var/tmp/evil.sock\"",
+            "listen = \"127.0.0.1:1\"\nlink_socket = \"/run/hx/link/../privd.sock\"",
+            "listen = \"127.0.0.1:1\"\nlink_socket = \"link.sock\"",
         ] {
             assert!(GatewayConfig::from_toml(bad).is_err(), "{bad}");
         }
