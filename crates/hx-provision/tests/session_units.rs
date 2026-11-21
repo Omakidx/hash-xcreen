@@ -131,6 +131,7 @@ fn the_socket_unit_is_as_specified() {
         let u = unit(text);
         assert_eq!(get(&u, "Socket", "ListenStream"), [SESSION_SOCKET]);
         assert_eq!(get(&u, "Socket", "SocketUser"), ["1000"]);
+        assert_eq!(get(&u, "Socket", "SocketGroup"), ["1000"]);
         assert_eq!(get(&u, "Socket", "SocketMode"), ["0600"]);
         assert_eq!(get(&u, "Socket", "DirectoryMode"), ["0755"]);
         assert_eq!(get(&u, "Socket", "Accept"), ["no"]);

@@ -129,6 +129,25 @@ follow; `hx-gatewayd` and everything else unprivileged is never allowed to influ
 - **In-container paths.** `hx-session` installs at `session::SESSION_BINARY`
   (`/usr/lib/hx-session/hx-session`), the password helper at `session::PASSWORD_CHECK_HELPER`; the
   recipes' units use exactly these.
+- **Checklist for every call site in privd** (from the security review):
+  - `require_current = true` outside `SETUP_OPEN`, and charge **every** `CurrentPasswordWrong`
+    to the shared `PASSWORD` failure budget (the helper's exit 1 is the only "wrong").
+  - On `Cancel` keep polling `change_user_password` / `check_user_password` until they resolve and
+    hold the `desktop:<id>` lock meanwhile; answer `CANCELLED` afterwards.
+  - Only ids from your own `client.scoped()` are yours to cancel: one scoped client per request.
+  - Resolve the time zone with `Settings::with_timezone_in(.., "/usr/share/zoneinfo")`.
+  - Enforce the ipc.md 6.8 host bounds (CPUs, memory headroom, disk above use and below pool
+    free) before `set_limits`; it checks only "not zero" and absurd maxima.
+  - Derive the instance name (`hx-<id>`) and the uid/gid for `SessionLink` yourself; the caller
+    never supplies either.
+  - Serialize per desktop. Two concurrent secret-path calls on one desktop sweep each other's
+    `/run/hx-provision` files.
+  - After a privd restart, sweep `/run/hx-provision` of every desktop (`IncusExecutor::sweep`)
+    before the first secret push.
+  - Treat `OperationEnd::Failed` text (and every `IncusError` message) as untrusted daemon text:
+    sanitize it before it reaches a response.
+  - `IncusError::Purged` means a mutating call's result could not be read and the intended state
+    is **not** in place: never treat it as success.
 - **Messages.** Text that came out of a container is sanitized (control and ANSI characters
   removed, truncated) before it appears in an error or outcome, but it is still untrusted: do not
   interpret it, and escape it for any UI.

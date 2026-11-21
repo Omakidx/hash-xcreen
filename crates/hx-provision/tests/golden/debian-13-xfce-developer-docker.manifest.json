@@ -91,7 +91,7 @@
       "path": "/etc/systemd/system/hx-session.socket",
       "mode": "0644",
       "owner": "root:root",
-      "sha256": "904c15bec18d2f82ee1ccdd382666550058ebe6be25a6de0f00861eec0d60077"
+      "sha256": "203c766b12a31049417884b6af57d2aee07952d69cf04e1a25608b1fd30a6ab9"
     },
     {
       "path": "/etc/systemd/system/hx-xorg.service",
