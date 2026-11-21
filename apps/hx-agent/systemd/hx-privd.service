@@ -1,0 +1,83 @@
+# hx-privd: the root daemon with the fixed command set of docs/ipc.md Part 1.
+#
+# It must run as root (it drives Incus, loads the host nftables ruleset and writes sysctl drop-ins),
+# so the unit takes away everything else that is compatible with that. Each choice, and what was
+# left out and why, is in apps/hx-agent/src/privd/README.md ("Unit hardening").
+#
+# Started through hx-privd.socket (socket activation): the daemon takes no arguments and reads no
+# environment; every path and the gateway user are compiled in.
+
+[Unit]
+Description=hash-xcreen privileged helper (hx-privd)
+Documentation=https://github.com/Omakidx/hash-xcreen/blob/main/docs/ipc.md
+Requires=hx-privd.socket
+After=hx-privd.socket incus.service systemd-tmpfiles-setup.service
+# Incus being down is not a reason to refuse to start: commands answer UNAVAILABLE and retry.
+
+[Service]
+Type=exec
+ExecStart=/usr/lib/hx/current/hx-privd
+User=root
+Group=root
+Restart=on-failure
+RestartSec=2s
+# A cancel waits up to 30 s for Incus operations to end (ipc.md 4).
+TimeoutStopSec=60s
+UMask=0077
+
+# ipc.md 5.2: mlockall(MCL_CURRENT | MCL_FUTURE) must succeed (the daemon refuses to start
+# otherwise), and a crash must not write a core file.
+LimitMEMLOCK=infinity
+LimitCORE=0
+
+# The verifier pepper (docs/ipc.md 5.3) is a systemd credential, sealed to the TPM where there is
+# one and to the host key otherwise; systemd decrypts it into this unit's credential directory. The
+# unit does not start without it. The installer (1E) creates it before enabling the units, see
+# apps/hx-agent/src/privd/README.md ("The pepper").
+LoadCredentialEncrypted=pepper:/etc/hx/creds/pepper.cred
+
+# State (/var/lib/hx, 0700) and the audit log (/var/log/hx, 0750) are the only places the daemon
+# owns; ReadWritePaths below are the host files it must write: the persisted nftables ruleset
+# and the sysctl drop-in (ipc.md 6.4), and iptables' lock file (DOCKER-USER rules).
+StateDirectory=hx
+StateDirectoryMode=0700
+LogsDirectory=hx
+LogsDirectoryMode=0750
+ProtectSystem=strict
+ReadWritePaths=/etc/hx /etc/sysctl.d
+ReadWritePaths=-/run/xtables.lock
+ProtectHome=yes
+PrivateTmp=yes
+
+# Capabilities: the whole set root has, minus all but these. nft and iptables need NET_ADMIN (and
+# NET_RAW for iptables-legacy); mlockall needs IPC_LOCK as a second line next to LimitMEMLOCK.
+# CAP_DAC_OVERRIDE is not needed: every file privd touches (state, /etc/hx, /etc/sysctl.d, block
+# device nodes root:disk 0660, the Incus socket root:incus-admin 0660, /proc, /sys, the credential
+# directory) is owned by root or world-readable, and root passes the owner check without it.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_IPC_LOCK
+# privd itself speaks only unix sockets and netlink: no IP packet to or from the daemon (nft,
+# iptables and ip configure the host's network, they do not send traffic through this cgroup).
+IPAddressDeny=any
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Kernel interfaces the daemon does not need. (ProtectKernelTunables, PrivateDevices, ProcSubset and
+# PrivateNetwork are deliberately NOT set: sysctl --system writes /proc/sys, blkid reads host block
+# devices, the daemon reads /proc/meminfo, and nft and iptables act on the host network.)
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+
+[Install]
+WantedBy=multi-user.target

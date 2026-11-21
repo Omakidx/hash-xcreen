@@ -1,0 +1,25 @@
+# hx-privd's socket (docs/ipc.md section 3, "Socket").
+#
+# systemd creates and owns the listening socket, so hx-privd needs no permission to create it and
+# the socket survives a privd restart (an update re-execs privd without dropping gatewayd's
+# connection queue). The group bits are only a first filter: privd checks SO_PEERCRED on every
+# accept and serves only root and the hx-gatewayd user.
+#
+# /run/hx comes from systemd-tmpfiles (tmpfiles.d/hx.conf), so the socket orders itself after it.
+
+[Unit]
+Description=hash-xcreen privileged helper socket
+Documentation=https://github.com/Omakidx/hash-xcreen/blob/main/docs/ipc.md
+Requires=systemd-tmpfiles-setup.service
+After=systemd-tmpfiles-setup.service
+
+[Socket]
+ListenStream=/run/hx/privd.sock
+SocketUser=root
+SocketGroup=hx-gatewayd
+SocketMode=0660
+Accept=no
+Service=hx-privd.service
+
+[Install]
+WantedBy=sockets.target

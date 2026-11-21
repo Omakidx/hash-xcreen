@@ -12,6 +12,9 @@ publish.workspace = true
 workspace = true
 
 [features]
+# Test-only constructors of hx-privd (inject the gateway uid, fakes). A release build never
+# enables it: only the crate's own dev-dependency on itself switches it on.
+test-support = ["dep:tempfile"]
 # Test-only hooks of the hx-gatewayd binary (`--admin-allow-uid`). Never enabled in a release
 # build: the crate's own tests turn it on through the dev-dependency on itself below.
 gateway-test-hooks = []
@@ -20,16 +23,23 @@ gateway-test-hooks = []
 argon2 = "0.6.0"
 bytes.workspace = true
 getrandom = "0.4"
+hkdf = "0.12"
+hmac = "0.12"
 hx-crypto.workspace = true
 hx-ipc = { workspace = true, features = ["privd", "link"] }
 hx-proto.workspace = true
 hx-provision.workspace = true
 hx-transport.workspace = true
-libc = "0.2"
+libc = "0.2" # seccomp numbers (gateway) and SO_PEERGROUPS (privd::peergroups)
 listenfd = "1.0.2"
+prost.workspace = true
 rustix = { workspace = true, features = ["fs", "mm", "process", "net"] }
 seccompiler = "0.5"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2.6.1"
+tempfile = { version = "3.27.0", optional = true }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "signal"] }
 toml = "0.8"
@@ -38,10 +48,8 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 zeroize.workspace = true
 
 [dev-dependencies]
-hx-agent = { path = ".", features = ["gateway-test-hooks"] }
-hmac = "0.12"
-prost.workspace = true
+hx-agent = { path = ".", features = ["test-support", "gateway-test-hooks"] }
+hyper = "1" # the real-Incus test builds one raw `Request`
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-sha2 = "0.10"
 tempfile = "3.27.0"
