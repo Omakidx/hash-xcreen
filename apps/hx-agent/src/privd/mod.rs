@@ -15,6 +15,7 @@
 //! | [`state`], [`limiter`], [`pepper`], [`audit`] | persistent phase and registry, failure caps and lockout, the pepper, the audit log |
 //! | [`runner`], [`probe`] | the closed set of host tools and host facts, behind traits |
 //! | [`cancel`], [`progress`] | cancellation and per-desktop locks, lossy progress frames |
+//! | [`update`] | self-update: manifest, keys, extraction, switch, health check (ipc.md 6.12) |
 
 pub mod activation;
 pub mod audit;
@@ -37,6 +38,7 @@ pub mod runner;
 pub mod server;
 pub mod state;
 pub mod timefmt;
+pub mod update;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;

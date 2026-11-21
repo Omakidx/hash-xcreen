@@ -22,6 +22,7 @@ gateway-test-hooks = []
 [dependencies]
 argon2 = { version = "0.6.0", features = ["zeroize"] } # wipes its memory blocks (the CLI hashes typed secrets)
 bytes.workspace = true
+flate2 = { version = "1.1.11", default-features = false, features = ["rust_backend"] }
 getrandom = "0.4"
 hkdf = "0.12"
 hmac = "0.12"
@@ -32,13 +33,17 @@ hx-provision.workspace = true
 hx-transport.workspace = true
 libc = "0.2" # seccomp numbers (gateway) and SO_PEERGROUPS (privd::peergroups)
 listenfd = "1.0.2"
+minisign-verify = "0.3.0"
 prost.workspace = true
 rustix = { workspace = true, features = ["fs", "mm", "process", "net", "rand", "termios"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-native-certs = "0.8.5"
 seccompiler = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 subtle = "2.6.1"
+tar = { version = "0.4.46", default-features = false }
 tempfile = { version = "3.27.0", optional = true }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "signal"] }
@@ -58,3 +63,5 @@ hyper = "1" # the real-Incus test builds one raw `Request`
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tempfile = "3.27.0"
+rcgen = "0.14.10"
+minisign = "0.10.0"

@@ -8,7 +8,7 @@
 use std::future::Future;
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use hx_ipc::peer::PeerCred;
@@ -34,6 +34,7 @@ use super::probe::{HostProbe, SystemProbe};
 use super::progress::ProgressSender;
 use super::runner::{CommandRunner, SystemRunner};
 use super::state::{DesktopRecord, Flag, PhaseKind, PrivdState, StateStore};
+use super::update::UpdateDeps;
 
 /// A command's successful answer.
 pub type Reply = response::Result;
@@ -156,6 +157,11 @@ pub struct Daemon<T: Transport + Clone + 'static> {
     suppressed: std::sync::atomic::AtomicU64,
     /// `(unix ms, docker_on_host, host_firewall_loaded)` of the last host probe.
     pub(crate) host_probe: Mutex<Option<(u64, bool, bool)>>,
+    /// The collaborators of self-update (keys, systemd, health probes); replaceable in tests.
+    update_deps: Mutex<Arc<UpdateDeps>>,
+    /// This daemon's own `Arc`, so that a command can hand work to a task that outlives it (the
+    /// restarts after `ApplyUpdate` answers).
+    pub(crate) me: Weak<Self>,
 }
 
 impl Daemon<UnixTransport> {
@@ -201,7 +207,12 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
         let state = store.load_state()?;
         let pepper = Pepper::load(cfg.credentials_dir.as_deref(), &store.path("pepper.key"))?;
         let limiter = Limiter::load(deps.clock.clone(), store.clone())?;
-        Ok(Arc::new(Self {
+        let update_deps = UpdateDeps::system(
+            deps.runner.clone(),
+            &cfg.socket_path,
+            &cfg.update.admin_socket,
+        );
+        Ok(Arc::new_cyclic(|me| Self {
             cfg,
             incus,
             runner: deps.runner,
@@ -217,7 +228,21 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
             conns: Arc::new(ConnCounter::default()),
             suppressed: std::sync::atomic::AtomicU64::new(0),
             host_probe: Mutex::new(None),
+            update_deps: Mutex::new(Arc::new(update_deps)),
+            me: me.clone(),
         }))
+    }
+
+    /// The collaborators of the update path.
+    pub(crate) fn update_deps(&self) -> Arc<UpdateDeps> {
+        lock(&self.update_deps).clone()
+    }
+
+    /// Replaces the update collaborators (the test keys, a fake systemd and probe). Only with the
+    /// `test-support` feature: a release build has no way to change the embedded keys.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_update_deps(&self, deps: UpdateDeps) {
+        *lock(&self.update_deps) = Arc::new(deps);
     }
 
     // ----- connections -------------------------------------------------------------------
@@ -771,9 +796,9 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
             Command::ProvisionSessionLink(r) => session::provision_link(self, ctx, r).await,
             Command::InstallSession(r) => session::install(self, ctx, r).await,
             Command::RestartSession(r) => session::restart(self, ctx, r).await,
-            Command::CheckUpdate(_) | Command::ApplyUpdate(_) | Command::RollbackUpdate(_) => Err(
-                CmdError::unimplemented("self-update is not available in this release"),
-            ),
+            Command::CheckUpdate(_) => update::check(self, ctx).await,
+            Command::ApplyUpdate(r) => update::apply(self, ctx, r).await,
+            Command::RollbackUpdate(_) => update::rollback(self, ctx).await,
             Command::DestroyDesktop(r) => desktop::destroy_desktop(self, ctx, r).await,
             Command::Uninstall(_) => Err(CmdError::unimplemented(
                 "uninstall is not available in this release",
