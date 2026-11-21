@@ -171,6 +171,28 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
     /// Builds a daemon: opens the state directory (a corrupt state file is an error, never a
     /// reset), loads or creates the pepper, and loads the persisted budgets.
     pub fn new(cfg: PrivdConfig, incus: Client<T>, deps: Deps) -> io::Result<Arc<Self>> {
+        Self::build(cfg, incus, deps, Catalog::embedded())
+    }
+
+    /// Like [`Daemon::new`] with another recipe catalog: the real-Incus test uses a minimal
+    /// recipe so that a run takes minutes, not an hour. Only with the `test-support` feature; the
+    /// binary always uses `Catalog::embedded()`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new_with_catalog(
+        cfg: PrivdConfig,
+        incus: Client<T>,
+        deps: Deps,
+        catalog: Catalog,
+    ) -> io::Result<Arc<Self>> {
+        Self::build(cfg, incus, deps, catalog)
+    }
+
+    fn build(
+        cfg: PrivdConfig,
+        incus: Client<T>,
+        deps: Deps,
+        catalog: Catalog,
+    ) -> io::Result<Arc<Self>> {
         let store = StateStore::open(&cfg.state_dir)?;
         let state = store.load_state()?;
         let pepper = Pepper::load_or_create(&store.path("pepper.key"))?;
@@ -187,7 +209,7 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
             limiter: Mutex::new(limiter),
             pepper,
             locks: Locks::new(),
-            catalog: Catalog::embedded(),
+            catalog,
             conns: Arc::new(ConnCounter::default()),
         }))
     }

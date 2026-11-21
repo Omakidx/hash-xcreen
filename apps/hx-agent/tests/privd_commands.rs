@@ -1996,3 +1996,39 @@ async fn set_user_password_refuses_a_desktop_that_is_not_running() {
         (ErrorCode::FailedPrecondition, ErrorDetail::DesktopNotReady)
     );
 }
+
+#[tokio::test]
+async fn the_host_ruleset_is_re_applied_after_an_address_change_from_what_setup_host_recorded() {
+    let runner = host_runner();
+    let h = Harness::start_with(GW, FakeProbe::default(), FakeIncus::new(), runner.clone());
+    // Before a SetupHost there is nothing to refresh.
+    assert!(!h.daemon.refresh_host().await.unwrap());
+    assert!(runner.calls().is_empty());
+    ok(run(
+        &h,
+        Role::Admin,
+        Command::SetupHost(pb::SetupHostRequest {
+            allow_private_networks: Some(true),
+            ..Default::default()
+        }),
+    )
+    .await);
+    let before = runner.calls().len();
+    std::fs::remove_file(&h.daemon.cfg.firewall_file).unwrap();
+    // A new address appears on the host: the re-run regenerates and loads the ruleset again,
+    // with the options Admin gave (private networks allowed: no drop rule for them).
+    assert!(h.daemon.refresh_host().await.unwrap());
+    assert!(runner.calls().len() > before);
+    let text = std::fs::read_to_string(&h.daemon.cfg.firewall_file).unwrap();
+    assert!(text.contains("table inet hx"));
+    assert!(
+        !text.contains("172.16.0.0/12"),
+        "allow_private_networks was kept"
+    );
+    let nft_loads = runner
+        .calls()
+        .iter()
+        .filter(|c| c.tool == Tool::Nft && c.args.first().map(String::as_str) == Some("-f"))
+        .count();
+    assert_eq!(nft_loads, 2);
+}

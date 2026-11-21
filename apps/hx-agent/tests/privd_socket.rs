@@ -791,3 +791,56 @@ async fn a_closed_connection_cancels_the_running_command() {
             .with(|s| !s.files.keys().any(|k| k.contains("stdin")))
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_stays_usable_after_a_request_that_streamed_progress() {
+    let h = Harness::start(me());
+    open_window(&h).await;
+    // Slow every command in the container a little, so that progress frames are due.
+    h.incus.with(|s| {
+        s.exec_rules.push(ExecRule {
+            needle: "".into(),
+            exit: 0,
+            stdout: String::new(),
+            delay: Some(Duration::from_millis(25)),
+        });
+    });
+    let mut c = h.connect();
+    c.hello();
+    let id = c.fresh_id();
+    c.send_request(
+        id,
+        Command::CreateDesktop(pb::CreateDesktopRequest {
+            desktop_id: "main".into(),
+            distro: pb::Distro::Ubuntu2404 as i32,
+            desktop: pb::DesktopKind::Xfce as i32,
+            preset: pb::Preset::Basic as i32,
+            username: "alice".into(),
+            ..Default::default()
+        }),
+        &[(pb::SecretKind::UserPassword, b"Correct-Horse-Battery-9")],
+        0,
+    );
+    let mut progress = 0;
+    loop {
+        match c.recv().frame {
+            Some(F::Progress(_)) => progress += 1,
+            Some(F::Response(r)) if r.request_id == id => {
+                ok_or_panic(&r);
+                break;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(progress > 0, "the create streamed progress");
+    // The same connection serves the next requests.
+    for _ in 0..3 {
+        let r = c.call(
+            Command::GetDesktop(pb::GetDesktopRequest {
+                desktop_id: "main".into(),
+            }),
+            &[],
+        );
+        ok_or_panic(&r);
+    }
+}

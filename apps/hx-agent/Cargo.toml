@@ -41,4 +41,5 @@ test-support = ["dep:tempfile"]
 
 [dev-dependencies]
 hx-agent = { path = ".", features = ["test-support"] }
+hyper = "1" # the real-Incus test builds one raw `Request`
 tempfile = "3"
