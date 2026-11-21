@@ -96,7 +96,29 @@ const BLOCKS: &[(&str, &str)] = &[
         "uninstall",
         "\
   uninstall [--keep-desktop | --destroy-desktop] [--yes]
-                                  Remove the agent, with a guided confirmation.
+                                  Remove the agent (units, files, port rule, gateway user) and,
+                                  with --destroy-desktop, the desktop; with a guided confirmation.
+",
+    ),
+    (
+        "install",
+        "\
+  install --interactive | --pair | --ssh | --token <t>  [options]
+                                  Install and set up the server (normally run by install.sh).
+                                  --interactive  ask every question on the terminal
+                                  --pair         the one-liner: type the pairing token at a hidden
+                                                 prompt; stops after installing it
+                                  --ssh          secrets on stdin (framed), JSON Lines on stdout
+                                  --token <t>    like --pair, but the token is on the command line:
+                                                 WEAKER (process list, shell history, auth log)
+                                  Run again to resume or to re-verify; a finished install says so.
+  options: --distro ubuntu-24.04|ubuntu-26.04|debian-12|debian-13  --desktop xfce
+           --user <name>  --hostname <h>  --timezone <tz>  --locale <l>  --keyboard <k>
+           --apps basic|developer  --docker  --cpu <n>  --memory <MiB|NG>  --disk <GiB>
+           --storage-device /dev/<disk>  --image auto|build  --port <1-65535, not 22 or 80>
+           --domain <fqdn>  --backup off|12h|24h  --backup-keep <n>  --channel stable|beta
+           --allow-private-networks  --bootstrap-dir <dir>  --lock-fd <n>
+  port-rule apply                 Re-apply the nftables rule for the public port (a unit runs it).
 ",
     ),
 ];
@@ -108,6 +130,8 @@ options:
 
 exit codes: 0 ok, 1 failed, 2 usage, 3 a daemon is unavailable, 4 refused by the server,
 5 not found or ambiguous, 6 not implemented in this release, 7 not root, 8 declined.
+install and uninstall also use: 9 preflight failed (nothing changed), 10 verification failed,
+11 another install or uninstall is running, 12 the options conflict with the existing install.
 ";
 
 /// The usage text, for one verb (`status`, `devices`, ...) or the whole thing.

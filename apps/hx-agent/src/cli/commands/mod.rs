@@ -15,6 +15,7 @@ mod docker;
 mod logs;
 mod pairing;
 mod pin;
+mod port_rule;
 mod setup;
 mod snapshots;
 mod status;
@@ -129,5 +130,8 @@ pub(crate) fn dispatch(env: &mut Env<'_>, cmd: Cmd) -> Result<Option<Outcome>, C
         Cmd::UpdateApply { version, yes } => some(update::apply(env, version, yes)),
         Cmd::UpdateRollback { yes } => some(update::rollback(env, yes)),
         Cmd::Uninstall { keep_desktop, yes } => some(uninstall::run(env, keep_desktop, yes)),
+        Cmd::PortRuleApply => some(port_rule::run(env)),
+        // Handled before the dispatch (their own output and exit codes).
+        Cmd::Install(_) | Cmd::InternalEmptyDir { .. } => Ok(None),
     }
 }

@@ -18,6 +18,10 @@ test-support = ["dep:tempfile"]
 # Test-only hooks of the hx-gatewayd binary (`--admin-allow-uid`). Never enabled in a release
 # build: the crate's own tests turn it on through the dev-dependency on itself below.
 gateway-test-hooks = []
+# Test-only hooks of `hx-agent install` (`--test-allow-container`, `--test-fail-after <stage>`) and
+# the fakes of `install::testing`. Never enabled in a release build: the crate's own tests turn it
+# on through the dev-dependency on itself below, and the release gate forbids it (design C12).
+install-test-hooks = []
 
 [dependencies]
 argon2 = { version = "0.6.0", features = ["zeroize"] } # wipes its memory blocks (the CLI hashes typed secrets)
@@ -35,7 +39,7 @@ libc = "0.2" # seccomp numbers (gateway) and SO_PEERGROUPS (privd::peergroups)
 listenfd = "1.0.2"
 minisign-verify = "0.3.0"
 prost.workspace = true
-rustix = { workspace = true, features = ["fs", "mm", "process", "net", "rand", "termios"] }
+rustix = { workspace = true, features = ["fs", "mm", "process", "net", "rand", "termios", "event", "stdio", "system"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-native-certs = "0.8.5"
 seccompiler = "0.5"
@@ -59,7 +63,7 @@ ffmpeg-next.workspace = true # the end-to-end test decodes the frames it receive
 hx-capture.workspace = true
 hx-session.workspace = true
 x11rb = { workspace = true, features = ["xtest"] }
-hx-agent = { path = ".", features = ["test-support", "gateway-test-hooks"] }
+hx-agent = { path = ".", features = ["test-support", "gateway-test-hooks", "install-test-hooks"] }
 hyper = "1" # the real-Incus test builds one raw `Request`
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

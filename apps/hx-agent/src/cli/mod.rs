@@ -206,6 +206,9 @@ fn command_name(c: &Cmd) -> &'static str {
         Cmd::UpdateApply { .. } => "update apply",
         Cmd::UpdateRollback { .. } => "update rollback",
         Cmd::Uninstall { .. } => "uninstall",
+        Cmd::Install(_) => "install",
+        Cmd::PortRuleApply => "port-rule apply",
+        Cmd::InternalEmptyDir { .. } => "__empty-dir",
     }
 }
 
@@ -245,6 +248,9 @@ pub fn run(args: &[String], env: &mut Env<'_>) -> u8 {
         Err(e) => return report_error(env, json_mode, "", &e),
     };
     let name = command_name(&parsed.cmd);
+    // `install --ssh` implies --json.
+    let json_mode = parsed.json;
+    env.json = json_mode;
     match &parsed.cmd {
         Cmd::Help(topic) => {
             write_out(env.out, &help::text(topic.as_deref()));
@@ -255,7 +261,22 @@ pub fn run(args: &[String], env: &mut Env<'_>) -> u8 {
             write_out(env.out, &line);
             return exit::OK;
         }
+        // The child of uninstall: it runs as the gateway's user and deletes with that user's own
+        // permissions only, so it needs no root check (and must not require one).
+        Cmd::InternalEmptyDir { path } => {
+            return match crate::install::uninstall::empty_dir_beneath(std::path::Path::new(path)) {
+                Ok(()) => exit::OK,
+                Err(_) => exit::FAILED,
+            };
+        }
         _ => {}
+    }
+    // The installer has its own output (JSON Lines, C3), exit codes (C1) and root check.
+    if matches!(parsed.cmd, Cmd::Install(_)) {
+        let Cmd::Install(a) = parsed.cmd else {
+            return exit::FAILED;
+        };
+        return crate::install::run_cli(*a, env);
     }
     if env.euid != 0 {
         return report_error(env, json_mode, name, &CliError::NotRoot);
