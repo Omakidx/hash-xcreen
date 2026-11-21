@@ -126,6 +126,30 @@ fn an_oversize_frame_over_a_real_socket_is_refused_without_reading_the_body() {
 }
 
 #[test]
+fn the_decoder_is_poisoned_after_a_descriptor_arrives() {
+    let (a, b) = UnixStream::pair().unwrap();
+    let (carried, _w) = UnixStream::pair().unwrap();
+    send_with_fd(&a, &encode_frame(1, b"x", 1_000).unwrap(), &carried);
+    let mut d = Decoder::new(P);
+    assert!(matches!(d.read_from(&mut NoCmsgReader(&b)), Err(ReadError::Ancillary(_))));
+    let wire = encode_frame(1, b"y", 1_000).unwrap();
+    assert!(matches!(
+        d.read_from(&mut &wire[..]),
+        Err(ReadError::Frame(FrameError::Poisoned))
+    ));
+}
+
+#[test]
+fn msg_trunc_is_a_violation() {
+    // Datagram sockets can truncate; the stream-only reader refuses that as well.
+    let (a, b) = std::os::unix::net::UnixDatagram::pair().unwrap();
+    a.send(&[1u8; 64]).unwrap();
+    let mut small = [0u8; 8];
+    let e = recv_no_cmsg(&b, &mut small).unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::InvalidData);
+}
+
+#[test]
 fn a_read_timeout_is_a_transport_error_not_a_violation() {
     let (_a, b) = UnixStream::pair().unwrap();
     b.set_read_timeout(Some(std::time::Duration::from_millis(30)))

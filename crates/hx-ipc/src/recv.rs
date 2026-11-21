@@ -17,7 +17,10 @@ use rustix::net::{RecvAncillaryBuffer, RecvFlags, ReturnFlags, recvmsg};
 
 use crate::error::AncillaryData;
 
-/// One `recvmsg` into `buf`. Returns the byte count (`0` is end of stream, as for `read`).
+/// One `recvmsg` into `buf`. **For `SOCK_STREAM` sockets only** (datagram sockets could set
+/// `MSG_TRUNC` legitimately; it is treated as a violation here).
+///
+/// Returns the byte count (`0` is end of stream, as for `read`).
 ///
 /// Errors: `io::ErrorKind::WouldBlock` and `Interrupted` pass through unchanged (so this works
 /// inside a tokio `AsyncFd::try_io` closure); a control message or `MSG_CTRUNC` is an
@@ -32,7 +35,11 @@ pub fn recv_no_cmsg<Fd: AsFd>(fd: Fd, buf: &mut [u8]) -> io::Result<usize> {
         &mut control,
         RecvFlags::empty(),
     )?;
-    if msg.flags.contains(ReturnFlags::CTRUNC) || control.drain().next().is_some() {
+    // MSG_TRUNC cannot happen on SOCK_STREAM; if it ever does the socket is not what this
+    // module is for (datagram sockets), so it is refused as well.
+    if msg.flags.intersects(ReturnFlags::CTRUNC | ReturnFlags::TRUNC)
+        || control.drain().next().is_some()
+    {
         return Err(io::Error::new(io::ErrorKind::InvalidData, AncillaryData));
     }
     Ok(msg.bytes)

@@ -174,7 +174,15 @@ impl<P: FramePolicy> Decoder<P> {
             let n = match read {
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e.into()),
+                Err(e) => {
+                    let e = ReadError::from(e);
+                    if matches!(e, ReadError::Ancillary(_)) {
+                        // A descriptor or control message is a violation: never reuse the stream.
+                        self.poisoned = true;
+                        self.zeroize_partial();
+                    }
+                    return Err(e);
+                }
             };
             if n == 0 {
                 return match self.finish() {
