@@ -58,6 +58,9 @@ pub trait Systemd: Send + Sync {
     /// Runs the fetcher for `job` to completion (`Ok`) or failure, bounded by the unit's own
     /// timeouts. The error text is privd's, never the fetcher's output.
     fn fetch<'a>(&'a self, job: &'a Job) -> BoxFut<'a, Result<(), String>>;
+    /// Stops the fetcher unit of `job` (the caller was cancelled: killing the client of
+    /// `systemctl start` would leave the download running). Best effort.
+    fn stop_fetch<'a>(&'a self, job: &'a Job) -> BoxFut<'a, ()>;
     /// Restarts a unit. For [`Unit::Privd`] the call returns without waiting (the caller is
     /// the process being restarted).
     fn restart<'a>(&'a self, unit: Unit) -> BoxFut<'a, Result<(), String>>;
@@ -67,10 +70,12 @@ pub trait Systemd: Send + Sync {
 
 /// Asking the daemons whether they answer.
 pub trait HealthProbe: Send + Sync {
-    /// Whether privd answers `Hello` and `Ping` on its own socket.
-    fn privd_answers(&self) -> BoxFut<'_, bool>;
-    /// Whether gatewayd's admin socket answers `Status`.
-    fn gatewayd_status(&self) -> BoxFut<'_, bool>;
+    /// Whether privd answers `Hello` and `Ping` on its own socket, and the `privd_version` of
+    /// its `HelloAck` (so that an old process still holding the socket is not mistaken for the
+    /// new one).
+    fn privd_answers(&self) -> BoxFut<'_, Option<String>>;
+    /// Whether gatewayd's admin socket answers `Status`, and the `gatewayd_version` it reports.
+    fn gatewayd_status(&self) -> BoxFut<'_, Option<String>>;
 }
 
 /// `systemctl` through the runner.
@@ -126,6 +131,13 @@ impl Systemd for SystemdCtl {
             } else {
                 format!("the update fetcher failed (journal of {unit})")
             })
+        })
+    }
+
+    fn stop_fetch<'a>(&'a self, job: &'a Job) -> BoxFut<'a, ()> {
+        Box::pin(async move {
+            let unit = Self::fetcher_unit(job);
+            let _ = self.ctl(&["stop", &unit], Duration::from_secs(20)).await;
         })
     }
 
@@ -197,7 +209,7 @@ fn connect(path: &std::path::Path) -> std::io::Result<UnixStream> {
 }
 
 /// `Hello`, then `Ping` on the privd socket.
-fn probe_privd(path: &std::path::Path) -> Option<()> {
+fn probe_privd(path: &std::path::Path) -> Option<String> {
     use std::io::Write;
     let mut s = connect(path).ok()?;
     let mut dec = Decoder::new(PrivdPolicy::new(Side::Client));
@@ -220,16 +232,19 @@ fn probe_privd(path: &std::path::Path) -> Option<()> {
             software: "hx-privd-update".into(),
         }),
     )?;
-    matches!(next(&s)?, ppb::frame::Frame::HelloAck(_)).then_some(())?;
+    let ppb::frame::Frame::HelloAck(ack) = next(&s)? else {
+        return None;
+    };
     send(
         &mut s,
         ppb::frame::Frame::Ping(ppb::Ping { nonce: 0x7570_6461 }),
     )?;
-    matches!(next(&s)?, ppb::frame::Frame::Pong(p) if p.nonce == 0x7570_6461).then_some(())
+    matches!(next(&s)?, ppb::frame::Frame::Pong(p) if p.nonce == 0x7570_6461)
+        .then_some(ack.privd_version)
 }
 
 /// `Hello`, then `Status` on the admin socket.
-fn probe_admin(path: &std::path::Path) -> Option<()> {
+fn probe_admin(path: &std::path::Path) -> Option<String> {
     use std::io::Write;
     let mut s = connect(path).ok()?;
     let mut dec = Decoder::new(PrivdPolicy::new(Side::Client));
@@ -263,31 +278,30 @@ fn probe_admin(path: &std::path::Path) -> Option<()> {
         }),
     )?;
     match next(&s)? {
-        apb::frame::Frame::Response(r)
-            if r.request_id == 1 && matches!(r.result, Some(apb::response::Result::Status(_))) =>
-        {
-            Some(())
-        }
+        apb::frame::Frame::Response(r) if r.request_id == 1 => match r.result {
+            Some(apb::response::Result::Status(st)) => Some(st.gatewayd_version),
+            _ => None,
+        },
         _ => None,
     }
 }
 
 impl HealthProbe for SocketProbe {
-    fn privd_answers(&self) -> BoxFut<'_, bool> {
+    fn privd_answers(&self) -> BoxFut<'_, Option<String>> {
         Box::pin(async move {
             let p = self.privd_socket.clone();
-            tokio::task::spawn_blocking(move || probe_privd(&p).is_some())
+            tokio::task::spawn_blocking(move || probe_privd(&p))
                 .await
-                .unwrap_or(false)
+                .unwrap_or(None)
         })
     }
 
-    fn gatewayd_status(&self) -> BoxFut<'_, bool> {
+    fn gatewayd_status(&self) -> BoxFut<'_, Option<String>> {
         Box::pin(async move {
             let p = self.admin_socket.clone();
-            tokio::task::spawn_blocking(move || probe_admin(&p).is_some())
+            tokio::task::spawn_blocking(move || probe_admin(&p))
                 .await
-                .unwrap_or(false)
+                .unwrap_or(None)
         })
     }
 }

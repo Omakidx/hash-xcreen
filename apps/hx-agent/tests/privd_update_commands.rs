@@ -1025,9 +1025,18 @@ async fn a_crash_before_the_switch_never_downgrades() {
     set_pending(&env, "1.1.0", Some("1.0.0"));
     let d = env.new_process("1.0.0");
     d.resume_update().await;
-    assert_eq!(env.layout().current().unwrap().as_deref(), Some("1.0.0"), "not 0.9.0");
+    assert_eq!(
+        env.layout().current().unwrap().as_deref(),
+        Some("1.0.0"),
+        "not 0.9.0"
+    );
     assert_eq!(env.layout().previous().unwrap().as_deref(), Some("0.9.0"));
-    assert!(UpdateState::load(&store(&d.cfg.state_dir)).unwrap().pending.is_none());
+    assert!(
+        UpdateState::load(&store(&d.cfg.state_dir))
+            .unwrap()
+            .pending
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -1079,7 +1088,11 @@ async fn an_update_with_no_recorded_predecessor_is_not_flipped_to_anything() {
     set_pending(&env, "1.1.0", None);
     env.health.status_ok.store(false, Ordering::SeqCst);
     env.new_process("1.1.0").resume_update().await;
-    assert_eq!(env.layout().current().unwrap().as_deref(), Some("1.1.0"), "no downgrade to 0.9");
+    assert_eq!(
+        env.layout().current().unwrap().as_deref(),
+        Some("1.1.0"),
+        "no downgrade to 0.9"
+    );
     assert!(state(&env).rolled_back.is_some());
 }
 
@@ -1231,12 +1244,17 @@ async fn gateway_cannot_loop_re_applying_a_rolled_back_release() {
 #[tokio::test]
 async fn the_snapshot_before_the_first_bad_update_survives_a_reapply_loop() {
     let env = Env::new();
-    env.h.incus.add_desktop("hx-main", "ubuntu-24.04-xfce-basic", "alice", true);
+    env.h
+        .incus
+        .add_desktop("hx-main", "ubuntu-24.04-xfce-basic", "alice", true);
     env.h.daemon.register_desktop("main").unwrap();
     env.publish("1.1.0", T0);
     check_result(env.check().await);
     ok(env.apply("1.1.0").await);
-    let first: Vec<String> = env.h.incus.with(|s| s.instances["hx-main"].snapshots.to_vec());
+    let first: Vec<String> = env
+        .h
+        .incus
+        .with(|s| s.instances["hx-main"].snapshots.to_vec());
     assert_eq!(first.len(), 1);
     env.health.status_ok.store(false, Ordering::SeqCst);
     env.new_process("1.1.0").resume_update().await;
@@ -1250,8 +1268,14 @@ async fn the_snapshot_before_the_first_bad_update_survives_a_reapply_loop() {
         env.new_process("1.1.0").resume_update().await;
         env.health.status_ok.store(true, Ordering::SeqCst);
     }
-    let all: Vec<String> = env.h.incus.with(|s| s.instances["hx-main"].snapshots.to_vec());
-    assert!(all.contains(&first[0]), "the first recovery point is still there: {all:?}");
+    let all: Vec<String> = env
+        .h
+        .incus
+        .with(|s| s.instances["hx-main"].snapshots.to_vec());
+    assert!(
+        all.contains(&first[0]),
+        "the first recovery point is still there: {all:?}"
+    );
     assert!(all.len() <= 4);
 }
 
@@ -1263,7 +1287,14 @@ async fn a_non_canonical_version_string_is_never_used() {
     let r = env.apply("01.1.0").await;
     assert_eq!(err(&r).0, ErrorCode::InvalidArgument);
     assert!(!env.h.daemon.cfg.update.versions_dir.join("01.1.0").exists());
-    assert!(!env.server.lock().unwrap().jobs.iter().any(|j| j.contains("01.")));
+    assert!(
+        !env.server
+            .lock()
+            .unwrap()
+            .jobs
+            .iter()
+            .any(|j| j.contains("01."))
+    );
     // The canonical one works.
     assert!(matches!(ok(env.apply("1.1.0").await), R::ApplyUpdate(_)));
 }
@@ -1275,14 +1306,24 @@ async fn a_very_old_manifest_is_reported_but_not_refused() {
     let c = check_result(env.check().await);
     assert_eq!(c.available.as_deref(), Some("1.1.0"));
     assert!(
-        env.h.audit.lines().iter().any(|l| l.contains("days old (possible freeze)")),
+        env.h
+            .audit
+            .lines()
+            .iter()
+            .any(|l| l.contains("days old (possible freeze)")),
         "reported"
     );
     // A recent one is not.
     let env = Env::new();
     env.publish("1.1.0", T0);
     check_result(env.check().await);
-    assert!(!env.h.audit.lines().iter().any(|l| l.contains("possible freeze")));
+    assert!(
+        !env.h
+            .audit
+            .lines()
+            .iter()
+            .any(|l| l.contains("possible freeze"))
+    );
 }
 
 #[tokio::test]
@@ -1294,7 +1335,10 @@ async fn freshness_is_tracked_per_channel() {
     st.accept("beta", NOW + 3_600);
     st.save(&store).unwrap();
     env.publish("1.1.0", T0);
-    assert_eq!(check_result(env.check().await).available.as_deref(), Some("1.1.0"));
+    assert_eq!(
+        check_result(env.check().await).available.as_deref(),
+        Some("1.1.0")
+    );
     let st = state(&env);
     assert_eq!(st.highest("stable"), T0);
     assert_eq!(st.highest("beta"), NOW + 3_600);
@@ -1316,10 +1360,85 @@ async fn entries_privd_cannot_remove_are_reported_not_hidden_behind_internal() {
     assert_eq!(code, ErrorCode::FailedPrecondition);
     assert!(msg.contains("administrator must clear"), "{msg}");
     assert!(
-        env.h.audit.lines().iter().any(|l| l.contains("entries privd cannot remove")),
+        env.h
+            .audit
+            .lines()
+            .iter()
+            .any(|l| l.contains("entries privd cannot remove")),
         "audited"
     );
     // Cleared by hand, it works again.
     std::fs::remove_dir_all(dir.join("trap")).unwrap();
     assert!(check_result(env.check().await).available.is_some());
+}
+
+// ----- N1, N2 ---------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_cancelled_check_stops_the_fetcher_unit() {
+    let env = Env::new();
+    env.publish("1.1.0", T0);
+    env.systemd.block_fetch.store(true, Ordering::SeqCst);
+    let ctx = Ctx::new(Role::Admin);
+    let cancel = ctx.cancel.clone();
+    let d = env.h.daemon.clone();
+    let task = tokio::spawn(async move {
+        d.handle(
+            request(1, Command::CheckUpdate(pb::CheckUpdateRequest {})),
+            ctx,
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    cancel.cancel(hx_agent::privd::cancel::CancelReason::Cancelled);
+    let r = task.await.unwrap();
+    assert_eq!(err(&r).0, ErrorCode::Cancelled);
+    assert_eq!(
+        env.systemd.stops.lock().unwrap().clone(),
+        ["manifest-stable"]
+    );
+}
+
+#[tokio::test]
+async fn apply_records_gatewayds_pid_and_the_health_check_wants_a_different_one() {
+    let env = applied_env().await;
+    assert_eq!(state(&env).pending.unwrap().gateway_pid, Some(4242));
+    // gatewayd was never restarted: same MainPID as before the update, active and stable.
+    let d = env.new_process("1.1.0");
+    env.systemd.gateway_pid.store(4242, Ordering::SeqCst);
+    d.resume_update().await;
+    let rb = state(&env).rolled_back.expect("rolled back");
+    assert!(rb.reason.contains("not restarted"), "{}", rb.reason);
+    assert_eq!(env.health.status_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(env.layout().current().unwrap().as_deref(), Some("1.0.0"));
+}
+
+#[tokio::test]
+async fn gatewayd_must_report_the_new_version() {
+    let env = applied_env().await;
+    let d = env.new_process("1.1.0");
+    *env.health.gateway_version.lock().unwrap() = Some("1.0.0".into());
+    d.resume_update().await;
+    let rb = state(&env).rolled_back.expect("rolled back");
+    assert!(
+        rb.reason.contains("reports version `1.0.0`"),
+        "{}",
+        rb.reason
+    );
+    assert_eq!(env.layout().current().unwrap().as_deref(), Some("1.0.0"));
+}
+
+#[tokio::test]
+async fn the_answering_privd_must_be_the_new_one() {
+    let env = applied_env().await;
+    let d = env.new_process("1.1.0");
+    // An old process still holding the socket answers as 1.0.0.
+    *env.health.privd_version.lock().unwrap() = Some("1.0.0".into());
+    d.resume_update().await;
+    let rb = state(&env).rolled_back.expect("rolled back");
+    assert!(
+        rb.reason.contains("privd answers as version 1.0.0"),
+        "{}",
+        rb.reason
+    );
 }

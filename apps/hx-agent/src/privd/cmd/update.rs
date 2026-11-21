@@ -128,7 +128,12 @@ fn ensure_dirs<T: Transport + Clone + 'static>(d: &Daemon<T>) -> Result<FetchDir
 async fn run_fetcher(ctx: &Ctx, deps: &UpdateDeps, job: Job) -> Result<(), CmdError> {
     tokio::select! {
         r = deps.systemd.fetch(&job) => r.map_err(CmdError::unavailable),
-        reason = ctx.cancel.cancelled() => Err(reason.error()),
+        reason = ctx.cancel.cancelled() => {
+            // Dropping the client does not stop the unit: stop it, so that no download runs on
+            // after the answer (and nothing writes while the next command sweeps the directory).
+            deps.systemd.stop_fetch(&job).await;
+            Err(reason.error())
+        }
     }
 }
 
@@ -238,7 +243,9 @@ async fn check_inner<T: Transport + Clone + 'static>(
     // so (there is no needs_attention flag for it in the wire enum).
     let age_days = d.now().saturating_sub(release.manifest.timestamp) / 86_400;
     if age_days > MAX_MANIFEST_AGE_DAYS {
-        log::warn(&format!("update: the release manifest is {age_days} days old"));
+        log::warn(&format!(
+            "update: the release manifest is {age_days} days old"
+        ));
         d.audit_notice(&format!(
             "update check: the release manifest is {age_days} days old (possible freeze)"
         ));
@@ -417,7 +424,12 @@ async fn apply_inner<T: Transport + Clone + 'static>(
         255,
         true,
     );
-    preupdate_snapshots(d, ctx, st.rolled_back.is_some() || st.manual_rollback.is_some()).await;
+    preupdate_snapshots(
+        d,
+        ctx,
+        st.rolled_back.is_some() || st.manual_rollback.is_some(),
+    )
+    .await;
     ctx.check_cancelled()?;
 
     // Rule 4: safe extraction from the verified copy.

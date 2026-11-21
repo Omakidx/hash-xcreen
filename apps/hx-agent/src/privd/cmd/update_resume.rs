@@ -115,7 +115,11 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
         let used = Duration::from_secs(self.now().saturating_sub(p.started_unix));
         let floor = u.health.stable + u.health.poll * 3;
         let budget = u.health.window.saturating_sub(used).max(floor);
-        match health::check(&deps, &u.health, budget).await {
+        let expect = health::Expect {
+            version: &p.version,
+            old_gateway_pid: p.gateway_pid,
+        };
+        match health::check(&deps, &u.health, budget, &expect).await {
             Ok(()) => self.confirm_update(&p.version),
             Err(reason) => {
                 self.rollback_now(&reason).await;

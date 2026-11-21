@@ -258,6 +258,9 @@ pub struct FakeSystemd {
     /// Each state query bumps the pid (a crash loop).
     pub gateway_flapping: AtomicBool,
     pub fail_privd_restart: AtomicBool,
+    /// Fetches never finish (a hung download); `stops` records `stop_fetch` calls.
+    pub block_fetch: AtomicBool,
+    pub stops: Mutex<Vec<String>>,
 }
 
 impl FakeSystemd {
@@ -269,6 +272,9 @@ impl FakeSystemd {
 impl Systemd for FakeSystemd {
     fn fetch<'a>(&'a self, job: &'a Job) -> BoxFut<'a, Result<(), String>> {
         Box::pin(async move {
+            if self.block_fetch.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
             let mut s = self.server.lock().unwrap();
             s.jobs.push(job.instance());
             if s.fail {
@@ -291,6 +297,12 @@ impl Systemd for FakeSystemd {
                 }
             }
             Ok(())
+        })
+    }
+
+    fn stop_fetch<'a>(&'a self, job: &'a Job) -> BoxFut<'a, ()> {
+        Box::pin(async move {
+            self.stops.lock().unwrap().push(job.instance());
         })
     }
 
@@ -324,16 +336,36 @@ pub struct FakeHealth {
     pub privd_ok: AtomicBool,
     pub status_ok: AtomicBool,
     pub status_calls: AtomicU32,
+    /// The version both daemons report (set by `Env::new_process` to the version it runs).
+    pub version: Mutex<String>,
+    /// Overrides what gatewayd's `Status` reports.
+    pub gateway_version: Mutex<Option<String>>,
+    /// Overrides what privd's `HelloAck` reports.
+    pub privd_version: Mutex<Option<String>>,
 }
 
 impl HealthProbe for FakeHealth {
-    fn privd_answers(&self) -> BoxFut<'_, bool> {
-        Box::pin(async move { self.privd_ok.load(Ordering::SeqCst) })
+    fn privd_answers(&self) -> BoxFut<'_, Option<String>> {
+        Box::pin(async move {
+            self.privd_ok.load(Ordering::SeqCst).then(|| {
+                self.privd_version
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| self.version.lock().unwrap().clone())
+            })
+        })
     }
-    fn gatewayd_status(&self) -> BoxFut<'_, bool> {
+    fn gatewayd_status(&self) -> BoxFut<'_, Option<String>> {
         Box::pin(async move {
             self.status_calls.fetch_add(1, Ordering::SeqCst);
-            self.status_ok.load(Ordering::SeqCst)
+            self.status_ok.load(Ordering::SeqCst).then(|| {
+                self.gateway_version
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| self.version.lock().unwrap().clone())
+            })
         })
     }
 }
@@ -378,11 +410,16 @@ impl Env {
             gateway_pid: AtomicU32::new(4242),
             gateway_flapping: AtomicBool::new(false),
             fail_privd_restart: AtomicBool::new(false),
+            block_fetch: AtomicBool::new(false),
+            stops: Mutex::new(Vec::new()),
         });
         let health = Arc::new(FakeHealth {
             privd_ok: AtomicBool::new(true),
             status_ok: AtomicBool::new(true),
             status_calls: AtomicU32::new(0),
+            version: Mutex::new(String::new()),
+            gateway_version: Mutex::new(None),
+            privd_version: Mutex::new(None),
         });
         let env = Self {
             h,
@@ -516,6 +553,9 @@ impl Env {
         )
         .expect("daemon");
         d.set_update_deps(self.deps(&[&self.signer.public()]));
+        // The restart: both daemons now report `running`, and gatewayd has a new process id.
+        *self.health.version.lock().unwrap() = running.to_string();
+        self.systemd.gateway_pid.fetch_add(1000, Ordering::SeqCst);
         d
     }
 

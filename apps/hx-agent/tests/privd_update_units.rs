@@ -111,7 +111,10 @@ fn the_fetcher_can_reach_the_internet_and_no_unix_socket() {
     ] {
         assert!(deny.iter().any(|d| d == r), "{r} is denied");
     }
-    assert_eq!(words(&u, "IPAddressAllow"), ["127.0.0.53/32", "127.0.0.54/32"]);
+    assert_eq!(
+        words(&u, "IPAddressAllow"),
+        ["127.0.0.53/32", "127.0.0.54/32"]
+    );
 }
 
 #[test]
@@ -256,13 +259,28 @@ fn the_fetcher_cannot_create_directories_links_or_change_modes() {
         .flat_map(|f| f.split_whitespace().map(str::to_string))
         .collect();
     for call in [
-        "mkdir", "mkdirat", "symlink", "symlinkat", "link", "linkat", "rename", "renameat",
-        "renameat2", "mknod", "mknodat", "chmod", "fchmod", "fchmodat", "fchmodat2",
+        "mkdir",
+        "mkdirat",
+        "symlink",
+        "symlinkat",
+        "link",
+        "linkat",
+        "rename",
+        "renameat",
+        "renameat2",
+        "mknod",
+        "mknodat",
+        "chmod",
+        "fchmod",
+        "fchmodat",
+        "fchmodat2",
     ] {
         assert!(denied.iter().any(|d| d == call), "{call} is denied");
     }
     // What it does need is not on the list.
-    for call in ["openat", "write", "fsync", "unlink", "unlinkat", "read", "connect"] {
+    for call in [
+        "openat", "write", "fsync", "unlink", "unlinkat", "read", "connect",
+    ] {
         assert!(!denied.iter().any(|d| d == call), "{call} stays allowed");
     }
 }
@@ -271,10 +289,18 @@ fn the_fetcher_cannot_create_directories_links_or_change_modes() {
 fn the_fetcher_sees_none_of_the_agents_other_state() {
     let u = fetcher_unit();
     let hidden = words(&u, "InaccessiblePaths");
-    for p in ["/etc/hx", "/var/log", "/var/lib/hx-gatewayd", "/var/lib/private"] {
+    for p in [
+        "/etc/hx",
+        "/var/log",
+        "/var/lib/hx-gatewayd",
+        "/var/lib/private",
+    ] {
         assert!(hidden.iter().any(|h| h == p), "{p}");
     }
-    assert!(!hidden.iter().any(|h| h == "/var/lib/hx"), "the bind mount's source stays reachable");
+    assert!(
+        !hidden.iter().any(|h| h == "/var/lib/hx"),
+        "the bind mount's source stays reachable"
+    );
 }
 
 #[test]
@@ -296,11 +322,17 @@ fn the_fetchers_directory_is_a_size_capped_tmpfs() {
     for unit in ["hx-privd.service", "hx-update-fetcher@.service"] {
         let u = parse(&read(unit));
         assert!(
-            u["Unit"]["RequiresMountsFor"].iter().any(|v| v == "/var/lib/hx/updates"),
+            u["Unit"]["RequiresMountsFor"]
+                .iter()
+                .any(|v| v == "/var/lib/hx/updates"),
             "{unit}"
         );
     }
     // The mount point exists before the mount.
     let t = read("tmpfiles.d/hx.conf");
-    assert!(t.lines().any(|l| l.split_whitespace().take(3).collect::<Vec<_>>() == ["d", "/var/lib/hx/updates", "1733"]));
+    assert!(
+        t.lines()
+            .any(|l| l.split_whitespace().take(3).collect::<Vec<_>>()
+                == ["d", "/var/lib/hx/updates", "1733"])
+    );
 }

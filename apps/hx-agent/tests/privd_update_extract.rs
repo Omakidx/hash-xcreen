@@ -104,7 +104,12 @@ fn parent_components_are_refused() {
 #[test]
 fn pax_and_long_name_headers_are_refused_so_a_nul_or_a_huge_name_cannot_be_expressed() {
     // A NUL, an over-long component and a bad UTF-8 name can only come in a pax `path` record.
-    for p in [&b"good\0../../evil"[..], &b"x"[..], &[b'x'; 300][..], b"caf\xc3\xa9\xff"] {
+    for p in [
+        &b"good\0../../evil"[..],
+        &b"x"[..],
+        &[b'x'; 300][..],
+        b"caf\xc3\xa9\xff",
+    ] {
         let e = TarEntry::file("placeholder", b"x", 0o644).with_pax_path(p);
         let (t, r) = refused(&[e]);
         assert_eq!(r, Refusal::LongHeader);
@@ -130,12 +135,19 @@ fn a_two_megabyte_long_name_is_refused_before_it_is_read() {
     tar.extend(std::iter::repeat_n(b'a', 2 * 1024 * 1024));
     tar.extend_from_slice(&[0u8; 1024]);
     let (t, r) = run_with(&gz(&tar), &Limits::default());
-    assert!(matches!(r, Err(ExtractError::Refused(Refusal::LongHeader))), "{r:?}");
+    assert!(
+        matches!(r, Err(ExtractError::Refused(Refusal::LongHeader))),
+        "{r:?}"
+    );
     nothing_outside(&t);
     // 'K' (long link) and 'x' / 'g' (pax) headers likewise.
     for kind in *b"Kxg" {
         let (_t, r) = run(&[TarEntry::special("h", kind)]);
-        assert!(matches!(r, Err(ExtractError::Refused(Refusal::LongHeader))), "{}", kind as char);
+        assert!(
+            matches!(r, Err(ExtractError::Refused(Refusal::LongHeader))),
+            "{}",
+            kind as char
+        );
     }
 }
 
@@ -181,7 +193,15 @@ fn a_file_and_a_directory_cannot_share_a_path() {
 
 #[test]
 fn symlink_entries_are_refused_whatever_they_point_at() {
-    for target in ["/etc/passwd", "../outside", "a/../../outside", "x", "lib", ".", ""] {
+    for target in [
+        "/etc/passwd",
+        "../outside",
+        "a/../../outside",
+        "x",
+        "lib",
+        ".",
+        "",
+    ] {
         let (t, r) = refused(&[TarEntry::dir("lib"), TarEntry::symlink("link", target)]);
         assert_eq!(r, Refusal::SymlinkEntry, "{target:?}");
         assert!(!t.path().join("root/link").exists());

@@ -199,7 +199,10 @@ pub async fn install_inner<T: Transport + Clone + 'static>(
     let root = store.parent().unwrap_or(store);
     let rel = format!(
         "{}/{}/{PACKAGE_FILE}",
-        store.file_name().and_then(|n| n.to_str()).unwrap_or("session"),
+        store
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("session"),
         recipe.distro.as_str()
     );
     let Some(bytes) = read_package(root, &rel)? else {
@@ -331,10 +334,16 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         let rel = "session/ubuntu-24.04/hx-session.deb";
         let p = sub.join("hx-session.deb");
-        assert_eq!(read_package(d.path(), "session/debian-12/hx-session.deb").unwrap(), None);
+        assert_eq!(
+            read_package(d.path(), "session/debian-12/hx-session.deb").unwrap(),
+            None
+        );
         std::fs::write(&p, b"deb").unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(read_package(d.path(), rel).unwrap().as_deref(), Some(&b"deb"[..]));
+        assert_eq!(
+            read_package(d.path(), rel).unwrap().as_deref(),
+            Some(&b"deb"[..])
+        );
         // Group- or world-writable: refused.
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o666)).unwrap();
         assert!(read_package(d.path(), rel).is_err());
@@ -353,6 +362,9 @@ mod tests {
         let cur = tempfile::tempdir().unwrap();
         let link = cur.path().join("current");
         std::os::unix::fs::symlink(d.path(), &link).unwrap();
-        assert_eq!(read_package(&link, rel).unwrap().as_deref(), Some(&b"deb"[..]));
+        assert_eq!(
+            read_package(&link, rel).unwrap().as_deref(),
+            Some(&b"deb"[..])
+        );
     }
 }

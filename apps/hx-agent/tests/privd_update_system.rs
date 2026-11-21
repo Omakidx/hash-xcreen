@@ -169,14 +169,15 @@ async fn the_privd_probe_gets_hello_and_pong_from_the_real_server() {
         privd_socket: h.socket.clone(),
         admin_socket: h.dir.path().join("none.sock"),
     };
-    assert!(probe.privd_answers().await);
+    // The version of privd's own HelloAck, so an old process is told from a new one.
+    assert!(probe.privd_answers().await.is_some_and(|v| !v.is_empty()));
     // Nothing listening: no.
     let probe = SocketProbe {
         privd_socket: h.dir.path().join("none.sock"),
         admin_socket: h.dir.path().join("none.sock"),
     };
-    assert!(!probe.privd_answers().await);
-    assert!(!probe.gatewayd_status().await);
+    assert!(probe.privd_answers().await.is_none());
+    assert!(probe.gatewayd_status().await.is_none());
 }
 
 /// A stand-in for gatewayd's admin socket: answers `Hello`, then `Status` with `reply`.
@@ -233,9 +234,15 @@ async fn the_admin_probe_wants_a_status_result_and_nothing_else() {
         admin_socket: d.path().join(name),
     };
     fake_admin(&d.path().join("ok.sock"), |_| {
-        apb::response::Result::Status(apb::StatusResult::default())
+        apb::response::Result::Status(apb::StatusResult {
+            gatewayd_version: "fake-1.2.3".into(),
+            ..Default::default()
+        })
     });
-    assert!(probe_for("ok.sock").gatewayd_status().await);
+    assert_eq!(
+        probe_for("ok.sock").gatewayd_status().await.as_deref(),
+        Some("fake-1.2.3")
+    );
 
     // An error answer to Status (gatewayd up but unhealthy), or the answer to another command.
     fake_admin(&d.path().join("err.sock"), |_| {
@@ -245,11 +252,11 @@ async fn the_admin_probe_wants_a_status_result_and_nothing_else() {
             ..Default::default()
         })
     });
-    assert!(!probe_for("err.sock").gatewayd_status().await);
+    assert!(probe_for("err.sock").gatewayd_status().await.is_none());
     fake_admin(&d.path().join("wrong.sock"), |_| {
         apb::response::Result::ListDevices(apb::ListDevicesResult::default())
     });
-    assert!(!probe_for("wrong.sock").gatewayd_status().await);
+    assert!(probe_for("wrong.sock").gatewayd_status().await.is_none());
 
     // A listener that accepts and says nothing: the probe gives up after its own timeout.
     let silent = UnixListener::bind(d.path().join("silent.sock")).unwrap();
@@ -257,7 +264,17 @@ async fn the_admin_probe_wants_a_status_result_and_nothing_else() {
         let _held: Vec<_> = silent.incoming().flatten().collect();
     });
     let started = std::time::Instant::now();
-    assert!(!probe_for("silent.sock").gatewayd_status().await);
+    assert!(probe_for("silent.sock").gatewayd_status().await.is_none());
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
-    assert!(!probe_for("missing.sock").gatewayd_status().await);
+    assert!(probe_for("missing.sock").gatewayd_status().await.is_none());
+}
+
+#[tokio::test]
+async fn stopping_a_fetch_stops_its_unit() {
+    let (ctl, r) = ctl_with(|_| success());
+    ctl.stop_fetch(&Job::Artifact("1.4.2".into())).await;
+    assert_eq!(
+        argv(&r),
+        [vec!["stop", "hx-update-fetcher@artifact-1.4.2.service"]]
+    );
 }

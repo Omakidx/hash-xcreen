@@ -98,7 +98,10 @@ impl UpdateState {
 
     /// Records an accepted timestamp (never lowers it).
     pub fn accept(&mut self, channel: &str, ts: u64) {
-        let e = self.highest_by_channel.entry(channel.to_string()).or_insert(0);
+        let e = self
+            .highest_by_channel
+            .entry(channel.to_string())
+            .or_insert(0);
         *e = (*e).max(ts);
     }
 }
