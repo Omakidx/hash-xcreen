@@ -332,6 +332,7 @@ fn port_rule_apply_reads_the_recorded_backend() {
     st.created.port_rule = Some(state::PortRule {
         backend: "ufw".into(),
         port: 443,
+        ..Default::default()
     });
     state::save(&root(d.path()).join("var/lib/hx/install-state.json"), &st).unwrap();
     let r = cli(d.path(), &["port-rule", "apply", "--json"]);

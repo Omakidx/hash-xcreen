@@ -154,6 +154,16 @@ be fresh). A changed option that cannot change after its stage is done (`--user`
 `--docker`, `--storage-device`, ...) is exit 12 with the command that changes it. `--image prebuilt`
 and `--image-file` are exit 6.
 
+The port rule (stage `firewall-port`): with ufw active, `ufw allow <p>/tcp` and `/udp`; else, if a
+native nftables input chain drops, one rule `meta l4proto { tcp, udp } th dport <p> accept comment
+"hx-agent-port"` inserted at the **top** of that chain, before every other rule, so the chain's own
+drop rules cannot shadow it (it also comes ahead of anything the administrator put first on
+purpose, such as a fail2ban or geo-blocking rule: for this port, every source is accepted).
+`hx-agent-port.service` brings it back after a ruleset reload. The planned rule is recorded in the
+state before it is inserted. Uninstall finds our comment in every input chain, falls back to
+searching by comment when the state is unreadable, and does not delete a ufw rule that already
+existed before the installer ran (recorded as `adopted`).
+
 With `--json` standard output is only JSON Lines (`stage`, `step`, `warn`, `result`; `docs/ipc.md`
 and the installer design C3) and human text goes to standard error.
 

@@ -452,7 +452,11 @@ pub fn run(
     }
     let _lock = super::lock::acquire(&d.paths.at(paths::LOCK_FILE), None)?;
     let st_path = d.paths.at(paths::UNINSTALL_STATE);
-    let installed = state::load(&d.paths.at(paths::STATE_FILE)).ok().flatten();
+    // An unreadable state must not silently skip the port rule (U4): it is searched by comment.
+    let (installed, state_unreadable) = match state::load(&d.paths.at(paths::STATE_FILE)) {
+        Ok(s) => (s, false),
+        Err(_) => (None, true),
+    };
     let mut st = match load_state(&st_path)? {
         Some(s) => {
             if s.keep_desktop && !keep_desktop && s.privd_done {
@@ -556,22 +560,32 @@ pub fn run(
             }
             "U4" => {
                 say("U4: removing the port rule\n");
-                if d.host
-                    && let Some(rec) = installed.as_ref().and_then(|s| s.created.port_rule.clone())
-                {
-                    port::remove(d.runner, &rec)?;
-                    if rec.backend == "nft" {
-                        let _ = d.runner.run(&Call::new(
-                            Tool::Systemctl,
-                            &["disable", "--now", "hx-agent-port.service"],
-                        ));
+                if d.host {
+                    match installed.as_ref().and_then(|s| s.created.port_rule.clone()) {
+                        Some(rec) => {
+                            port::remove(d.runner, &rec)?;
+                            if rec.backend == "manual" {
+                                report.notes.push(format!(
+                                    "the firewall rule for port {} was opened by hand; remove it by hand",
+                                    rec.port
+                                ));
+                            }
+                        }
+                        None => {
+                            if state_unreadable {
+                                report.warnings.push(
+                                    "install-state.json is unreadable: the port rule is searched by its comment (nftables and ufw)"
+                                        .into(),
+                                );
+                            }
+                            port::remove_fallback(d.runner)?;
+                        }
                     }
-                    if rec.backend == "manual" {
-                        report.notes.push(format!(
-                            "the firewall rule for port {} was opened by hand; remove it by hand",
-                            rec.port
-                        ));
-                    }
+                    // Harmless when it was never enabled.
+                    let _ = d.runner.run(&Call::new(
+                        Tool::Systemctl,
+                        &["disable", "--now", "hx-agent-port.service"],
+                    ));
                 }
             }
             "U5" => {

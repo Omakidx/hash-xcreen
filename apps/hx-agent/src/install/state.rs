@@ -70,6 +70,10 @@ pub struct PortRule {
     pub backend: String,
     /// The port the rule opens.
     pub port: u16,
+    /// ufw protocols (`tcp`, `udp`) whose rule already existed before the installer ran: they
+    /// are the administrator's and uninstall leaves them.
+    #[serde(default)]
+    pub adopted: Vec<String>,
 }
 
 /// Incus as the installer found or installed it.

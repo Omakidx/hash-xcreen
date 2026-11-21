@@ -568,3 +568,173 @@ fn our_dropin_directory_stays_if_something_else_is_in_it() {
     assert!(d.join("90-admin.conf").exists());
     assert!(!d.join("50-port.conf").exists());
 }
+
+// ----- the port rule (L4) -----------------------------------------------------------------------
+
+fn drop_chain(family: &str, table: &str, name: &str) -> serde_json::Value {
+    serde_json::json!({"chain": {"family": family, "table": table, "name": name, "handle": 1,
+        "type": "filter", "hook": "input", "prio": 0, "policy": "drop"}})
+}
+
+fn our_nft_rules(m: &Machine) -> usize {
+    m.runner
+        .nft_items
+        .iter()
+        .filter_map(|i| i.get("rule"))
+        .filter(|r| r["comment"] == "hx-agent-port")
+        .count()
+}
+
+fn rerun_ssh(m: &mut Machine, extra: &[(&'static str, &str)]) -> u8 {
+    let mut a = ssh_args(std::path::Path::new("/none"), extra, &[]);
+    a.bootstrap_dir = None;
+    m.install(a, Some(frames(None, None)))
+}
+
+#[test]
+fn a_rule_in_a_chain_that_stopped_dropping_is_still_removed() {
+    let mut m = Machine::new();
+    m.runner
+        .nft_items
+        .push(drop_chain("inet", "filter", "input"));
+    let dir = release(&mut m, &Tamper::default());
+    assert_eq!(full_install(&mut m, &dir), 0);
+    assert_eq!(our_nft_rules(&m), 1);
+    // The administrator changed the policy afterwards: the chain no longer drops.
+    m.runner.nft_items[0]["chain"]["policy"] = serde_json::json!("accept");
+    ok(uninstall(&mut m, false, 0).0);
+    assert_eq!(
+        our_nft_rules(&m),
+        0,
+        "found by comment in every input chain"
+    );
+}
+
+#[test]
+fn a_stale_rule_in_a_chain_that_stopped_dropping_is_cleaned_on_the_next_install_run() {
+    let mut m = Machine::new();
+    m.runner
+        .nft_items
+        .push(drop_chain("inet", "filter", "input"));
+    m.runner.nft_items.push(drop_chain("ip", "filter", "INPUT"));
+    let dir = release(&mut m, &Tamper::default());
+    assert_eq!(full_install(&mut m, &dir), 0);
+    assert_eq!(our_nft_rules(&m), 2);
+    m.runner.nft_items[1]["chain"]["policy"] = serde_json::json!("accept");
+    assert_eq!(rerun_ssh(&mut m, &[("--port", "8443")]), 0);
+    assert_eq!(
+        our_nft_rules(&m),
+        1,
+        "only the chain that still drops keeps a rule"
+    );
+}
+
+#[test]
+fn a_failure_half_way_is_recorded_before_it_happens_and_removed_by_uninstall() {
+    let mut m = Machine::new();
+    m.runner
+        .nft_items
+        .push(drop_chain("inet", "filter", "input"));
+    m.runner.nft_items.push(drop_chain("ip", "filter", "INPUT"));
+    // The first insert works, the second fails.
+    m.runner
+        .fail_on(Tool::Nft, "insert rule ip filter INPUT", 1, Some(1));
+    let dir = release(&mut m, &Tamper::default());
+    assert_eq!(full_install(&mut m, &dir), 1);
+    assert_eq!(m.result()["stage"], "firewall-port");
+    assert_eq!(our_nft_rules(&m), 1, "one rule is in");
+    let rec = m
+        .state()
+        .unwrap()
+        .created
+        .port_rule
+        .expect("recorded before the insert");
+    assert_eq!((rec.backend.as_str(), rec.port), ("nft", 443));
+    ok(uninstall(&mut m, false, 0).0);
+    assert_eq!(our_nft_rules(&m), 0);
+}
+
+#[test]
+fn an_unreadable_state_does_not_skip_the_port_rule() {
+    // nft by comment
+    let mut m = Machine::new();
+    m.runner
+        .nft_items
+        .push(drop_chain("inet", "filter", "input"));
+    let dir = release(&mut m, &Tamper::default());
+    assert_eq!(full_install(&mut m, &dir), 0);
+    std::fs::write(path(&m, paths::STATE_FILE), b"{ not json").unwrap();
+    let rep = ok(uninstall(&mut m, false, 0).0);
+    assert_eq!(our_nft_rules(&m), 0);
+    assert!(
+        rep.warnings.iter().any(|w| w.contains("unreadable")),
+        "{:?}",
+        rep.warnings
+    );
+    // ufw by its comment: ours go, the administrator's stay.
+    let mut m = Machine::new();
+    m.runner.ufw = Some(true);
+    m.runner.ufw_rules.push("allow 22/tcp".into());
+    m.runner.ufw_foreign.insert("allow 22/tcp".into());
+    let dir = release(&mut m, &Tamper::default());
+    assert_eq!(full_install(&mut m, &dir), 0);
+    std::fs::write(path(&m, paths::STATE_FILE), b"\xff\xfe").unwrap();
+    let rep = ok(uninstall(&mut m, false, 0).0);
+    assert_eq!(m.runner.ufw_rules, ["allow 22/tcp"]);
+    assert!(rep.warnings.iter().any(|w| w.contains("unreadable")));
+}
+
+#[test]
+fn a_ufw_rule_that_was_already_there_is_adopted_and_survives_uninstall() {
+    let mut m = Machine::new();
+    m.runner.ufw = Some(true);
+    m.runner.ufw_rules.push("allow 443/tcp".into());
+    m.runner.ufw_foreign.insert("allow 443/tcp".into());
+    let dir = release(&mut m, &Tamper::default());
+    assert_eq!(full_install(&mut m, &dir), 0);
+    let rec = m.state().unwrap().created.port_rule.unwrap();
+    assert_eq!(
+        rec.adopted,
+        ["tcp"],
+        "the existing tcp rule is the administrator's"
+    );
+    assert_eq!(m.runner.ufw_rules, ["allow 443/tcp", "allow 443/udp"]);
+    // A re-run does not turn it into ours, and keeps what is ours.
+    assert_eq!(rerun_ssh(&mut m, &[]), 0);
+    assert_eq!(
+        m.state().unwrap().created.port_rule.unwrap().adopted,
+        ["tcp"]
+    );
+    ok(uninstall(&mut m, false, 0).0);
+    assert_eq!(
+        m.runner.ufw_rules,
+        ["allow 443/tcp"],
+        "only the udp rule was ours"
+    );
+}
+
+#[test]
+fn moving_the_port_leaves_an_adopted_rule_alone() {
+    let mut m = Machine::new();
+    m.runner.ufw = Some(true);
+    m.runner.ufw_rules.push("allow 443/tcp".into());
+    m.runner.ufw_foreign.insert("allow 443/tcp".into());
+    let dir = release(&mut m, &Tamper::default());
+    assert_eq!(full_install(&mut m, &dir), 0);
+    assert_eq!(rerun_ssh(&mut m, &[("--port", "8443")]), 0);
+    assert_eq!(
+        m.runner.ufw_rules,
+        ["allow 443/tcp", "allow 8443/tcp", "allow 8443/udp"]
+    );
+    assert!(
+        m.state()
+            .unwrap()
+            .created
+            .port_rule
+            .unwrap()
+            .adopted
+            .is_empty()
+    );
+    ok(uninstall(&mut m, false, 0).0);
+    assert_eq!(m.runner.ufw_rules, ["allow 443/tcp"]);
+}

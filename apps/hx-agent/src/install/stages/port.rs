@@ -12,6 +12,19 @@
 //!    exact commands are printed.
 //! 4. Otherwise: `none`.
 //!
+//! **Where the nft rule goes.** The rule is inserted at the TOP of the blocking input chain
+//! (`nft insert`), before every other rule, so that the chain's own drop rules cannot shadow it. The
+//! consequence is that it also comes before anything the administrator put at the top on purpose
+//! (a fail2ban or geo-blocking rule): for this one port, tcp and udp, traffic from every source is
+//! accepted ahead of them. That is the intended meaning of "open the agent's port"; an operator who
+//! wants source restrictions uses `--port` with their own rules, or the `manual` path.
+//!
+//! **Bookkeeping.** The planned rule is recorded in the state before it is inserted, so that a
+//! failure half way is still removed by uninstall. At removal our comment is searched in EVERY input
+//! chain (not only the chains that still drop), and an unreadable state falls back to searching nft
+//! by comment and ufw by its comment. A ufw rule that already existed (`ufw` answers "Skipping
+//! adding existing rule") is `adopted`: it was the administrator's, and uninstall does not delete it.
+//!
 //! Everything goes through the closed tool set. Names that came out of `nft -j list ruleset` are
 //! checked against a strict charset before they are used as arguments.
 
@@ -79,8 +92,9 @@ fn dport_of(expr: &[Value]) -> Option<u16> {
     })
 }
 
-/// Reads `nft -j list ruleset` and returns the input base chains that block inbound traffic.
-pub fn analyze_nft(json: &str) -> Vec<DropChain> {
+/// Reads `nft -j list ruleset`: every input base chain (outside the tables we ignore), whether it
+/// blocks inbound traffic, and our rules in it.
+fn analyze_all(json: &str) -> Vec<(DropChain, bool)> {
     let Ok(v) = serde_json::from_str::<Value>(json) else {
         return Vec::new();
     };
@@ -138,8 +152,22 @@ pub fn analyze_nft(json: &str) -> Vec<DropChain> {
         }
     }
     chains
+}
+
+/// The input base chains that block inbound traffic.
+pub fn analyze_nft(json: &str) -> Vec<DropChain> {
+    analyze_all(json)
         .into_iter()
-        .filter(|(_, b)| *b)
+        .filter(|(_, blocks)| *blocks)
+        .map(|(c, _)| c)
+        .collect()
+}
+
+/// Every input base chain that holds a rule of ours, blocking or not.
+pub fn analyze_ours(json: &str) -> Vec<DropChain> {
+    analyze_all(json)
+        .into_iter()
+        .filter(|(c, _)| !c.ours.is_empty())
         .map(|(c, _)| c)
         .collect()
 }
@@ -162,36 +190,52 @@ fn fail(what: &str, o: Option<Output>) -> InstallError {
     ))
 }
 
-/// Inserts (or keeps) the accept rule in every blocking input chain and removes our rule for
-/// another port. Returns whether a blocking chain exists.
+fn delete_rule(r: &mut dyn Runner, c: &DropChain, handle: u64) -> Result<()> {
+    let o = run(
+        r,
+        &Call::owned(
+            Tool::Nft,
+            vec![
+                "delete".into(),
+                "rule".into(),
+                c.family.clone(),
+                c.table.clone(),
+                c.chain.clone(),
+                "handle".into(),
+                handle.to_string(),
+            ],
+        ),
+    );
+    if o.as_ref().is_some_and(Output::ok) {
+        Ok(())
+    } else {
+        Err(fail("removing the nftables port rule", o))
+    }
+}
+
+/// Inserts (or keeps) the accept rule at the top of every blocking input chain and removes our rule
+/// for another port, and our rules in chains that no longer block. Returns whether a blocking
+/// chain exists.
 pub fn apply_nft(r: &mut dyn Runner, port: u16) -> Result<bool> {
     let Some(list) = run(r, &Call::new(Tool::Nft, &["-j", "list", "ruleset"])).filter(Output::ok)
     else {
         return Ok(false);
     };
-    let chains = analyze_nft(&list.out_text());
+    let chains = analyze_all(&list.out_text());
     let p = port.to_string();
-    for c in &chains {
+    let mut any_blocking = false;
+    for (c, blocks) in &chains {
+        if !*blocks {
+            // The chain stopped dropping: a rule of ours in it is stale.
+            for (handle, _) in &c.ours {
+                delete_rule(r, c, *handle)?;
+            }
+            continue;
+        }
+        any_blocking = true;
         for (handle, rule_port) in &c.ours {
             if *rule_port != Some(port) {
-                let o = run(
-                    r,
-                    &Call::owned(
-                        Tool::Nft,
-                        vec![
-                            "delete".into(),
-                            "rule".into(),
-                            c.family.clone(),
-                            c.table.clone(),
-                            c.chain.clone(),
-                            "handle".into(),
-                            handle.to_string(),
-                        ],
-                    ),
-                );
-                if !o.as_ref().is_some_and(Output::ok) {
-                    return Err(fail("removing the old port rule", o));
-                }
+                delete_rule(r, c, *handle)?;
             }
         }
         if !c.ours.iter().any(|(_, rp)| *rp == Some(port)) {
@@ -228,66 +272,117 @@ pub fn apply_nft(r: &mut dyn Runner, port: u16) -> Result<bool> {
             }
         }
     }
-    Ok(!chains.is_empty())
+    Ok(any_blocking)
 }
 
-/// Removes every nft rule of ours (uninstall).
+/// Removes every nft rule of ours, in every input chain whether it still drops or not.
 pub fn remove_nft(r: &mut dyn Runner) -> Result<()> {
     let Some(list) = run(r, &Call::new(Tool::Nft, &["-j", "list", "ruleset"])).filter(Output::ok)
     else {
         return Ok(());
     };
-    for c in analyze_nft(&list.out_text()) {
+    for c in analyze_ours(&list.out_text()) {
         for (handle, _) in &c.ours {
+            delete_rule(r, &c, *handle)?;
+        }
+    }
+    Ok(())
+}
+
+const PROTOS: [&str; 2] = ["tcp", "udp"];
+
+/// `ufw allow <port>/<proto> comment hash-xcreen`. Returns true when the rule already existed
+/// ("Skipping adding existing rule").
+fn ufw_add(r: &mut dyn Runner, port: u16, proto: &str) -> Result<bool> {
+    let o = run(
+        r,
+        &Call::owned(
+            Tool::Ufw,
+            vec![
+                "allow".into(),
+                format!("{port}/{proto}"),
+                "comment".into(),
+                UFW_COMMENT.into(),
+            ],
+        ),
+    );
+    match o {
+        Some(o) if o.ok() => Ok(o.out_text().contains("Skipping adding existing rule")),
+        o => Err(fail("ufw", o)),
+    }
+}
+
+fn ufw_delete(r: &mut dyn Runner, port: u16, proto: &str) -> Result<()> {
+    let o = run(
+        r,
+        &Call::owned(
+            Tool::Ufw,
+            vec!["delete".into(), "allow".into(), format!("{port}/{proto}")],
+        ),
+    );
+    if o.as_ref().is_some_and(Output::ok) {
+        Ok(())
+    } else {
+        Err(fail("ufw", o))
+    }
+}
+
+/// Removes the port rule recorded in the state (uninstall U4). A ufw protocol that was `adopted`
+/// is left alone: it was the administrator's rule.
+pub fn remove(r: &mut dyn Runner, rec: &PortRule) -> Result<()> {
+    match rec.backend.as_str() {
+        "ufw" => {
+            for proto in PROTOS {
+                if !rec.adopted.iter().any(|a| a == proto) {
+                    ufw_delete(r, rec.port, proto)?;
+                }
+            }
+            Ok(())
+        }
+        "nft" => remove_nft(r),
+        _ => Ok(()),
+    }
+}
+
+/// With no readable state: our nft rules by their comment, and the ufw rules that carry our
+/// comment (`ufw show added` lists them as `ufw allow 443/tcp comment 'hash-xcreen'`). A ufw rule
+/// without our comment is never touched.
+pub fn remove_fallback(r: &mut dyn Runner) -> Result<()> {
+    remove_nft(r)?;
+    let Some(o) = run(r, &Call::new(Tool::Ufw, &["show", "added"])).filter(Output::ok) else {
+        return Ok(());
+    };
+    for line in o.out_text().lines() {
+        let l = line.trim();
+        let Some(rest) = l.strip_prefix("ufw ") else {
+            continue;
+        };
+        let Some((spec, tail)) = rest.split_once(" comment ") else {
+            continue;
+        };
+        if tail.trim().trim_matches('\'') != UFW_COMMENT {
+            continue;
+        }
+        let words: Vec<&str> = spec.split_whitespace().collect();
+        let plain = words.len() == 2
+            && words[0] == "allow"
+            && words[1]
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b == b'/' || b.is_ascii_lowercase());
+        if plain {
             let o = run(
                 r,
                 &Call::owned(
-                    Tool::Nft,
-                    vec![
-                        "delete".into(),
-                        "rule".into(),
-                        c.family.clone(),
-                        c.table.clone(),
-                        c.chain.clone(),
-                        "handle".into(),
-                        handle.to_string(),
-                    ],
+                    Tool::Ufw,
+                    vec!["delete".into(), "allow".into(), words[1].to_owned()],
                 ),
             );
             if !o.as_ref().is_some_and(Output::ok) {
-                return Err(fail("removing the nftables port rule", o));
+                return Err(fail("ufw", o));
             }
         }
     }
     Ok(())
-}
-
-fn ufw_rules(r: &mut dyn Runner, port: u16, add: bool) -> Result<()> {
-    for proto in ["tcp", "udp"] {
-        let spec = format!("{port}/{proto}");
-        let call = if add {
-            Call::owned(
-                Tool::Ufw,
-                vec!["allow".into(), spec, "comment".into(), UFW_COMMENT.into()],
-            )
-        } else {
-            Call::owned(Tool::Ufw, vec!["delete".into(), "allow".into(), spec])
-        };
-        let o = run(r, &call);
-        if !o.as_ref().is_some_and(Output::ok) {
-            return Err(fail("ufw", o));
-        }
-    }
-    Ok(())
-}
-
-/// Removes the port rule recorded in the state (uninstall U4).
-pub fn remove(r: &mut dyn Runner, rec: &PortRule) -> Result<()> {
-    match rec.backend.as_str() {
-        "ufw" => ufw_rules(r, rec.port, false),
-        "nft" => remove_nft(r),
-        _ => Ok(()),
-    }
 }
 
 fn manual_hint(r: &mut dyn Runner, port: u16) -> Option<String> {
@@ -314,45 +409,104 @@ fn manual_hint(r: &mut dyn Runner, port: u16) -> Option<String> {
     })
 }
 
-/// What the stage decided.
+/// What the stage decided, before it does anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Plan {
+    /// ufw is active.
+    Ufw,
+    /// A native nftables input chain drops.
+    Nft,
+    /// firewalld or iptables blocks: the commands for the operator.
+    Manual(String),
+    /// Nothing blocks.
+    Nothing,
+}
+
+impl Plan {
+    /// The backend name recorded in the state.
+    pub fn backend(&self) -> &'static str {
+        match self {
+            Self::Ufw => "ufw",
+            Self::Nft => "nft",
+            Self::Manual(_) => "manual",
+            Self::Nothing => "none",
+        }
+    }
+}
+
+/// Reads the firewall (no change) and decides.
+pub fn plan(r: &mut dyn Runner, port: u16) -> Plan {
+    if ufw_active(r) {
+        return Plan::Ufw;
+    }
+    let blocking = run(r, &Call::new(Tool::Nft, &["-j", "list", "ruleset"]))
+        .filter(Output::ok)
+        .is_some_and(|l| !analyze_nft(&l.out_text()).is_empty());
+    if blocking {
+        return Plan::Nft;
+    }
+    match manual_hint(r, port) {
+        Some(h) => Plan::Manual(h),
+        None => Plan::Nothing,
+    }
+}
+
+/// What the stage did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortOutcome {
     /// `ufw`, `nft`, `manual` or `none`.
     pub backend: String,
     /// The commands to run by hand (`manual`).
     pub hint: Option<String>,
+    /// ufw protocols whose rule already existed (not ours to delete).
+    pub adopted: Vec<String>,
 }
 
-/// Opens `port`, moving a rule from `previous` if the port changed.
-pub fn apply(r: &mut dyn Runner, port: u16, previous: Option<&PortRule>) -> Result<PortOutcome> {
-    if ufw_active(r) {
-        if let Some(p) = previous
-            && p.backend == "ufw"
-            && p.port != port
-        {
-            ufw_rules(r, p.port, false)?;
+/// Carries out `plan` for `port`, moving a rule from `previous` if the port or backend changed.
+/// `checkpoint` is called with the rule as recorded so far after every step that changes the host,
+/// so that the caller can persist it.
+pub fn execute(
+    r: &mut dyn Runner,
+    plan: &Plan,
+    port: u16,
+    previous: Option<&PortRule>,
+    checkpoint: &mut dyn FnMut(&PortRule),
+) -> Result<PortOutcome> {
+    // A rule of another backend or port is ours to move, never an adopted one.
+    if let Some(p) = previous
+        && (p.backend != plan.backend() || p.port != port)
+    {
+        remove(r, p)?;
+    }
+    let same = previous.filter(|p| p.backend == plan.backend() && p.port == port);
+    let mut adopted = same.map(|p| p.adopted.clone()).unwrap_or_default();
+    match plan {
+        Plan::Ufw => {
+            for proto in PROTOS {
+                let existed = ufw_add(r, port, proto)?;
+                // First sight of a rule that was already there: the administrator's.
+                if existed && same.is_none() && !adopted.iter().any(|a| a == proto) {
+                    adopted.push(proto.to_owned());
+                }
+                checkpoint(&PortRule {
+                    backend: "ufw".into(),
+                    port,
+                    adopted: adopted.clone(),
+                });
+            }
         }
-        ufw_rules(r, port, true)?;
-        return Ok(PortOutcome {
-            backend: "ufw".into(),
-            hint: None,
-        });
-    }
-    if apply_nft(r, port)? {
-        return Ok(PortOutcome {
-            backend: "nft".into(),
-            hint: None,
-        });
-    }
-    if let Some(h) = manual_hint(r, port) {
-        return Ok(PortOutcome {
-            backend: "manual".into(),
-            hint: Some(h),
-        });
+        Plan::Nft => {
+            apply_nft(r, port)?;
+        }
+        Plan::Manual(_) | Plan::Nothing => {}
     }
     Ok(PortOutcome {
-        backend: "none".into(),
-        hint: None,
+        backend: plan.backend().to_owned(),
+        hint: match plan {
+            Plan::Manual(h) => Some(h.clone()),
+            _ => None,
+        },
+        adopted,
     })
 }
 
@@ -390,11 +544,34 @@ pub fn check(ctx: &mut Ctx<'_>) -> Result<bool> {
 
 /// Opens the port and records how.
 pub fn run_stage(ctx: &mut Ctx<'_>) -> Result<Outcome> {
+    let port = ctx.opts.port;
     let previous = ctx.state.created.port_rule.clone();
-    let out = apply(ctx.runner, ctx.opts.port, previous.as_ref())?;
+    let plan = plan(ctx.runner, port);
+    // Record the planned rule BEFORE touching the firewall, so that a failure half way is still
+    // found (and removed) by uninstall.
+    let same = previous
+        .as_ref()
+        .filter(|p| p.backend == plan.backend() && p.port == port);
+    ctx.state.created.port_rule = Some(PortRule {
+        backend: plan.backend().to_owned(),
+        port,
+        adopted: same.map(|p| p.adopted.clone()).unwrap_or_default(),
+    });
+    ctx.save_state()?;
+    let out = {
+        let path = ctx.paths.at(crate::install::paths::STATE_FILE);
+        let state = &mut ctx.state;
+        let runner = &mut *ctx.runner;
+        let mut checkpoint = |rule: &PortRule| {
+            state.created.port_rule = Some(rule.clone());
+            let _ = crate::install::state::save(&path, state);
+        };
+        execute(runner, &plan, port, previous.as_ref(), &mut checkpoint)?
+    };
     ctx.state.created.port_rule = Some(PortRule {
         backend: out.backend.clone(),
-        port: ctx.opts.port,
+        port,
+        adopted: out.adopted.clone(),
     });
     ctx.log
         .line((ctx.now)(), &format!("port rule: {}", out.backend));

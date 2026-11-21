@@ -187,7 +187,14 @@ pub(super) fn run(
                     "; the desktop and its objects were deleted"
                 }
             );
-            for n in r.notes.iter().chain(r.summary.warnings.iter()) {
+            let warnings: Vec<String> = r
+                .summary
+                .warnings
+                .iter()
+                .chain(r.warnings.iter())
+                .cloned()
+                .collect();
+            for n in r.notes.iter().chain(warnings.iter()) {
                 text.push_str(n);
                 text.push('\n');
             }
@@ -198,7 +205,7 @@ pub(super) fn run(
                     "keep_desktop": keep_desktop,
                     "removed": r.summary.removed,
                     "kept": r.summary.kept,
-                    "warnings": r.summary.warnings,
+                    "warnings": warnings,
                     "steps": r.ran,
                     "notes": r.notes,
                 }),

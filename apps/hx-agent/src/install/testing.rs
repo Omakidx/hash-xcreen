@@ -101,6 +101,8 @@ pub struct FakeRunner {
     pub ufw: Option<bool>,
     /// ufw rules added.
     pub ufw_rules: Vec<String>,
+    /// ufw rules that are the administrator's (no `hash-xcreen` comment).
+    pub ufw_foreign: BTreeSet<String>,
     /// nft ruleset items (`chain`, `rule`, ...), as `nft -j` prints them.
     pub nft_items: Vec<Value>,
     /// nft is installed.
@@ -143,6 +145,7 @@ impl FakeRunner {
             systemd: 255,
             ufw: None,
             ufw_rules: Vec::new(),
+            ufw_foreign: BTreeSet::new(),
             nft_items: Vec::new(),
             nft: true,
             iptables_input: "-P INPUT ACCEPT\n".to_owned(),
@@ -173,7 +176,7 @@ impl FakeRunner {
                     | Tool::Ip
                     | Tool::Iptables => false,
                     Tool::Systemctl => !matches!(a0, "--version" | "is-enabled" | "is-active"),
-                    Tool::Ufw => a0 != "status",
+                    Tool::Ufw => !matches!(a0, "status" | "show"),
                     Tool::Nft => !(a0 == "-j" && c.args.get(1).map(String::as_str) == Some("list")),
                     Tool::SystemdCreds => a0 == "encrypt",
                     _ => true,
@@ -524,8 +527,26 @@ impl Runner for FakeRunner {
                         "Status: inactive\n"
                     }),
                     Some("allow") => {
-                        self.ufw_rules.push(format!("allow {}", a[1]));
-                        Self::ok("Rule added\n")
+                        let rule = format!("allow {}", a[1]);
+                        if self.ufw_rules.contains(&rule) {
+                            Self::ok("Skipping adding existing rule\n")
+                        } else {
+                            self.ufw_rules.push(rule);
+                            Self::ok("Rule added\n")
+                        }
+                    }
+                    Some("show") => {
+                        let mut t = String::from(
+                            "Added user rules (see 'ufw status' for running firewall):\n",
+                        );
+                        for r in &self.ufw_rules {
+                            if self.ufw_foreign.contains(r) {
+                                t.push_str(&format!("ufw {r}\n"));
+                            } else {
+                                t.push_str(&format!("ufw {r} comment 'hash-xcreen'\n"));
+                            }
+                        }
+                        Self::ok(&t)
                     }
                     Some("delete") => {
                         let spec = format!("allow {}", a.last().cloned().unwrap_or_default());
