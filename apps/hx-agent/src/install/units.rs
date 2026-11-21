@@ -3,16 +3,6 @@
 //! The units ship inside `hx-agent` (design C7, `include_str!`), are installed by the installer and
 //! are not touched by self-update. A test asserts that every file under `apps/hx-agent/systemd/`
 //! is a row of [`FILES`] and the other way round, so a new unit file cannot be forgotten.
-//!
-//! TODO(1E integration): two files arrive from other workstreams and are not on this branch, so
-//! `include_str!` cannot name them yet. Integration adds exactly two rows to [`FILES`]:
-//!
-//! ```text
-//! WS-4b  hx-gatewayd-public.socket   Dest::Unit, Enable::Now      (D-Port, FileDescriptorName=public)
-//! WS-4a  hx-privd-rescue.service     Dest::Unit, Enable::No       (C8/C10, OnFailure= target of hx-privd)
-//! ```
-//!
-//! and the `every_systemd_file_is_embedded` test then passes again with them present.
 
 /// Where a file goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,14 +112,25 @@ pub const FILES: &[EmbeddedFile] = &[
         Dest::Unit,
         Enable::Now
     ),
-    // TODO(1E integration, WS-4b): the public socket row goes here, before hx-gatewayd.service.
+    file!(
+        "hx-gatewayd-public.socket",
+        "hx-gatewayd-public.socket",
+        Dest::Unit,
+        Enable::Now
+    ),
     file!(
         "hx-gatewayd.service",
         "hx-gatewayd.service",
         Dest::Unit,
         Enable::Now
     ),
-    // TODO(1E integration, WS-4a): the rescue unit row goes here.
+    // The OnFailure= target of hx-privd.service; it has no [Install] section.
+    file!(
+        "hx-privd-rescue.service",
+        "hx-privd-rescue.service",
+        Dest::Unit,
+        Enable::No
+    ),
     file!(
         "hx-agent-port.service",
         "hx-agent-port.service",

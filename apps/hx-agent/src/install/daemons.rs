@@ -41,23 +41,23 @@ pub struct UninstallSummary {
 
 /// The adapter between `pb::UninstallResult` and [`UninstallSummary`].
 ///
-/// ASSUMPTION (WS-4a, branch `phase-1/1e-privd`, contract C9):
+/// Contract C9 (privd.proto):
 /// `message UninstallResult { bool keep_desktop = 1; repeated string removed = 2;
 /// repeated string kept = 3; repeated string warnings = 4; }`, entries `kind:name`.
-/// TODO(1E integration): until `privd.proto` has those fields this returns an empty summary;
-/// replace the body with
-/// `UninstallSummary { removed: r.removed.clone(), kept: r.kept.clone(), warnings: r.warnings.clone() }`.
-pub fn uninstall_summary(_r: &pb::UninstallResult) -> UninstallSummary {
-    UninstallSummary::default()
+pub fn uninstall_summary(r: &pb::UninstallResult) -> UninstallSummary {
+    UninstallSummary {
+        removed: r.removed.clone(),
+        kept: r.kept.clone(),
+        warnings: r.warnings.clone(),
+    }
 }
 
 /// The adapter for the `ERROR_DETAIL_UNINSTALLING` detail of C9 (privd refuses Gateway commands
 /// and Admin mutations while its uninstall marker exists).
-/// ASSUMPTION: `ErrorDetail::Uninstalling = 13`, `ProgressStage::Uninstall = 14` (progress needs no
+/// `ErrorDetail::Uninstalling = 13`, `ProgressStage::Uninstall = 14` (progress needs no
 /// code: stages print by name).
-/// TODO(1E integration): once the enum has the value, return `d == pb::ErrorDetail::Uninstalling`.
-pub fn is_uninstalling(_d: pb::ErrorDetail) -> bool {
-    false
+pub fn is_uninstalling(d: pb::ErrorDetail) -> bool {
+    d == pb::ErrorDetail::Uninstalling
 }
 
 /// The daemons.
