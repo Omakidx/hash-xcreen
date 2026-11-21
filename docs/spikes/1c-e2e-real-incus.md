@@ -117,11 +117,23 @@ Cause: the build stage only *enables* units (`systemctl enable`, never `--now`) 
 
 Fix (commit `dba3bf0`): `build_on_server` restarts the container after the post stage and waits for `running` again. Regression test `build_on_server_restarts_the_container_after_the_post_stage` in `crates/hx-provision/tests/orchestrate.rs`: it failed before (`["start"]`), it passes after. Cost: one container restart (about 5 s) on the build path. The three clean runs above ran with the fix.
 
-### 7.2 OPEN, intermittent: a WebSocket client may see `INTERNAL_ERROR` where `UNAUTHORIZED` is expected on revoke
+### 7.2 FIXED, intermittent: a WebSocket client may see `INTERNAL_ERROR` where `UNAUTHORIZED` is expected on revoke
 
 One occurrence in a kept-desktop development run: the tablet's WebSocket connection, revoked mid-stream while the desktop was busy, reported `closed.code == InternalError` instead of `Unauthorized` (the assertion `left: InternalError, right: Unauthorized`). The close reason was not printed at that point, so the evidence is the code only. It did not recur in the next development run and the 3 clean runs (4 more WebSocket revokes, all `Unauthorized`, reason "device revoked", `by_peer=true`), nor in an in-process probe that revoked a streaming WebSocket client under heavy load 10 times in a row (all `Unauthorized`; the probe was scratch code and is not committed). The QUIC path never showed it.
 
 Hypothesis, not confirmed: `hx-transport`'s WebSocket writer records `InternalError` ("connection lost") when a write fails, and the first recorded close wins; if the TCP connection is torn down while the client is still acknowledging frames, the client can record the write error before it has processed the server's close frame. The protocol says the client must see the close code (it decides whether to offer re-pairing). Next step for the owner of `hx-transport`: print `closed.reason` on the failing path (the test does now: `revoke ... reason ...`) and, if it is "connection lost", have the writer defer to a close frame that is already queued in the reader. Not fixed here: it needs a deterministic reproduction first.
+
+Confirmed, plus a second path, in `fix/ws-close-reason-precedence`:
+
+1. The hypothesis. The client's reader is behind (a full video queue) while the server sends its close frame and tears the socket down. The client's next write fails (EPIPE, or tungstenite's `SendAfterClosing` once the reader has parsed the close), and the writer records `InternalError` ("connection lost") before the reader reaches the close frame.
+2. A failed Pong flush. tungstenite flushes its automatic Pong at the start of every read and gives up the read if that flush fails. With a server `Ping` (every 5 s, protocol §9) between the last frame and the close, the reader ends with "Broken pipe" and never reads the close frame.
+
+Fix (commit `b62f386`): once a write has failed, later writes stay pending instead of failing, so reads go on past the failed Pong. The writer gives the reader one close grace to find a close frame before it records `InternalError`. The reader drops deliveries that would block and reads on to the close frame. Regression tests in `crates/hx-transport/tests/websocket.rs`: `server_close_wins_over_a_write_error_behind_a_busy_reader` (real server) and `server_close_behind_a_ping_wins_over_the_failed_pong` (raw server, `Ping` before the close). Both failed every run before (`InternalError`, "connection lost") and pass after.
+
+Related changes in the same branch:
+
+- Commit `0f5c704`: after a close, the reader gives the peer one grace period in total. Before, each peer message restarted the grace, so a client that kept sending kept the closed socket open.
+- Commit `4129512`: the writer sends a local close frame that it could skip in a narrow race.
 
 ### 7.3 Observations (not bugs of this change)
 

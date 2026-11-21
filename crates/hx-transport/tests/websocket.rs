@@ -429,3 +429,177 @@ async fn unacknowledged_frames_are_capped() {
     }
     assert_eq!(sent, 256);
 }
+
+/// A close frame from the server wins over a local write error. Reproduces the revoke seen on
+/// real Incus (docs/spikes/1c-e2e-real-incus.md §7.2): the client's reader is behind (here: the
+/// application does not take video, so the reader waits on a full video queue), the server
+/// closes with `Unauthorized` and tears the TCP connection down, and the client keeps writing.
+/// Its write fails before its reader has reached the close frame; the connection must still
+/// report the server's code, not `InternalError` ("connection lost").
+#[tokio::test]
+async fn server_close_wins_over_a_write_error_behind_a_busy_reader() {
+    let p = common::pair(TransportPreference::WebSocket).await;
+
+    // Fill the client's video queue (16) and one more: its reader now waits on delivery.
+    const QUEUED: u64 = 17;
+    for n in 0..QUEUED as u32 {
+        let header = hx_proto::media::MediaHeader {
+            codec: VideoCodec::H264,
+            flags: 0,
+            frame_number: n,
+            capture_timestamp_us: 0,
+            payload_len: 4,
+        };
+        p.srv
+            .send_video_frame(header, Bytes::from_static(b"data"))
+            .await
+            .expect("send frame");
+    }
+    tokio::time::timeout(WAIT, async {
+        while p.client.stats().frames_received < QUEUED {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("client reader reaches the full video queue");
+
+    // Revoke: the close frame goes out, then the server side goes away (its reader gives up
+    // waiting for the client's close reply and the socket is dropped).
+    p.srv.close(CloseCode::Unauthorized, "device revoked").await;
+    drop(p.srv);
+
+    // The client keeps sending input until its writer finds the socket gone.
+    let input = pb::InputEvent {
+        event: Some(pb::input_event::Event::Key(pb::KeyEvent {
+            scancode: 4,
+            pressed: true,
+        })),
+    };
+    tokio::time::timeout(WAIT, async {
+        while p.client.send_input(&input).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a write fails once the server is gone");
+
+    let info = tokio::time::timeout(WAIT, p.client.closed())
+        .await
+        .expect("closed in time");
+    assert_eq!(info.code, CloseCode::Unauthorized, "{info:?}");
+    assert_eq!(info.reason, "device revoked");
+    assert!(info.by_peer);
+}
+
+/// Same as above with a WebSocket `Ping` between the last frame and the close, from a raw
+/// server so the order on the wire is fixed. Answering the `Ping` makes the client's reader
+/// flush a `Pong` before it reads on; once the socket is gone that flush fails, and the read
+/// must still reach the close frame instead of ending with the write error.
+#[tokio::test]
+async fn server_close_behind_a_ping_wins_over_the_failed_pong() {
+    use tokio_tungstenite::tungstenite::protocol::{
+        CloseFrame, frame::coding::CloseCode as WsCloseCode,
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let mut tls = (*common::server_tls()).clone();
+    tls.alpn_protocols = vec![ALPN_WEBSOCKET.to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+    let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+    const QUEUED: u32 = 17;
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.expect("accept");
+        let tls = acceptor.accept(tcp).await.expect("TLS");
+        let mut ws = tokio_tungstenite::accept_async(tls).await.expect("upgrade");
+        match ws.next().await {
+            Some(Ok(Message::Binary(b))) => assert_eq!(b[0], 0x01, "Hello on control"),
+            other => panic!("expected Hello, got {other:?}"),
+        }
+        let ack = ControlMessage::new(Ctl::HelloAck(pb::HelloAck {
+            version: Some(hx_proto::version::ProtocolVersion::CURRENT.into()),
+            capabilities: server_hello().capabilities.into(),
+            session_id: Bytes::from_static(&[7; 16]),
+            software: "raw server".into(),
+        }));
+        let mut v = vec![0x01];
+        v.extend_from_slice(&message::encode(&ack).expect("encode"));
+        ws.send(Message::Binary(Bytes::from(v))).await.expect("ack");
+        // Fill the client's video queue (16) and one more: its reader then waits on delivery.
+        for n in 0..QUEUED {
+            let header = hx_proto::media::MediaHeader {
+                codec: VideoCodec::H264,
+                flags: 0,
+                frame_number: n,
+                capture_timestamp_us: 0,
+                payload_len: 4,
+            };
+            let mut v = vec![0x05];
+            v.extend_from_slice(&header.encode().expect("header"));
+            v.extend_from_slice(b"data");
+            ws.send(Message::Binary(Bytes::from(v)))
+                .await
+                .expect("frame");
+        }
+        go_rx.await.expect("go");
+        ws.send(Message::Ping(Bytes::new())).await.expect("ping");
+        ws.send(Message::Close(Some(CloseFrame {
+            code: WsCloseCode::from(CloseCode::Unauthorized.websocket_code()),
+            reason: "device revoked".into(),
+        })))
+        .await
+        .expect("close");
+        // Like the real server, read on (the client's reader is stuck, so no close reply
+        // comes) and then drop the socket. Dropping it with unread data would make the kernel
+        // reset the connection and discard the close frame before it is sent.
+        while let Ok(Some(Ok(_))) =
+            tokio::time::timeout(Duration::from_millis(200), ws.next()).await
+        {}
+    });
+
+    let client = common::client(TransportPreference::WebSocket)
+        .connect(
+            &hx_transport::Target {
+                addr,
+                server_name: rustls::pki_types::ServerName::try_from("localhost").expect("name"),
+            },
+            &client_hello(),
+        )
+        .await
+        .expect("client connects");
+    tokio::time::timeout(WAIT, async {
+        while client.stats().frames_received < u64::from(QUEUED) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("client reader reaches the full video queue");
+    go_tx.send(()).expect("server waits");
+    tokio::time::timeout(WAIT, server)
+        .await
+        .expect("server in time")
+        .expect("server task");
+
+    let input = pb::InputEvent {
+        event: Some(pb::input_event::Event::Key(pb::KeyEvent {
+            scancode: 4,
+            pressed: true,
+        })),
+    };
+    tokio::time::timeout(WAIT, async {
+        while client.send_input(&input).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a write fails once the server is gone");
+
+    let info = tokio::time::timeout(WAIT, client.closed())
+        .await
+        .expect("closed in time");
+    assert_eq!(info.code, CloseCode::Unauthorized, "{info:?}");
+    assert_eq!(info.reason, "device revoked");
+}
