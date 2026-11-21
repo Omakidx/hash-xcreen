@@ -180,12 +180,11 @@ impl Gateway {
         let devices = DeviceService::new(auth.clone(), privd.clone(), live.clone());
         let login = Login::new(
             registry.clone(),
-            auth.clone(),
             verifiers.clone(),
             privd.clone(),
             clock.clone(),
             LoginConfig::default(),
-            devices.revoke_gate(),
+            devices.clone(),
         );
         let sessions = SessionManager::new(
             SessionSettings {
@@ -198,7 +197,6 @@ impl Gateway {
             privd.clone(),
             devices.clone(),
             live.clone(),
-            auth.clone(),
             clock,
         );
         let server = Arc::new(

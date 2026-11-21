@@ -14,9 +14,8 @@
 //! * Audit events are best effort with a few retries: a compromised gateway can omit or forge
 //!   them (ipc.md 6.15); the log is a tripwire, not a guarantee.
 
-use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use hx_crypto::{Authenticator, DeviceId, DeviceRecord, RevokeReason};
@@ -50,8 +49,6 @@ pub struct DeviceService {
     /// the "keep one active device" and "requester still active" checks are only sound if
     /// nothing else revokes between the check and the write.
     revoke_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Which paired device asked for a pending revocation (consumed by the announcer).
-    actors: Mutex<HashMap<DeviceId, DeviceId>>,
     version: AtomicU64,
 }
 
@@ -86,38 +83,17 @@ pub fn device_info(rec: &DeviceRecord, current: bool) -> pb::DeviceInfo {
 }
 
 impl DeviceService {
-    /// Creates the service and starts its announcer task.
+    /// Creates the service.
     pub fn new(auth: Authenticator, privd: PrivdClient, live: Arc<LiveSessions>) -> Arc<Self> {
         let (tx, _) = broadcast::channel(64);
-        let svc = Arc::new(Self {
-            auth: auth.clone(),
+        Arc::new(Self {
+            auth,
             privd,
             live,
             tx,
             revoke_lock: Arc::new(tokio::sync::Mutex::new(())),
-            actors: Mutex::new(HashMap::new()),
             version: AtomicU64::new(1),
-        });
-        let weak = Arc::downgrade(&svc);
-        let mut rx = auth.subscribe_revocations();
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(id) => {
-                        let Some(svc) = Weak::upgrade(&weak) else {
-                            break;
-                        };
-                        svc.announce_revoked(id);
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        // A lag means missed notices; clients re-list to resynchronize.
-                        tracing::warn!(missed = n, "revocation announcements were missed");
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
-        svc
+        })
     }
 
     /// The lock every revocation path takes ([`super::login::Login`] takes it for a lockout).
@@ -150,15 +126,14 @@ impl DeviceService {
         self.auth.registry().list()
     }
 
-    fn announce_revoked(&self, id: DeviceId) {
+    /// Records a revocation that was just persisted, **directly** (not through a broadcast
+    /// that a slow consumer could lag behind): audit event, closing of the device's live
+    /// sessions, and the notice to the clients. `by` is the paired device that asked, or
+    /// `None` for the operator and the PIN lockout; it belongs to this very revocation.
+    fn record_revoked(&self, id: DeviceId, by: Option<DeviceId>) {
         self.bump_version();
-        let by = self
-            .actors
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&id);
         let Ok(Some(rec)) = self.auth.registry().get(&id) else {
-            return; // removed, not revoked: there is no event for that
+            return;
         };
         if !rec.is_revoked() {
             return;
@@ -185,6 +160,22 @@ impl DeviceService {
             device: device_info(&rec, false),
             by,
         }));
+    }
+
+    /// Revokes `id` after too many wrong PINs, serialized with every other revocation. True if
+    /// it was revoked now. (The PIN login calls this; the lockout is not subject to the
+    /// "keep one active device" rule: a device that fails its PIN five times is locked out
+    /// even if it was the last one, and the operator reinstates it.)
+    pub async fn revoke_lockout(&self, id: DeviceId) -> Result<bool, hx_crypto::Error> {
+        let _serial = self.revoke_lock.lock().await;
+        let done = self
+            .auth
+            .revoke(&id, RevokeReason::TooManyPinFailures)
+            .await?;
+        if done {
+            self.record_revoked(id, None);
+        }
+        Ok(done)
     }
 
     /// A device paired: record it and tell the live sessions.
@@ -295,19 +286,14 @@ impl DeviceService {
         if active <= 1 {
             return S::LastActiveDevice;
         }
-        self.actors
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(target, requester);
         match self.auth.revoke(&target, RevokeReason::User).await {
-            Ok(true) => S::Ok,
+            Ok(true) => {
+                self.record_revoked(target, Some(requester));
+                S::Ok
+            }
             Ok(false) => S::AlreadyRevoked,
             Err(e) => {
                 tracing::error!(error = %e, "revocation failed");
-                self.actors
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .remove(&target);
                 S::Failed
             }
         }
@@ -327,7 +313,9 @@ impl DeviceService {
             return Ok(Some(0));
         }
         let sessions = self.live.count_for(&target);
-        self.auth.revoke(&target, RevokeReason::User).await?;
+        if self.auth.revoke(&target, RevokeReason::User).await? {
+            self.record_revoked(target, None);
+        }
         Ok(Some(sessions))
     }
 

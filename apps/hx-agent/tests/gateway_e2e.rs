@@ -1199,3 +1199,63 @@ async fn a_locked_pin_purpose_makes_devices_wait_and_never_revokes_them() {
     let _ = env.login(&phone, "phone", PIN).await;
     assert_eq!(failed(&env), 0);
 }
+
+/// N6: revocations are recorded directly, not through a broadcast that can lag: a burst larger
+/// than the broadcast capacity (64) still reaches privd's audit log in full.
+#[tokio::test]
+async fn a_burst_of_revocations_is_audited_in_full() {
+    let env = Env::start().await;
+    let mut keys = Vec::new();
+    for i in 0..66 {
+        let k = new_key();
+        env.pair(&k, &format!("device {i}")).await;
+        keys.push(k);
+    }
+    for k in &keys {
+        env.gw
+            .devices()
+            .revoke_by_operator(Env::id_of(k))
+            .await
+            .unwrap();
+    }
+    assert!(
+        env.privd
+            .wait_for(|s| s
+                .events
+                .iter()
+                .filter(|e| e.0 == AuditEvent::DeviceRevoked)
+                .count()
+                == 66)
+            .await,
+        "every revocation was audited"
+    );
+}
+
+/// F2 (lockout path): a revocation caused by the PIN lockout takes the same lock as every other
+/// one, and is audited and announced like them.
+#[tokio::test]
+async fn a_lockout_revocation_is_serialized_with_the_others_and_recorded() {
+    let env = Env::start().await;
+    let (a, b) = (new_key(), new_key());
+    env.pair(&a, "alice").await;
+    env.pair(&b, "bob").await;
+    let gate = env.gw.devices().revoke_gate();
+    let held = gate.lock().await;
+    let devices = env.gw.devices().clone();
+    let id = Env::id_of(&b);
+    let lockout = tokio::spawn(async move { devices.revoke_lockout(id).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !lockout.is_finished(),
+        "the lockout waits for the revocation lock"
+    );
+    assert!(env.gw.devices().is_active(&Env::id_of(&b)));
+    drop(held);
+    assert!(within(lockout).await.unwrap().unwrap());
+    assert!(!env.gw.devices().is_active(&Env::id_of(&b)));
+    assert!(
+        env.privd
+            .wait_for(|s| s.events.iter().any(|e| e.0 == AuditEvent::DeviceRevoked))
+            .await
+    );
+}

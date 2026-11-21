@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use hx_crypto::{Authenticator, Clock, DeviceId, DeviceRecord};
+use hx_crypto::{Clock, DeviceId, DeviceRecord};
 use hx_ipc::privd::pb::AuditEvent;
 use hx_proto::channel::CloseCode;
 use hx_proto::message::{MgmtDirection, sanitize_device_name};
@@ -129,7 +129,6 @@ pub struct SessionManager {
     live: Arc<LiveSessions>,
     devices: Arc<DeviceService>,
     privd: PrivdClient,
-    auth: Authenticator,
     next_token: AtomicU64,
 }
 
@@ -141,7 +140,6 @@ impl SessionManager {
         privd: PrivdClient,
         devices: Arc<DeviceService>,
         live: Arc<LiveSessions>,
-        auth: Authenticator,
         clock: Arc<dyn Clock>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -153,7 +151,6 @@ impl SessionManager {
             live,
             devices,
             privd,
-            auth,
             next_token: AtomicU64::new(1),
         })
     }
