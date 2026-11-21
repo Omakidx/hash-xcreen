@@ -435,16 +435,24 @@ async fn writer(
 }
 
 async fn reader(inner: Arc<Inner>, mut stream: SplitStream<Ws>) {
+    let mut closed = inner.subscribe_closed();
+    // Once the connection is closed, the peer gets one grace period in total to answer with
+    // its own close frame: a peer that keeps sending must not keep the socket open.
+    let mut grace_until: Option<Instant> = None;
     loop {
-        // After a local close, give the peer a moment to answer with its own close frame.
-        let wait = if inner.closed_info().is_some() {
-            CLOSE_GRACE
-        } else {
-            IDLE_TIMEOUT
+        let limit = grace_until.unwrap_or_else(|| Instant::now() + IDLE_TIMEOUT);
+        let next = tokio::select! {
+            biased;
+            n = stream.next() => Some(n),
+            _ = wait_closed(&mut closed), if grace_until.is_none() => {
+                grace_until = Some(Instant::now() + CLOSE_GRACE);
+                continue;
+            }
+            _ = tokio::time::sleep_until(limit) => None,
         };
-        let next = match tokio::time::timeout(wait, stream.next()).await {
-            Ok(n) => n,
-            Err(_) => {
+        let next = match next {
+            Some(n) => n,
+            None => {
                 inner.record_close(CloseInfo {
                     code: CloseCode::InternalError,
                     reason: "idle timeout".into(),
