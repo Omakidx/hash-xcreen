@@ -1,0 +1,27 @@
+# The admin socket of hx-gatewayd (docs/ipc.md section 9): root only.
+#
+# systemd creates it and hands it to hx-gatewayd.service (socket activation, LISTEN_FDS), because
+# the gateway runs as an unprivileged user and cannot create a root-owned socket in /run/hx.
+# The gateway also checks SO_PEERCRED (uid 0) on every connection. Because the socket is
+# activated, the update health probe (docs/ipc.md section 6.12) can connect even while the
+# gateway is restarting.
+
+[Unit]
+Description=hx-gatewayd admin socket (root only)
+Documentation=https://github.com/Omakidx/hash-xcreen
+# /run/hx comes from systemd-tmpfiles (docs/ipc.md section 3).
+After=systemd-tmpfiles-setup.service
+Requires=systemd-tmpfiles-setup.service
+
+[Socket]
+ListenStream=/run/hx/gatewayd-admin.sock
+SocketUser=root
+SocketGroup=root
+SocketMode=0600
+Accept=no
+Service=hx-gatewayd.service
+FileDescriptorName=admin
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

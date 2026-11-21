@@ -150,7 +150,7 @@ flowchart LR
 
 ### 1C — Agent core
 - [x] `hx-privd` command set specified and reviewed before implementation ([ipc.md](ipc.md) v0.3; the session link too)
-- [ ] `hx-gatewayd` unprivileged with systemd hardening and seccomp allowlist
+- [x] `hx-gatewayd` unprivileged with systemd hardening and seccomp allowlist
 - [ ] Unix-socket IPC: gateway ↔ privd, gateway ↔ session
 - [ ] Device list and revocation; `hx-agent` CLI (status, devices, logs, uninstall)
 - [ ] Self-update with signature check and rollback
