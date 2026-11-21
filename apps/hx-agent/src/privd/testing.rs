@@ -436,6 +436,10 @@ impl FakeIncus {
                 }
                 "DELETE" => {
                     s.objects.remove(&key);
+                    if *coll == "storage-pools" {
+                        // The default pool of the fake exists by flag, not as an object.
+                        s.pool_exists = false;
+                    }
                     return Ok(ok_sync(Value::Null));
                 }
                 _ => {}

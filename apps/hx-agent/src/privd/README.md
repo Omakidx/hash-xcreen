@@ -51,6 +51,7 @@ is an error: privd refuses to start rather than reset a lockout or a window.
 | `ratelimit` | JSON: `PepperVerify` failure times per purpose and the locks, `PepperEnrol` call times, current-password check times | 0600 |
 | `pepper.key` | 32 random bytes, the verifier pepper, **only when there is no systemd credential** (a development run, or a host that has not migrated yet; see "The pepper") | 0600 |
 | `owner-key` | the enrolled owner public key (Phase 2 shape) | 0644 |
+| `uninstall-state` | JSON: present once an `Uninstall` has begun (see "Uninstall"); while it exists privd refuses everything but `Uninstall` and Admin reads | 0600 |
 | `updates-state` | JSON: highest accepted manifest timestamp, the verified version, a `pending` update awaiting its health check, the last automatic rollback | 0600 |
 | `staging/` | privd's own verified copies: the staged manifest and signature (the artifact is an unnamed `O_TMPFILE`, never a name here) | dir 0700 |
 | `updates/` | what the fetcher left: **hostile**, root-owned mode 1733, bind-mounted into the fetcher's unit, swept before every fetch | dir 1733 |
@@ -89,7 +90,8 @@ For the installer (1E):
 
 ## Authorization
 
-`Daemon::handle` runs, in order: `hx_ipc` validation (done when the frame is decoded) → class →
+`Daemon::handle` runs, in order: `hx_ipc` validation (done when the frame is decoded) → the
+uninstall gate (`UNINSTALLING`, see "Uninstall") → class →
 `hx_ipc::privd::gateway_denied` (class `X`, Admin-only arguments by presence, `DeleteSnapshot` kinds,
 the `SetUserPassword` current password) → phase gates (`A`: READY or SETUP_OPEN; `S`: SETUP_OPEN only;
 `EnableDocker` after setup is `PERMISSION_DENIED`) → `UNIMPLEMENTED` for reserved commands → rate
@@ -158,7 +160,7 @@ waiters and a 10 s wait). `Ping` is answered at once, at most 10 times a second.
 | RestartSession | implemented |
 | CheckUpdate, ApplyUpdate, RollbackUpdate | implemented (see "Self-update"); a build whose `release-keys/` are `UNPROVISIONED` answers `FAILED_PRECONDITION` |
 | DestroyDesktop | implemented |
-| Uninstall | `UNIMPLEMENTED`: installer-level removal of units, credentials and the registry |
+| Uninstall | implemented, narrowed to what privd created (see "Uninstall"); the CLI removes units, credentials, binaries and gatewayd's state |
 | ResetLockout, EnrolOwnerKey | implemented |
 | UpgradeIncus, BeginSecretUpload, every Phase 2 command | `UNIMPLEMENTED` (reserved) |
 | PepperVerify, PepperEnrol, RecordEvent | implemented |
@@ -191,12 +193,10 @@ ipc.md 6.12 is the contract; this is how it is built (code in `update/`, `cmd/up
   `Status`, all within 90 s of the switch. Otherwise the links flip back, both units restart again
   and `needs_attention=UPDATE_ROLLED_BACK` is set. A new privd that starts three times without
   succeeding is rolled back too, and so is one running a version other than the one switched in.
-* **Not covered by privd.** A new `hx-privd` binary that cannot start at all (a missing library, a
-  bad ELF) is never seen by `resume_update`; systemd's `Restart=on-failure` retries the same binary.
-  The installer should add `StartLimitBurst`/`OnFailure=` pointing at a rollback helper that lives
-  outside `/usr/lib/hx/<version>` (for example a ten-line script that swaps the two links); that is a
-  1E item. Unit files are not part of an artifact: a release that needs a changed unit needs the
-  installer, not self-update.
+* **Not covered by `resume_update`.** A new `hx-privd` binary that cannot start at all (a missing
+  library, a bad ELF) is never seen by `resume_update`. That case is the rescue helper's: see
+  "The rescue helper" below. Unit files are not part of an artifact: a release that needs a changed
+  unit needs the installer, not self-update.
 * **Tests** never restart a unit or connect to a daemon: `FakeSystemd`, a fake health probe and the
   test keys are injected through `Daemon::set_update_deps`, which exists only with `test-support`.
 
@@ -207,8 +207,93 @@ ipc.md 6.12 is the contract; this is how it is built (code in `update/`, `cmd/up
 * **Versions.** `CARGO_PKG_VERSION` of the built binaries equals the manifest `version` and the artifact's `VERSION` file (the health check compares what privd and gatewayd report with the pending version).
 * **Layout.** `/usr/lib/hx/<version>/` from the same artifact, root 0755, with **relative** `current` and `previous` symlinks; `/usr/lib/hx/current/<binary>` in every unit.
 * **Units.** Install `hx-update-fetcher@.service`, `var-lib-hx-updates.mount` and the updated `tmpfiles.d/hx.conf`; add an installer-written `hx-update-fetcher@.service.d/resolvers.conf` with `IPAddressAllow=` for the host's real upstream resolvers (the shipped unit allows only systemd-resolved's stubs; on Google Cloud the link-local metadata resolver needs this too).
-* **Safety net.** An `OnFailure=` helper on `hx-privd.service`, installed **outside** `/usr/lib/hx/<version>`, that restores `pending.previous` from `updates-state` explicitly (as `Daemon::rollback_now` does: set `current` to the recorded version, never flip), plus `StartLimitBurst` and `StartLimitIntervalSec` that allow at least `MAX_ATTEMPTS` (3) starts before systemd gives up.
+* **Safety net.** `hx-privd.service` carries `OnFailure=hx-privd-rescue.service`, `StartLimitIntervalSec=300` and `StartLimitBurst=5` (more than `MAX_ATTEMPTS`, which a test enforces). The installer must put the `hx-privd-rescue` binary at `/usr/lib/hx-rescue/hx-privd-rescue` (root, 0755, **outside** `/usr/lib/hx`, so pruning never removes it) and install `hx-privd-rescue.service`. See "The rescue helper".
 * **Release hosting.** `channel-<stable|beta>/manifest-<arch>.json` and `.minisig`, and `v<version>/hx-<version>-<arch>.tar.gz`, under the repository's releases.
+
+## The rescue helper
+
+`hx-privd-rescue` (`src/bin/hx-privd-rescue.rs`, logic in `privd::rescue`) is what
+`hx-privd.service` runs through `OnFailure=` once its start limit is reached. With
+`Restart=on-failure`, systemd enters "failed" only then, so a new privd that crashes at start gets
+`StartLimitBurst` tries (including its own three-start rollback) before the helper runs. It takes
+no arguments and reads no environment. It:
+
+1. opens `/var/lib/hx` and `updates-state` with `O_NOFOLLOW` and requires a directory owned by root
+   and not writable by others, and a regular file owned by root, mode exactly 0600, at most 1 MiB
+   (anything else is refused and nothing changes);
+2. reads **only** `pending.version` and `pending.previous`, both checked with the release-version
+   syntax of ipc.md 6.12 rule 1 before they reach a path;
+3. does nothing (exit 0) without a `pending` update: privd failed for another reason;
+4. otherwise calls `Layout::restore(previous, version)`, the call `rollback_now` makes, and
+   **never writes `updates-state`** (an older helper must not drop fields a newer privd added).
+   If `current` names neither the failed version nor its predecessor, someone moved it since and
+   the links are left alone;
+5. runs `systemctl reset-failed hx-privd.service hx-privd.socket` and `systemctl start
+   hx-privd.socket hx-privd.service` (absolute path, fixed argument vector, cleared environment,
+   60 s timeout).
+
+The old privd then starts with `pending` still set, finds `running_version != pending.version` and
+runs `rollback_now`: bookkeeping (`rolled_back`, `UPDATE_ROLLED_BACK`) and a restart of both units
+(`tests/privd_rescue.rs` runs this hand-over end to end). The helper's own unit allows 3 runs an
+hour, so a privd that fails for a reason a rollback does not fix cannot loop for ever. The unit has
+`ProtectSystem=strict`, `ReadWritePaths=/usr/lib/hx`, no capabilities, no network.
+
+**Not yet seen under real systemd:** the empty capability set rests on root's connection to
+systemd's private socket being authorised by uid. If a host refuses it, widen
+`CapabilityBoundingSet=` in `hx-privd-rescue.service` and say why here.
+
+## Uninstall
+
+privd's sandbox (`ProtectSystem=strict`, no `CAP_DAC_OVERRIDE`) cannot remove units, users or
+gatewayd's state, so `Uninstall` (Admin only, host lock plus every desktop lock) removes **only
+what privd created**; `hx-agent uninstall` does the rest (units, `/etc/hx/creds`, `/usr/lib/hx`,
+`/var/lib/hx-gatewayd`, the user, the port rule).
+
+* **State and gate.** `/var/lib/hx/uninstall-state` (JSON: `mode`, `started`, `done` steps,
+  `privd_done`, `removed`) is written first. While it exists, every Gateway command and every Admin
+  mutation other than `Uninstall` answers `FAILED_PRECONDITION` with detail `UNINSTALLING`; the
+  check runs before the phase gates, again when a command takes the host or a desktop lock, and in
+  the background host refresh. Admin reads still work. privd never deletes the file (the CLI removes
+  `/var/lib/hx` whole), so the gate survives a restart of privd.
+* **Keep mode** (`keep_desktop=true`): the session-link proxy device of each registry desktop,
+  only on an instance with the `user.hx.*` marker. The desktop, pool, bridge, ACL, profiles, the
+  nft table, the ruleset file, the `DOCKER-USER` rules and the sysctl file stay.
+* **Destroy mode** (`confirm_destroy` required): additionally `teardown::destroy_desktop` for each
+  registry desktop (marker-checked, its `hx-` snapshots first), `teardown::teardown_host` with the
+  compiled-in names (profiles, bridge, ACL, pool, each only with the marker), `nft delete table inet
+  hx` if present, the ruleset file, both `DOCKER-USER` rules (`-C` then `-D` until `-C` fails), and
+  `/etc/sysctl.d/90-hx-incus.conf`. The **live sysctl values are not reverted**: they go at the next
+  boot, and the result says so (`kept`).
+* **Never** touches Incus itself, units, `/etc/hx/creds` or `/var/lib/hx-gatewayd`. An object with
+  our name but no marker is left alone and reported in `kept` and `warnings`. Files are unlinked
+  relative to a directory descriptor opened `O_NOFOLLOW` (a symlink at the path is removed, never
+  followed).
+* **Idempotent and resumable.** Every step inspects the host and acts on what is there; a failed
+  step leaves the state file, and calling `Uninstall` again finishes. `removed` accumulates across
+  runs. Keep may become destroy; destroy to keep is refused (`UNINSTALLING`) until a destroy has
+  converged (`privd_done`), after which a keep request is answered from it (`keep_desktop=false`,
+  a warning) without doing anything. Incus being unreachable fails the step that needs it
+  (`UNAVAILABLE`): leaving a proxy device behind would stop the desktop from starting once
+  `/run/hx/link` is gone.
+* **Result.** `UninstallResult { keep_desktop, removed, kept, warnings }`, at most 64 entries of 256
+  bytes: `kind:name` such as `session-link:main`, `desktop:main`, `network:hxbr0`,
+  `nft-table:inet hx`, `docker-user-rules:2`, `file:/etc/hx/host-firewall.nft`. Progress frames use
+  stage `UNINSTALL`.
+
+## The firewall units
+
+`hx-host-firewall.service` and `hx-docker-user.service` are installed and enabled by the **installer**
+(1E), not by privd: its sandbox cannot write unit directories. privd only writes the ruleset file
+`/etc/hx/host-firewall.nft` (and loads it with `nft -f`) and applies the `DOCKER-USER` rules itself
+when `SetupHost` runs.
+
+## Test-only features
+
+`test-support` (constructors that inject a gateway uid and fakes) and `privd-test-hooks`: a failed
+`sysctl -p`, for example EPERM in a nested VM or an unprivileged container, or values that did not
+take effect, become an audited warning and `SetupHostResult.sysctl_applied=false` instead of an
+error. **Never in a release build**; no crate enables it, including this crate's own dev-dependency.
+The release gate must reject it.
 
 ## Unit hardening
 
@@ -250,7 +335,9 @@ to `incus.service` through a drop-in.
 
 ## Deviations and follow-ups
 
-* The pepper is a root-only file in the state directory, not yet sealed with `systemd-creds`.
+* The pepper is sealed: the unit loads it with `LoadCredentialEncrypted=` (see "The pepper") and
+  does not start without `/etc/hx/creds/pepper.cred`. The plaintext `pepper.key` fallback exists
+  only for a development run or a host that has not migrated.
 * Host addresses are enumerated with `ip -j address show` (fixed argv, parsed with `serde_json`), not
   with a netlink socket of our own.
 * Security-relevant budgets are written on every change (rarer than once a second by construction)

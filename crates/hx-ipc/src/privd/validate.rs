@@ -15,7 +15,8 @@ use super::commands::{
 use super::pb::{self, SecretKind, request::Command};
 use super::{
     MAC_LEN, MAX_ERROR_MESSAGE_LEN, MAX_PASSWORD_BYTES, MAX_PROGRESS_STEP_LEN, MAX_SECRET_BYTES,
-    MAX_SECRET_SLOTS, MAX_SOFTWARE_LEN, Side, UPLOAD_NONCE_LEN,
+    MAX_SECRET_SLOTS, MAX_SOFTWARE_LEN, MAX_UNINSTALL_ITEMS, MAX_UNINSTALL_TEXT_LEN, Side,
+    UPLOAD_NONCE_LEN,
 };
 use crate::error::FrameError;
 use crate::secret::Secret;
@@ -92,6 +93,20 @@ fn validate_response(r: &pb::Response) -> Check {
                 Some(s) => known::<pb::ProgressStage>(s, "error.stage"),
                 None => Ok(()),
             }
+        }
+        Some(R::Uninstall(u)) => {
+            for (list, what) in [
+                (&u.removed, "uninstall.removed"),
+                (&u.kept, "uninstall.kept"),
+                (&u.warnings, "uninstall.warnings"),
+            ] {
+                require(
+                    list.len() <= MAX_UNINSTALL_ITEMS
+                        && list.iter().all(|t| t.len() <= MAX_UNINSTALL_TEXT_LEN),
+                    what,
+                )?;
+            }
+            Ok(())
         }
         Some(_) => Ok(()),
     }

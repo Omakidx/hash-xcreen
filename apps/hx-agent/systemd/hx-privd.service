@@ -15,6 +15,16 @@ After=hx-privd.socket incus.service systemd-tmpfiles-setup.service
 # The fetcher's directory is its own size-capped tmpfs (var-lib-hx-updates.mount).
 RequiresMountsFor=/var/lib/hx/updates
 # Incus being down is not a reason to refuse to start: commands answer UNAVAILABLE and retry.
+#
+# Safety net of self-update (docs/ipc.md 6.12). A new privd that cannot start at all never reaches
+# its own health check, so nothing would roll the update back. With Restart=on-failure the unit
+# enters "failed" only when the start limit is reached; then systemd runs the rescue helper, which
+# restores the previous release and starts privd again (apps/hx-agent/src/privd/rescue.rs). The
+# limit must allow at least MAX_ATTEMPTS + 1 = 4 starts, so that privd's own crash-loop rollback
+# (cmd/update_resume.rs) gets its three tries first; tests/privd_units.rs keeps the two in step.
+OnFailure=hx-privd-rescue.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=exec

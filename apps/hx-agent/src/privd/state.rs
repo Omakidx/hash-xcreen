@@ -7,8 +7,9 @@
 //! |---|---|---|
 //! | `privd-state` | JSON: phase and setup window, desktop registry, attention flags, host setup record | 0600 |
 //! | `ratelimit` | JSON: failure logs and locks of `PepperVerify`, enrol and current-password check logs | 0600 |
-//! | `pepper.key` | 32 random bytes, the verifier pepper (never sent; `systemd-creds` sealing is a follow-up) | 0600 |
+//! | `pepper.key` | 32 random bytes, the verifier pepper, only when the unit has no sealed `pepper` credential (a development run or an unmigrated host; the unit's `LoadCredentialEncrypted=` normally supplies it, see `pepper.rs`) | 0600 |
 //! | `owner-key` | the enrolled owner public key (Phase 2 shape) | 0644 |
+//! | `uninstall-state` | present once `Uninstall` has begun; gates every other command (`cmd::uninstall`) | 0600 |
 //!
 //! Every write is atomic (temporary file, `fsync`, `rename`, `fsync` of the directory). A file that
 //! exists but cannot be parsed is an error, not a reset: privd refuses to start rather than
