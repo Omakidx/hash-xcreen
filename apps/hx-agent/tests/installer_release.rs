@@ -44,7 +44,10 @@ fn now() -> u64 {
 fn privd_accepts_the_test_release_dir() {
     let t = tempfile::tempdir().unwrap();
     let rel = t.path().join("rel");
-    make(&rel, &["--version", "0.3.0-rc.2", "--min-previous", "0.2.0"]);
+    make(
+        &rel,
+        &["--version", "0.3.0-rc.2", "--min-previous", "0.2.0"],
+    );
 
     let manifest = std::fs::read(rel.join("manifest-x86_64.json")).unwrap();
     let sig = std::fs::read_to_string(rel.join("manifest-x86_64.json.minisig")).unwrap();
@@ -52,7 +55,8 @@ fn privd_accepts_the_test_release_dir() {
 
     // signature: only the test CURRENT key signs, privd's prehash-only verifier accepts it
     let keys = UpdateKeys::from_public_keys(&[pubkey.trim()]).unwrap();
-    keys.verify(&manifest, &sig).expect("privd must accept the signature");
+    keys.verify(&manifest, &sig)
+        .expect("privd must accept the signature");
 
     // manifest: the canonical one-liner, every privd field check passes
     assert_eq!(manifest.iter().filter(|b| **b == b'\n').count(), 1);
@@ -71,7 +75,10 @@ fn privd_accepts_the_test_release_dir() {
             now: now(),
         })
         .expect("privd must accept the manifest");
-    assert_eq!(release.manifest.artifact, artifact_name("0.3.0-rc.2", "x86_64"));
+    assert_eq!(
+        release.manifest.artifact,
+        artifact_name("0.3.0-rc.2", "x86_64")
+    );
 
     // artifact: size and SHA-256 equal the manifest's, then privd's extract unpacks it
     let art = std::fs::read(rel.join(&release.manifest.artifact)).unwrap();
@@ -88,7 +95,10 @@ fn privd_accepts_the_test_release_dir() {
     let stats = extract_tar_gz(art.as_slice(), fd.as_fd(), &Limits::default(), &|| false)
         .expect("privd's extract must accept the tarball (ustar only)");
     assert!(stats.files >= 10, "{stats:?}");
-    for b in REQUIRED_BINARIES.iter().chain(&["hx-backup-worker", "hx-privd-rescue"]) {
+    for b in REQUIRED_BINARIES
+        .iter()
+        .chain(&["hx-backup-worker", "hx-privd-rescue"])
+    {
         let m = std::fs::metadata(root.join(b)).unwrap_or_else(|e| panic!("{b}: {e}"));
         assert!(m.is_file() && m.permissions().mode() & 0o111 != 0, "{b}");
     }
@@ -97,7 +107,13 @@ fn privd_accepts_the_test_release_dir() {
         "0.3.0-rc.2\n"
     );
     for d in ["ubuntu-24.04", "ubuntu-26.04", "debian-12", "debian-13"] {
-        assert!(root.join("session").join(d).join("hx-session.deb").is_file(), "{d}");
+        assert!(
+            root.join("session")
+                .join(d)
+                .join("hx-session.deb")
+                .is_file(),
+            "{d}"
+        );
     }
 }
 
@@ -117,7 +133,11 @@ fn install_sh_of_the_test_release_dir_accepts_the_same_signature() {
             .code()
     };
     for sh in ["sh", "bash"] {
-        assert_eq!(verify(sh, &rel.join("manifest-x86_64.json")), Some(0), "{sh}");
+        assert_eq!(
+            verify(sh, &rel.join("manifest-x86_64.json")),
+            Some(0),
+            "{sh}"
+        );
     }
     let tampered = t.path().join("tampered.json");
     let mut bytes = std::fs::read(rel.join("manifest-x86_64.json")).unwrap();

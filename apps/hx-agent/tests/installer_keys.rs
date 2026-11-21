@@ -62,8 +62,8 @@ fn the_release_gate_blocks_exactly_while_a_key_is_unprovisioned() {
         .arg(repo().join("release/gate.sh"))
         .output()
         .unwrap();
-    let provisioned = file_key("current.pub") != "UNPROVISIONED"
-        && file_key("next.pub") != "UNPROVISIONED";
+    let provisioned =
+        file_key("current.pub") != "UNPROVISIONED" && file_key("next.pub") != "UNPROVISIONED";
     assert_eq!(
         out.status.success(),
         provisioned,

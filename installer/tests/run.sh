@@ -24,6 +24,7 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 { cat "$vec/msg.bin"; printf x; } >"$tmp/msg.tampered"
 
+# shellcheck disable=SC2034  # the last column is read by the Rust test only
 while read -r name cur nxt msg sig expect reason _privd; do
     case $name in '' | '#'*) continue ;; esac
     m=$vec/$msg

@@ -197,7 +197,10 @@ mod tests {
         let before = [CURRENT, NEXT].into_iter().filter_map(parse_key).count();
         match TEST_KEY {
             Some(k) => {
-                assert!(parse_key(k).is_some(), "HX_TEST_RELEASE_PUBKEY is not a key");
+                assert!(
+                    parse_key(k).is_some(),
+                    "HX_TEST_RELEASE_PUBKEY is not a key"
+                );
                 assert_eq!(UpdateKeys::embedded().len(), before + 1);
             }
             None => assert_eq!(UpdateKeys::embedded().len(), before),
