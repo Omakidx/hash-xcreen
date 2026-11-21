@@ -61,23 +61,7 @@ fn require(cond: bool, what: &'static str) -> Result<(), FrameError> {
     }
 }
 
-/// Removes control characters (including ANSI escape introducers and the Unicode bidirectional
-/// controls) and truncates to `max_bytes` on a character boundary. Session-supplied text goes
-/// through this before it reaches a log or the admin API; it is never shown in a client UI.
-pub fn sanitize_text(s: &str, max_bytes: usize) -> String {
-    let mut out = String::with_capacity(s.len().min(max_bytes));
-    for c in s.chars() {
-        let bidi = matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
-        if c.is_control() || bidi {
-            continue;
-        }
-        if out.len() + c.len_utf8() > max_bytes {
-            break;
-        }
-        out.push(c);
-    }
-    out
-}
+pub use crate::text::sanitize_text;
 
 /// `StreamConfig` ranges (section 14.1): the gateway before sending, the session on receipt.
 ///
@@ -254,14 +238,6 @@ pub fn validate_transfer_open(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn sanitize_strips_controls_bidi_and_truncates_on_a_boundary() {
-        assert_eq!(sanitize_text("a\x1b[31mb\u{202E}c\n", 64), "a[31mbc");
-        assert_eq!(sanitize_text("ééé", 5), "éé");
-        assert_eq!(sanitize_text("", 5), "");
-        assert_eq!(sanitize_text("abcdef", 0), "");
-    }
 
     #[test]
     fn cancel_frames_window() {

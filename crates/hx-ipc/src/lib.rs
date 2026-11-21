@@ -63,6 +63,7 @@
 pub mod error;
 pub mod frame;
 pub mod recv;
+pub mod text;
 
 #[cfg(feature = "privd")]
 pub mod admin;
