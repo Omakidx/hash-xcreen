@@ -206,6 +206,7 @@ pub(crate) async fn connect(path: &Path, cfg: LinkConfig) -> Result<Connected, C
     tokio::spawn(tasks::ctl_reader(shared.clone(), ctl_reader));
     tokio::spawn(tasks::ctl_writer(shared.clone(), ctl));
     tokio::spawn(tasks::media_reader(shared.clone(), media_reader));
+    tokio::spawn(tasks::video_stage(shared.clone()));
     tokio::spawn(tasks::bulk_reader(shared.clone(), bulk_reader));
     tokio::spawn(tasks::bulk_writer(shared.clone(), bulk, bulk_rx));
     tokio::spawn(tasks::maintenance(shared.clone()));

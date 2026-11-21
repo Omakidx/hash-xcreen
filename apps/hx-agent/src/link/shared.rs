@@ -163,7 +163,13 @@ struct InboxState {
     pos: Option<hx_proto::pb::CursorPosition>,
     transfers: VecDeque<TransferEvent>,
     frames: VecDeque<Frame>,
+    /// Frames read and checked but waiting for their `stream_format` (a key frame can win the
+    /// race against it): the media reader never waits, the staging task does.
+    staged: VecDeque<Staged>,
+    /// Pool bytes of `frames` (body plus [`FRAME_OVERHEAD`] each).
     frame_bytes: u64,
+    /// Pool bytes of `staged`.
+    staged_bytes: u64,
     /// RGBA bytes of the cursor shapes sitting in `events`.
     shape_bytes: usize,
 }
@@ -180,6 +186,22 @@ fn shape_len(ev: &LinkEvent) -> usize {
     }
 }
 
+/// What each queued frame costs besides its body (the `Frame`, its format handle and the
+/// `Bytes` header), counted against the video pool so that many tiny frames cannot hide in it.
+pub(crate) const FRAME_OVERHEAD: u64 = 256;
+
+fn cost(body_len: usize) -> u64 {
+    body_len as u64 + FRAME_OVERHEAD
+}
+
+/// A validated video frame waiting for its format (see [`Inbox::stage_frame`]).
+pub(crate) struct Staged {
+    pub frame: hx_ipc::link::frames::VideoFrame,
+    /// The size the frame's SPS announces, if it carries one.
+    pub sps: Option<super::annexb::SpsInfo>,
+    pub received_at: Instant,
+}
+
 const EVENT_CAP: usize = 256;
 const TRANSFER_CAP: usize = 512;
 
@@ -187,6 +209,8 @@ const TRANSFER_CAP: usize = 512;
 pub(crate) struct Inbox {
     st: Mutex<InboxState>,
     pub(crate) wake: Notify,
+    /// Wakes the staging task.
+    pub(crate) staged_wake: Notify,
 }
 
 impl Inbox {
@@ -194,6 +218,7 @@ impl Inbox {
         Self {
             st: Mutex::new(InboxState::default()),
             wake: Notify::new(),
+            staged_wake: Notify::new(),
         }
     }
 
@@ -263,12 +288,13 @@ impl Inbox {
     pub(crate) fn push_frame(&self, f: Frame, pool: u64) -> Vec<u32> {
         let mut evicted = Vec::new();
         let mut s = lock(&self.st);
-        let len = f.body.len() as u64;
-        while s.frame_bytes + len > pool {
+        let len = cost(f.body.len());
+        // Staged frames share the pool; only already-queued frames are evicted here.
+        while s.frame_bytes + s.staged_bytes + len > pool {
             let Some(old) = s.frames.pop_front() else {
                 break;
             };
-            s.frame_bytes -= old.body.len() as u64;
+            s.frame_bytes -= cost(old.body.len());
             evicted.push(old.number());
         }
         s.frame_bytes += len;
@@ -276,6 +302,41 @@ impl Inbox {
         drop(s);
         self.wake.notify_one();
         evicted
+    }
+
+    /// Parks a checked frame for the staging task within the shared video pool. The oldest
+    /// queued frames, then the oldest staged ones, are evicted to make room; returns their
+    /// numbers. The media reader calls this and never waits.
+    pub(crate) fn stage_frame(&self, st: Staged, pool: u64) -> Vec<u32> {
+        let mut evicted = Vec::new();
+        let len = cost(st.frame.body.len());
+        {
+            let mut s = lock(&self.st);
+            while s.frame_bytes + s.staged_bytes + len > pool {
+                if let Some(old) = s.frames.pop_front() {
+                    s.frame_bytes -= cost(old.body.len());
+                    evicted.push(old.number());
+                } else if let Some(old) = s.staged.pop_front() {
+                    s.staged_bytes -= cost(old.frame.body.len());
+                    evicted.push(old.frame.header.frame_number);
+                } else {
+                    break;
+                }
+            }
+            s.staged_bytes += len;
+            s.staged.push_back(st);
+        }
+        self.staged_wake.notify_one();
+        evicted
+    }
+
+    /// The oldest staged frame. It leaves the pool accounting while the staging task holds it
+    /// (the "one frame in flight" of the memory bound).
+    pub(crate) fn take_staged(&self) -> Option<Staged> {
+        let mut s = lock(&self.st);
+        let st = s.staged.pop_front()?;
+        s.staged_bytes -= cost(st.frame.body.len());
+        Some(st)
     }
 
     /// Removes queued frames numbered up to `up_to` (serial arithmetic); returns their numbers.
@@ -286,7 +347,7 @@ impl Inbox {
         let mut bytes = 0;
         for f in s.frames.drain(..).collect::<Vec<_>>() {
             if serial_gt(f.number(), up_to) {
-                bytes += f.body.len() as u64;
+                bytes += cost(f.body.len());
                 kept.push_back(f);
             } else {
                 gone.push(f.number());
@@ -294,6 +355,18 @@ impl Inbox {
         }
         s.frames = kept;
         s.frame_bytes = bytes;
+        let mut kept = VecDeque::with_capacity(s.staged.len());
+        let mut bytes = 0;
+        for f in s.staged.drain(..).collect::<Vec<_>>() {
+            if serial_gt(f.frame.header.frame_number, up_to) {
+                bytes += cost(f.frame.body.len());
+                kept.push_back(f);
+            } else {
+                gone.push(f.frame.header.frame_number);
+            }
+        }
+        s.staged = kept;
+        s.staged_bytes = bytes;
         gone
     }
 
@@ -301,7 +374,10 @@ impl Inbox {
     pub(crate) fn drain_frames(&self) -> Vec<u32> {
         let mut s = lock(&self.st);
         s.frame_bytes = 0;
-        s.frames.drain(..).map(|f| f.number()).collect()
+        s.staged_bytes = 0;
+        let mut numbers: Vec<u32> = s.frames.drain(..).map(|f| f.number()).collect();
+        numbers.extend(s.staged.drain(..).map(|f| f.frame.header.frame_number));
+        numbers
     }
 
     /// The next thing for the consumer: events, then the cursor position, transfers, frames.
@@ -318,7 +394,7 @@ impl Inbox {
             return Some(LinkEvent::Transfer(t));
         }
         let f = s.frames.pop_front()?;
-        s.frame_bytes -= f.body.len() as u64;
+        s.frame_bytes -= cost(f.body.len());
         Some(LinkEvent::Frame(f))
     }
 
@@ -331,8 +407,10 @@ impl Inbox {
         Some(e)
     }
 
+    /// Pool bytes in use: queued and staged frames, overhead included.
     pub(crate) fn queued_frame_bytes(&self) -> u64 {
-        lock(&self.st).frame_bytes
+        let s = lock(&self.st);
+        s.frame_bytes + s.staged_bytes
     }
 }
 

@@ -18,7 +18,7 @@
 
 use super::annexb;
 use super::lane::{LaneFail, LaneReader, WriteFail, write_all_stall};
-use super::shared::{BulkOut, InXfer, Pop, Shared, lock};
+use super::shared::{BulkOut, InXfer, Pop, Shared, Staged, lock};
 use super::types::{
     FailureClass, Frame, LinkEvent, SessionEvent, StreamFormat, TransferChunk, TransferEvent,
 };
@@ -360,8 +360,58 @@ async fn on_video(sh: &Arc<Shared>, v: hx_ipc::link::frames::VideoFrame) -> Resu
             return Ok(());
         }
     }
-    let fmt = format_for(sh, n, key, checked.sps.map(|s| (s.width, s.height))).await?;
-    if let Some(sps) = checked.sps
+    // The rest needs the stream_format, which may still be in flight on ctl: park the frame
+    // for the staging task. This reader never waits (docs/ipc.md 15.2).
+    let evicted = sh.inbox.stage_frame(
+        Staged {
+            frame: v,
+            sps: checked.sps,
+            received_at: now,
+        },
+        sh.cfg.video_pool_bytes(),
+    );
+    if !evicted.is_empty() {
+        sh.count(|c| c.evicted_frames += evicted.len() as u64);
+        sh.report_frames(&evicted, pb::FrameOutcome::Dropped);
+        sh.arm_resync();
+    }
+    Ok(())
+}
+
+/// The staging task: resolves each parked frame's stream format (a key frame waits, within
+/// [`FORMAT_WAIT`], for the announcement that may still be in flight), then applies the epoch
+/// filter and the resync gate and queues the frame for the consumer. Only this task waits; the
+/// media reader keeps draining the lane.
+pub(crate) async fn video_stage(sh: Arc<Shared>) {
+    let s = sh.clone();
+    run(&sh, async move {
+        loop {
+            let wake = s.inbox.staged_wake.notified();
+            tokio::pin!(wake);
+            wake.as_mut().enable();
+            match s.inbox.take_staged() {
+                Some(st) => {
+                    if let Err(f) = process_staged(&s, st).await {
+                        return f;
+                    }
+                }
+                None => wake.await,
+            }
+        }
+    })
+    .await;
+}
+
+async fn process_staged(sh: &Arc<Shared>, st: Staged) -> Result<(), Fail> {
+    let Staged {
+        frame: v,
+        sps,
+        received_at: now,
+    } = st;
+    let h = v.header;
+    let (n, key) = (h.frame_number, h.is_key());
+    let fmt = format_for(sh, n, key, sps.map(|s| (s.width, s.height))).await?;
+    if let Some(sps) = sps
         && (sps.width, sps.height) != (fmt.width, fmt.height)
     {
         return Err(violation(format!(

@@ -1702,3 +1702,88 @@ async fn connect_errors_say_whether_the_session_closed_right_after_the_preamble(
     assert!(!err.closed_after_preamble);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_frame_waiting_for_its_format_never_pauses_the_media_lane() {
+    // Review note on 15.2: the 2 s wait for a stream_format must not stop the media reader. The
+    // fake writes the IDR of a new size, then 3 MiB of frames behind it, and only afterwards
+    // announces the size. Before, the reader sat in the wait and the writes stalled (and with
+    // the announcement sent after the writes, the link died).
+    let new_sps = sps_for(80, 45); // 1280 x 720
+    let (tx, rx) = mpsc::channel::<Duration>();
+    let f = session(None, move |l| {
+        std::thread::sleep(Duration::from_millis(300));
+        l.ctl.write_all(&stream_format(1, 0)).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        l.media
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let t0 = Instant::now();
+        let mut w = video(0, 1 | 2, 1, &key_payload());
+        w.extend(video(1, 1 | 2, 1, &new_sps));
+        for n in 2..5u32 {
+            w.extend(video(n, 0, 1, &p_payload(1024 * 1024)));
+        }
+        l.media.write_all(&w).unwrap();
+        tx.send(t0.elapsed()).unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+        let sf = ctl_frame(pb::session_to_gateway::Message::StreamFormat(
+            pb::StreamFormat {
+                epoch: 1,
+                codec: VideoCodec::H264 as i32,
+                width: 1280,
+                height: 720,
+                fps: 60,
+                first_frame: 1,
+            },
+        ));
+        l.ctl.write_all(&sf).unwrap();
+    });
+    let (link, mut ev) = connect(&f).await;
+    link.start(1, start_config()).unwrap();
+    let wrote = tokio::task::spawn_blocking(move || rx.recv().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        wrote < Duration::from_millis(400),
+        "the lane was drained while the key frame waited: wrote in {wrote:?}"
+    );
+    // Once the format arrives everything comes out in order, with the right formats.
+    let mut got = Vec::new();
+    while got.len() < 5 {
+        let fr = next_frame(&mut ev).await;
+        got.push((fr.number(), fr.format.width));
+    }
+    assert_eq!(got, [(0, 1920), (1, 1280), (2, 1280), (3, 1280), (4, 1280)]);
+    assert!(!link.is_closed());
+    drop(ev);
+    drop(f);
+
+    // A flood behind the waiting key frame is bounded by the shared pool: the oldest are
+    // evicted and reported, the lane is still drained, and nothing is a violation.
+    let f = session(None, move |l| {
+        std::thread::sleep(Duration::from_millis(300));
+        l.ctl.write_all(&stream_format(1, 0)).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        l.media
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut w = video(0, 1 | 2, 1, &key_payload());
+        w.extend(video(1, 1 | 2, 1, &sps_for(80, 45)));
+        l.media.write_all(&w).unwrap();
+        for n in 2..28u32 {
+            l.media
+                .write_all(&video(n, 0, 1, &p_payload(1024 * 1024)))
+                .unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    });
+    let (link, mut ev) = connect(&f).await;
+    link.start(1, start_config()).unwrap();
+    let first = next_frame(&mut ev).await;
+    assert_eq!(first.number(), 0);
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let c = link.counters();
+    assert!(c.evicted_frames >= 1, "{c:?}");
+    assert!(link.queued_video_bytes() <= 12 * 1024 * 1024 + 256 * 4);
+}
