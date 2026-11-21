@@ -18,11 +18,22 @@ use hx_ipc::{admin, link};
 struct Counting;
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
+/// Allocations (and growths) of at least `BIG_FROM` bytes; 0 disables counting.
+static BIG_FROM: AtomicUsize = AtomicUsize::new(0);
+static BIG_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn note_big(size: usize) {
+    let t = BIG_FROM.load(SeqCst);
+    if t != 0 && size >= t {
+        BIG_COUNT.fetch_add(1, SeqCst);
+    }
+}
 
 #[allow(unsafe_code)]
 // SAFETY: forwards every call to the system allocator unchanged and only counts bytes.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        note_big(l.size());
         let p = unsafe { System.alloc(l) };
         if !p.is_null() {
             let now = LIVE.fetch_add(l.size(), SeqCst) + l.size();
@@ -35,6 +46,7 @@ unsafe impl GlobalAlloc for Counting {
         unsafe { System.dealloc(p, l) }
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+        note_big(new);
         let q = unsafe { System.realloc(p, l, new) };
         if !q.is_null() {
             if new >= l.size() {
@@ -161,4 +173,20 @@ fn worst_case_bodies_are_rejected_without_amplification() {
     let (r, peak) = peak_during(|| frames::parse(&p, raw, 1 << 30));
     assert!(r.is_err());
     assert!(peak <= SLACK, "frame_feedback: {peak}");
+
+    // The kind-2 path makes exactly the copies documented in the crate docs: the frame's own
+    // buffer (filled straight from the reader) and the `Secret`. Anything else (a scratch read
+    // buffer, a growth by reallocation, a protobuf copy) would add a big allocation here.
+    use hx_ipc::frame::Decoder;
+    use hx_ipc::privd::{Incoming, PrivdPolicy};
+    let secret = vec![0x5Au8; 8_000];
+    let wire = privd::encode_secret(7, 0, &secret).unwrap();
+    let mut decoder = Decoder::new(PrivdPolicy::new(Side::Server));
+    BIG_COUNT.store(0, SeqCst);
+    BIG_FROM.store(4_000, SeqCst);
+    let raw = decoder.read_from(&mut &wire[..]).unwrap().unwrap();
+    let got = privd::decode(raw, Side::Server).unwrap();
+    BIG_FROM.store(0, SeqCst);
+    assert!(matches!(got, Incoming::Secret(_)));
+    assert_eq!(BIG_COUNT.load(SeqCst), 2, "frame buffer + Secret, no other copy of the secret");
 }

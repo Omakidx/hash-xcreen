@@ -49,11 +49,33 @@
 //! **violations** of the peer's: close the connection (privd, admin) or drop the link (session
 //! link, `docs/ipc.md` section 19.2). Transport errors are [`ReadError::Io`].
 //!
+//! # Secrets
+//!
+//! A kind-2 frame never passes through `prost`. Read the privd and admin sockets with
+//! [`frame::Decoder::read_from`] over a [`recv::NoCmsgReader`]: the frame buffer is then filled
+//! directly by `recvmsg` and no intermediate user buffer exists. The copies of a secret are
+//! exactly: the kernel socket buffer; the decoder's frame buffer (zeroized by
+//! [`secret::SecretFrame::from_body`] after the copy, and on drop or poison if the frame is cut
+//! short); and the [`secret::Secret`] (zeroized on drop). Swap is prevented process-wide, so
+//! **privd and gatewayd must call `mlockall(MCL_CURRENT | MCL_FUTURE)` at start** (this crate
+//! cannot: it forbids unsafe code and per-buffer `mlock` would not cover the frame buffer).
+//! `tests/alloc.rs` asserts that the kind-2 path allocates only those two buffers. `Debug` of
+//! frames, decoders and secrets never prints body bytes.
+//!
+//! # Build note for `hx-session`
+//!
+//! Cargo unifies features across the packages of one build. Build `hx-session` release
+//! artifacts with `cargo build -p hx-session` (not `--workspace`), or the `privd` feature that
+//! `hx-agent` enables is switched on for `hx-ipc` in the session binary too.
+//!
+//! [`peer::peer_credentials`] must not be called on a socket whose peer lives in a child pid
+//! namespace (see its documentation).
+//!
 //! # Not here
 //!
 //! * the time limits (5 s hello, 5 s body, 10 minute idle) are constants for the I/O layer
 //!   (`privd::HELLO_TIMEOUT` and friends); this crate never sleeps;
-//! * `mlock`, `PR_SET_DUMPABLE` and `openat2` belong to privd itself;
+//! * `mlockall`, `PR_SET_DUMPABLE` and `openat2` belong to privd and gatewayd themselves;
 //! * the HPKE sealed form of secrets (Phase 2): only the proto fields are reserved;
 //! * the H.264 Annex B / SPS sanity check of `docs/ipc.md` section 15.1 (it needs the stream
 //!   state of the relay and belongs with the gateway's media path).
