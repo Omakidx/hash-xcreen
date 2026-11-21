@@ -111,7 +111,11 @@ fn is_global_v6(a: &Ipv6Addr) -> bool {
         || (s[0] & 0xfe00) == 0xfc00 // fc00::/7 unique local
         || (s[0] & 0xffc0) == 0xfe80 // fe80::/10 link local
         || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation
-        || (s[0] == 0x0064 && s[1] == 0xff9b)) // NAT64 prefix: reaches v4 space unchecked
+        || (s[0] == 0x0064 && s[1] == 0xff9b) // NAT64 prefix: reaches v4 space unchecked
+        || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 1) // 64:ff9b:1::/48 local-use NAT64
+        || s[0] == 0x2002 // 2002::/16 6to4: embeds an arbitrary IPv4 address
+        || s[..6].iter().all(|x| *x == 0) // ::/96 IPv4-compatible (deprecated)
+        || (s[0] & 0xffc0) == 0xfec0) // fec0::/10 site-local (deprecated)
 }
 
 fn resolve(
@@ -516,12 +520,19 @@ mod tests {
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1",
             "64:ff9b::7f00:1",
+            "64:ff9b:1::1",
+            "2002:7f00:1::1",
+            "2002::1",
+            "::7f00:1",
+            "::10.0.0.1",
+            "fec0::1",
+            "febf::1",
             "2001:db8::1",
         ];
         for a in no {
             assert!(!is_global(&a.parse().unwrap()), "{a}");
         }
-        for a in ["140.82.112.3", "8.8.8.8", "2606:4700::1111"] {
+        for a in ["140.82.112.3", "8.8.8.8", "2606:4700::1111", "2a00:1450::1", "2001:4860::1"] {
             assert!(is_global(&a.parse().unwrap()), "{a}");
         }
     }
