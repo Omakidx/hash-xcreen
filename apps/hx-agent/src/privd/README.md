@@ -49,7 +49,7 @@ is an error: privd refuses to start rather than reset a lockout or a window.
 |---|---|---|
 | `privd-state` | JSON: phase and setup window (`return_to`, start, expiry), desktop registry with per-desktop attention flags, host-wide flags, the last `SetupHost` options | 0600 |
 | `ratelimit` | JSON: `PepperVerify` failure times per purpose and the locks, `PepperEnrol` call times, current-password check times | 0600 |
-| `pepper.key` | 32 random bytes, the verifier pepper (never sent). `systemd-creds` sealing (`/etc/hx/creds/pepper.cred` of ipc.md section 2) is a follow-up | 0600 |
+| `pepper.key` | 32 random bytes, the verifier pepper, **only when there is no systemd credential** (a development run, or a host that has not migrated yet; see "The pepper") | 0600 |
 | `owner-key` | the enrolled owner public key (Phase 2 shape) | 0644 |
 
 Other files privd writes: `/etc/hx/host-firewall.nft` (0600, the generated ruleset, loaded at boot
@@ -60,6 +60,29 @@ by `hx-host-firewall.service`), `/etc/sysctl.d/90-hx-incus.conf` (0644), `/var/l
 The registry exists because `hx-provision`'s client has no "list instances" call: privd manages
 exactly the desktops it created (an id is written before its instance exists, so a crash leaves a
 record to clean up) and never touches an instance it did not.
+
+## The pepper
+
+privd reads the pepper of the PIN and password verifiers (ipc.md 5.3) from the systemd credential
+`pepper` (`$CREDENTIALS_DIRECTORY/pepper`, accepted only under `/run/credentials/`) when the unit has
+one, else from the root-only `/var/lib/hx/pepper.key`, creating that file on first use (written to a
+temporary file, synced, hard-linked into place, so it never exists half written; owner and mode are
+checked on every load). A credential that is present but has the wrong length, owner or mode is an
+error, never a silent fallback. The shipped unit has
+`LoadCredentialEncrypted=pepper:/etc/hx/creds/pepper.cred`, so on a host that follows the steps below
+the plaintext file is never created.
+
+For the installer (1E):
+
+* **First install:** before enabling the units, `head -c 32 /dev/urandom | systemd-creds encrypt
+  --name=pepper - /etc/hx/creds/pepper.cred` (root, file 0600; sealed to the TPM where there is one,
+  else to the host key). The unit does not start without the file.
+* **Migrating a host that ran with `pepper.key`:** the existing pepper must be kept, or every stored
+  verifier becomes invalid: `systemd-creds encrypt --name=pepper /var/lib/hx/pepper.key
+  /etc/hx/creds/pepper.cred`, restart privd (the log says nothing about the source; check
+  `systemctl show -p LoadCredentialEncrypted hx-privd`), then `shred -u /var/lib/hx/pepper.key`.
+* Until this is done on a host with a TPM, the pepper is only as protected as a root-only file: a
+  stolen disk image yields it. That is a release blocker for 1E.
 
 ## Authorization
 

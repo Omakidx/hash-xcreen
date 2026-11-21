@@ -30,6 +30,12 @@ UMask=0077
 LimitMEMLOCK=infinity
 LimitCORE=0
 
+# The verifier pepper (docs/ipc.md 5.3) is a systemd credential, sealed to the TPM where there is
+# one and to the host key otherwise; systemd decrypts it into this unit's credential directory. The
+# unit does not start without it. The installer (1E) creates it before enabling the units, see
+# apps/hx-agent/src/privd/README.md ("The pepper").
+LoadCredentialEncrypted=pepper:/etc/hx/creds/pepper.cred
+
 # State (/var/lib/hx, 0700) and the audit log (/var/log/hx, 0750) are the only places the daemon
 # owns; ReadWritePaths below are the host files it must write: the persisted nftables ruleset
 # and the sysctl drop-in (ipc.md 6.4), and iptables' lock file (DOCKER-USER rules).

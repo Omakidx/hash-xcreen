@@ -181,6 +181,11 @@ fn the_service_is_root_hardened_and_matches_the_daemons_paths() {
             "{c}"
         );
     }
+    // N7: the pepper comes from a systemd credential.
+    assert_eq!(
+        one(&u, "Service", "LoadCredentialEncrypted"),
+        "pepper:/etc/hx/creds/pepper.cred"
+    );
     // No environment is passed and the command is not a shell line (ipc.md 5.2, 7 rule 3).
     assert!(!u["Service"].contains_key("Environment"));
     assert!(!u["Service"].contains_key("EnvironmentFile"));

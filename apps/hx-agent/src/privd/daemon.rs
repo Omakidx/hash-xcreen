@@ -199,7 +199,7 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
     ) -> io::Result<Arc<Self>> {
         let store = StateStore::open(&cfg.state_dir)?;
         let state = store.load_state()?;
-        let pepper = Pepper::load_or_create(&store.path("pepper.key"))?;
+        let pepper = Pepper::load(cfg.credentials_dir.as_deref(), &store.path("pepper.key"))?;
         let limiter = Limiter::load(deps.clock.clone(), store.clone())?;
         Ok(Arc::new(Self {
             cfg,

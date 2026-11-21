@@ -22,6 +22,16 @@ pub const SYSCTL_FILE: &str = "/etc/sysctl.d/90-hx-incus.conf";
 /// The audit log (the unit's `LogsDirectory=hx`).
 pub const AUDIT_LOG: &str = "/var/log/hx/audit.log";
 
+/// The one value taken from the environment: systemd's `$CREDENTIALS_DIRECTORY`. It is used only
+/// if it names a directory under `/run/credentials/` (where systemd puts a service's credentials),
+/// so no other path can be substituted; an unset variable (a development run) means no credential.
+fn credentials_dir_from_env() -> Option<PathBuf> {
+    let v = std::env::var_os("CREDENTIALS_DIRECTORY")?;
+    let p = PathBuf::from(v);
+    (p.starts_with("/run/credentials/") && !p.components().any(|c| c.as_os_str() == ".."))
+        .then_some(p)
+}
+
 /// uid and gid of the desktop user inside the container, from the recipe (ipc.md 6.11).
 pub const DESKTOP_IDS: (u32, u32) = (1000, 1000);
 
@@ -32,6 +42,9 @@ pub struct PrivdConfig {
     pub socket_path: PathBuf,
     /// Mode and owner the socket must have (self-check).
     pub expected_socket: FileMeta,
+    /// systemd's credential directory of this unit (`$CREDENTIALS_DIRECTORY`), where the unit's
+    /// `LoadCredentialEncrypted=pepper:...` puts the decrypted pepper.
+    pub credentials_dir: Option<PathBuf>,
     /// Root-only state directory (`/var/lib/hx`).
     pub state_dir: PathBuf,
     /// Persisted host firewall ruleset (`/etc/hx/host-firewall.nft`).
@@ -80,6 +93,7 @@ impl PrivdConfig {
                 uid: 0,
                 gid: gateway.gid,
             },
+            credentials_dir: credentials_dir_from_env(),
             state_dir: STATE_DIR.into(),
             firewall_file: FIREWALL_FILE.into(),
             sysctl_file: SYSCTL_FILE.into(),
@@ -115,6 +129,7 @@ impl PrivdConfig {
                 uid: rustix::process::getuid().as_raw(),
                 gid: rustix::process::getgid().as_raw(),
             },
+            credentials_dir: None,
             state_dir: dir.join("state"),
             firewall_file: dir.join("host-firewall.nft"),
             sysctl_file: dir.join("90-hx-incus.conf"),
