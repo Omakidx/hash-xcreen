@@ -49,7 +49,7 @@ async fn check_reports_the_verified_release_and_stages_it() {
     assert!(u.staging_dir.join("manifest.json").is_file());
     assert!(u.staging_dir.join("manifest.json.minisig").is_file());
     let st = state(&env);
-    assert_eq!(st.highest_manifest_ts, T0);
+    assert_eq!(st.highest("stable"), T0);
     assert_eq!(st.verified_version.as_deref(), Some("1.1.0"));
     // The fetch directory was swept before the fetch and the fetcher was asked for the manifest.
     assert_eq!(env.server.lock().unwrap().jobs, ["manifest-stable"]);
@@ -117,7 +117,7 @@ async fn an_unsigned_or_mis_signed_manifest_is_refused() {
             "{junk:?}"
         );
     }
-    assert_eq!(state(&env).highest_manifest_ts, 0, "nothing was accepted");
+    assert_eq!(state(&env).highest("stable"), 0, "nothing was accepted");
     assert!(
         !env.h
             .daemon
@@ -212,13 +212,13 @@ async fn a_replayed_older_manifest_is_refused_and_the_counter_never_goes_back() 
         check_result(env.check().await).available.as_deref(),
         Some("1.2.0")
     );
-    assert_eq!(state(&env).highest_manifest_ts, T0 + 500);
+    assert_eq!(state(&env).highest("stable"), T0 + 500);
     // The old, validly signed release is served again (a replay of a vulnerable release).
     env.serve(&old);
     let (code, msg) = err(&env.check().await);
     assert_eq!(code, ErrorCode::FailedPrecondition);
     assert!(msg.contains("replay") || msg.contains("older"), "{msg}");
-    assert_eq!(state(&env).highest_manifest_ts, T0 + 500);
+    assert_eq!(state(&env).highest("stable"), T0 + 500);
     // The same manifest again (equal timestamp) is fine.
     env.publish("1.2.0", T0 + 500);
     assert!(check_result(env.check().await).available.is_some());
@@ -227,7 +227,7 @@ async fn a_replayed_older_manifest_is_refused_and_the_counter_never_goes_back() 
     assert_eq!(
         UpdateState::load(&store(&again.cfg.state_dir))
             .unwrap()
-            .highest_manifest_ts,
+            .highest("stable"),
         T0 + 500
     );
 }
@@ -237,7 +237,7 @@ async fn a_manifest_dated_far_in_the_future_cannot_pin_the_counter() {
     let env = Env::new();
     env.publish("1.1.0", NOW + 10 * 86_400);
     assert_eq!(err(&env.check().await).0, ErrorCode::FailedPrecondition);
-    assert_eq!(state(&env).highest_manifest_ts, 0);
+    assert_eq!(state(&env).highest("stable"), 0);
 }
 
 #[tokio::test]
@@ -315,7 +315,7 @@ async fn hostile_fetch_directories_are_refused_without_following_anything() {
     assert!(msg.contains("quota"), "{msg}");
 
     // Nothing was accepted, and an honest fetch afterwards works (the directory was swept).
-    assert_eq!(state(&env).highest_manifest_ts, 0);
+    assert_eq!(state(&env).highest("stable"), 0);
     env.server.lock().unwrap().hook = None;
     env.serve(&p);
     assert_eq!(
@@ -1133,4 +1133,172 @@ async fn a_corrupt_updates_state_is_never_replaced_by_defaults() {
     assert_eq!(std::fs::read(&path).unwrap(), b"{oops", "left untouched");
     assert_eq!(err(&env.check().await).0, ErrorCode::Internal);
     assert_eq!(std::fs::read(&path).unwrap(), b"{oops");
+}
+
+// ----- L1, L3, N5, N6 -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_apply_limit_survives_a_restart_of_privd() {
+    let env = Env::new();
+    env.publish("1.1.0", T0);
+    check_result(env.check().await);
+    ok(env.apply("1.1.0").await);
+    env.new_process("1.1.0").resume_update().await;
+    env.publish("1.2.0", T0 + 1);
+    check_result(env.check().await);
+    ok(env.apply("1.2.0").await);
+    // A fresh process has fresh in-memory buckets; the persisted log still says two.
+    let n = env.new_process("1.2.0");
+    let r = n
+        .handle(
+            request(
+                1,
+                Command::ApplyUpdate(pb::ApplyUpdateRequest {
+                    version: "1.3.0".into(),
+                }),
+            ),
+            Ctx::new(Role::Admin),
+        )
+        .await;
+    let (code, msg) = err(&r);
+    assert_eq!(code, ErrorCode::ResourceExhausted);
+    assert!(msg.contains("2 a day"), "{msg}");
+    // A day later it is allowed again (refused here only because nothing is staged for 1.3.0).
+    env.h.clock.advance_secs(86_401);
+    let r = n
+        .handle(
+            request(
+                2,
+                Command::ApplyUpdate(pb::ApplyUpdateRequest {
+                    version: "1.3.0".into(),
+                }),
+            ),
+            Ctx::new(Role::Admin),
+        )
+        .await;
+    assert_ne!(err(&r).0, ErrorCode::ResourceExhausted);
+}
+
+#[tokio::test]
+async fn gateway_cannot_loop_re_applying_a_rolled_back_release() {
+    let env = applied_env().await;
+    env.health.status_ok.store(false, Ordering::SeqCst);
+    env.new_process("1.1.0").resume_update().await;
+    env.h
+        .daemon
+        .mutate_state(|s| s.phase.phase = hx_agent::privd::state::PhaseKind::Ready)
+        .unwrap();
+    let gw = env
+        .call(
+            Role::Gateway,
+            Command::ApplyUpdate(pb::ApplyUpdateRequest {
+                version: "1.1.0".into(),
+            }),
+        )
+        .await;
+    let (code, msg) = err(&gw);
+    assert_eq!(code, ErrorCode::PermissionDenied);
+    assert!(msg.contains("Admin"), "{msg}");
+    // Admin may; and the recovery snapshot is not rotated away while the record exists.
+    env.health.status_ok.store(true, Ordering::SeqCst);
+    env.publish("1.1.0", T0);
+    check_result(env.check().await);
+    assert!(matches!(ok(env.apply("1.1.0").await), R::ApplyUpdate(_)));
+    // After an Admin's own rollback, Gateway is likewise refused for that release.
+    let env = applied_env().await;
+    env.new_process("1.1.0").resume_update().await;
+    env.h
+        .daemon
+        .mutate_state(|s| s.phase.phase = hx_agent::privd::state::PhaseKind::Ready)
+        .unwrap();
+    ok(env
+        .call(
+            Role::Admin,
+            Command::RollbackUpdate(pb::RollbackUpdateRequest {}),
+        )
+        .await);
+    let gw = env
+        .call(
+            Role::Gateway,
+            Command::ApplyUpdate(pb::ApplyUpdateRequest {
+                version: "1.1.0".into(),
+            }),
+        )
+        .await;
+    assert_eq!(err(&gw).0, ErrorCode::PermissionDenied);
+}
+
+#[tokio::test]
+async fn the_snapshot_before_the_first_bad_update_survives_a_reapply_loop() {
+    let env = Env::new();
+    env.h.incus.add_desktop("hx-main", "ubuntu-24.04-xfce-basic", "alice", true);
+    env.h.daemon.register_desktop("main").unwrap();
+    env.publish("1.1.0", T0);
+    check_result(env.check().await);
+    ok(env.apply("1.1.0").await);
+    let first: Vec<String> = env.h.incus.with(|s| s.instances["hx-main"].snapshots.to_vec());
+    assert_eq!(first.len(), 1);
+    env.health.status_ok.store(false, Ordering::SeqCst);
+    env.new_process("1.1.0").resume_update().await;
+    env.health.status_ok.store(true, Ordering::SeqCst);
+    for _ in 0..3 {
+        env.h.clock.advance_secs(86_401);
+        env.publish("1.1.0", T0);
+        check_result(env.check().await);
+        ok(env.apply("1.1.0").await);
+        env.health.status_ok.store(false, Ordering::SeqCst);
+        env.new_process("1.1.0").resume_update().await;
+        env.health.status_ok.store(true, Ordering::SeqCst);
+    }
+    let all: Vec<String> = env.h.incus.with(|s| s.instances["hx-main"].snapshots.to_vec());
+    assert!(all.contains(&first[0]), "the first recovery point is still there: {all:?}");
+    assert!(all.len() <= 4);
+}
+
+#[tokio::test]
+async fn a_non_canonical_version_string_is_never_used() {
+    let env = Env::new();
+    env.publish("1.1.0", T0);
+    check_result(env.check().await);
+    let r = env.apply("01.1.0").await;
+    assert_eq!(err(&r).0, ErrorCode::InvalidArgument);
+    assert!(!env.h.daemon.cfg.update.versions_dir.join("01.1.0").exists());
+    assert!(!env.server.lock().unwrap().jobs.iter().any(|j| j.contains("01.")));
+    // The canonical one works.
+    assert!(matches!(ok(env.apply("1.1.0").await), R::ApplyUpdate(_)));
+}
+
+#[tokio::test]
+async fn a_very_old_manifest_is_reported_but_not_refused() {
+    let env = Env::new();
+    env.publish("1.1.0", NOW - 100 * 86_400);
+    let c = check_result(env.check().await);
+    assert_eq!(c.available.as_deref(), Some("1.1.0"));
+    assert!(
+        env.h.audit.lines().iter().any(|l| l.contains("days old (possible freeze)")),
+        "reported"
+    );
+    // A recent one is not.
+    let env = Env::new();
+    env.publish("1.1.0", T0);
+    check_result(env.check().await);
+    assert!(!env.h.audit.lines().iter().any(|l| l.contains("possible freeze")));
+}
+
+#[tokio::test]
+async fn freshness_is_tracked_per_channel() {
+    // A beta counter far ahead must not make a valid stable manifest look like a replay.
+    let env = Env::new();
+    let store = store(&env.h.daemon.cfg.state_dir);
+    let mut st = UpdateState::load(&store).unwrap();
+    st.accept("beta", NOW + 3_600);
+    st.save(&store).unwrap();
+    env.publish("1.1.0", T0);
+    assert_eq!(check_result(env.check().await).available.as_deref(), Some("1.1.0"));
+    let st = state(&env);
+    assert_eq!(st.highest("stable"), T0);
+    assert_eq!(st.highest("beta"), NOW + 3_600);
+    // Replay protection still holds within the stable channel.
+    env.publish("1.1.0", T0 - 10);
+    assert_eq!(err(&env.check().await).0, ErrorCode::FailedPrecondition);
 }

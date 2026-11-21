@@ -45,6 +45,14 @@ use super::update_resume::schedule_restarts;
 const MAX_SIG_BYTES: u64 = 16 * 1024;
 /// The `preupdate` snapshots kept per desktop (the new one included).
 const KEEP_PREUPDATE: usize = 2;
+/// While a rolled-back release is on record, rotation is suspended up to this many snapshots, so
+/// that the one taken before the first bad update survives a re-apply loop.
+const PRESERVE_PREUPDATE: usize = 4;
+/// A manifest older than this is reported as a possible freeze.
+const MAX_MANIFEST_AGE_DAYS: u64 = 90;
+const DAY: u64 = 86_400;
+/// `ApplyUpdate` admissions per day (ipc.md 8); persisted in `updates-state`.
+const APPLY_PER_DAY: usize = 2;
 
 fn refused(msg: impl Into<String>) -> CmdError {
     CmdError::precondition(ErrorDetail::Unspecified, msg)
@@ -209,12 +217,23 @@ async fn check_inner<T: Transport + Clone + 'static>(
     let release = verify_manifest(d, &deps.keys, &manifest, &sig)?;
 
     // Rule 3: freshness. A replayed older (signed, possibly vulnerable) manifest is refused.
-    if !st.is_fresh(release.manifest.timestamp) {
+    if !st.is_fresh(u.channel.as_str(), release.manifest.timestamp) {
         return Err(refused(
             "the release manifest is older than one already accepted (replay)",
         ));
     }
-    st.accept(release.manifest.timestamp);
+    st.accept(u.channel.as_str(), release.manifest.timestamp);
+    // A manifest that is fresh by the counter but old by the calendar may be a freeze (an
+    // attacker replaying the newest manifest they hold). Not a hard failure: a project that
+    // simply stopped releasing must not lose its updates path; the audit log and the journal say
+    // so (there is no needs_attention flag for it in the wire enum).
+    let age_days = d.now().saturating_sub(release.manifest.timestamp) / 86_400;
+    if age_days > MAX_MANIFEST_AGE_DAYS {
+        log::warn(&format!("update: the release manifest is {age_days} days old"));
+        d.audit_notice(&format!(
+            "update check: the release manifest is {age_days} days old (possible freeze)"
+        ));
+    }
 
     let staged_manifest = u.staging_dir.join(MANIFEST_FILE);
     let staged_sig = u.staging_dir.join(MANIFEST_SIG_FILE);
@@ -276,6 +295,32 @@ async fn apply_inner<T: Transport + Clone + 'static>(
     let u = &d.cfg.update;
     let _g = d.lock_host(ctx).await?;
     let mut st = load_state(d)?;
+    let now = d.now();
+    // A release that failed its health check, or that an Admin rolled back, is not re-applied
+    // by Gateway for 24 h: a loop of apply and rollback would restart units and rotate away the
+    // recovery snapshot.
+    let recently = |r: &Option<crate::privd::update::state::RolledBack>| {
+        r.as_ref()
+            .is_some_and(|r| r.version == version && now.saturating_sub(r.at) < DAY)
+    };
+    if ctx.role != Role::Admin && (recently(&st.rolled_back) || recently(&st.manual_rollback)) {
+        return Err(CmdError::denied(
+            "that release was rolled back; only an Admin may re-apply it within 24 hours",
+        ));
+    }
+    // The 2-a-day limit, kept in updates-state so a restart (or the rollback itself) does not
+    // reset it.
+    st.apply_log.retain(|t| now.saturating_sub(*t) < DAY);
+    if st.apply_log.len() >= APPLY_PER_DAY {
+        let oldest = st.apply_log.iter().min().copied().unwrap_or(now);
+        let retry = (oldest + DAY).saturating_sub(now).saturating_mul(1000);
+        return Err(CmdError::exhausted(
+            "ApplyUpdate is limited to 2 a day",
+            u32::try_from(retry).unwrap_or(u32::MAX),
+        ));
+    }
+    st.apply_log.push(now);
+    save_state(d, &st)?;
     if st.pending.is_some() {
         return Err(refused(
             "an update is already being applied; its health check has not finished",
@@ -305,7 +350,15 @@ async fn apply_inner<T: Transport + Clone + 'static>(
             "that version is not the verified release; run CheckUpdate first",
         ));
     }
-    if !st.is_fresh(release.manifest.timestamp) {
+    // From here on the canonical string of the signed manifest is used, never the caller's
+    // (`01.1.0` and `1.1.0` compare equal but are different path names).
+    if release.manifest.version != version {
+        return Err(CmdError::invalid(
+            "apply_update.version: not the canonical form of the verified version",
+        ));
+    }
+    let version: &str = &release.manifest.version;
+    if !st.is_fresh(u.channel.as_str(), release.manifest.timestamp) {
         return Err(refused(
             "the verified release is older than one already accepted; run CheckUpdate again",
         ));
@@ -355,7 +408,7 @@ async fn apply_inner<T: Transport + Clone + 'static>(
         255,
         true,
     );
-    preupdate_snapshots(d, ctx).await;
+    preupdate_snapshots(d, ctx, st.rolled_back.is_some() || st.manual_rollback.is_some()).await;
     ctx.check_cancelled()?;
 
     // Rule 4: safe extraction from the verified copy.
@@ -457,7 +510,7 @@ pub async fn rollback<T: Transport + Clone + 'static>(
         return Err(CmdError::denied("rollback_update: Admin only"));
     }
     let _g = d.lock_host(ctx).await?;
-    let st = load_state(d)?;
+    let mut st = load_state(d)?;
     if st.pending.is_some() {
         return Err(refused(
             "an update is being applied; its health check decides whether it rolls back",
@@ -480,6 +533,12 @@ pub async fn rollback<T: Transport + Clone + 'static>(
             refused("the previous version is not intact; it cannot be switched to")
         }
     })?;
+    st.manual_rollback = Some(crate::privd::update::state::RolledBack {
+        version: from.clone(),
+        reason: "rolled back by an administrator".into(),
+        at: d.now(),
+    });
+    save_state(d, &st)?;
     d.audit_notice(&format!("update rollback: {from} -> {to}"));
     schedule_restarts(d, false);
     Ok(response::Result::RollbackUpdate(
@@ -501,7 +560,11 @@ fn preupdate_name(now: u64) -> Result<String, CmdError> {
 
 /// Best effort: a `preupdate` snapshot of every ready desktop, keeping the newest two. Any
 /// failure is logged and the update goes on (ipc.md 6.12: "best effort").
-async fn preupdate_snapshots<T: Transport + Clone + 'static>(d: &Daemon<T>, ctx: &Ctx) {
+async fn preupdate_snapshots<T: Transport + Clone + 'static>(
+    d: &Daemon<T>,
+    ctx: &Ctx,
+    preserve: bool,
+) {
     let ids: Vec<String> = d.read_state(|s| s.desktops.keys().cloned().collect());
     for id in ids {
         let Ok(_g) = d.lock_desktop(ctx, &id, false).await else {
@@ -524,8 +587,16 @@ async fn preupdate_snapshots<T: Transport + Clone + 'static>(d: &Daemon<T>, ctx:
                 .map(|s| s.name)
                 .collect();
             old.sort();
-            while old.len() >= KEEP_PREUPDATE {
-                client.delete_snapshot(&l.name, &old.remove(0)).await?;
+            if preserve {
+                // A rolled-back release is on record: keep what exists (the snapshot before the
+                // first bad update included) and stop adding at the cap.
+                if old.len() >= PRESERVE_PREUPDATE {
+                    return Ok(());
+                }
+            } else {
+                while old.len() >= KEEP_PREUPDATE {
+                    client.delete_snapshot(&l.name, &old.remove(0)).await?;
+                }
             }
             client
                 .create_snapshot(&l.name, &preupdate_name(d.now())?)
