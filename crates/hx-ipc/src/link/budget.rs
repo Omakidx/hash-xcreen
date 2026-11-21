@@ -187,6 +187,43 @@ pub mod limits {
     pub const fn video_frames(max_fps: usize) -> usize {
         max_fps.saturating_mul(2)
     }
+
+    // Frame-count limits. Byte budgets do not bound per-frame CPU (a flood of 5-byte frames
+    // costs far more per byte than a video frame), so every lane also has a frames-per-second
+    // limit. Exceeding one is a violation (docs/ipc.md section 19.2), unlike the message-class
+    // limits above, where only the excess is dropped.
+
+    /// All frames the gateway accepts on `ctl` per second. Legitimate peak: cursor positions
+    /// (at most one per millisecond, 1 000) plus the capped classes above (about 50) with
+    /// headroom for bursts: 2 000.
+    pub const CTL_FRAMES_FROM_SESSION: usize = 2_000;
+    /// All frames the session accepts on `ctl` per second. Legitimate peak: input events (the
+    /// gateway's own cap is 2 000 per second) plus motion (1 000) plus feedback and stats
+    /// (about 20): 4 000.
+    pub const CTL_FRAMES_FROM_GATEWAY: usize = 4_000;
+    /// All frames on `bulk` per second, per direction. A full-speed transfer is 64 MiB/s in
+    /// 64 KiB chunks, 1 024 data frames per second; opens, ends and aborts are bounded by 4
+    /// concurrent transfers. Twice the data rate: 2 048.
+    pub const BULK_FRAMES: usize = 2_048;
+    /// Audio frames per second (reserved): 10 ms Opus frames are 100 per second; twice that.
+    pub const AUDIO_FRAMES: usize = 200;
+    /// `ctl` frames per second that decode to no known variant (`UnknownVariant`). A negotiated
+    /// peer never sends one (a newer minor sends nothing to an older negotiated minor), so any
+    /// sustained rate is abuse; a little slack covers a rolling update.
+    pub const UNKNOWN_VARIANTS: usize = 10;
+}
+
+/// The frame-count limit per second for the receiver `role` reading `lane` (all kinds
+/// together), or `None` for the silent direction. Video has its own `2 x max_fps` limit
+/// ([`limits::video_frames`]) and is not counted here.
+pub fn lane_frame_limit(receiver: Role, lane: Lane) -> Option<usize> {
+    match (lane, receiver) {
+        (Lane::Ctl, Role::Gateway) => Some(limits::CTL_FRAMES_FROM_SESSION),
+        (Lane::Ctl, Role::Session) => Some(limits::CTL_FRAMES_FROM_GATEWAY),
+        (Lane::Media, Role::Gateway) => Some(limits::AUDIO_FRAMES),
+        (Lane::Media, Role::Session) => None,
+        (Lane::Bulk, _) => Some(limits::BULK_FRAMES),
+    }
 }
 
 #[cfg(test)]
@@ -266,6 +303,25 @@ mod tests {
         assert!(!b.violated(at(t0, 4_000)), "only 2.8 s since the restart");
         drain(&mut b, at(t0, 4_200), true);
         assert!(b.violated(at(t0, 4_200)));
+    }
+
+    #[test]
+    fn frame_count_limits_stop_floods_of_tiny_frames() {
+        assert_eq!(lane_frame_limit(Role::Session, Lane::Media), None);
+        let t0 = Instant::now();
+        // A flood of 5-byte TransferEnd frames: 10 000 within one second.
+        let mut w = RateWindow::per_second(lane_frame_limit(Role::Gateway, Lane::Bulk).unwrap());
+        let allowed = (0..10_000).filter(|i| w.allow(at(t0, (*i as u64) / 10))).count();
+        assert_eq!(allowed, limits::BULK_FRAMES);
+        // A legitimate full-speed transfer (1 024 data frames per second) is never refused.
+        let mut w = RateWindow::per_second(limits::BULK_FRAMES);
+        assert!((0..4_096).all(|i| w.allow(at(t0, i as u64 * 1_000 / 1_024))));
+        // Empty ctl frames decoding to UnknownVariant: only a trickle is tolerated.
+        let mut w = RateWindow::per_second(limits::UNKNOWN_VARIANTS);
+        let allowed = (0..1_000).filter(|i| w.allow(at(t0, *i as u64))).count();
+        assert_eq!(allowed, limits::UNKNOWN_VARIANTS);
+        assert_eq!(lane_frame_limit(Role::Gateway, Lane::Ctl), Some(2_000));
+        assert_eq!(lane_frame_limit(Role::Session, Lane::Ctl), Some(4_000));
     }
 
     #[test]
