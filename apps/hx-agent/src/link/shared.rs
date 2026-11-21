@@ -164,6 +164,20 @@ struct InboxState {
     transfers: VecDeque<TransferEvent>,
     frames: VecDeque<Frame>,
     frame_bytes: u64,
+    /// RGBA bytes of the cursor shapes sitting in `events`.
+    shape_bytes: usize,
+}
+
+/// Cursor shapes queued for a consumer that does not read: at most 4 MiB of pixels (one second of
+/// the section 13 shape budget), latest wins. Before this the event queue was bounded by count
+/// only, so 256 shapes of 256 KiB were 64 MiB (review L3).
+pub(crate) const SHAPE_QUEUE_BYTES: usize = 4 * 1024 * 1024;
+
+fn shape_len(ev: &LinkEvent) -> usize {
+    match ev {
+        LinkEvent::Cursor(super::types::CursorUpdate::Shape(s)) => s.rgba.len(),
+        _ => 0,
+    }
 }
 
 const EVENT_CAP: usize = 256;
@@ -187,13 +201,44 @@ impl Inbox {
     pub(crate) fn push_event(&self, ev: LinkEvent) -> bool {
         let mut s = lock(&self.st);
         let dropped = s.events.len() >= EVENT_CAP;
-        if dropped {
-            s.events.pop_front();
+        if dropped && let Some(old) = s.events.pop_front() {
+            s.shape_bytes -= shape_len(&old);
         }
+        s.shape_bytes += shape_len(&ev);
         s.events.push_back(ev);
         drop(s);
         self.wake.notify_one();
         dropped
+    }
+
+    /// Queues a cursor shape within [`SHAPE_QUEUE_BYTES`]: the oldest queued shapes are
+    /// dropped to make room (the newest is what the cursor looks like). Returns how many.
+    pub(crate) fn push_shape(&self, shape: hx_proto::pb::CursorShape) -> usize {
+        let ev = LinkEvent::Cursor(super::types::CursorUpdate::Shape(shape));
+        let len = shape_len(&ev);
+        let mut dropped = 0;
+        {
+            let mut s = lock(&self.st);
+            while s.shape_bytes + len > SHAPE_QUEUE_BYTES {
+                let Some(i) = s.events.iter().position(|e| shape_len(e) > 0) else {
+                    break;
+                };
+                if let Some(old) = s.events.remove(i) {
+                    s.shape_bytes -= shape_len(&old);
+                    dropped += 1;
+                }
+            }
+        }
+        if self.push_event(ev) {
+            dropped += 1;
+        }
+        dropped
+    }
+
+    /// Bytes of cursor shapes currently queued.
+    #[cfg(test)]
+    pub(crate) fn queued_shape_bytes(&self) -> usize {
+        lock(&self.st).shape_bytes
     }
 
     pub(crate) fn push_position(&self, p: hx_proto::pb::CursorPosition) {
@@ -263,6 +308,7 @@ impl Inbox {
     pub(crate) fn pop(&self) -> Option<LinkEvent> {
         let mut s = lock(&self.st);
         if let Some(e) = s.events.pop_front() {
+            s.shape_bytes -= shape_len(&e);
             return Some(e);
         }
         if let Some(p) = s.pos.take() {
@@ -279,7 +325,10 @@ impl Inbox {
     /// Only the ordinary events (not frames, positions or transfers): what is still delivered
     /// after the link ended.
     pub(crate) fn pop_event_only(&self) -> Option<LinkEvent> {
-        lock(&self.st).events.pop_front()
+        let mut s = lock(&self.st);
+        let e = s.events.pop_front()?;
+        s.shape_bytes -= shape_len(&e);
+        Some(e)
     }
 
     pub(crate) fn queued_frame_bytes(&self) -> u64 {
@@ -822,5 +871,52 @@ mod credit_tests {
         drop(held);
         assert!(credits.room());
         assert_eq!(credits.at_limit.load(Relaxed), 0);
+    }
+}
+
+#[cfg(test)]
+mod shape_queue_tests {
+    use super::*;
+
+    fn shape(id: u64) -> hx_proto::pb::CursorShape {
+        // 256 x 256 RGBA: 256 KiB, the largest legal shape.
+        hx_proto::pb::CursorShape {
+            id,
+            width: 256,
+            height: 256,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            rgba: Bytes::from(vec![0u8; 256 * 256 * 4]),
+        }
+    }
+
+    #[test]
+    fn a_stalled_consumer_holds_at_most_the_shape_budget_and_keeps_the_newest() {
+        // Review L3: 256 queued shapes of 256 KiB were 64 MiB. Now at most 4 MiB, latest wins.
+        let inbox = Inbox::new();
+        let mut dropped = 0;
+        for id in 0..1_000u64 {
+            dropped += inbox.push_shape(shape(id));
+            assert!(inbox.queued_shape_bytes() <= SHAPE_QUEUE_BYTES);
+        }
+        assert_eq!(inbox.queued_shape_bytes(), SHAPE_QUEUE_BYTES);
+        assert_eq!(dropped, 1_000 - 16);
+        // What is left is the newest 16, in order, and reading them empties the account.
+        let mut ids = Vec::new();
+        while let Some(LinkEvent::Cursor(super::super::types::CursorUpdate::Shape(s))) = inbox.pop()
+        {
+            ids.push(s.id);
+        }
+        assert_eq!(ids, (984..1_000).collect::<Vec<_>>());
+        assert_eq!(inbox.queued_shape_bytes(), 0);
+        // Other events are untouched by the shape budget and still bounded by count.
+        for _ in 0..1_000 {
+            inbox.push_event(LinkEvent::SessionGoodbye { code: 1 });
+        }
+        let mut n = 0;
+        while inbox.pop().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, EVENT_CAP);
     }
 }

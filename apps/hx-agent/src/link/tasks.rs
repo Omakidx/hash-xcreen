@@ -20,8 +20,7 @@ use super::annexb;
 use super::lane::{LaneFail, LaneReader, WriteFail, write_all_stall};
 use super::shared::{BulkOut, InXfer, Pop, Shared, lock};
 use super::types::{
-    CursorUpdate, FailureClass, Frame, LinkEvent, SessionEvent, StreamFormat, TransferChunk,
-    TransferEvent,
+    FailureClass, Frame, LinkEvent, SessionEvent, StreamFormat, TransferChunk, TransferEvent,
 };
 use hx_ipc::link::frames::{
     LinkFrame, encode_gateway_message, encode_transfer_abort, encode_transfer_data_prefix, parse,
@@ -183,11 +182,9 @@ fn on_cursor(sh: &Arc<Shared>, c: hx_proto::pb::CursorEvent, now: Instant) {
             if within && r.shapes.allow(now) {
                 r.shape_bytes.push_back((now, bytes));
                 drop(r);
-                if sh
-                    .inbox
-                    .push_event(LinkEvent::Cursor(CursorUpdate::Shape(shape)))
-                {
-                    sh.count(|c| c.dropped_events += 1);
+                let dropped = sh.inbox.push_shape(shape);
+                if dropped > 0 {
+                    sh.count(|c| c.dropped_shapes += dropped as u64);
                 }
             } else {
                 drop(r);

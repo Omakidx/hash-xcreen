@@ -1606,7 +1606,7 @@ async fn a_refusal_during_an_upload_does_not_end_the_link_and_the_abort_arrives(
             let kind = raw.kind;
             match parse(&policy, raw, u64::MAX).unwrap() {
                 LinkFrame::TransferData { data: b, .. } => data += b.len() as u64,
-                LinkFrame::TransferAbort { id, code } => frames.push((kind, code)),
+                LinkFrame::TransferAbort { code, .. } => frames.push((kind, code)),
                 LinkFrame::TransferEnd { .. } => {
                     frames.push((kind, 0));
                     break;
