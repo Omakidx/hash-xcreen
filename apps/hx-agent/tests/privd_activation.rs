@@ -36,7 +36,10 @@ fn activated_child() {
             String::from_utf8_lossy(&buf)
         ))
     })();
-    std::fs::write(&out, verdict.unwrap_or_else(|e| format!("FAILED: {e}"))).unwrap();
+    // Write to a temporary name and rename into place, so a reader never sees a partial file.
+    let tmp = format!("{out}.tmp");
+    std::fs::write(&tmp, verdict.unwrap_or_else(|e| format!("FAILED: {e}"))).unwrap();
+    std::fs::rename(&tmp, &out).unwrap();
 }
 
 #[test]
