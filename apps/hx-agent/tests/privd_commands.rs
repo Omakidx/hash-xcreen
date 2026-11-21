@@ -1278,17 +1278,13 @@ async fn reserved_and_unavailable_commands_answer_unimplemented() {
             desktop_id: "main".into(),
         }),
         Command::GetRecipientKey(Default::default()),
-        Command::CheckUpdate(Default::default()),
-        Command::ApplyUpdate(pb::ApplyUpdateRequest {
-            version: "9.9.9".into(),
-        }),
+        // CheckUpdate, ApplyUpdate and RollbackUpdate are implemented (privd_update_*.rs).
     ] {
         let r = run(&h, Role::Gateway, c).await;
         assert_eq!(code(&r), ErrorCode::Unimplemented, "{r:?}");
     }
     for c in [
         Command::UpgradeIncus(Default::default()),
-        Command::RollbackUpdate(Default::default()),
         Command::Uninstall(pb::UninstallRequest {
             keep_desktop: true,
             confirm_destroy: false,
