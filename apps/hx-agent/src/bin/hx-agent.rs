@@ -22,10 +22,14 @@ fn main() -> ExitCode {
         eprintln!("hx-agent: error: cannot disable core dumps: {e}");
         return ExitCode::from(exit::FAILED);
     }
-    let euid = rustix::process::geteuid().as_raw();
+    // Root means real AND effective uid 0: a setuid copy run by a user is not root.
+    let euid = cli::admin_uid(
+        rustix::process::getuid().as_raw(),
+        rustix::process::geteuid().as_raw(),
+    );
     if euid == 0 {
-        // Best effort: keep a typed secret out of swap. The sockets and Argon2 need no more.
-        let _ = hardening::lock_memory();
+        // Keep a typed secret out of swap; say so if that is not possible, before any prompt.
+        cli::lock_memory_or_warn(&mut io::stderr(), hardening::lock_memory);
     }
     // Files this process creates (none today) are private.
     rustix::process::umask(rustix::fs::Mode::from_bits_truncate(0o077));

@@ -28,7 +28,7 @@
 //!
 //! The usage, exit codes and `--json` envelope are documented in `README.md` next to this file.
 
-use std::io::Write;
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -109,6 +109,38 @@ pub struct Env<'a> {
     pub now: fn() -> u64,
     /// `--json` was given (set by [`run`]).
     pub json: bool,
+}
+
+/// The uid the CLI acts as: 0 only if **both** the real and the effective uid are 0. A setuid-root
+/// copy of the binary run by an ordinary user has an effective uid of 0 and a real uid of that
+/// user; it must not become an administration tool for them, so such a process counts as the
+/// real (non-root) user and is refused.
+pub fn admin_uid(real: u32, effective: u32) -> u32 {
+    if real == 0 && effective == 0 {
+        0
+    } else if effective != 0 {
+        effective
+    } else {
+        real
+    }
+}
+
+/// Locks all memory (so a typed secret is never swapped out) with `lock`, and says so on `err` if
+/// that fails. Called at start, before any prompt can run: the command continues, but the
+/// operator knows a secret could reach swap.
+pub fn lock_memory_or_warn(err: &mut dyn Write, lock: impl FnOnce() -> io::Result<()>) -> bool {
+    match lock() {
+        Ok(()) => true,
+        Err(e) => {
+            write_out(
+                err,
+                &format!(
+                    "hx-agent: warning: cannot lock memory ({e}); a password or PIN typed now could be written to swap\n"
+                ),
+            );
+            false
+        }
+    }
 }
 
 /// The current Unix time.

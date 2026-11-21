@@ -572,3 +572,45 @@ async fn n1_a_socket_that_is_not_the_daemons_gets_nothing() {
     cfg.admin_socket = p.path.clone();
     assert_eq!(cli(&cfg, &["devices", "list"], &[], &[]).await.code, 0);
 }
+
+// ----------------------------------------------------------------------------------------- N2
+
+#[test]
+fn n2_only_real_and_effective_root_is_root() {
+    use hx_agent::cli::admin_uid;
+    assert_eq!(admin_uid(0, 0), 0);
+    // A setuid-root copy run by uid 1000: effective 0, real 1000 is NOT root.
+    assert_ne!(admin_uid(1000, 0), 0);
+    assert_ne!(
+        admin_uid(0, 1000),
+        0,
+        "dropped privileges are not root either"
+    );
+    assert_ne!(admin_uid(1000, 1000), 0);
+}
+
+#[tokio::test]
+async fn n2_a_setuid_style_identity_is_refused_like_any_non_root_user() {
+    let dir = private_tempdir();
+    let cfg = unreachable_config(dir.path());
+    let id = hx_agent::cli::admin_uid(1000, 0);
+    let r = cli_as(&cfg, id, &["pairing", "token"], &[], &[]).await;
+    assert_eq!(r.code, 7, "{r:?}");
+    assert!(r.asked.is_empty());
+}
+
+#[test]
+fn n2_a_failed_mlockall_is_reported_before_any_prompt() {
+    let mut err = Vec::new();
+    let ok =
+        hx_agent::cli::lock_memory_or_warn(&mut err, || Err(std::io::Error::from_raw_os_error(12)));
+    assert!(!ok);
+    let text = String::from_utf8(err).unwrap();
+    assert!(
+        text.contains("cannot lock memory") && text.contains("swap"),
+        "{text}"
+    );
+    let mut quiet = Vec::new();
+    assert!(hx_agent::cli::lock_memory_or_warn(&mut quiet, || Ok(())));
+    assert!(quiet.is_empty());
+}
