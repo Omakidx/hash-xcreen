@@ -133,29 +133,24 @@ pub fn push_dir(inst: &str, local: &std::path::Path, remote_parent: &str) {
 /// The names of every `hx1e-` object, per kind. Empty means clean.
 pub fn leftovers() -> Vec<String> {
     let mut v = Vec::new();
+    // Only `incus list` takes `-c`; the others print the name first in CSV. A listing that fails
+    // must not read as "nothing left": it panics instead.
     for (kind, args) in [
         ("instance", vec!["list", "--format", "csv", "-c", "n"]),
-        (
-            "profile",
-            vec!["profile", "list", "--format", "csv", "-c", "n"],
-        ),
-        (
-            "network",
-            vec!["network", "list", "--format", "csv", "-c", "n"],
-        ),
-        (
-            "storage",
-            vec!["storage", "list", "--format", "csv", "-c", "n"],
-        ),
+        ("profile", vec!["profile", "list", "--format", "csv"]),
+        ("network", vec!["network", "list", "--format", "csv"]),
+        ("storage", vec!["storage", "list", "--format", "csv"]),
         (
             "network-acl",
-            vec!["network", "acl", "list", "--format", "csv", "-c", "n"],
+            vec!["network", "acl", "list", "--format", "csv"],
         ),
     ] {
         let o = incus(&args);
-        for l in o.stdout.lines().map(str::trim) {
-            if l.starts_with(PREFIX) {
-                v.push(format!("{kind}:{l}"));
+        assert!(o.ok(), "incus {args:?} failed: {} {}", o.stdout, o.stderr);
+        for l in o.stdout.lines() {
+            let name = l.split(',').next().unwrap_or_default().trim();
+            if name.starts_with(PREFIX) {
+                v.push(format!("{kind}:{name}"));
             }
         }
     }

@@ -179,7 +179,7 @@ leftovers)
     [ -z "$left" ] || fail "leftovers after uninstall ($mode):$left"
     if [ "$mode" = destroy ]; then
         nft list table inet hx >/dev/null 2>&1 && fail "table inet hx is still loaded"
-        ours=$(for c in "list" "profile list" "network list" "storage list" "network acl list"; do incus $c -f csv -c n 2>/dev/null; done | grep '^hx' || true)
+        ours=$(for c in "list" "profile list" "network list" "storage list" "network acl list"; do incus $c -f csv 2>/dev/null | cut -d, -f1; done | grep '^hx' || true)
         [ -z "$ours" ] || fail "inner Incus objects left: $ours"
     else
         incus list hx-main -c n --format csv | grep -q '^hx-main$' || fail "keep mode must keep the desktop"

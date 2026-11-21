@@ -1439,7 +1439,7 @@ fn uninstall_both(l1: &L1) {
         "network acl list",
     ]
     .iter()
-    .map(|c| l1.exec_ok(&format!("incus {c} -f csv -c n 2>&1")))
+    .map(|c| l1.exec_ok(&format!("incus {c} -f csv 2>&1 | cut -d, -f1")))
     .collect::<Vec<_>>()
     .join("\n");
     let ours: Vec<&str> = inner
