@@ -179,11 +179,25 @@ impl Locks {
         cancel: &CancelToken,
         wait: Duration,
     ) -> Result<Guard, CmdError> {
+        self.acquire_as(key, cancel, wait, true).await
+    }
+
+    /// [`Locks::acquire`] for a caller of a role: one waiter slot is reserved for Admin, so a
+    /// Gateway that fills the queue (at most `MAX_WAITERS - 1` of its commands wait) cannot keep
+    /// an administrator's command from queueing.
+    pub async fn acquire_as(
+        &self,
+        key: LockKey<'_>,
+        cancel: &CancelToken,
+        wait: Duration,
+        admin: bool,
+    ) -> Result<Guard, CmdError> {
+        let limit = if admin { MAX_WAITERS } else { MAX_WAITERS - 1 };
         let lock = self.lock_for(key);
         if let Ok(p) = lock.sem.clone().try_acquire_owned() {
             return Ok(Guard(p));
         }
-        if lock.waiters.fetch_add(1, Ordering::SeqCst) >= MAX_WAITERS {
+        if lock.waiters.fetch_add(1, Ordering::SeqCst) >= limit {
             lock.waiters.fetch_sub(1, Ordering::SeqCst);
             return Err(CmdError::exhausted(
                 "too many commands are waiting for this desktop",
@@ -281,6 +295,58 @@ mod tests {
         );
         for w in waiters {
             assert!(w.await.unwrap().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn n3_one_waiter_slot_is_reserved_for_admin() {
+        let locks = Arc::new(Locks::new());
+        let c = CancelToken::new();
+        let _held = locks
+            .acquire(LockKey::Desktop("main"), &c, LOCK_WAIT)
+            .await
+            .unwrap();
+        let mut waiters = Vec::new();
+        for _ in 0..MAX_WAITERS - 1 {
+            let (l, c) = (locks.clone(), c.clone());
+            waiters.push(tokio::spawn(async move {
+                l.acquire_as(
+                    LockKey::Desktop("main"),
+                    &c,
+                    Duration::from_millis(400),
+                    false,
+                )
+                .await
+                .map(|_| ())
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // A fourth Gateway command is refused at once; an Admin command still queues.
+        let e = locks
+            .acquire_as(LockKey::Desktop("main"), &c, Duration::from_secs(5), false)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, hx_ipc::privd::pb::ErrorCode::ResourceExhausted);
+        let (l, c2) = (locks.clone(), c.clone());
+        let admin = tokio::spawn(async move {
+            l.acquire_as(
+                LockKey::Desktop("main"),
+                &c2,
+                Duration::from_millis(300),
+                true,
+            )
+            .await
+            .map(|_| ())
+        });
+        let r = admin.await.unwrap();
+        // It queued (and timed out waiting): the refusal is the wait timeout, not "too many".
+        assert!(
+            r.unwrap_err()
+                .message
+                .contains("another command is running")
+        );
+        for w in waiters {
+            let _ = w.await;
         }
     }
 

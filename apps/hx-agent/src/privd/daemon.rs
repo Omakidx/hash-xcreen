@@ -328,7 +328,12 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
     ) -> Result<Guard, CmdError> {
         let g = self
             .locks
-            .acquire(LockKey::Desktop(id), &ctx.cancel, LOCK_WAIT)
+            .acquire_as(
+                LockKey::Desktop(id),
+                &ctx.cancel,
+                LOCK_WAIT,
+                ctx.role == Role::Admin,
+            )
             .await?;
         if !allow_stuck && self.flags_for(id).contains(&Flag::StuckOperation) {
             return Err(CmdError::precondition(
@@ -342,7 +347,12 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
     /// Takes the host lock.
     pub async fn lock_host(&self, ctx: &Ctx) -> Result<Guard, CmdError> {
         self.locks
-            .acquire(LockKey::Host, &ctx.cancel, LOCK_WAIT)
+            .acquire_as(
+                LockKey::Host,
+                &ctx.cancel,
+                LOCK_WAIT,
+                ctx.role == Role::Admin,
+            )
             .await
     }
 
