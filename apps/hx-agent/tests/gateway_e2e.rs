@@ -572,20 +572,13 @@ async fn takeovers_are_limited_to_three_per_ten_minutes() {
         );
         conns.push(c);
     }
-    // Bob replacing his own stale session is exempt from the policy and the limit.
+    // Bob replacing his own session while the old connection is alive is not exempt: the same
+    // limit applies (a copied key plus PIN cannot displace the owner at will).
     let bob_again = env.login(&b, "bob[31m", PIN).await;
     bob_again.send_control(&view_config()).await.unwrap();
-    assert!(
-        eventually(|| async {
-            env.link
-                .log()
-                .iter()
-                .filter(|e| matches!(e, Event::Attach(_)))
-                .count()
-                == 5
-        })
-        .await
-    );
+    let g = goodbye(&bob_again).await;
+    assert_eq!(g.code, CloseCode::Busy.code());
+    assert!(g.message.contains("too many takeovers"), "{}", g.message);
     // A different device is refused until the window passes.
     let alice = env.login(&a, "alice", PIN).await;
     alice.send_control(&view_config()).await.unwrap();
@@ -598,8 +591,8 @@ async fn takeovers_are_limited_to_three_per_ten_minutes() {
             .iter()
             .filter(|e| matches!(e, Event::Attach(_)))
             .count(),
-        5,
-        "the refused takeover attached nothing"
+        4,
+        "the refused takeovers attached nothing"
     );
     drop(conns);
 }
@@ -1073,4 +1066,62 @@ async fn a_revocation_during_a_slow_claim_closes_the_session_at_once_and_attache
         env.link.log()
     );
     assert!(!env.gw.sessions().has_active_client().await);
+}
+
+/// F5: under `deny`, the same key cannot displace its own live session.
+#[tokio::test]
+async fn a_copied_key_cannot_displace_the_live_owner_even_under_deny() {
+    let env = Env::start_with(EnvOptions {
+        takeover_deny: true,
+        ..Default::default()
+    })
+    .await;
+    let a = new_key();
+    env.pair(&a, "alice").await;
+    env.set_pin(PIN).await;
+    let owner = env.login(&a, "alice", PIN).await;
+    owner.send_control(&view_config()).await.unwrap();
+    assert!(eventually(|| async { env.link.log().len() == 1 }).await);
+    let copy = env.login(&a, "alice", PIN).await;
+    copy.send_control(&view_config()).await.unwrap();
+    let g = goodbye(&copy).await;
+    assert_eq!(g.code, CloseCode::Busy.code());
+    assert_eq!(env.link.log(), [Event::Attach("alice".into())]);
+    assert!(owner.close_info().is_none(), "the owner was left alone");
+}
+
+/// F5: a device whose old connection is dead (it answers no ping) can still come back, even
+/// under `deny`: that is the stale-session case the exemption exists for.
+#[tokio::test]
+async fn a_device_replaces_its_own_unresponsive_session_even_under_deny() {
+    let env = Env::start_with(EnvOptions {
+        takeover_deny: true,
+        ..Default::default()
+    })
+    .await;
+    let a = new_key();
+    env.pair(&a, "alice").await;
+    env.set_pin(PIN).await;
+    // A connection that never reads its control stream cannot answer the gateway's ping.
+    let mut stale = RawClient::connect(env.gw.quic_addr().unwrap(), &a, env.server_public()).await;
+    stale.hello_v10().await;
+    assert_eq!(stale.submit_pin(PIN).await, hx_crypto::wire::AuthStatus::Ok);
+    stale.send_ctl(&view_config()).await;
+    assert!(eventually(|| async { env.link.log().len() == 1 }).await);
+    let back = env.login(&a, "alice", PIN).await;
+    back.send_control(&view_config()).await.unwrap();
+    assert!(
+        eventually(|| async {
+            env.link
+                .log()
+                .iter()
+                .filter(|e| matches!(e, Event::Attach(_)))
+                .count()
+                == 2
+        })
+        .await,
+        "{:?}",
+        env.link.log()
+    );
+    assert!(back.close_info().is_none());
 }

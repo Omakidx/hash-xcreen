@@ -69,6 +69,8 @@ pub const REVOKES_PER_WINDOW: usize = 10;
 pub const REVOKE_WINDOW: Duration = Duration::from_secs(60);
 /// How long delivery of a `Goodbye` is awaited (protocol 5.7).
 pub const GOODBYE_FLUSH: Duration = Duration::from_secs(1);
+/// How long a device's own old connection has to answer before it counts as dead.
+const SELF_REPLACE_PING: Duration = Duration::from_secs(1);
 /// Bound on each takeover step that calls into the link.
 const LINK_STEP_TIMEOUT: Duration = Duration::from_secs(2);
 /// Bound on writing one message to a client's control channel from the session loop.
@@ -223,7 +225,12 @@ impl SessionManager {
         let new_name = sanitize_device_name(&device.name);
         if let Some(old) = active.take() {
             let same_device = old.device_id == device.id;
-            if !same_device && let Err(refusal) = self.limiter.permit() {
+            // A device replacing its own session is exempt from the policy and the limit only
+            // if the old connection is dead: it does not answer a ping within a second (a
+            // client that lost its network). A copied key plus PIN against a live owner
+            // connection gets no exemption, so it cannot displace the owner at will.
+            let exempt = same_device && old.conn.ping(SELF_REPLACE_PING).await.is_err();
+            if !exempt && let Err(refusal) = self.limiter.permit() {
                 *active = Some(old);
                 return Claim::Busy(match refusal {
                     Refusal::Denied => "another device is using this desktop",
@@ -234,6 +241,7 @@ impl SessionManager {
                 old = %short_id(&old.device_id),
                 new = %short_id(&device.id),
                 same_device,
+                exempt,
                 "taking over the desktop"
             );
             // (1) and (2), then the old relay is torn down.
@@ -242,7 +250,7 @@ impl SessionManager {
             old.client.detach(DetachReason::Displaced).await;
             // (3) tell the old client, then close it.
             notify_displaced(&old.conn, &new_name, &device.id).await;
-            if !same_device {
+            if !exempt {
                 let privd = self.privd.clone();
                 let (id, label) = (*device.id.as_bytes(), new_name.clone());
                 tokio::spawn(async move {
