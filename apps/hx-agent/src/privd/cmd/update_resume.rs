@@ -68,8 +68,14 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
         let deps = self.update_deps();
         let u = &self.cfg.update;
         let cancel = CancelToken::new();
-        let Ok(_g) = self.locks.acquire(LockKey::Host, &cancel, LOCK_WAIT).await else {
-            log::error("update: could not take the host lock to resume the update");
+        // The host refresh at start may hold the lock for up to 120 s; the update must still be
+        // judged, so wait through that and the health window, not the usual 10 s. If the lock
+        // truly cannot be had, roll back rather than leave `pending` set for ever.
+        let wait = Duration::from_secs(150) + u.health.window;
+        let Ok(_g) = self.locks.acquire(LockKey::Host, &cancel, wait).await else {
+            log::error("update: could not take the host lock to judge the update");
+            self.rollback_now("the update could not be judged (the host lock was never free)")
+                .await;
             return;
         };
         let mut st = match UpdateState::load(&self.store) {
@@ -119,7 +125,16 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
 
     fn confirm_update(&self, version: &str) {
         let layout = Layout::new(&self.cfg.update.versions_dir);
-        let mut st = UpdateState::load(&self.store).unwrap_or_default();
+        // An unreadable updates-state is never replaced by defaults: that would reset the
+        // freshness counters. Leave it alone and say so.
+        let mut st = match UpdateState::load(&self.store) {
+            Ok(s) => s,
+            Err(e) => {
+                log::error(&format!("updates-state: {e}; leaving it untouched"));
+                self.audit_notice("update confirmation skipped: updates-state is unreadable");
+                return;
+            }
+        };
         st.pending = None;
         st.rolled_back = None;
         if let Err(e) = st.save(&self.store) {
@@ -141,37 +156,50 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
         let _ = self.run_self_checks();
     }
 
-    /// Flips back to the previous version, records why, restarts both units. Returns whether the
-    /// flip happened. The caller holds the host lock (or is the only user of the files).
+    /// Restores the version the pending update recorded as its predecessor, records why, and
+    /// restarts both units. Returns whether a version was restored. Idempotent: if `current`
+    /// already is that version (the update was never switched in, or a crash interrupted an
+    /// earlier rollback) only the bookkeeping is done; `current` is never moved to anything older.
+    /// The caller holds the host lock (or is the only user of the files).
     pub(crate) async fn rollback_now(&self, reason: &str) -> bool {
         let deps = self.update_deps();
         let layout = Layout::new(&self.cfg.update.versions_dir);
         let reason = sanitize_text(reason, 200);
-        let mut st = UpdateState::load(&self.store).unwrap_or_default();
-        let version = st
-            .pending
-            .as_ref()
-            .map(|p| p.version.clone())
-            .unwrap_or_default();
-        let flipped = layout.swap_back();
-        match &flipped {
-            Ok((from, to)) => {
-                self.audit_notice(&format!(
-                    "needs_attention=UPDATE_ROLLED_BACK: {from} rolled back to {to}: {reason}"
-                ));
-            }
+        let mut st = match UpdateState::load(&self.store) {
+            Ok(s) => s,
             Err(e) => {
-                log::error(&format!(
-                    "update: the rollback could not flip the link: {e}"
-                ));
+                log::error(&format!("updates-state: {e}; the rollback cannot proceed"));
+                self.audit_notice("update rollback refused: updates-state is unreadable");
+                return false;
+            }
+        };
+        let Some(p) = st.pending.clone() else {
+            return false;
+        };
+        let restored = match &p.previous {
+            Some(to) => layout.restore(to, &p.version),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "the update recorded no previous version",
+            )),
+        };
+        match &restored {
+            Ok(_) => self.audit_notice(&format!(
+                "needs_attention=UPDATE_ROLLED_BACK: {} rolled back to {}: {reason}",
+                p.version,
+                p.previous.as_deref().unwrap_or("?")
+            )),
+            Err(e) => {
+                log::error(&format!("update: the rollback could not restore: {e}"));
                 self.audit_notice(&format!(
-                    "needs_attention=UPDATE_ROLLED_BACK: rollback of {version} failed: {reason}"
+                    "needs_attention=UPDATE_ROLLED_BACK: rollback of {} failed: {reason}",
+                    p.version
                 ));
             }
         }
         st.pending = None;
         st.rolled_back = Some(RolledBack {
-            version,
+            version: p.version,
             reason,
             at: self.now(),
         });
@@ -179,7 +207,7 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
             log::error(&format!("updates-state: {e}"));
         }
         self.set_flag(None, Flag::UpdateRolledBack, true);
-        if flipped.is_ok() {
+        if restored.is_ok() {
             if let Err(e) = deps.systemd.restart(Unit::Gatewayd).await {
                 log::error(&format!("update: {e}"));
             }
@@ -187,6 +215,6 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
                 log::error(&format!("update: {e}"));
             }
         }
-        flipped.is_ok()
+        restored.is_ok()
     }
 }

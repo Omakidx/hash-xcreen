@@ -32,6 +32,10 @@ pub struct Pending {
     /// binary ends in a rollback instead of an endless restart).
     #[serde(default)]
     pub attempts: u32,
+    /// gatewayd's `MainPID` before the switch: the health check requires a different one, which
+    /// proves gatewayd restarted into the new binary.
+    #[serde(default)]
+    pub gateway_pid: Option<u32>,
 }
 
 /// The last automatic rollback.

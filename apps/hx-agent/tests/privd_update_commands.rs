@@ -987,3 +987,150 @@ async fn an_invalid_version_is_rejected_at_the_boundary() {
     }
     assert!(env.server.lock().unwrap().jobs.is_empty());
 }
+
+// ----- rollback restores an explicit version (M1, N3), judging waits for the lock (M2), L4 -----------
+
+fn set_pending(env: &Env, version: &str, previous: Option<&str>) {
+    let store = store(&env.h.daemon.cfg.state_dir);
+    let mut st = UpdateState::load(&store).unwrap();
+    st.pending = Some(hx_agent::privd::update::state::Pending {
+        version: version.into(),
+        previous: previous.map(str::to_string),
+        started_unix: NOW,
+        attempts: 0,
+        gateway_pid: None,
+    });
+    st.save(&store).unwrap();
+}
+
+fn links(env: &Env, current: &str, previous: &str) {
+    let vd = &env.h.daemon.cfg.update.versions_dir;
+    for v in ["0.9.0", "1.0.0", "1.1.0"] {
+        if !vd.join(v).exists() {
+            install_release(vd, v);
+        }
+    }
+    for (name, target) in [("current", current), ("previous", previous)] {
+        let p = vd.join(name);
+        let _ = std::fs::remove_file(&p);
+        std::os::unix::fs::symlink(target, p).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_crash_before_the_switch_never_downgrades() {
+    // Case (a): pending was saved, the switch never happened; links are 1.0 / 0.9.
+    let env = Env::new();
+    links(&env, "1.0.0", "0.9.0");
+    set_pending(&env, "1.1.0", Some("1.0.0"));
+    let d = env.new_process("1.0.0");
+    d.resume_update().await;
+    assert_eq!(env.layout().current().unwrap().as_deref(), Some("1.0.0"), "not 0.9.0");
+    assert_eq!(env.layout().previous().unwrap().as_deref(), Some("0.9.0"));
+    assert!(UpdateState::load(&store(&d.cfg.state_dir)).unwrap().pending.is_none());
+}
+
+#[tokio::test]
+async fn a_second_rollback_after_a_crash_does_not_flip_back_to_the_bad_version() {
+    // Case (b): the rollback moved the links (1.0 / 1.1) but pending was not yet cleared.
+    let env = Env::new();
+    links(&env, "1.0.0", "1.1.0");
+    set_pending(&env, "1.1.0", Some("1.0.0"));
+    let d = env.new_process("1.0.0");
+    d.resume_update().await;
+    assert_eq!(env.layout().current().unwrap().as_deref(), Some("1.0.0"));
+    assert_eq!(env.layout().previous().unwrap().as_deref(), Some("1.1.0"));
+    let st = UpdateState::load(&store(&d.cfg.state_dir)).unwrap();
+    assert!(st.pending.is_none());
+    assert_eq!(st.rolled_back.unwrap().version, "1.1.0");
+    // And again: nothing moves.
+    d.resume_update().await;
+    assert_eq!(env.layout().current().unwrap().as_deref(), Some("1.0.0"));
+}
+
+#[tokio::test]
+async fn equal_current_and_previous_links_are_left_alone() {
+    // Case (c).
+    let env = Env::new();
+    links(&env, "1.0.0", "1.0.0");
+    set_pending(&env, "1.1.0", Some("1.0.0"));
+    env.new_process("1.0.0").resume_update().await;
+    assert_eq!(env.layout().current().unwrap().as_deref(), Some("1.0.0"));
+    assert_eq!(env.layout().previous().unwrap().as_deref(), Some("1.0.0"));
+}
+
+#[tokio::test]
+async fn a_rollback_restores_the_recorded_version_even_if_previous_is_something_else() {
+    // The links say 1.1 / 0.9 (a stale `previous`): the automatic rollback restores 1.0 (what
+    // was recorded), not 0.9.
+    let env = Env::new();
+    links(&env, "1.1.0", "0.9.0");
+    set_pending(&env, "1.1.0", Some("1.0.0"));
+    env.health.status_ok.store(false, Ordering::SeqCst);
+    env.new_process("1.1.0").resume_update().await;
+    assert_eq!(env.layout().current().unwrap().as_deref(), Some("1.0.0"));
+    assert_eq!(env.layout().previous().unwrap().as_deref(), Some("1.1.0"));
+}
+
+#[tokio::test]
+async fn an_update_with_no_recorded_predecessor_is_not_flipped_to_anything() {
+    let env = Env::new();
+    links(&env, "1.1.0", "0.9.0");
+    set_pending(&env, "1.1.0", None);
+    env.health.status_ok.store(false, Ordering::SeqCst);
+    env.new_process("1.1.0").resume_update().await;
+    assert_eq!(env.layout().current().unwrap().as_deref(), Some("1.1.0"), "no downgrade to 0.9");
+    assert!(state(&env).rolled_back.is_some());
+}
+
+#[tokio::test]
+async fn admin_rollback_will_not_land_on_the_release_that_was_rolled_back() {
+    let env = applied_env().await;
+    env.health.status_ok.store(false, Ordering::SeqCst);
+    env.new_process("1.1.0").resume_update().await;
+    // current 1.0, previous 1.1 (known bad): a manual rollback would flip to it.
+    let r = env
+        .call(
+            Role::Admin,
+            Command::RollbackUpdate(pb::RollbackUpdateRequest {}),
+        )
+        .await;
+    let (code, msg) = err(&r);
+    assert_eq!(code, ErrorCode::FailedPrecondition);
+    assert!(msg.contains("failed its health check"), "{msg}");
+    assert_eq!(env.layout().current().unwrap().as_deref(), Some("1.0.0"));
+}
+
+#[tokio::test]
+async fn the_new_process_judges_the_update_even_if_the_host_lock_is_busy_for_a_long_time() {
+    let env = applied_env().await;
+    let d = env.new_process("1.1.0");
+    // The host refresh at start holds the lock for longer than the usual 10 s wait.
+    let held = {
+        let d = d.clone();
+        tokio::spawn(async move {
+            let _g = d.lock_host(&Ctx::new(Role::Admin)).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(11)).await;
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    d.resume_update().await;
+    held.await.unwrap();
+    let st = UpdateState::load(&store(&d.cfg.state_dir)).unwrap();
+    assert!(st.pending.is_none(), "judged, not left pending");
+    assert!(st.rolled_back.is_none());
+    assert_eq!(env.layout().current().unwrap().as_deref(), Some("1.1.0"));
+}
+
+#[tokio::test]
+async fn a_corrupt_updates_state_is_never_replaced_by_defaults() {
+    let env = applied_env().await;
+    let path = env.h.daemon.cfg.state_dir.join("updates-state");
+    std::fs::write(&path, b"{oops").unwrap();
+    env.health.status_ok.store(false, Ordering::SeqCst);
+    let d = env.new_process("1.1.0");
+    d.resume_update().await;
+    assert_eq!(std::fs::read(&path).unwrap(), b"{oops", "left untouched");
+    assert_eq!(err(&env.check().await).0, ErrorCode::Internal);
+    assert_eq!(std::fs::read(&path).unwrap(), b"{oops");
+}

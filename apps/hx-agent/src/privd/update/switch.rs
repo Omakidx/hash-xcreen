@@ -252,6 +252,27 @@ impl Layout {
         Ok(old)
     }
 
+    /// Restores `to` as `current` (the version a pending update recorded as its predecessor) and
+    /// parks `bad` as `previous`. Idempotent and never older than `to`: if `current` already is
+    /// `to` nothing moves (a second call after a crash, or an update that was never switched in).
+    /// Returns whether `current` changed.
+    pub fn restore(&self, to: &str, bad: &str) -> io::Result<bool> {
+        self.verify_dir(to)
+            .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?;
+        let root = self.open()?;
+        if self.read_link(&root, "current")?.as_deref() == Some(to) {
+            return Ok(false);
+        }
+        self.set_link(&root, "current", to)?;
+        let bad_exists = is_version_dir(bad)
+            && bad != to
+            && rustix::fs::statat(&root, bad, AtFlags::SYMLINK_NOFOLLOW).is_ok();
+        if bad_exists {
+            self.set_link(&root, "previous", bad)?;
+        }
+        Ok(true)
+    }
+
     /// Points `current` at `previous` and `previous` at the old `current`. Returns
     /// `(from, to)`: the version that was current and the one that is now.
     pub fn swap_back(&self) -> io::Result<(String, String)> {

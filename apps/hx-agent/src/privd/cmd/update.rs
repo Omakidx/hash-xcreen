@@ -419,6 +419,13 @@ async fn apply_inner<T: Transport + Clone + 'static>(
         previous,
         started_unix: d.now(),
         attempts: 0,
+        gateway_pid: deps
+            .systemd
+            .state(crate::privd::update::Unit::Gatewayd)
+            .await
+            .ok()
+            .map(|s| s.main_pid)
+            .filter(|p| *p != 0),
     });
     st.verified_version = None;
     save_state(d, &st)?;
@@ -454,6 +461,15 @@ pub async fn rollback<T: Transport + Clone + 'static>(
     if st.pending.is_some() {
         return Err(refused(
             "an update is being applied; its health check decides whether it rolls back",
+        ));
+    }
+    // The release that was rolled back for failing its health check is not an acceptable
+    // target: `previous` points at it after an automatic rollback.
+    if let (Some(rb), Ok(Some(prev))) = (&st.rolled_back, layout(d).previous())
+        && rb.version == prev
+    {
+        return Err(refused(
+            "the previous version is the release that failed its health check; it is not a rollback target",
         ));
     }
     let (from, to) = layout(d).swap_back().map_err(|e| {
