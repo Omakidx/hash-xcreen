@@ -114,6 +114,77 @@ pub trait LinkClient: Send + Sync {
     fn detach(&self, reason: DetachReason) -> BoxFuture<'_, ()>;
 }
 
+/// Wraps the handle a link returned: once it is detached (the client left, was displaced or was
+/// revoked) every further call is ignored, whatever the implementation does. A displaced
+/// client's session loop can still deliver a `ViewConfig` for a moment; it must reach nothing.
+pub struct GuardedClient {
+    inner: std::sync::Arc<dyn LinkClient>,
+    detached: std::sync::atomic::AtomicBool,
+}
+
+impl GuardedClient {
+    /// Wraps `inner`.
+    pub fn new(inner: std::sync::Arc<dyn LinkClient>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            inner,
+            detached: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn live(&self) -> bool {
+        !self.detached.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl LinkClient for GuardedClient {
+    fn view_config(&self, config: pb::ViewConfig) -> BoxFuture<'_, ()> {
+        if self.live() {
+            self.inner.view_config(config)
+        } else {
+            Box::pin(async {})
+        }
+    }
+    fn request_keyframe(&self, last: u32) -> BoxFuture<'_, ()> {
+        if self.live() {
+            self.inner.request_keyframe(last)
+        } else {
+            Box::pin(async {})
+        }
+    }
+    fn client_stats(&self, stats: pb::ClientStats) -> BoxFuture<'_, ()> {
+        if self.live() {
+            self.inner.client_stats(stats)
+        } else {
+            Box::pin(async {})
+        }
+    }
+    fn release_input(&self) -> BoxFuture<'_, ()> {
+        if self.live() {
+            self.inner.release_input()
+        } else {
+            Box::pin(async {})
+        }
+    }
+    fn cancel_in_flight(&self) -> BoxFuture<'_, ()> {
+        if self.live() {
+            self.inner.cancel_in_flight()
+        } else {
+            Box::pin(async {})
+        }
+    }
+    fn detach(&self, reason: DetachReason) -> BoxFuture<'_, ()> {
+        // Once, whatever the caller does.
+        if self
+            .detached
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            Box::pin(async {})
+        } else {
+            self.inner.detach(reason)
+        }
+    }
+}
+
 /// The stub link of this round: there is no desktop to relay yet.
 #[derive(Debug, Default)]
 pub struct UnavailableLink;
@@ -315,5 +386,66 @@ pub mod recording {
         fn state(&self) -> LinkState {
             LinkState::Up
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[derive(Default)]
+    struct Count {
+        calls: AtomicU32,
+        detaches: Mutex<Vec<DetachReason>>,
+    }
+    impl LinkClient for Count {
+        fn view_config(&self, _: pb::ViewConfig) -> BoxFuture<'_, ()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        }
+        fn request_keyframe(&self, _: u32) -> BoxFuture<'_, ()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        }
+        fn client_stats(&self, _: pb::ClientStats) -> BoxFuture<'_, ()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        }
+        fn release_input(&self) -> BoxFuture<'_, ()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        }
+        fn cancel_in_flight(&self) -> BoxFuture<'_, ()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        }
+        fn detach(&self, r: DetachReason) -> BoxFuture<'_, ()> {
+            self.detaches.lock().unwrap().push(r);
+            Box::pin(async {})
+        }
+    }
+
+    #[tokio::test]
+    async fn a_detached_handle_ignores_everything_and_detaches_once() {
+        let inner = std::sync::Arc::new(Count::default());
+        let g = GuardedClient::new(inner.clone());
+        g.view_config(pb::ViewConfig::default()).await;
+        g.release_input().await;
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 2);
+        g.detach(DetachReason::Displaced).await;
+        g.detach(DetachReason::Left).await;
+        g.view_config(pb::ViewConfig::default()).await;
+        g.request_keyframe(1).await;
+        g.client_stats(pb::ClientStats::default()).await;
+        g.release_input().await;
+        g.cancel_in_flight().await;
+        assert_eq!(
+            inner.calls.load(Ordering::SeqCst),
+            2,
+            "nothing after detach"
+        );
+        assert_eq!(*inner.detaches.lock().unwrap(), [DetachReason::Displaced]);
     }
 }

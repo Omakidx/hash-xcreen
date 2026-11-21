@@ -99,6 +99,32 @@ impl LiveSessions {
             .collect()
     }
 
+    /// Closes every live session of `device` with `code` and returns how many were closed.
+    /// This does not depend on the sessions' own loops, so a session that is busy (claiming
+    /// the desktop, waiting on privd) is closed at once when its device is revoked.
+    pub async fn close_device(&self, device: &DeviceId, code: CloseCode, reason: &str) -> usize {
+        let conns: Vec<Connection> = self
+            .map
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .filter(|(d, _)| d == device)
+            .map(|(_, c)| c.clone())
+            .collect();
+        let n = conns.len();
+        let tasks: Vec<_> = conns
+            .into_iter()
+            .map(|c| {
+                let reason = reason.to_owned();
+                tokio::spawn(async move { c.close(code, &reason).await })
+            })
+            .collect();
+        for t in tasks {
+            let _ = t.await;
+        }
+        n
+    }
+
     /// Closes every live session with `code` and returns how many were closed.
     pub async fn close_all(&self, code: CloseCode, reason: &str) -> usize {
         let conns = self.connections();

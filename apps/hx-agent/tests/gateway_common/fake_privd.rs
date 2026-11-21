@@ -49,6 +49,8 @@ pub struct State {
     pub start_calls: u32,
     /// `ProvisionSessionLink` calls.
     pub provision_calls: u32,
+    /// Delay before answering `StartDesktop` (milliseconds).
+    pub start_delay_ms: u64,
     /// Delay before answering `PepperVerify` (milliseconds).
     pub verify_delay_ms: u64,
     /// Role reported in `HelloAck`.
@@ -378,6 +380,10 @@ fn serve(mut stream: UnixStream, state: Arc<Mutex<State>>, conn: u32) {
                 }
             }
             C::StartDesktop(_) => {
+                let delay = state.lock().unwrap().start_delay_ms;
+                if delay > 0 {
+                    std::thread::sleep(Duration::from_millis(delay));
+                }
                 let mut s = state.lock().unwrap();
                 s.start_calls += 1;
                 s.desktop_state = pb::DesktopState::Running as i32;

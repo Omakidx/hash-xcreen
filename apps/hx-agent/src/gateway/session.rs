@@ -54,7 +54,8 @@ use hx_transport::Connection;
 use tokio::sync::{Mutex, broadcast};
 
 use super::desktop::{
-    AttachRequest, DesktopLink, DesktopSupervisor, DetachReason, LinkClient, LinkError,
+    AttachRequest, DesktopLink, DesktopSupervisor, DetachReason, GuardedClient, LinkClient,
+    LinkError,
 };
 use super::devices::{DeviceNotice, DeviceService};
 use super::live::LiveSessions;
@@ -101,7 +102,13 @@ enum Claim {
     Claimed(Arc<dyn LinkClient>, u64),
     Busy(&'static str),
     Unavailable,
+    /// The device was revoked (or the connection closed) while the claim was running.
+    Revoked,
 }
+
+/// How long making the desktop ready may take before the client is told "unavailable": the
+/// supervisor's lock must not be held for minutes by a slow `StartDesktop`.
+const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What a message handler asks the loop to do next.
 enum Flow {
@@ -155,7 +162,12 @@ impl SessionManager {
     }
 
     /// Runs one authorized session to its end. Returns when the connection is closed.
-    pub async fn serve(self: &Arc<Self>, conn: Connection, device: DeviceRecord) {
+    pub async fn serve(
+        self: &Arc<Self>,
+        conn: Connection,
+        device: DeviceRecord,
+        revocations: broadcast::Receiver<DeviceId>,
+    ) {
         let Ok(live_guard) = self.live.register(device.id, conn.clone()) else {
             tracing::warn!(device = %short_id(&device.id), "too many live sessions; refusing");
             goodbye(
@@ -176,18 +188,30 @@ impl SessionManager {
             token: 0,
             revokes: VecDeque::new(),
         };
-        s.run().await;
+        s.run(revocations).await;
         s.cleanup().await;
         drop(live_guard);
     }
 
     /// Claims the desktop for `device` (see the module documentation).
     async fn claim(&self, conn: &Connection, device: &DeviceRecord, view: pb::ViewConfig) -> Claim {
-        if let Err(e) = self.supervisor.ensure_ready().await {
-            tracing::warn!(reason = %log_text(&e.0, 200), "the desktop is not ready");
-            return Claim::Unavailable;
+        match tokio::time::timeout(READY_TIMEOUT, self.supervisor.ensure_ready()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(reason = %log_text(&e.0, 200), "the desktop is not ready");
+                return Claim::Unavailable;
+            }
+            Err(_) => {
+                tracing::warn!("making the desktop ready took too long");
+                return Claim::Unavailable;
+            }
         }
         let mut active = self.active.lock().await;
+        // The device may have been revoked while the desktop was starting: look again, under
+        // the lock, right before anything is displaced or attached.
+        if conn.close_info().is_some() || !self.devices.is_active(&device.id) {
+            return Claim::Revoked;
+        }
         // A stale entry (its connection already closed) is not an active client.
         if active
             .as_ref()
@@ -241,6 +265,9 @@ impl SessionManager {
         };
         match self.link.attach(request).await {
             Ok(client) => {
+                // Whatever the link does with a handle after it is detached, the gateway's
+                // wrapper ignores it.
+                let client: Arc<dyn LinkClient> = GuardedClient::new(client);
                 let token = self.next_token.fetch_add(1, Ordering::Relaxed);
                 *active = Some(Active {
                     token,
@@ -346,8 +373,7 @@ struct Session {
 }
 
 impl Session {
-    async fn run(&mut self) {
-        let mut revocations = self.mgr.auth.subscribe_revocations();
+    async fn run(&mut self, mut revocations: broadcast::Receiver<DeviceId>) {
         let mut notices = self.mgr.devices.subscribe();
         let mut tick = tokio::time::interval(self.mgr.settings.watch_interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -510,6 +536,7 @@ impl Session {
                 goodbye(&self.conn, CloseCode::Busy, why, "busy").await;
                 Flow::End(None)
             }
+            Claim::Revoked => Flow::End(Some((CloseCode::Unauthorized, "device revoked"))),
             Claim::Unavailable => {
                 goodbye(
                     &self.conn,

@@ -397,6 +397,8 @@ async fn session(sh: &Shared, pending: PendingSession) {
     if !sh.verifiers.has_pin() {
         return refuse(pending).await;
     }
+    // Subscribed before the login runs, so a revocation during it is never missed.
+    let revocations = sh.auth.subscribe_revocations();
     let caps = capabilities_with_file_limit(&OFFERED_CODECS, sh.features, sh.config.max_file_bytes);
     let conn = match pending
         .accept(ServerHello {
@@ -425,7 +427,7 @@ async fn session(sh: &Shared, pending: PendingSession) {
         }
     };
     tracing::info!(device = %device.id, "session authorized");
-    sh.sessions.serve(conn, device).await;
+    sh.sessions.serve(conn, device, revocations).await;
 }
 
 /// Loads the identity key from a credential file: 32 raw bytes, or 64 hex characters.

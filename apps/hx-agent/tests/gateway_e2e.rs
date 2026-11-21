@@ -1032,3 +1032,45 @@ async fn a_device_cannot_revoke_down_to_zero_active_devices() {
         .await;
     assert_eq!(s, pb::RevokeStatus::LastActiveDevice);
 }
+
+/// F3: a device revoked while its claim is waiting for the desktop to start is closed at once
+/// (not when the claim finishes) and is never attached.
+#[tokio::test]
+async fn a_revocation_during_a_slow_claim_closes_the_session_at_once_and_attaches_nothing() {
+    let env = Env::start().await;
+    env.privd.with(|s| {
+        s.desktop_state = hx_ipc::privd::pb::DesktopState::Stopped as i32;
+        s.start_delay_ms = 3000;
+    });
+    let a = new_key();
+    env.pair(&a, "alice").await;
+    env.set_pin(PIN).await;
+    let ca = env.login(&a, "alice", PIN).await;
+    ca.send_control(&view_config()).await.unwrap();
+    // The claim is now waiting in StartDesktop (3 s). Revoke the device.
+    assert!(
+        env.privd
+            .wait_for(|s| s.commands.iter().any(|c| c == "StartDesktop"))
+            .await
+    );
+    let started = std::time::Instant::now();
+    env.gw
+        .devices()
+        .revoke_by_operator(Env::id_of(&a))
+        .await
+        .unwrap();
+    assert_eq!(closed_with(&ca).await.code, CloseCode::Unauthorized);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "closed in {:?}",
+        started.elapsed()
+    );
+    // Let the slow StartDesktop finish: the claim must find the device revoked.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        env.link.log().is_empty(),
+        "nothing was attached: {:?}",
+        env.link.log()
+    );
+    assert!(!env.gw.sessions().has_active_client().await);
+}

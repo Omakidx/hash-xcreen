@@ -164,6 +164,22 @@ impl DeviceService {
             return;
         }
         self.audit(AuditEvent::DeviceRevoked, id, &rec.name);
+        // Close the device's live sessions from here, not only from their own loops: a loop
+        // that is busy (claiming the desktop, waiting on privd) would notice much later. A
+        // self-revoke is left a moment so that its answer is delivered first.
+        let live = self.live.clone();
+        let self_revoke = by == Some(id);
+        tokio::spawn(async move {
+            if self_revoke {
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            }
+            live.close_device(
+                &id,
+                hx_proto::channel::CloseCode::Unauthorized,
+                "device revoked",
+            )
+            .await;
+        });
         let _ = self.tx.send(Arc::new(DeviceNotice {
             kind: pb::DeviceEventKind::Revoked,
             device: device_info(&rec, false),
