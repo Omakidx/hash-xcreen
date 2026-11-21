@@ -5,7 +5,7 @@
 mod install_engine_common;
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use hx_agent::install::error::InstallError;
 use hx_agent::install::paths;
@@ -19,10 +19,15 @@ use install_engine_common::*;
 #[derive(Default)]
 struct FakeCleaner {
     calls: Vec<(String, u32, u32)>,
+    /// The release directory (`/usr/lib/hx` of the test root) that holds the running agent.
+    agent_dir: PathBuf,
+    /// Whether `agent_dir` still existed at each call: the real cleaner execs the agent binary.
+    agent_dir_existed: Vec<bool>,
 }
 
 impl Cleaner for FakeCleaner {
     fn empty_as_owner(&mut self, dir: &Path, uid: u32, gid: u32) -> io::Result<()> {
+        self.agent_dir_existed.push(self.agent_dir.exists());
         self.calls
             .push((dir.to_string_lossy().into_owned(), uid, gid));
         empty_dir_beneath(dir)
@@ -52,7 +57,10 @@ fn uninstall(
     keep: bool,
     euid: u32,
 ) -> (Result<Report, UninstallError>, FakeCleaner, String) {
-    let mut cleaner = FakeCleaner::default();
+    let mut cleaner = FakeCleaner {
+        agent_dir: m.paths.at("/usr/lib/hx"),
+        ..FakeCleaner::default()
+    };
     let mut said = String::new();
     let mut progress = |_: &hx_agent::cli::privd::ProgressLine| {};
     let r = {
@@ -144,6 +152,23 @@ fn destroy_removes_everything_in_order() {
     // gatewayd's state is emptied by the child that runs as its user (rule 15).
     assert_eq!(cleaner.calls.len(), 1);
     assert_eq!((cleaner.calls[0].1, cleaner.calls[0].2), (998, 998));
+}
+
+/// Found by the nested-Incus installer run: the real cleaner runs `current_exe() __empty-dir`
+/// as gatewayd's user, but U5 had already removed `/usr/lib/hx`, so the binary was gone and
+/// `hx-agent uninstall` failed with "cannot empty gatewayd's state as its user: No such file".
+#[test]
+fn gatewayds_state_is_emptied_while_the_agent_binary_still_exists() {
+    let mut m = installed();
+    let (r, cleaner, _) = uninstall(&mut m, false, 0);
+    ok(r);
+    assert_eq!(cleaner.calls.len(), 1);
+    assert_eq!(
+        cleaner.agent_dir_existed,
+        [true],
+        "the release directory with the running agent must still exist when the child is started"
+    );
+    assert!(!exists(&m, "/usr/lib/hx"), "and it is removed afterwards");
 }
 
 #[test]

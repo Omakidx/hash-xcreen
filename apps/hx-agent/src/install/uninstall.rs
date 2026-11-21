@@ -263,6 +263,42 @@ fn remove_path(p: &Path) -> io::Result<()> {
 
 fn u5_files(d: &mut UninstallDeps<'_>, keep: bool, installed: Option<&InstallState>) -> Result<()> {
     let p = d.paths.clone();
+    // gatewayd's state comes FIRST: the cleaner runs this very binary again, as gatewayd's user
+    // (`current_exe() __empty-dir`), and the binary lives in /usr/lib/hx, which is removed below.
+    // Found by the nested-Incus installer run: with this step last, the child could not start
+    // ("cannot empty gatewayd's state as its user: No such file or directory").
+    // gatewayd's state, as that user (rule 15).
+    let state_dir = p.at(paths::GATEWAYD_STATE);
+    if std::fs::symlink_metadata(&state_dir).is_ok() {
+        match gateway_ids(&p) {
+            Some((uid, gid)) => {
+                d.cleaner
+                    .empty_as_owner(&state_dir, uid, gid)
+                    .map_err(|e| {
+                        InstallError::tool(format!(
+                            "cannot empty gatewayd's state as its user: {e}"
+                        ))
+                    })?;
+            }
+            None => {
+                return Err(InstallError::tool(
+                    "the hx-gatewayd user is gone but its state directory remains; refusing to walk it as root",
+                ));
+            }
+        }
+        let parent = state_dir.parent().unwrap_or(Path::new("/"));
+        let pfd = rustix::fs::open(
+            parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| InstallError::tool(format!("cannot open {}: {e}", parent.display())))?;
+        let name = state_dir.file_name().unwrap_or_default();
+        rustix::fs::unlinkat(&pfd, name, AtFlags::REMOVEDIR).map_err(|e| {
+            InstallError::tool(format!("cannot remove gatewayd's state directory: {e}"))
+        })?;
+    }
+
     // The files the installer recorded.
     if let Some(st) = installed {
         for f in st.created.files.iter().chain(st.created.dropins.iter()) {
@@ -328,37 +364,6 @@ fn u5_files(d: &mut UninstallDeps<'_>, keep: bool, installed: Option<&InstallSta
         }
     } else {
         remove_path(&etc)?;
-    }
-    // gatewayd's state, as that user (rule 15).
-    let state_dir = p.at(paths::GATEWAYD_STATE);
-    if std::fs::symlink_metadata(&state_dir).is_ok() {
-        match gateway_ids(&p) {
-            Some((uid, gid)) => {
-                d.cleaner
-                    .empty_as_owner(&state_dir, uid, gid)
-                    .map_err(|e| {
-                        InstallError::tool(format!(
-                            "cannot empty gatewayd's state as its user: {e}"
-                        ))
-                    })?;
-            }
-            None => {
-                return Err(InstallError::tool(
-                    "the hx-gatewayd user is gone but its state directory remains; refusing to walk it as root",
-                ));
-            }
-        }
-        let parent = state_dir.parent().unwrap_or(Path::new("/"));
-        let pfd = rustix::fs::open(
-            parent,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|e| InstallError::tool(format!("cannot open {}: {e}", parent.display())))?;
-        let name = state_dir.file_name().unwrap_or_default();
-        rustix::fs::unlinkat(&pfd, name, AtFlags::REMOVEDIR).map_err(|e| {
-            InstallError::tool(format!("cannot remove gatewayd's state directory: {e}"))
-        })?;
     }
     Ok(())
 }

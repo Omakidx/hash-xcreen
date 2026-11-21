@@ -48,9 +48,11 @@ canary-check)
     ;;
 
 units)
-    for u in hx-privd.socket hx-gatewayd-admin.socket hx-gatewayd-public.socket incus.socket hx-host-firewall.service; do
+    for u in hx-privd.socket hx-gatewayd-admin.socket hx-gatewayd-public.socket incus.socket; do
         [ "$(systemctl is-active "$u")" = active ] || fail "$u is not active"
     done
+    # hx-host-firewall.service only reloads the ruleset at boot (privd loaded it for this boot).
+    [ "$(systemctl is-enabled hx-host-firewall.service)" = enabled ] || fail "hx-host-firewall.service is not enabled"
     ss -H -ltnu | grep -q ':443 ' || fail "nothing listens on 443"
     [ "$(ss -H -ltnu | grep -c ':443 ')" -ge 2 ] || fail "443 must listen for tcp and udp"
     out=$(systemd-analyze verify /usr/local/lib/systemd/system/hx-privd.service /usr/local/lib/systemd/system/hx-privd.socket \
@@ -136,7 +138,8 @@ reboot-check)
     # design: table inet hx exists before incus.service starts, so no desktop runs unfiltered
     fw=$(systemctl show hx-host-firewall.service -p ActiveEnterTimestampMonotonic --value)
     ic=$(systemctl show incus.service -p ActiveEnterTimestampMonotonic --value)
-    [ "${fw:-0}" -gt 0 ] || fail "hx-host-firewall.service did not run"
+    [ "$(systemctl is-active hx-host-firewall.service)" = active ] || fail "hx-host-firewall.service did not run at boot"
+    [ "${fw:-0}" -gt 0 ] || fail "hx-host-firewall.service has no start time"
     [ "${ic:-0}" -eq 0 ] || [ "$fw" -le "$ic" ] || fail "incus.service ($ic) started before the firewall ($fw)"
     i=0
     while [ $i -lt 60 ]; do

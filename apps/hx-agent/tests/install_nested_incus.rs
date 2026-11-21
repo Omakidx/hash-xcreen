@@ -139,6 +139,37 @@ impl Secrets {
         }
     }
 
+    /// Development only (HX1E_KEEP=1 writes, HX1E_REUSE=1 reads): a kept L1 container has the
+    /// secrets of the run that made it, and an attached run needs the same ones. The file is in
+    /// the git-ignored target directory, mode 0600, and holds throwaway test values.
+    fn for_run(keep: bool, reuse: bool) -> Self {
+        let path = install_harness::work_dir().join("kept-secrets");
+        if reuse {
+            let t =
+                std::fs::read_to_string(&path).expect("kept-secrets (run with HX1E_KEEP=1 first)");
+            let mut l = t.lines();
+            return Self {
+                password: l.next().expect("password").to_owned(),
+                pin: l.next().expect("pin").to_owned(),
+                token: l.next().expect("token").to_owned(),
+            };
+        }
+        let s = Self::new();
+        if keep {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .mode(0o600)
+                .open(&path)
+                .expect("kept-secrets");
+            writeln!(f, "{}\n{}\n{}", s.password, s.pin, s.token).expect("write");
+        }
+        s
+    }
+
     fn frames(&self) -> Vec<u8> {
         frames::stream(&self.password, &self.pin, Some(&self.token), None)
     }
@@ -188,9 +219,13 @@ fn the_real_installer_runs_end_to_end_in_a_nested_incus_container() {
             })
             .collect();
 
-    // Leftovers of an earlier run first, then the objects that must not change.
-    let left = inc::cleanup();
-    assert!(left.is_empty(), "cannot clean old hx1e- objects: {left:?}");
+    // Leftovers of an earlier run first, then the objects that must not change. (HX1E_REUSE=1
+    // is a development switch: it attaches to the L1 container a HX1E_KEEP=1 run left behind.)
+    let reuse = env_on("HX1E_REUSE");
+    if !reuse {
+        let left = inc::cleanup();
+        assert!(left.is_empty(), "cannot clean old hx1e- objects: {left:?}");
+    }
     let defaults_before = inc::default_objects();
 
     let art = install_harness::build_artifacts();
@@ -207,7 +242,9 @@ fn the_real_installer_runs_end_to_end_in_a_nested_incus_container() {
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut world = world;
-        inc::create_host_objects();
+        if !reuse {
+            inc::create_host_objects();
+        }
         let (port, _proxy) = world.rt.block_on(e2e_common::start_proxy(IpAddr::V4(
             inc::BRIDGE_ADDR.parse::<Ipv4Addr>().unwrap(),
         )));
@@ -337,75 +374,88 @@ fn run_distro(w: &World, d: &Distro) {
     let t_all = Instant::now();
     let id = d.id;
 
+    let reuse = env_on("HX1E_REUSE");
+    let keep = env_on("HX1E_KEEP");
     // ---- launch L1 ----
-    inc::configure_profile(d.apparmor_signal);
-    inc::incus_ok(&[
-        "launch",
-        d.image,
-        d.name,
-        "--no-profiles",
-        "--profile",
-        inc::PROFILE,
-    ]);
+    if !reuse {
+        inc::configure_profile(d.apparmor_signal);
+        inc::incus_ok(&[
+            "launch",
+            d.image,
+            d.name,
+            "--no-profiles",
+            "--profile",
+            inc::PROFILE,
+        ]);
+    }
     let ip = wait_ready(d);
     let l1 = L1 {
         w,
         d,
-        secrets: Secrets::new(),
+        secrets: Secrets::for_run(keep, reuse),
         ip,
     };
-    let cfg = inc::incus_ok(&["config", "show", d.name, "--expanded"]);
-    for bad in ["security.privileged: \"true\"", "raw.lxc"] {
-        assert!(
-            !cfg.contains(bad),
-            "L1 must not be privileged or use raw.lxc: {cfg}"
+    let timings = if reuse {
+        // Attach: the sampler of the canary starts again; the install is already done.
+        l1.exec_ok(&format!(
+            "systemctl stop hx1e-canary.service 2>/dev/null; : > {HITS}; systemd-run --unit=hx1e-canary --collect -q sh -c 'while :; do grep -l -a -F -f {PAT} /proc/[0-9]*/cmdline /proc/[0-9]*/environ 2>/dev/null; sleep 0.05; done >> {HITS}'"
+        ));
+        dropins(&l1);
+        Vec::new()
+    } else {
+        let cfg = inc::incus_ok(&["config", "show", d.name, "--expanded"]);
+        for bad in ["security.privileged: \"true\"", "raw.lxc"] {
+            assert!(
+                !cfg.contains(bad),
+                "L1 must not be privileged or use raw.lxc: {cfg}"
+            );
+        }
+        for want in [
+            "security.nesting: \"true\"",
+            "security.idmap.isolated: \"true\"",
+            "limits.kernel.memlock: unlimited",
+        ] {
+            assert!(cfg.contains(want), "{want} missing: {cfg}");
+        }
+        pass(
+            id,
+            "L1 launched",
+            format!(
+                "{} at {} ({}), unprivileged, nesting, isolated idmap",
+                d.name, l1.ip, d.image
+            ),
         );
-    }
-    for want in [
-        "security.nesting: \"true\"",
-        "security.idmap.isolated: \"true\"",
-        "limits.kernel.memlock: unlimited",
-    ] {
-        assert!(cfg.contains(want), "{want} missing: {cfg}");
-    }
-    pass(
-        id,
-        "L1 launched",
-        format!(
-            "{} at {} ({}), unprivileged, nesting, isolated idmap",
-            d.name, l1.ip, d.image
-        ),
-    );
 
-    prelude(&l1);
-    pass(
-        id,
-        "L1 prelude",
-        "apt proxy, curl/openssl/acl, systemd-creds host secret, unit drop-ins (deviations 4, 5, 8)",
-    );
+        prelude(&l1);
+        pass(
+            id,
+            "L1 prelude",
+            "apt proxy, curl/openssl/acl, systemd-creds host secret, unit drop-ins (deviations 4, 5, 8)",
+        );
 
-    // The canary: patterns for the secrets, and a sampler that records any process whose
-    // command line or environment holds one, for the whole run.
-    inc::push_bytes(d.name, l1.secrets.patterns().as_bytes(), PAT, "0600");
-    l1.exec_ok(&format!(
-        ": > {HITS}; systemd-run --unit=hx1e-canary --collect -q sh -c 'while :; do grep -l -a -F -f {PAT} /proc/[0-9]*/cmdline /proc/[0-9]*/environ 2>/dev/null; sleep 0.05; done >> {HITS}'"
-    ));
+        // The canary: patterns for the secrets, and a sampler that records any process whose
+        // command line or environment holds one, for the whole run.
+        inc::push_bytes(d.name, l1.secrets.patterns().as_bytes(), PAT, "0600");
+        l1.exec_ok(&format!(
+            ": > {HITS}; systemd-run --unit=hx1e-canary --collect -q sh -c 'while :; do grep -l -a -F -f {PAT} /proc/[0-9]*/cmdline /proc/[0-9]*/environ 2>/dev/null; sleep 0.05; done >> {HITS}'"
+        ));
 
-    push_release(&l1);
-    pass(
-        id,
-        "release pushed",
-        format!(
-            "{} files, root-owned, in {REL}",
-            l1.exec_ok(&format!("ls {REL} | wc -l")).trim()
-        ),
-    );
+        push_release(&l1);
+        pass(
+            id,
+            "release pushed",
+            format!(
+                "{} files, root-owned, in {REL}",
+                l1.exec_ok(&format!("ls {REL} | wc -l")).trim()
+            ),
+        );
 
-    // ---- clean-host refusals (nothing may change) ----
-    refusals(&l1);
+        // ---- clean-host refusals (nothing may change) ----
+        refusals(&l1);
 
-    // ---- the resume chain: fail after every stage, then resume ----
-    let timings = resume_chain(&l1);
+        // ---- the resume chain: fail after every stage, then resume ----
+        resume_chain(&l1)
+    };
 
     // ---- the finished install ----
     let fin = l1.install(443, &[]);
@@ -502,10 +552,14 @@ fn wait_ready(d: &Distro) -> String {
     let end = Instant::now() + Duration::from_secs(120);
     loop {
         let o = inc::incus(&["list", d.name, "-c", "4", "--format", "csv"]);
+        // One address per line, quoted when there are several ("10.77.0.9 (eth0)" and, once the
+        // inner Incus runs, "10.x.y.1 (hxbr0)"): take the one of eth0.
         let ip = o
             .stdout
-            .split_whitespace()
-            .next()
+            .lines()
+            .map(|l| l.trim().trim_matches('"'))
+            .find(|l| l.ends_with("(eth0)"))
+            .and_then(|l| l.split_whitespace().next())
             .unwrap_or_default()
             .to_owned();
         if ip.parse::<Ipv4Addr>().is_ok() {
@@ -684,7 +738,10 @@ fn resume_chain(l1: &L1) -> Vec<(String, u64)> {
         // was converged, and nothing after it started.
         for s in &seen {
             let st = out.state_of(s).unwrap_or_default();
-            assert!(st == "skip" || st == "done", "{s} after {stage}: {st}");
+            assert!(
+                matches!(st.as_str(), "skip" | "done" | "deferred"),
+                "{s} after {stage}: {st}"
+            );
         }
         let after: Vec<String> = out
             .stages()
@@ -699,16 +756,19 @@ fn resume_chain(l1: &L1) -> Vec<(String, u64)> {
         let ms = out.ms_of(stage).unwrap_or(0);
         timings.push((stage.to_owned(), ms));
         let st = l1.state();
-        assert_eq!(
-            st["stages"][stage]["state"], "done",
-            "{stage} recorded: {st}"
-        );
+        // `backup` is recorded as deferred (Phase 2: SetBackupSchedule is UNIMPLEMENTED).
+        let want = if stage == "backup" {
+            "deferred"
+        } else {
+            "done"
+        };
+        assert_eq!(st["stages"][stage]["state"], want, "{stage} recorded: {st}");
         assert_eq!(st["complete"], false);
         seen.push(stage);
         pass(
             id,
             &format!("resume: stop after {stage}"),
-            format!("exit 1 TEST_HOOK, recorded done, {ms} ms; the next run resumes"),
+            format!("exit 1 TEST_HOOK, recorded {want}, {ms} ms; the next run resumes"),
         );
     }
     timings
@@ -794,8 +854,14 @@ fn desktop_run_with_lock_race(l1: &L1) -> RunOut {
 
 fn units_and_credentials(l1: &L1, server_hex: &str) {
     let id = l1.d.id;
-    let act = l1.exec_ok("systemctl is-active hx-privd.socket hx-gatewayd-admin.socket hx-gatewayd-public.socket incus.socket hx-host-firewall.service");
+    let act = l1.exec_ok("systemctl is-active hx-privd.socket hx-gatewayd-admin.socket hx-gatewayd-public.socket incus.socket");
     assert!(act.lines().all(|l| l == "active"), "units: {act}");
+    let fw = l1.exec_ok("systemctl is-enabled hx-host-firewall.service");
+    assert_eq!(
+        fw.trim(),
+        "enabled",
+        "hx-host-firewall.service must be enabled for the next boot"
+    );
     // The public socket is socket-activated: a connection starts gatewayd (checked below by the
     // client); here the sockets listen on 443 for both protocols.
     let ss = l1.exec_ok("ss -H -ltnu");
@@ -807,7 +873,7 @@ fn units_and_credentials(l1: &L1, server_hex: &str) {
     pass(
         id,
         "units active",
-        "hx-privd.socket, hx-gatewayd-{admin,public}.socket, incus.socket, hx-host-firewall.service; 443 tcp+udp listening",
+        "hx-privd.socket, hx-gatewayd-{admin,public}.socket, incus.socket (active) and hx-host-firewall.service (enabled; it only reloads the ruleset at boot, privd loaded it now); 443 tcp+udp listening",
     );
 
     let v = l1.exec("systemd-analyze verify /usr/local/lib/systemd/system/hx-privd.service /usr/local/lib/systemd/system/hx-privd.socket /usr/local/lib/systemd/system/hx-gatewayd.service /usr/local/lib/systemd/system/hx-gatewayd-admin.socket /usr/local/lib/systemd/system/hx-gatewayd-public.socket /usr/local/lib/systemd/system/hx-host-firewall.service /usr/local/lib/systemd/system/hx-privd-rescue.service 2>&1");
@@ -889,6 +955,16 @@ fn token_pair_and_login(
     ))
 }
 
+/// A fresh pairing code, made by the CLI on L1 (what the user would read out to the app).
+fn new_code(l1: &L1) -> String {
+    let code = l1.exec_ok(&format!(
+        "{AGENT} pairing code 2>&1 | grep -Eo '[0-9A-Z]{{4}}-[0-9A-Z]{{4}}' | head -1"
+    ));
+    let code = code.trim().to_owned();
+    assert_eq!(code.len(), 9, "pairing code: {code:?}");
+    code
+}
+
 /// Pairing with the app's token (the install's last frame) and the PIN login, over QUIC and over
 /// WebSocket, against `L1-IP:port`; then, if the desktop runs, the first frame.
 fn client_checks(l1: &L1, server: PublicKey, port: u16, first_pair: bool) {
@@ -924,11 +1000,7 @@ fn client_checks(l1: &L1, server: PublicKey, port: u16, first_pair: bool) {
         );
     }
     // WebSocket: pair with a fresh code created on L1 through the CLI, then log in with the PIN.
-    let code = l1.exec_ok(&format!(
-        "{AGENT} pairing code 2>&1 | grep -Eo '[0-9A-Z]{{4}}-[0-9A-Z]{{4}}' | head -1"
-    ));
-    let code = code.trim().to_owned();
-    assert_eq!(code.len(), 9, "pairing code: {code:?}");
+    let code = new_code(l1);
     let t0 = Instant::now();
     let _c = token_pair_and_login(
         l1,
@@ -1106,13 +1178,14 @@ fn port_change(l1: &L1, server: PublicKey) {
     let ss = l1.exec_ok("ss -H -ltnu");
     assert!(ss.contains("*:8443"), "{ss}");
     assert!(!ss.contains("*:443"), "443 must be closed: {ss}");
+    let code = new_code(l1);
     let _c = token_pair_and_login(
         l1,
         server,
         8443,
         TransportPreference::Quic,
-        "hx1e-quic",
-        None,
+        "hx1e-quic-8443",
+        Some(&code),
     );
     // 443 refuses TCP.
     assert!(
@@ -1129,13 +1202,14 @@ fn port_change(l1: &L1, server: PublicKey) {
     assert_eq!(back.exit, 0, "{:?}\n{}", back.lines.last(), back.stderr);
     let ss = l1.exec_ok("ss -H -ltnu");
     assert!(ss.contains("*:443") && !ss.contains("*:8443"), "{ss}");
+    let code = new_code(l1);
     let _c = token_pair_and_login(
         l1,
         server,
         443,
         TransportPreference::WebSocket,
-        "hx1e-ws",
-        None,
+        "hx1e-ws-back",
+        Some(&code),
     );
     pass(
         id,
@@ -1229,20 +1303,28 @@ fn restart(l1: &L1, server: PublicKey) {
     inc::incus_ok(&["restart", l1.d.name]);
     let _ = wait_ready(l1.d);
     let took = t0.elapsed().as_secs();
-    let act = l1.exec_ok("systemctl is-active hx-privd.socket hx-gatewayd-admin.socket hx-gatewayd-public.socket incus.socket hx-host-firewall.service");
+    let act = l1.exec_ok("systemctl is-active hx-privd.socket hx-gatewayd-admin.socket hx-gatewayd-public.socket incus.socket");
     assert!(act.lines().all(|l| l == "active"), "after restart: {act}");
+    // The boot-time oneshot ran: it is what loads `table inet hx` before Incus after a reboot.
+    let fw = l1.exec_ok("systemctl is-active hx-host-firewall.service");
+    assert_eq!(
+        fw.trim(),
+        "active",
+        "hx-host-firewall.service did not run at boot"
+    );
     let tables = l1.exec_ok("nft list tables");
     assert!(
         tables.contains("table inet hx"),
         "inet hx must be loaded again after a restart: {tables}"
     );
+    let code = new_code(l1);
     let _c = token_pair_and_login(
         l1,
         server,
         443,
         TransportPreference::Quic,
-        "hx1e-quic",
-        None,
+        "hx1e-quic-restart",
+        Some(&code),
     );
     let inner = l1.exec_ok("incus list -f csv -c ns");
     pass(
