@@ -101,6 +101,13 @@ The binary is not in the image: the `hx-session` package installs it at
 a test keeps the units in step). The same package ships `/usr/lib/hx-session/hx-pwcheck`, the
 current-password checker. `~/Received` links to `/var/lib/hx-session/received`.
 
+**FFmpeg runtime.** The package's `Depends` (computed by `dpkg-shlibdeps`) names the distro's
+`libavcodecNN` and `libavutilNN`, and privd installs it with `dpkg -i`, which resolves no
+dependencies. The recipe therefore installs those two packages itself, through the per-distro
+vars `libavcodec_pkg` and `libavutil_pkg` of `fragments/distro-<distro>.toml` (referenced from the
+package list of `fragments/xfce-desktop.toml`). `packaging/hx-session/check-recipe-covers-depends.sh`
+fails when a built `.deb` depends on a library the recipe does not install.
+
 ## Adding a recipe
 
 1. New distro: add `fragments/distro-<name>.toml` with `base_image` and the vars, and one recipe

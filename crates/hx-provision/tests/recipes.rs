@@ -132,6 +132,35 @@ fn every_shipped_recipe_resolves() {
     assert_eq!(n, 16);
 }
 
+/// The hx-session .deb depends on the distro's libavcodec and libavutil sonames, and privd's
+/// InstallSession runs `dpkg -i`, which resolves nothing: every recipe must install exactly them.
+/// Sources (checked 2026-11-21): packages.ubuntu.com (resolute: 7:8.0.1-3ubuntu2),
+/// packages.debian.org (bookworm 7:5.1.9-0+deb12u1, trixie 7:7.1.5-0+deb13u1), and the spike
+/// 1c-e2e for noble (FFmpeg 6.1).
+#[test]
+fn every_recipe_installs_the_ffmpeg_runtime_the_session_package_needs() {
+    for (distro, avcodec, avutil) in [
+        (Distro::Ubuntu2404, "libavcodec60", "libavutil58"),
+        (Distro::Ubuntu2604, "libavcodec62", "libavutil60"),
+        (Distro::Debian12, "libavcodec59", "libavutil57"),
+        (Distro::Debian13, "libavcodec61", "libavutil59"),
+    ] {
+        for preset in [Preset::Basic, Preset::Developer] {
+            let m = plan(id(distro, preset), &[]).manifest();
+            for want in [avcodec, avutil] {
+                assert!(
+                    m.packages.contains(&want.to_string()),
+                    "{distro:?} {preset:?} does not install {want}"
+                );
+            }
+            assert!(
+                !m.packages.iter().any(|p| p.contains("{{")),
+                "unexpanded variable in the package list"
+            );
+        }
+    }
+}
+
 #[test]
 fn distro_specifics() {
     let m = |d| plan(id(d, Preset::Basic), &[]).manifest();
