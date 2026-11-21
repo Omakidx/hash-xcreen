@@ -1,6 +1,6 @@
-# Wire protocol (version 1.0)
+# Wire protocol (version 1.1)
 
-The contract between hash-xcreen's session/agent side (the **server**) and its viewers (the **client**: desktop app now, browser and others later). The code in `crates/hx-proto` (messages, media header, versioning) and `crates/hx-transport` (QUIC and WebSocket transports) implements exactly what is written here. If the two disagree, that is a bug in one of them: fix it and update this file in the same branch.
+This document defines protocol 1.0 and its additive revision 1.1 (§4.5 lists exactly what 1.1 adds; everything tagged "1.1" is absent from a 1.0 peer). The contract between hash-xcreen's session/agent side (the **server**) and its viewers (the **client**: desktop app now, browser and others later). The code in `crates/hx-proto` (messages, media header, versioning) and `crates/hx-transport` (QUIC and WebSocket transports) implements exactly what is written here. If the two disagree, that is a bug in one of them: fix it and update this file in the same branch.
 
 Design background is in [architecture.md](architecture.md) §6–§8. Pairing and authentication (workstream 1B) are specified in §11.
 
@@ -60,7 +60,7 @@ Every QUIC stream and every datagram begins with a one-byte **channel id**. WebS
 
 | Id | Channel | Direction | QUIC transport | Priority | Messages |
 |---|---|---|---|---|---|
-| `0x01` | Control | both | One client-opened **bidirectional** stream, opened first | High (50) | `ControlMessage`, length-prefixed |
+| `0x01` | Control | both | One client-opened **bidirectional** stream, opened first | High (50) | `ControlMessage`, length-prefixed (includes the 1.1 `ServerStats`, §5.8, and the takeover `Goodbye`, §5.7) |
 | `0x02` | Input (keys, buttons, scroll) | client → server | One long-lived client-opened unidirectional stream | Highest (100) | `InputEvent`, length-prefixed |
 | `0x03` | Mouse motion | client → server | **Datagrams**, latest wins | Highest (datagrams are sent ahead of stream data) | `MouseMove` datagram (§7.1) |
 | `0x04` | Cursor | server → client | One long-lived server-opened unidirectional stream | High (50) | `CursorEvent`, length-prefixed |
@@ -94,6 +94,9 @@ Rules:
 | `TransferHeader` encoded | 4096 |
 | File name in `TransferHeader` | 255 bytes; also rejected: `/`, `\`, `:`, C0/C1/DEL control characters, bidi controls (U+202A–202E, U+2066–2069, U+200E/F, U+061C), `.` and `..`, a trailing `.` or space, and the Windows device names CON, PRN, AUX, NUL, CONIN$, CONOUT$, COM1–9, LPT1–9 and the superscript forms COM¹²³, LPT¹²³ (with or without extension); also zero-width/invisible characters (U+200B–200D, U+2060, U+FEFF, U+180E) |
 | Clipboard transfer total | 67108864 (64 MiB) |
+| File transfer total | 4294967296 (4 GiB) ceiling and default, lowered by `max_file_bytes` (§5.6); applies to every version |
+| `Goodbye.peer_device_name` / `peer_device_id` (1.1) | 64 bytes (sanitised) / 0 or 16 bytes |
+| `ServerStats` rate (1.1) | at most 1 per second sent; a client may drop beyond 4 per second |
 | WebSocket transfer chunk | 65536 |
 | Queued, unread incoming transfer data (WebSocket) | 1 MiB per transfer and 4 MiB per connection; a transfer that exceeds either is aborted (`abort`, §9.4). On QUIC the same bound comes from stream and connection flow control (§1) |
 | Unread input messages queued (WebSocket) | 4096; a peer that outpaces the application beyond this is closed with `PROTOCOL_ERROR` (QUIC: per-stream flow control instead) |
@@ -109,7 +112,7 @@ A receiver that sees a value above its limit treats it as a protocol error (reli
 
 | Field | # | Type | Meaning |
 |---|---|---|---|
-| `version` | 1 | `Version` | Client protocol `major.minor` (this document: `1.0`) |
+| `version` | 1 | `Version` | Client protocol `major.minor` (this document: `1.1`; a client that implements only 1.0 sends `1.0`) |
 | `capabilities` | 2 | `Capabilities` | What the client can decode and do |
 | `intent` | 3 | `Intent` | `INTENT_SESSION` (1) normal session, `INTENT_PAIR` (2) pairing, §11. `INTENT_UNSPECIFIED` (0) is invalid |
 | `software` | 4 | string | e.g. `hx-desktop 0.1.0`, informational, at most 128 bytes |
@@ -134,15 +137,15 @@ A receiver that sees a value above its limit treats it as a protocol error (reli
 
 `Version`: `major` (1, uint32), `minor` (2, uint32).
 
-`Capabilities`: `video_codecs` (1, repeated `VideoCodec`, packed), `features` (2, uint64 bitmask, §4.3).
+`Capabilities`: `video_codecs` (1, repeated `VideoCodec`, packed), `features` (2, uint64 bitmask, §4.3), `max_file_bytes` (3, uint64, **1.1**: the largest file transfer this side accepts, §5.6; 0 = not stated, otherwise 1 to 4294967296 (4 GiB); a larger value is invalid).
 
 `VideoCodec`: `UNSPECIFIED` 0 (invalid), `H264` 1, `AV1` 2, `H265` 3 (reserved; not produced in v1). The number is also the codec byte in the media header (§6).
 
 ### 4.2 Version rules
 
-- The version is `major.minor`; this document defines `1.0`.
+- The version is `major.minor`; this document defines `1.0` and `1.1`.
 - **Different major** (the `Hello` major differs from the ALPN/path major or from the server's): the server answers `Refuse{reason: UPDATE_REQUIRED, version: <server version>}` and closes with `UPDATE_REQUIRED` (§8). The client shows an "update required" message. No other message is processed. The `Hello` of a different major is parsed only as far as `version` (field 1); every other field of it is ignored.
-- **Same major, different minor**: accepted. The negotiated minor is `min(client.minor, server.minor)`. Both sides then use only features available at the negotiated minor and present in both capability sets (§4.3). Unknown protobuf fields are ignored (standard protobuf behaviour), so a newer minor can add fields and messages that an older peer skips; a newer minor MUST NOT send a new message type on a channel to a peer whose negotiated minor predates it.
+- **Same major, different minor**: accepted. The negotiated minor is `min(client.minor, server.minor)`. Both sides then use only features available at the negotiated minor and present in both capability sets (§4.3). Unknown protobuf fields are ignored (standard protobuf behaviour), so a newer minor can add fields and messages that an older peer skips; a newer minor MUST NOT send a new message type on a channel to a peer whose negotiated minor predates it (a `ControlMessage` whose only variant is unknown to the receiver has no variant set and is malformed, so a new control variant is never safe to send to an older peer).
 - Security properties (authentication, authorization, size limits, the restricted state) are never gated by a minor version or a feature bit: every peer enforces them regardless of what was negotiated.
 - A change that an older peer cannot safely ignore (removed field, changed meaning, changed byte layout) requires a new major.
 - The agent supports the current major and the previous one, by serving both ALPN values. The web client always matches its agent.
@@ -151,13 +154,14 @@ A receiver that sees a value above its limit treats it as a protocol error (reli
 
 Capabilities advertised in `HelloAck` are an *offer*: negotiated features take effect only when the server authorizes the connection (§2.1). For an `INTENT_PAIR` hello the server advertises no features and no codecs, so a pairing connection can never carry anything but control messages.
 
-`features` is a bitmask. Both sides compute `negotiated = client.features & server.features & mask(negotiated_minor)` and `codecs = client.video_codecs ∩ server.video_codecs`, in the server's order of preference. Bits unknown to a side are ignored by that side.
+`features` is a bitmask. Both sides compute `negotiated = client.features & server.features & mask(negotiated_minor)` (bits 0 to 2 exist from 1.0, bit 3 from 1.1) and `codecs = client.video_codecs ∩ server.video_codecs`, in the server's order of preference. Bits unknown to a side are ignored by that side.
 
 | Bit | Name | Introduced | Enables |
 |---|---|---|---|
 | 0 | `AUDIO` | 1.0 | Audio channel `0x06` |
 | 1 | `CLIPBOARD` | 1.0 | Clipboard channel `0x07` |
 | 2 | `FILE_TRANSFER` | 1.0 | Files channel `0x08` |
+| 3 | `SERVER_STATS` | 1.1 | `ServerStats` control messages (§5.8), sent only while the client has asked for them (`ViewConfig.stats_enabled`) |
 
 An empty `codecs` intersection is not a handshake error; the server then answers `StreamInfo` only after a `ViewConfig` with a codec that is in the intersection, and rejects other codecs with `Goodbye` (code `PROTOCOL_ERROR`). Video, cursor, input, mouse and control are always available (not feature-gated).
 
@@ -166,6 +170,16 @@ An empty `codecs` intersection is not a handshake error; the server then answers
 - The first message on the control channel MUST be `Hello`; anything else is `PROTOCOL_ERROR`. A second `Hello`, or a `HelloAck`/`Refuse` from a client, is `PROTOCOL_ERROR`.
 - No `Hello` within 10 s of transport accept: close with `HELLO_TIMEOUT`.
 - The server decides acceptance after the version check (e.g. authorisation from the TLS identity, intent, capacity): it answers `HelloAck` or `Refuse` with reason `UNAUTHORIZED`, `BUSY` or `PAIRING_CLOSED`, then closes with the matching code (§8).
+
+### 4.5 What 1.1 adds
+
+Decision: **a minor bump to 1.1, not an unversioned addition to 1.0.** Three of the four additions are skippable by a 1.0 peer (new fields on `Goodbye`, `Capabilities` and `ViewConfig`; a new close code, which a 1.0 peer reads as `INTERNAL_ERROR`, §8), but the fourth, the `ServerStats` control variant, is not: a 1.0 receiver decodes it as a `ControlMessage` with no variant and closes with `PROTOCOL_ERROR`. §4.2 therefore requires it to be gated by the negotiated minor, and the feature bit `SERVER_STATS` makes the client's consent explicit. Nothing in 1.0 changes meaning, so there is no new major and the ALPN stays `hx/1`.
+
+| Addition | Where | Gated by |
+|---|---|---|
+| `TAKEN_OVER` close code (9) and `Goodbye.peer_device_name` / `peer_device_id` | §5.2, §5.7, §8 | Negotiated minor at least 1; for minor 0 the server uses `BUSY` instead (§5.7) |
+| `ServerStats` (`ControlMessage.server_stats` = 11), `ViewConfig.stats_enabled` (9) | §5.2, §5.8 | Negotiated feature `SERVER_STATS` |
+| `Capabilities.max_file_bytes` (3) | §4.1, §5.6 | Minor at least 1 for the advertisement; the 4 GiB ceiling itself applies to every peer (§4.2: size limits are never gated) |
 
 ## 5. Messages
 
@@ -199,6 +213,7 @@ A `oneof` envelope. Exactly one variant MUST be set, else the message is invalid
 | `pong` | 8 | both | Echo of a `ping` |
 | `stats` | 9 | C → S | Client decode statistics |
 | `goodbye` | 10 | both | Orderly end, informational |
+| `server_stats` | 11 | S → C | **1.1.** Numeric statistics for the stats overlay, §5.8 |
 | `pairing` | 100 | both | **Owned by 1B.** Opaque pairing envelope, §11 |
 | `auth` | 101 | both | **Owned by 1B.** Opaque PIN/auth envelope, §11 |
 
@@ -214,6 +229,7 @@ A `oneof` envelope. Exactly one variant MUST be set, else the message is invalid
 | `scale_percent` | 6 | uint32 | HiDPI scale, 100 = 1×; 0 = 100; otherwise 50..=400 |
 | `audio_enabled` | 7 | bool | Send audio (requires negotiated `AUDIO`) |
 | `clipboard_enabled` | 8 | bool | Allow clipboard (requires negotiated `CLIPBOARD`) |
+| `stats_enabled` | 9 | bool | **1.1.** Send `ServerStats` (requires negotiated `SERVER_STATS`); false (the default) means none are sent, so a hidden overlay costs nothing |
 
 `StreamInfo` (S → C; sent after the first `ViewConfig` and whenever format changes, e.g. resize):
 
@@ -233,7 +249,7 @@ Video colour is always BT.709, limited range (also tagged in the bitstream VUI; 
 
 `ClientStats` (C → S, about once per second): `interval_ms` (1), `decoded_frames` (2), `dropped_frames` (3, stale or undecodable), `decode_p95_us` (4); all uint32, counts are for the interval.
 
-`Goodbye`: `code` (1, uint32, a close code from §8), `message` (2, string, at most 256 bytes).
+`Goodbye`: `code` (1, uint32, a close code from §8), `message` (2, string, at most 256 bytes), `peer_device_name` (3, string, **1.1**, at most 64 bytes) and `peer_device_id` (4, bytes, **1.1**, empty or exactly 16 bytes). Fields 3 and 4 are set only with code `TAKEN_OVER` (§5.7); a 1.0 peer ignores them.
 
 ### 5.3 Input channel: `InputEvent` (client → server)
 
@@ -266,6 +282,52 @@ Each transfer is its own unidirectional QUIC stream, opened by whichever side se
 The receiver enforces `size` (more or fewer bytes than announced is a protocol error for that stream, which is reset with `TRANSFER_ERROR`; the connection continues) and the clipboard limit of §3.1. A receiver MAY abort a transfer at any time with `STOP_SENDING` (`TRANSFER_REJECTED`). Progress is the bytes received so far over `size`. Transfers only occur if the matching feature was negotiated and the user has not disabled it (`clipboard_enabled`).
 
 On WebSocket the same content is carried in messages tagged with a transfer id (§9.4).
+
+### 5.6 Maximum file size (1.1)
+
+Every file transfer is bounded by one limit, in both directions, checked from the header alone (before a single body byte is read).
+
+- **Ceiling.** `MAX_FILE_SIZE` = 4294967296 bytes (4 GiB), also the default. Every implementation enforces it regardless of negotiation (a security property, §4.2): a file `TransferHeader` with `size` above it is refused. Clipboard transfers keep their own 64 MiB limit (§3.1).
+- **Configurable lower.** The server operator may lower the limit. The server advertises it in `HelloAck.capabilities.max_file_bytes`; a client MAY advertise its own lower receive limit in `Hello.capabilities.max_file_bytes`. `0` or an absent field means "not stated" (the ceiling). A value above the ceiling is invalid. The **effective limit** is the minimum of the ceiling and every stated value, computed identically by both sides (`hx_proto::version::negotiate` returns it as `Negotiated::max_file_bytes`); with a negotiated minor of 0 it is the ceiling. "No files at all" is expressed by not offering `FILE_TRANSFER`, not by a tiny value.
+- **Sender.** A sender MUST NOT open a file transfer whose size exceeds the effective limit, and tells its user why ("file too large, limit N") instead of sending.
+- **Receiver.** A receiver that reads a file header with `size` above the effective limit refuses the transfer: QUIC `STOP_SENDING` with `TRANSFER_REJECTED` (`0x101`), WebSocket `abort` (§9.4). The connection continues, nothing is written and no body byte is accepted. A body longer or shorter than the announced `size` remains `TRANSFER_ERROR` (§5.5). A header that is itself invalid is a protocol error as before.
+- A zero-byte file is allowed. `size` is the exact body length, so the check is `size <= limit`.
+- Gateways: the limit applies on both hops (gateway to client, and gateway to session, where it is the session link's `max_file_bytes`, ipc.md §16); the lower of the two configured values is the one advertised here.
+
+`hx_proto::message::TransferHeader::validate_file(limit)` implements the receiver check.
+
+### 5.7 Takeover notice (1.1)
+
+When a second authenticated client displaces the active one (ipc.md §18), the server tells the displaced client before closing:
+
+1. The server sends `Goodbye{code: TAKEN_OVER, message, peer_device_name, peer_device_id}` on the control channel, finishes the control stream, waits for it to be delivered (at most 1 s), then closes the connection with code `TAKEN_OVER` (QUIC application code 9; WebSocket close code 4009). The close reason is a fixed text (`taken over`) and never carries the name.
+2. `peer_device_name` is the **new device's name after sanitisation**: the `device_name` it paired with, with control characters (C0, C1, DEL), bidirectional controls and invisible characters (the sets rejected in file names, §3.1) removed, surrounding whitespace trimmed, and cut to at most 64 bytes on a character boundary. It may be empty. A receiver rejects a `Goodbye` whose name is longer than 64 bytes or still contains one of those characters (the same total-validation rule as every other message; the client then treats the close as a plain `TAKEN_OVER` without a name). `hx_proto::message::sanitize_device_name` is the reference implementation.
+3. `peer_device_id` is the new device's 16-byte device id (§11.1), or empty if the server will not say. The name is chosen by the other device and can imitate another ("My phone"), so the client MUST display it as plain text (no markup, no formatting) next to the first 8 hex digits of the id, and never use either for authorization.
+4. The displaced client's UI states that another device took over and offers **"Revoke that device"** (a stolen device that gets used is the likely reason to be displaced). The wire protocol adds no revoke message and no new authentication: the action uses the existing authenticated device-management path, that is the server's `RevokeDevice` (ipc.md §9; revocation closes that device's live sessions, §11.5), and `peer_device_id` is the identifier to hand to it. How a remote client reaches that path is outside this document (§13); a client that has none offers only the notice.
+5. To a peer whose negotiated minor is 0 the server cannot use the new code: it sends `Goodbye{code: BUSY, message: "another device took over this desktop"}` and closes with `BUSY`.
+6. A client that sees close code `TAKEN_OVER` MUST NOT reconnect automatically (it would displace the other device in turn); reconnecting is a user action.
+
+### 5.8 Server statistics (1.1)
+
+`ServerStats` is one control message (S → C, `ControlMessage.server_stats`, field 11) for the client's stats overlay. It carries **numbers only**: it has no string and no bytes field and none may be added, so nothing a session or the desktop produced can reach a client through it (ipc.md §19.1 rule 3). The server builds it from its own measurements; the gateway builds it from the session's `SessionStats` and its transport numbers.
+
+All fields are `uint32`; counts are for the interval, as for `ClientStats`.
+
+| Field | # | Meaning |
+|---|---|---|
+| `interval_ms` | 1 | Length of the interval, 1 to 60000 |
+| `frames` | 2 | Video frames sent |
+| `keyframes` | 3 | Of those, frames flagged `KEY` |
+| `dropped_frames` | 4 | Frames cancelled or skipped as stale (§6.2) |
+| `bitrate_kbps` | 5 | Measured video bitrate sent, kbit/s |
+| `target_bitrate_kbps` | 6 | Encoder target bitrate, kbit/s |
+| `fps_ceiling` | 7 | Current frame-rate ceiling, at most 240 |
+| `encode_p95_us` | 8 | 95th percentile encode time, microseconds |
+| `total_p95_us` | 9 | 95th percentile time from capture to the frame being handed to the transport, microseconds |
+| `queue_depth_max` | 10 | Largest number of frames queued for sending in the interval |
+| `rtt_us` | 11 | The server's smoothed transport round-trip time in microseconds; 0 if unknown |
+
+Rules: it is sent only after authorization, only if `SERVER_STATS` was negotiated, and only while the client's latest `ViewConfig` has `stats_enabled = true`; **at most once per second** per connection (nominal interval 1000 ms). A client MAY drop messages that arrive faster than 4 per second (counted, never a protocol error) and ignores one it did not ask for. A `ServerStats` from a client, or sent when not negotiated, is a protocol error (`PROTOCOL_ERROR`). Counters the server cannot measure are 0. The values are diagnostic only and never feed any trust decision.
 
 ## 6. Media (video) channel
 
@@ -356,8 +418,9 @@ Connection close (QUIC `CONNECTION_CLOSE` application error code; WebSocket clos
 | 6 | `PAIRING_CLOSED` | `INTENT_PAIR` while no pairing token is valid |
 | 7 | `SHUTDOWN` | Server is stopping |
 | 8 | `INTERNAL_ERROR` | Server fault |
+| 9 | `TAKEN_OVER` | **1.1.** Another device took over this desktop (§5.7). Sent only to a peer whose negotiated minor is at least 1; a 1.0 peer would read it as `INTERNAL_ERROR` |
 
-Unknown codes received are treated as `INTERNAL_ERROR`. The reason string of a close is for logs only (at most 128 bytes, never secrets).
+Unknown codes received are treated as `INTERNAL_ERROR` (so a 1.0 peer reads `TAKEN_OVER` that way). The reason string of a close is for logs only (at most 128 bytes, never secrets).
 
 Stream reset / stop codes (application error codes on a single stream; the connection continues):
 
@@ -365,7 +428,7 @@ Stream reset / stop codes (application error codes on a single stream; the conne
 |---|---|---|
 | `0x57A1E` | `STALE_FRAME` | Sender cancelled a video frame (§6.2) |
 | `0x100` | `TRANSFER_ERROR` | Transfer body did not match its header |
-| `0x101` | `TRANSFER_REJECTED` | Receiver refused a transfer (policy, size) |
+| `0x101` | `TRANSFER_REJECTED` | Receiver refused a transfer (policy; a file header above the effective limit, §5.6) |
 
 ## 9. WebSocket fallback
 
@@ -425,7 +488,11 @@ There are none on the wire. The sender SHOULD interleave: control, input, mouse 
 | Video frame not newer than `last_released` | Drop the frame, count it, continue |
 | Malformed or unknown datagram | Drop it, count it, continue |
 | Transfer body length mismatch | Reset that stream, continue |
-| Control message sent by the wrong role (`ViewConfig`, `RequestKeyframe`, `ClientStats` from the server; `StreamInfo` from the client) | Close, `PROTOCOL_ERROR` |
+| File header with `size` above the effective limit (§5.6) | `STOP_SENDING` `TRANSFER_REJECTED` (WebSocket: `abort`), continue |
+| `ServerStats` from a client, or without `SERVER_STATS` negotiated | Close, `PROTOCOL_ERROR` |
+| `Goodbye` with an over-long or unsanitised `peer_device_name`, or a `peer_device_id` of other than 0 or 16 bytes | Malformed (as any invalid message) |
+| Close `TAKEN_OVER` | End the session, show the notice (§5.7), do not reconnect automatically |
+| Control message sent by the wrong role (`ViewConfig`, `RequestKeyframe`, `ClientStats` from the server; `StreamInfo` and `ServerStats` from the client) | Close, `PROTOCOL_ERROR` |
 | `Hello`, `HelloAck` or `Refuse` after the handshake | Close, `PROTOCOL_ERROR` |
 | Different major in `Hello` | `Refuse(UPDATE_REQUIRED)`, close `UPDATE_REQUIRED` |
 | No `Hello` in 10 s | Close `HELLO_TIMEOUT` |
@@ -543,8 +610,10 @@ A TLS or certificate verification failure while connecting (QUIC TLS alert, reje
 
 - Phase 3 (WebTransport): the `h3` path currently holds its pre-authentication slot for the whole lifetime of the handler it dispatches to, not only until authorization. The Phase 3 handler must release or re-account the slot once the browser session is authorized, or long-lived WebTransport sessions would exhaust the pre-authentication limits.
 - Application-layer policy owned by 1B/1C: re-check pinned/revoked keys on every `PendingSession`, close live sessions on revocation, sanitize `Hello.software` and `Hello.device_name` before display or logging, clamp input coordinates in the injector, and treat transfer file names as hints.
+- `hx-transport` does not yet enforce the 1.1 rules for `ServerStats` (rejecting it from a client or when `SERVER_STATS` was not negotiated, §5.8) nor apply `Negotiated::max_file_bytes` to incoming file headers (§5.6); the gateway/transport round must add both, and until then the application layer does.
+- The wire protocol has no message for a client to revoke a device after a takeover (§5.7): the client reaches the existing device-management path (`RevokeDevice`), whose remote client-facing transport is not specified here.
 - Fuzz targets for 1H: `MediaHeader::decode`, `decode_datagram`, `message::decode::<ControlMessage | InputEvent | CursorEvent | TransferHeader>`, `message::decode_framed`, `version::peek_hello_version`, `file_name_problem`, and the WebSocket message router.
 
 ## 14. Schema location
 
-The protobuf schema is `crates/hx-proto/proto/hx.proto` (package `hx.v1`); field numbers there are the numbers in this document. The messages inside the `pairing` and `auth` envelopes (§11) are defined by `crates/hx-crypto/src/wire.rs`. Field numbers are never reused. Adding fields or messages is a minor-version change (§4.2).
+The protobuf schema is `crates/hx-proto/proto/hx.proto` (package `hx.v1`); field numbers there are the numbers in this document. The messages inside the `pairing` and `auth` envelopes (§11) are defined by `crates/hx-crypto/src/wire.rs`. Field numbers are never reused. Adding fields or messages is a minor-version change (§4.2); the 1.1 additions are listed in §4.5.

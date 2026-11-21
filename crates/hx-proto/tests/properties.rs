@@ -3,12 +3,12 @@
 use bytes::Bytes;
 use hx_proto::{
     ProtoError, VideoCodec,
-    channel::{ChannelId, CloseCode, MAX_CURSOR_MESSAGE},
+    channel::{ChannelId, CloseCode, MAX_CURSOR_MESSAGE, MAX_DEVICE_NAME, MAX_FILE_SIZE},
     datagram::{
         AudioPacket, Datagram, MAX_AUDIO_PAYLOAD, MouseCoalescer, MouseMove, decode_datagram,
     },
     media::{FLAGS_KNOWN, MAX_VIDEO_PAYLOAD, MEDIA_HEADER_LEN, MediaHeader},
-    message::{self, Wire},
+    message::{self, Wire, device_name_problem, sanitize_device_name},
     order::{ReorderWindow, serial_gt},
     pb::{
         self, ControlMessage, CursorEvent, InputEvent, TransferHeader,
@@ -36,12 +36,39 @@ fn version() -> impl Strategy<Value = pb::Version> {
 }
 
 fn caps() -> impl Strategy<Value = pb::Capabilities> {
-    (proptest::collection::vec(codec(), 0..=8), any::<u64>()).prop_map(
-        |(video_codecs, features)| pb::Capabilities {
-            video_codecs,
-            features,
-        },
+    (
+        proptest::collection::vec(codec(), 0..=8),
+        any::<u64>(),
+        prop_oneof![Just(0u64), 1u64..=MAX_FILE_SIZE],
     )
+        .prop_map(
+            |(video_codecs, features, max_file_bytes)| pb::Capabilities {
+                video_codecs,
+                features,
+                max_file_bytes,
+            },
+        )
+}
+
+fn server_stats() -> impl Strategy<Value = pb::ServerStats> {
+    (
+        1u32..=60_000,
+        0u32..=240,
+        proptest::collection::vec(any::<u32>(), 9..=9),
+    )
+        .prop_map(|(interval_ms, fps_ceiling, v)| pb::ServerStats {
+            interval_ms,
+            frames: v[0],
+            keyframes: v[1],
+            dropped_frames: v[2],
+            bitrate_kbps: v[3],
+            target_bitrate_kbps: v[4],
+            fps_ceiling,
+            encode_p95_us: v[5],
+            total_p95_us: v[6],
+            queue_depth_max: v[7],
+            rtt_us: v[8],
+        })
 }
 
 fn control() -> impl Strategy<Value = ControlMessage> {
@@ -92,9 +119,10 @@ fn control() -> impl Strategy<Value = ControlMessage> {
         prop_oneof![Just(0u32), 50u32..=400],
         any::<bool>(),
         any::<bool>(),
+        any::<bool>(),
     )
         .prop_map(
-            |(codec, max_fps, bandwidth_cap_kbps, (width, height), scale_percent, a, c)| {
+            |(codec, max_fps, bandwidth_cap_kbps, (width, height), scale_percent, a, c, st)| {
                 Ctl::ViewConfig(pb::ViewConfig {
                     codec,
                     max_fps,
@@ -104,6 +132,7 @@ fn control() -> impl Strategy<Value = ControlMessage> {
                     scale_percent,
                     audio_enabled: a,
                     clipboard_enabled: c,
+                    stats_enabled: st,
                 })
             },
         );
@@ -137,8 +166,26 @@ fn control() -> impl Strategy<Value = ControlMessage> {
                 decode_p95_us: d,
             })
         }),
-        (any::<u32>(), text(256))
-            .prop_map(|(code, message)| Ctl::Goodbye(pb::Goodbye { code, message })),
+        (any::<u32>(), text(256)).prop_map(|(code, message)| Ctl::Goodbye(pb::Goodbye {
+            code,
+            message,
+            ..Default::default()
+        })),
+        (
+            any::<u32>(),
+            any::<String>(),
+            prop_oneof![
+                Just(Vec::new()),
+                proptest::collection::vec(any::<u8>(), 16..=16)
+            ],
+        )
+            .prop_map(|(code, name, id)| Ctl::Goodbye(pb::Goodbye {
+                code,
+                message: String::new(),
+                peer_device_name: sanitize_device_name(&name),
+                peer_device_id: Bytes::from(id),
+            })),
+        server_stats().prop_map(Ctl::ServerStats),
         proptest::collection::vec(any::<u8>(), 0..=4096).prop_map(|d| Ctl::Pairing(pb::Opaque {
             data: Bytes::from(d)
         })),
@@ -455,6 +502,7 @@ fn malformed_messages_are_rejected() {
     let caps = pb::Capabilities {
         video_codecs: vec![99],
         features: 0,
+        max_file_bytes: 0,
     };
     let m = ControlMessage::new(Ctl::Hello(pb::Hello {
         version: v,
@@ -721,11 +769,16 @@ fn close_codes_roundtrip() {
         CloseCode::PairingClosed,
         CloseCode::Shutdown,
         CloseCode::InternalError,
+        CloseCode::TakenOver,
     ] {
         assert_eq!(CloseCode::from_code(u64::from(c.code())), c);
         assert_eq!(CloseCode::from_websocket_code(c.websocket_code()), Some(c));
     }
     assert_eq!(CloseCode::from_code(12345), CloseCode::InternalError);
+    assert_eq!(CloseCode::TakenOver.code(), 9);
+    assert_eq!(CloseCode::TakenOver.websocket_code(), 4009);
+    // Codes after the defined ones are unknown, not aliases of TakenOver.
+    assert_eq!(CloseCode::from_code(10), CloseCode::InternalError);
     assert_eq!(CloseCode::from_websocket_code(1000), None);
     assert!(ChannelId::from_u8(0).is_err());
 }
@@ -887,4 +940,285 @@ fn mouse_coalescer_drops_stale() {
     }));
     assert_eq!(c.dropped_stale(), 2);
     assert_eq!(c.take().map(|u| u.absolute), Some(Some((1, 1))));
+}
+
+// ---------------------------------------------------------------- protocol 1.1
+
+fn ctl(m: Ctl) -> ControlMessage {
+    ControlMessage::new(m)
+}
+
+fn goodbye(name: &str, id: &[u8]) -> ControlMessage {
+    ctl(Ctl::Goodbye(pb::Goodbye {
+        code: CloseCode::TakenOver.code(),
+        message: String::new(),
+        peer_device_name: name.to_owned(),
+        peer_device_id: Bytes::copy_from_slice(id),
+    }))
+}
+
+proptest! {
+    #[test]
+    fn sanitized_names_are_valid_and_bounded(name in any::<String>()) {
+        let s = sanitize_device_name(&name);
+        prop_assert!(s.len() <= MAX_DEVICE_NAME);
+        prop_assert!(device_name_problem(&s).is_none());
+        prop_assert_eq!(s.trim(), s.as_str());
+        // Idempotent.
+        prop_assert_eq!(sanitize_device_name(&s), s.clone());
+        prop_assert!(goodbye(&s, &[]).validate().is_ok());
+    }
+
+    #[test]
+    fn server_stats_range_checks(
+        s in server_stats(), bad_interval in (60_001u32..=u32::MAX), bad_fps in 241u32..=u32::MAX,
+    ) {
+        let mut x = s;
+        x.interval_ms = bad_interval;
+        prop_assert!(ctl(Ctl::ServerStats(x)).validate().is_err());
+        let mut x = s;
+        x.interval_ms = 0;
+        prop_assert!(ctl(Ctl::ServerStats(x)).validate().is_err());
+        let mut x = s;
+        x.fps_ceiling = bad_fps;
+        prop_assert!(ctl(Ctl::ServerStats(x)).validate().is_err());
+    }
+
+    #[test]
+    fn effective_file_limit_is_the_minimum(
+        sv in 0u32..3, cv in 0u32..3, sl in prop_oneof![Just(0u64), 1u64..=MAX_FILE_SIZE],
+        cl in prop_oneof![Just(0u64), 1u64..=MAX_FILE_SIZE],
+    ) {
+        let mut sc = hx_proto::version::capabilities(&[], Features::NONE);
+        sc.max_file_bytes = sl;
+        let mut cc = hx_proto::version::capabilities(&[], Features::NONE);
+        cc.max_file_bytes = cl;
+        let (s, c) = (ProtocolVersion { major: 1, minor: sv }, ProtocolVersion { major: 1, minor: cv });
+        let n = negotiate(s, &sc, c, &cc).expect("same major");
+        let n2 = negotiate(c, &cc, s, &sc).expect("same major");
+        prop_assert_eq!(n.max_file_bytes, n2.max_file_bytes);
+        prop_assert!(n.max_file_bytes <= MAX_FILE_SIZE && n.max_file_bytes >= 1);
+        if sv.min(cv) == 0 {
+            prop_assert_eq!(n.max_file_bytes, MAX_FILE_SIZE);
+        } else {
+            let want = [sl, cl].into_iter().filter(|v| *v != 0).min().unwrap_or(MAX_FILE_SIZE);
+            prop_assert_eq!(n.max_file_bytes, want);
+        }
+    }
+
+    #[test]
+    fn file_header_size_check(size in any::<u64>(), limit in 1u64..=MAX_FILE_SIZE) {
+        let h = TransferHeader { mime: "a/b".into(), name: "f".into(), size };
+        prop_assert_eq!(h.validate_file(limit).is_ok(), size <= limit);
+        // A limit above the ceiling never raises it.
+        prop_assert_eq!(h.validate_file(u64::MAX).is_ok(), size <= MAX_FILE_SIZE);
+    }
+}
+
+#[test]
+fn takeover_goodbye_edges() {
+    let id = [7u8; 16];
+    assert!(goodbye("Anna's phone", &id).validate().is_ok());
+    assert!(goodbye("", &[]).validate().is_ok());
+    // Name length: exactly 64 bytes passes, 65 fails.
+    assert!(goodbye(&"n".repeat(64), &id).validate().is_ok());
+    assert!(goodbye(&"n".repeat(65), &id).validate().is_err());
+    // Multi-byte characters count in bytes.
+    assert!(goodbye(&"é".repeat(32), &id).validate().is_ok());
+    assert!(goodbye(&"é".repeat(33), &id).validate().is_err());
+    // Unsanitised names are rejected.
+    for bad in [
+        "a\nb",
+        "a\u{1b}[31m",
+        "a\u{202E}b",
+        "a\u{200B}b",
+        "a\u{7f}",
+        "a\u{85}",
+    ] {
+        assert!(goodbye(bad, &id).validate().is_err(), "{bad:?}");
+    }
+    // Id length: 0 or 16 only.
+    for n in [1usize, 15, 17, 32] {
+        assert!(goodbye("x", &vec![1u8; n]).validate().is_err(), "{n}");
+    }
+    // The sanitiser fixes what the validator rejects and cuts on a char boundary.
+    assert_eq!(sanitize_device_name("  a\u{202E}b\nc \u{200B}"), "abc");
+    let long = "é".repeat(100);
+    let s = sanitize_device_name(&long);
+    assert_eq!(s.len(), 64);
+    assert!(s.chars().all(|c| c == 'é'));
+    assert_eq!(sanitize_device_name("\u{1b}\u{202E}"), "");
+}
+
+#[test]
+fn takeover_goodbye_is_additive_for_old_peers() {
+    // A 1.0 peer ignores fields 3 and 4: the same bytes decode as a plain Goodbye there.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct OldGoodbye {
+        #[prost(uint32, tag = "1")]
+        code: u32,
+        #[prost(string, tag = "2")]
+        message: String,
+    }
+    let g = pb::Goodbye {
+        code: 9,
+        message: "taken over".into(),
+        peer_device_name: "Laptop".into(),
+        peer_device_id: Bytes::from_static(&[1; 16]),
+    };
+    let old = <OldGoodbye as prost::Message>::decode(prost::Message::encode_to_vec(&g).as_slice())
+        .expect("old decoder skips unknown fields");
+    assert_eq!((old.code, old.message.as_str()), (9, "taken over"));
+}
+
+#[test]
+fn server_stats_is_numeric_only_and_sized() {
+    let s = pb::ServerStats {
+        interval_ms: 1000,
+        frames: u32::MAX,
+        keyframes: u32::MAX,
+        dropped_frames: u32::MAX,
+        bitrate_kbps: u32::MAX,
+        target_bitrate_kbps: u32::MAX,
+        fps_ceiling: 240,
+        encode_p95_us: u32::MAX,
+        total_p95_us: u32::MAX,
+        queue_depth_max: u32::MAX,
+        rtt_us: u32::MAX,
+    };
+    let m = ctl(Ctl::ServerStats(s));
+    let bytes = message::encode(&m).expect("valid");
+    // Eleven varint fields: a small, fixed bound, nowhere near the control limit.
+    assert!(bytes.len() <= 11 * 6 + 2, "{}", bytes.len());
+    assert_eq!(
+        message::decode::<ControlMessage>(&bytes).expect("decodes"),
+        m
+    );
+    // The boundary values themselves.
+    for (interval, fps, ok) in [
+        (1, 0, true),
+        (60_000, 240, true),
+        (0, 0, false),
+        (60_001, 0, false),
+        (1000, 241, false),
+    ] {
+        let m = ctl(Ctl::ServerStats(pb::ServerStats {
+            interval_ms: interval,
+            fps_ceiling: fps,
+            ..Default::default()
+        }));
+        assert_eq!(m.validate().is_ok(), ok, "{interval} {fps}");
+    }
+}
+
+#[test]
+fn server_stats_variant_is_unknown_to_a_1_0_peer() {
+    // Why the feature is gated by minor (protocol 4.5): a peer that does not know field 11 sees
+    // an envelope without a variant.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct Old {
+        #[prost(oneof = "OldBody", tags = "7")]
+        message: Option<OldBody>,
+    }
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    enum OldBody {
+        #[prost(message, tag = "7")]
+        Ping(pb::Ping),
+    }
+    let m = ctl(Ctl::ServerStats(pb::ServerStats {
+        interval_ms: 1000,
+        ..Default::default()
+    }));
+    let old = <Old as prost::Message>::decode(prost::Message::encode_to_vec(&m).as_slice())
+        .expect("decodes");
+    assert!(old.message.is_none());
+}
+
+#[test]
+fn file_limit_edges_and_capabilities() {
+    let header = |size| TransferHeader {
+        mime: "application/zip".into(),
+        name: "a.zip".into(),
+        size,
+    };
+    assert!(header(0).validate_file(1).is_ok());
+    assert!(header(MAX_FILE_SIZE).validate_file(MAX_FILE_SIZE).is_ok());
+    assert!(
+        header(MAX_FILE_SIZE + 1)
+            .validate_file(MAX_FILE_SIZE)
+            .is_err()
+    );
+    assert!(header(1024).validate_file(1023).is_err());
+    assert!(header(u64::MAX).validate_file(u64::MAX).is_err());
+    // Advertised limits above the ceiling are invalid, the ceiling itself is fine.
+    let hello = |limit| {
+        ctl(Ctl::Hello(pb::Hello {
+            version: Some(pb::Version { major: 1, minor: 1 }),
+            capabilities: Some(pb::Capabilities {
+                max_file_bytes: limit,
+                ..Default::default()
+            }),
+            intent: 1,
+            software: String::new(),
+            device_name: String::new(),
+        }))
+    };
+    assert!(hello(MAX_FILE_SIZE).validate().is_ok());
+    assert!(hello(MAX_FILE_SIZE + 1).validate().is_err());
+    assert!(hello(u64::MAX).validate().is_err());
+    // A 1.0 peer states no limit and the 1.1 side still ends up at the ceiling or its own.
+    let mut server = hx_proto::version::capabilities(&[], Features::NONE);
+    server.max_file_bytes = 1 << 30;
+    let client = hx_proto::version::capabilities(&[], Features::NONE);
+    let n = negotiate(
+        ProtocolVersion::CURRENT,
+        &server,
+        ProtocolVersion { major: 1, minor: 0 },
+        &client,
+    )
+    .unwrap();
+    assert_eq!(
+        n.max_file_bytes, MAX_FILE_SIZE,
+        "minor 0 ignores stated limits"
+    );
+    let n = negotiate(
+        ProtocolVersion::CURRENT,
+        &server,
+        ProtocolVersion::CURRENT,
+        &client,
+    )
+    .unwrap();
+    assert_eq!(n.max_file_bytes, 1 << 30);
+}
+
+#[test]
+fn server_stats_feature_exists_from_1_1_only() {
+    assert!(!Features::defined_up_to(0).contains(Features::SERVER_STATS));
+    assert!(Features::defined_up_to(1).contains(Features::SERVER_STATS));
+    let all = hx_proto::version::capabilities(&[], Features(u64::MAX));
+    let v10 = ProtocolVersion { major: 1, minor: 0 };
+    let n = negotiate(ProtocolVersion::CURRENT, &all, v10, &all).unwrap();
+    assert!(!n.features.contains(Features::SERVER_STATS));
+    let n = negotiate(
+        ProtocolVersion::CURRENT,
+        &all,
+        ProtocolVersion::CURRENT,
+        &all,
+    )
+    .unwrap();
+    assert!(n.features.contains(Features::SERVER_STATS));
+}
+
+#[test]
+fn view_config_stats_flag_defaults_off() {
+    let v = pb::ViewConfig::default();
+    assert!(!v.stats_enabled);
+    let m = ctl(Ctl::ViewConfig(pb::ViewConfig {
+        stats_enabled: true,
+        ..Default::default()
+    }));
+    assert_eq!(
+        message::decode::<ControlMessage>(&message::encode(&m).unwrap()).unwrap(),
+        m
+    );
 }

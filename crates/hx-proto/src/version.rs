@@ -2,12 +2,15 @@
 
 use prost::Message;
 
-use crate::pb::{self, VideoCodec};
+use crate::{
+    channel::MAX_FILE_SIZE,
+    pb::{self, VideoCodec},
+};
 
 /// Major version of this implementation; also part of the ALPN and WebSocket path.
 pub const PROTOCOL_MAJOR: u32 = 1;
 /// Minor version of this implementation.
-pub const PROTOCOL_MINOR: u32 = 0;
+pub const PROTOCOL_MINOR: u32 = 1;
 /// QUIC and TLS ALPN for native clients.
 pub const ALPN: &[u8] = b"hx/1";
 /// ALPN of the WebTransport (HTTP/3) entry, dispatched but not implemented in Phase 1.
@@ -65,12 +68,18 @@ impl Features {
     pub const CLIPBOARD: Self = Self(1 << 1);
     /// File transfer channel (1.0).
     pub const FILE_TRANSFER: Self = Self(1 << 2);
+    /// `ServerStats` control messages (1.1).
+    pub const SERVER_STATS: Self = Self(1 << 3);
 
     /// Every feature defined up to and including `minor` of the current major.
     pub const fn defined_up_to(minor: u32) -> Self {
-        // Version 1.0 defines bits 0..=2. A later minor adds its bits here.
-        let _ = minor;
-        Self(Self::AUDIO.0 | Self::CLIPBOARD.0 | Self::FILE_TRANSFER.0)
+        // Version 1.0 defines bits 0..=2, 1.1 adds bit 3. A later minor adds its bits here.
+        let v10 = Self::AUDIO.0 | Self::CLIPBOARD.0 | Self::FILE_TRANSFER.0;
+        if minor >= 1 {
+            Self(v10 | Self::SERVER_STATS.0)
+        } else {
+            Self(v10)
+        }
     }
 
     /// True if all bits of `other` are set.
@@ -94,6 +103,19 @@ pub fn capabilities(codecs: &[VideoCodec], features: Features) -> pb::Capabiliti
     pb::Capabilities {
         video_codecs: codecs.iter().map(|c| *c as i32).collect(),
         features: features.0,
+        max_file_bytes: 0,
+    }
+}
+
+/// Like [`capabilities`], also stating the largest file this side accepts (1.1).
+pub fn capabilities_with_file_limit(
+    codecs: &[VideoCodec],
+    features: Features,
+    max_file_bytes: u64,
+) -> pb::Capabilities {
+    pb::Capabilities {
+        max_file_bytes,
+        ..capabilities(codecs, features)
     }
 }
 
@@ -106,6 +128,9 @@ pub struct Negotiated {
     pub features: Features,
     /// Codecs both support, in the server's order of preference.
     pub codecs: Vec<VideoCodec>,
+    /// Effective file transfer limit (protocol §5.6): the lowest of the 4 GiB ceiling and the
+    /// limits both sides stated (stated limits count from negotiated minor 1).
+    pub max_file_bytes: u64,
 }
 
 /// Negotiation failure.
@@ -151,6 +176,14 @@ pub fn negotiate(
             codecs.push(c);
         }
     }
+    let max_file_bytes = if minor >= 1 {
+        [server.max_file_bytes, client.max_file_bytes]
+            .into_iter()
+            .filter(|v| *v != 0)
+            .fold(MAX_FILE_SIZE, u64::min)
+    } else {
+        MAX_FILE_SIZE
+    };
     Ok(Negotiated {
         version: ProtocolVersion {
             major: server_version.major,
@@ -158,6 +191,7 @@ pub fn negotiate(
         },
         features,
         codecs,
+        max_file_bytes,
     })
 }
 
