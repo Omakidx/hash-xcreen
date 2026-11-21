@@ -9,7 +9,7 @@
 //! number has no safe wrapper. The block is one call after the descriptor was shown to be open.
 #![allow(unsafe_code)]
 
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
@@ -29,6 +29,7 @@ fn locked() -> InstallError {
 
 /// Takes the lock at `path`, or adopts and verifies the inherited `lock_fd`.
 pub fn acquire(path: &Path, lock_fd: Option<i32>) -> Result<Lock, InstallError> {
+    let adopted = lock_fd.is_some();
     let fd = match lock_fd {
         Some(n) => adopt(n, path)?,
         None => {
@@ -51,8 +52,17 @@ pub fn acquire(path: &Path, lock_fd: Option<i32>) -> Result<Lock, InstallError> 
     };
     match rustix::fs::flock(&fd, FlockOperation::NonBlockingLockExclusive) {
         Ok(()) => Ok(Lock { _fd: fd }),
-        Err(rustix::io::Errno::WOULDBLOCK) => Err(locked()),
-        Err(e) => Err(InstallError::internal(format!("cannot take the lock: {e}"))),
+        Err(e) => {
+            // An inherited descriptor is not closed on failure (the caller's shell owns the lock).
+            if adopted {
+                let _ = fd.into_raw_fd();
+            }
+            if e == rustix::io::Errno::WOULDBLOCK {
+                Err(locked())
+            } else {
+                Err(InstallError::internal(format!("cannot take the lock: {e}")))
+            }
+        }
     }
 }
 
@@ -69,19 +79,33 @@ fn adopt(n: i32, path: &Path) -> Result<OwnedFd, InstallError> {
     // SAFETY: the descriptor is open (checked above) and was handed to this process for exactly
     // this purpose by `install.sh` (`exec ... --lock-fd 9`); nothing else in the process owns it.
     let fd = unsafe { OwnedFd::from_raw_fd(n) };
-    let st =
-        rustix::fs::fstat(&fd).map_err(|e| InstallError::internal(format!("--lock-fd: {e}")))?;
-    let on_disk = rustix::fs::lstat(path).map_err(|_| {
-        InstallError::usage("--lock-fd does not match the lock file (it does not exist)")
-    })?;
+    // Until the descriptor is shown to be the lock file it is not ours to close: on every error
+    // path it is leaked (`into_raw_fd`), never dropped.
+    let refuse = |fd: OwnedFd, e: InstallError| {
+        let _ = fd.into_raw_fd();
+        e
+    };
+    let st = match rustix::fs::fstat(&fd) {
+        Ok(st) => st,
+        Err(e) => return Err(refuse(fd, InstallError::internal(format!("--lock-fd: {e}")))),
+    };
+    let Ok(on_disk) = rustix::fs::lstat(path) else {
+        return Err(refuse(
+            fd,
+            InstallError::usage("--lock-fd does not match the lock file (it does not exist)"),
+        ));
+    };
     let regular =
         rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::RegularFile;
     if !regular
         || st.st_uid != rustix::process::geteuid().as_raw()
         || (st.st_dev, st.st_ino) != (on_disk.st_dev, on_disk.st_ino)
     {
-        return Err(InstallError::usage(
-            "--lock-fd is not the lock file (a regular file of ours, the same file as the lock path)",
+        return Err(refuse(
+            fd,
+            InstallError::usage(
+                "--lock-fd is not the lock file (a regular file of ours, the same file as the lock path)",
+            ),
         ));
     }
     // The tools the installer runs must not inherit the descriptor.
@@ -93,8 +117,6 @@ fn adopt(n: i32, path: &Path) -> Result<OwnedFd, InstallError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::IntoRawFd;
-
     #[test]
     fn a_second_holder_gets_exit_11() {
         let d = tempfile::tempdir().unwrap();
@@ -135,6 +157,11 @@ mod tests {
         let n = other.into_raw_fd();
         let e = acquire(&p, Some(n)).unwrap_err();
         assert_eq!(e.exit, 2, "{}", e.message);
+        // N3: a descriptor that is not the lock file is not ours to close.
+        assert!(
+            std::path::Path::new(&format!("/proc/self/fd/{n}")).exists(),
+            "the refused descriptor is still open"
+        );
         // Not open, or too small.
         assert!(acquire(&p, Some(1_000_000)).is_err());
         assert!(acquire(&p, Some(1)).is_err());
