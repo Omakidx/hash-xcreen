@@ -175,7 +175,7 @@ Passwords and PINs are never in the command, and neither is the token (decision 
 
 ### 5.2 Installer options
 
-`install.sh` consumes `--channel`, `--release-dir` and `--progress text|json` (forwarded to the agent as the global `--json`) and passes every other argument to `hx-agent install` unchanged. The interface of `hx-agent install`:
+`install.sh` consumes `--channel`, `--release-dir`, `--allow-old-release` (accept a manifest older than 90 days, with a warning; never forwarded) and `--progress text|json` (forwarded to the agent as the global `--json`) and passes every other argument to `hx-agent install` unchanged. The interface of `hx-agent install`:
 
 ```
 hx-agent [--json] install [MODE] [OPTIONS] [--bootstrap-dir <abs>] [--lock-fd <n>]
@@ -214,6 +214,7 @@ The agent reads no environment variable; its children get a cleared environment 
 | `--channel` | `stable`, `beta` | `stable` | reconcilable. Chooses the manifest `install.sh` fetches and sets `[update] channel` in `/etc/hx/privd.toml` |
 | `--allow-private-networks` | flag (interactive: a typed `yes`); the opt-in promised in §4.2 | off | reconcilable (`SetupHost` converges) |
 | `--release-dir` (`install.sh` only) | absolute, root-owned directory holding a manifest, signature and tarball, **still verified** | none | n/a |
+| `--allow-old-release` (`install.sh` only) | flag: accept a signed manifest older than 90 days, with a warning | off | n/a |
 | `--progress` (`install.sh` only) | `text`, `json` | `text` | n/a |
 
 Fixed options may change freely while the desktop is not ready: `CreateDesktop` destroys a `creating` or `failed` instance and starts again ([ipc.md](ipc.md) §6.5).
