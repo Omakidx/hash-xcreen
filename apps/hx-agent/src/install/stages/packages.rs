@@ -1,5 +1,9 @@
 //! Stage `packages`: the prerequisite packages (design D4: `btrfs-progs`, `nftables`,
-//! `ca-certificates`). Done when `dpkg-query` says every one is installed.
+//! `ca-certificates`, and `dnsmasq-base`). Done when `dpkg-query` says every one is installed.
+//!
+//! `dnsmasq-base` is only a *Recommends* of the distro's `incus` package, and apt runs here with
+//! `--no-install-recommends`; without it Incus cannot create a managed bridge (`Failed to check
+//! dnsmasq version`), so `SetupHost` fails. Found by the nested-Incus installer run.
 //!
 //! apt runs with a cleared environment plus `DEBIAN_FRONTEND=noninteractive` and
 //! `NEEDRESTART_MODE=a`, and waits up to 10 minutes for the dpkg lock (a fresh VPS runs
@@ -11,7 +15,7 @@ use crate::install::error::Result;
 use crate::install::runner::{APT_ENV, Call, Tool};
 
 /// What the installer needs on the host.
-pub const PACKAGES: &[&str] = &["btrfs-progs", "nftables", "ca-certificates"];
+pub const PACKAGES: &[&str] = &["btrfs-progs", "nftables", "ca-certificates", "dnsmasq-base"];
 
 /// The apt lock wait, seconds.
 pub const LOCK_WAIT: &str = "DPkg::Lock::Timeout=600";
@@ -72,4 +76,17 @@ pub fn run(ctx: &mut Ctx<'_>) -> Result<Outcome> {
         }
     }
     Ok(Outcome::Done)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_prerequisites_include_what_incus_only_recommends_but_needs_for_a_bridge() {
+        // `incus` Recommends dnsmasq-base and apt runs without recommends: a managed bridge
+        // (hxbr0, with DHCP) cannot be created without it.
+        assert!(PACKAGES.contains(&"dnsmasq-base"), "{PACKAGES:?}");
+        assert!(PACKAGES.contains(&"btrfs-progs") && PACKAGES.contains(&"nftables"));
+    }
 }
