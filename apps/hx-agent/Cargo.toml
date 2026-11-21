@@ -10,3 +10,13 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+hx-crypto.workspace = true
+hx-ipc = { workspace = true, features = ["privd", "link"] }
+hx-proto.workspace = true
+hx-provision.workspace = true
+hx-transport.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "signal"] }
+tracing.workspace = true
