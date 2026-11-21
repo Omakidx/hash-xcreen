@@ -12,8 +12,7 @@
 //! | Module | Role |
 //! |---|---|
 //! | [`server`] | [`server::Gateway::start`]: wires everything, accepts pending sessions |
-//! | [`login`] | the session login: registry lookup, PIN exchange with the pepper in privd |
-//! | [`verifier`] | `HMAC(pepper, Argon2id(secret))` records, their file, `PepperEnrol` |
+//! | [`verifier`] | `HMAC(pepper, Argon2id(secret))` records, their file, `PepperEnrol`, and `PrivdPinVerifier` (the authenticator's PIN check) |
 //! | [`privd_client`] | the async client of `hx-privd` (role `Gateway`) |
 //! | [`session`] | one authorized connection's control loop, claiming, takeover (ipc.md 18) |
 //! | [`takeover`] | takeover policy and the 3-per-10-minutes limit |
@@ -40,7 +39,6 @@ pub mod devices;
 pub mod harden;
 pub(crate) mod ipc_io;
 pub mod live;
-pub mod login;
 pub mod privd_client;
 pub mod server;
 pub mod session;

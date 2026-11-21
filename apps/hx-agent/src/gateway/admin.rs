@@ -40,7 +40,6 @@ use tokio::sync::{Semaphore, watch};
 use super::devices::{DeviceService, device_info};
 use super::ipc_io::read_frame;
 use super::live::LiveSessions;
-use super::login::Login;
 use super::session::SessionManager;
 use super::util::{device_id, now_unix};
 use super::verifier::{VerifierRecord, VerifierStore};
@@ -129,8 +128,6 @@ impl SetupMirror {
 pub struct AdminState {
     /// Device operations.
     pub devices: Arc<DeviceService>,
-    /// The PIN login (backoff state).
-    pub login: Login,
     /// The verifiers.
     pub verifiers: Arc<VerifierStore>,
     /// The authenticator (pairing window).
@@ -153,7 +150,6 @@ impl AdminState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         devices: Arc<DeviceService>,
-        login: Login,
         verifiers: Arc<VerifierStore>,
         auth: Authenticator,
         sessions: Arc<SessionManager>,
@@ -163,7 +159,6 @@ impl AdminState {
     ) -> Arc<Self> {
         Arc::new(Self {
             devices,
-            login,
             verifiers,
             auth,
             sessions,
@@ -451,7 +446,9 @@ async fn handle(
                     let info = device_info(r, false);
                     let state = if r.is_revoked() {
                         pb::DeviceState::Revoked
-                    } else if st.login.is_backing_off(&r.id) {
+                    } else if r.failed_pins > 0 {
+                        // "Locked": PIN failures that no success has cleared yet (the
+                        // authenticator's backoff clock is private to it).
                         pb::DeviceState::Locked
                     } else {
                         pb::DeviceState::Active
@@ -492,7 +489,7 @@ async fn handle(
             match st.devices.reinstate(id).await {
                 Ok(Some(_)) => {
                     // A locked (not revoked) device has its failure counter and wait reset too.
-                    st.login
+                    st.auth
                         .reset_lockout(&id)
                         .await
                         .map_err(|e| internal("lockout reset failed", e))?;
@@ -544,8 +541,8 @@ async fn handle(
                 .audit_opt(AuditEvent::PasswordVerifierChanged, None, "admin");
             Ok(R::SetPasswordVerifier(pb::SetPasswordVerifierResult {}))
         }
-        C::CreatePairingToken(_) => {
-            // The token is secret slot 0. Read, validated, wiped on drop.
+        C::CreatePairingToken(r) => {
+            // The token is secret slot 0: read, parsed, installed, wiped on drop.
             let secret = secrets.pop().ok_or_else(|| {
                 error(
                     privd_pb::ErrorCode::InvalidArgument,
@@ -558,26 +555,31 @@ async fn handle(
                     "the token is not text",
                 )
             })?;
-            PairingToken::parse(text)
+            let token = PairingToken::parse(text)
                 .map_err(|_| error(privd_pb::ErrorCode::InvalidArgument, "not a pairing token"))?;
-            Err(error(
-                privd_pb::ErrorCode::Unimplemented,
-                "installing a supplied token needs PairingWindow::install_token; use CreatePairingCode",
-            ))
+            let ttl = pairing_ttl(st, r.expires_in_s);
+            st.auth
+                .pairing()
+                .install_token(&token, ttl)
+                .map_err(|e| internal("installing the token failed", e))?;
+            st.devices
+                .audit_opt(AuditEvent::PairingOpened, None, "token");
+            Ok(R::CreatePairingToken(pb::CreatePairingTokenResult {
+                expires_at_unix_s: now + ttl.as_secs(),
+            }))
         }
-        C::CreatePairingCode(_) => {
+        C::CreatePairingCode(r) => {
+            let ttl = pairing_ttl(st, r.expires_in_s);
             let code = st
                 .auth
                 .pairing()
-                .issue_code()
+                .issue_code_with_ttl(ttl)
                 .map_err(|e| internal("issuing a code failed", e))?;
             st.devices
                 .audit_opt(AuditEvent::PairingOpened, None, "code");
             Ok(R::CreatePairingCode(pb::CreatePairingCodeResult {
                 code: code.to_text().to_string(),
-                // The window's configured lifetime (the request's value is an upper bound that
-                // cannot be shortened per code without an hx-crypto change).
-                expires_at_unix_s: now + st.pairing_ttl_s,
+                expires_at_unix_s: now + ttl.as_secs(),
             }))
         }
         C::SetupWindow(r) => {
@@ -616,6 +618,12 @@ async fn handle(
             }))
         }
     }
+}
+
+/// The lifetime of a pairing credential: what the caller asked for, capped at the configured
+/// lifetime (the window caps it again).
+fn pairing_ttl(st: &AdminState, requested_s: u32) -> Duration {
+    Duration::from_secs(u64::from(requested_s).min(st.pairing_ttl_s))
 }
 
 fn parse_verifier(bytes: &[u8], min_memory_kib: u32) -> Result<VerifierRecord, privd_pb::Error> {

@@ -28,9 +28,8 @@ use hx_crypto::{
 };
 use hx_proto::VideoCodec;
 use hx_proto::channel::CloseCode;
-use hx_proto::pb::{Intent, RefuseReason};
 use hx_proto::version::{Features, PROTOCOL_MINOR, capabilities_with_file_limit};
-use hx_transport::{PendingSession, Server, ServerHello, ServerOptions};
+use hx_transport::{PendingSession, Server, ServerOptions};
 use tokio::net::UnixListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -40,11 +39,10 @@ use super::config::GatewayConfig;
 use super::desktop::DesktopLink;
 use super::devices::DeviceService;
 use super::live::LiveSessions;
-use super::login::{Login, LoginConfig};
 use super::privd_client::PrivdClient;
 use super::session::{SessionManager, SessionSettings};
 use super::util::log_text;
-use super::verifier::{VerifierError, VerifierStore};
+use super::verifier::{PrivdPinVerifier, VerifierError, VerifierStore};
 
 /// The software string sent in `HelloAck` (at most 128 bytes).
 pub const SOFTWARE: &str = concat!("hx-gatewayd ", env!("CARGO_PKG_VERSION"));
@@ -106,15 +104,11 @@ impl StartOptions {
 }
 
 struct Shared {
-    config: GatewayConfig,
     auth: Authenticator,
-    registry: Arc<dyn DeviceRegistry>,
-    login: Login,
     verifiers: Arc<VerifierStore>,
     devices: Arc<DeviceService>,
     sessions: Arc<SessionManager>,
     live: Arc<LiveSessions>,
-    features: Features,
 }
 
 /// A running gateway.
@@ -166,6 +160,13 @@ impl Gateway {
             AuthenticatorConfig {
                 server_name: config.server_name.clone(),
                 software: SOFTWARE.into(),
+                // What a session is offered and gets when its PIN is accepted.
+                capabilities: capabilities_with_file_limit(
+                    &OFFERED_CODECS,
+                    Features::defined_up_to(PROTOCOL_MINOR),
+                    config.max_file_bytes,
+                ),
+                session_features: Features::defined_up_to(PROTOCOL_MINOR),
                 pairing: PairingLimits {
                     token_ttl: ttl,
                     code_ttl: ttl,
@@ -176,16 +177,13 @@ impl Gateway {
             clock.clone(),
         );
         let privd = PrivdClient::new(&config.privd_socket, Default::default());
-        let live = LiveSessions::new();
-        let devices = DeviceService::new(auth.clone(), privd.clone(), live.clone(), clock.clone());
-        let login = Login::new(
-            registry.clone(),
+        // The PIN check: Argon2id here, the yes/no from privd's pepper (docs/ipc.md 5.3).
+        auth.set_pin_verifier(Arc::new(PrivdPinVerifier::new(
             verifiers.clone(),
             privd.clone(),
-            clock.clone(),
-            LoginConfig::default(),
-            devices.clone(),
-        );
+        )));
+        let live = LiveSessions::new();
+        let devices = DeviceService::new(auth.clone(), privd.clone(), live.clone(), clock.clone());
         let sessions = SessionManager::new(
             SessionSettings {
                 desktop_id: config.desktop_id.clone(),
@@ -209,18 +207,13 @@ impl Gateway {
         );
         let shared = Arc::new(Shared {
             auth: auth.clone(),
-            registry,
-            login: login.clone(),
             verifiers: verifiers.clone(),
             devices: devices.clone(),
             sessions: sessions.clone(),
             live: live.clone(),
-            features: Features::defined_up_to(PROTOCOL_MINOR),
-            config: config.clone(),
         });
         let admin_state = AdminState::new(
             devices,
-            login,
             verifiers,
             auth,
             sessions,
@@ -342,20 +335,11 @@ async fn handle_pending(sh: Arc<Shared>, pending: PendingSession) {
     let software = log_text(&hello.software, 128);
     let name = log_text(&hello.device_name, 64);
     let remote = pending.remote_addr();
-    let intent = Intent::try_from(hello.intent).unwrap_or(Intent::Unspecified);
-    tracing::debug!(%remote, %software, device = %name, ?intent, "pending session");
-    match intent {
-        Intent::Pair => pair(&sh, pending).await,
-        Intent::Session => session(&sh, pending).await,
-        Intent::Unspecified => {
-            let _ = pending
-                .refuse(RefuseReason::Unauthorized, "not authorized")
-                .await;
-        }
-    }
-}
-
-async fn pair(sh: &Shared, pending: PendingSession) {
+    tracing::debug!(%remote, %software, device = %name, intent = hello.intent, "pending session");
+    // Subscribed before the authentication runs, so a revocation during it is never missed.
+    let revocations = sh.auth.subscribe_revocations();
+    // Pairing and the PIN login are both `Authenticator::authenticate`: the current registry
+    // is read for every session, the PIN is checked by `PrivdPinVerifier`.
     match sh.auth.authenticate(pending).await {
         Ok(Outcome::Paired { connection, device }) => {
             tracing::info!(device = %device.id, "device paired");
@@ -366,69 +350,13 @@ async fn pair(sh: &Shared, pending: PendingSession) {
             let _ = tokio::time::timeout(Duration::from_secs(2), connection.closed()).await;
             connection.close(CloseCode::NoError, "paired").await;
         }
-        Ok(Outcome::Authorized { connection, .. }) => {
-            // `authenticate` never authorizes: its PIN is unset and sessions are handled below.
-            connection
-                .close(CloseCode::InternalError, "unexpected")
-                .await;
+        Ok(Outcome::Authorized { connection, device }) => {
+            tracing::info!(device = %device.id, "session authorized");
+            sh.sessions.serve(connection, device, revocations).await;
         }
         Ok(Outcome::Refused(_)) => {}
-        Err(e) => tracing::debug!(error = %e, "pairing ended without success"),
+        Err(e) => tracing::debug!(error = %e, "authentication ended without success"),
     }
-}
-
-async fn session(sh: &Shared, pending: PendingSession) {
-    let refuse = |p: PendingSession| async move {
-        let _ = p.refuse(RefuseReason::Unauthorized, "not authorized").await;
-    };
-    let Ok(key) = tls::peer_key(pending.peer_certificates()) else {
-        return refuse(pending).await;
-    };
-    // The current registry, never a cached answer.
-    let device = match sh.registry.find_by_key(&key) {
-        Ok(Some(d)) if !d.is_revoked() => d,
-        Ok(_) => return refuse(pending).await,
-        Err(e) => {
-            tracing::error!(error = %e, "registry lookup failed; refusing");
-            return refuse(pending).await;
-        }
-    };
-    // No PIN anywhere: the server is not set up yet. The text is the same as for an unknown
-    // peer (protocol 11.6).
-    if !sh.verifiers.has_pin() {
-        return refuse(pending).await;
-    }
-    // Subscribed before the login runs, so a revocation during it is never missed.
-    let revocations = sh.auth.subscribe_revocations();
-    let caps = capabilities_with_file_limit(&OFFERED_CODECS, sh.features, sh.config.max_file_bytes);
-    let conn = match pending
-        .accept(ServerHello {
-            capabilities: caps,
-            software: SOFTWARE.into(),
-        })
-        .await
-    {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::debug!(error = %e, "accepting the session failed");
-            return;
-        }
-    };
-    if let Err(e) = sh.login.pin_exchange(&conn, &device).await {
-        tracing::debug!(device = %device.id, error = %e, "login failed");
-        Login::close_failed(&conn, "authentication failed").await;
-        return;
-    }
-    let device = match sh.login.complete(&conn, &device, sh.features).await {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::debug!(device = %device.id, error = %e, "login could not be completed");
-            Login::close_failed(&conn, "authentication failed").await;
-            return;
-        }
-    };
-    tracing::info!(device = %device.id, "session authorized");
-    sh.sessions.serve(conn, device, revocations).await;
 }
 
 /// Loads the identity key from a credential file: 32 raw bytes, or 64 hex characters.

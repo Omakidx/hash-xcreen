@@ -9,11 +9,10 @@
 //!   (yes or no, failures counted globally and capped, section 5.3); a verifier is created with
 //!   `PepperEnrol`. **The gateway never sees the pepper, and never sees a MAC except the one
 //!   `PepperEnrol` returns for a verifier it is creating** (it stores that value, nothing else).
-//! * hx-crypto's `PinHash` compares the Argon2id output locally, so it cannot carry a peppered
-//!   verifier, and `Authenticator::set_pin` has no hook for a remote check. The gateway therefore
-//!   runs the session login itself ([`super::login`]) with hx-crypto's registry for the
-//!   per-device failure counter and revocation, and uses this module for the secret. The exact
-//!   hx-crypto change that would let `Authenticator` do it is in the round report.
+//! * The session login is `Authenticator::authenticate` with [`PrivdPinVerifier`] installed as
+//!   its `PinVerifier`: the authenticator owns every rule of protocol 11.4 (counting, backoff,
+//!   revocation, refunding an attempt that could not be checked), this module only answers
+//!   yes, no, unavailable or locked.
 //!
 //! # Record format
 //!
@@ -32,9 +31,11 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use argon2::{Algorithm, Argon2, Params, Version};
+use hx_crypto::auth::{BoxFuture, PinVerdict, PinVerifier};
 use hx_crypto::{DeviceId, PinParams};
 use hx_ipc::privd::pb::LockoutPurpose;
 use zeroize::Zeroizing;
@@ -344,6 +345,129 @@ impl VerifierStore {
         persist(&self.path, &next)?;
         *self.state.write().unwrap_or_else(|p| p.into_inner()) = next;
         Ok(())
+    }
+}
+
+/// Bound on the `PepperVerify` call of a login: a privd that does not answer is "unavailable",
+/// never "wrong" (the authenticator has no timeout of its own on a verifier).
+pub const PRIVD_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long PIN checks are refused without asking privd again after it reported the PIN
+/// purpose locked, when privd names no time of its own.
+pub const LOCKED_WAIT: Duration = Duration::from_secs(60);
+
+/// The gateway's [`PinVerifier`] (`docs/ipc.md` section 5.3): Argon2id here, then privd's
+/// `PepperVerify`, which answers only yes or no. The authenticator owns every rule of protocol
+/// 11.4 (counting before checking, the per-device lock, backoff, the 5th failure revokes); this
+/// only answers with a [`PinVerdict`]:
+///
+/// | privd | verdict | effect in the authenticator |
+/// |---|---|---|
+/// | yes | `Right` | counter reset, session authorized |
+/// | no | `Wrong` | counted, backoff, the 5th revokes |
+/// | down, timeout, any failure | `Unavailable` | attempt refunded, never revokes, client told to retry |
+/// | PIN purpose locked | `Locked` | attempt refunded, never revokes, client told `NOT_AVAILABLE` |
+///
+/// After `Locked` the verifier answers `Locked` itself, without asking privd, for privd's
+/// `retry_after` (else [`LOCKED_WAIT`]): the authenticator sets no wait of its own on `Locked`
+/// (a proposed hx-crypto change), so this is what keeps reconnecting devices from hammering
+/// privd while the purpose is locked.
+pub struct PrivdPinVerifier {
+    store: Arc<VerifierStore>,
+    privd: PrivdClient,
+    timeout: Duration,
+    locked_until: Mutex<Option<Instant>>,
+}
+
+impl PrivdPinVerifier {
+    /// A verifier over `store` that asks `privd`.
+    pub fn new(store: Arc<VerifierStore>, privd: PrivdClient) -> Self {
+        Self {
+            store,
+            privd,
+            timeout: PRIVD_TIMEOUT,
+            locked_until: Mutex::new(None),
+        }
+    }
+
+    /// The same with another privd timeout (tests).
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    fn locked(&self) -> bool {
+        let mut l = self.locked_until.lock().unwrap_or_else(|p| p.into_inner());
+        match *l {
+            Some(t) if t > Instant::now() => true,
+            Some(_) => {
+                *l = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn lock_for(&self, wait: Duration) {
+        *self.locked_until.lock().unwrap_or_else(|p| p.into_inner()) = Some(Instant::now() + wait);
+    }
+}
+
+impl PinVerifier for PrivdPinVerifier {
+    fn has_pin(&self, device: &DeviceId) -> bool {
+        self.store.pin_for(device).is_some()
+    }
+
+    fn verify<'a>(
+        &'a self,
+        device: &'a DeviceId,
+        pin: Zeroizing<Vec<u8>>,
+    ) -> BoxFuture<'a, PinVerdict> {
+        Box::pin(async move {
+            if self.locked() {
+                return PinVerdict::Locked;
+            }
+            let Some(record) = self.store.pin_for(device) else {
+                return PinVerdict::Unavailable;
+            };
+            // A malformed PIN is a wrong one, without a hash (protocol 11.4 rule 4).
+            let Ok(pin) = hx_crypto::Pin::from_bytes(&pin) else {
+                return PinVerdict::Wrong;
+            };
+            let expected = *record.expected_mac();
+            let output = tokio::task::spawn_blocking(move || record.derive(pin.as_bytes())).await;
+            let output = match output {
+                Ok(Ok(o)) => o,
+                _ => return PinVerdict::Unavailable,
+            };
+            let answer = tokio::time::timeout(
+                self.timeout,
+                self.privd
+                    .pepper_verify(LockoutPurpose::Pin, &expected, &*output),
+            )
+            .await;
+            match answer {
+                Ok(Ok(true)) => PinVerdict::Right,
+                Ok(Ok(false)) => PinVerdict::Wrong,
+                Ok(Err(e)) if e.is_locked() => {
+                    let wait = match &e {
+                        PrivdError::Remote(r) if !r.retry_after.is_zero() => r.retry_after,
+                        _ => LOCKED_WAIT,
+                    };
+                    tracing::error!("privd reports the PIN purpose locked; PIN logins wait");
+                    self.lock_for(wait);
+                    PinVerdict::Locked
+                }
+                Ok(Err(e)) => {
+                    // The error carries no request content.
+                    tracing::warn!(error = %e, "PepperVerify failed");
+                    PinVerdict::Unavailable
+                }
+                Err(_) => {
+                    tracing::warn!("PepperVerify timed out");
+                    PinVerdict::Unavailable
+                }
+            }
+        })
     }
 }
 

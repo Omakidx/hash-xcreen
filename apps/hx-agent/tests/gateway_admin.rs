@@ -347,7 +347,7 @@ async fn pin_and_password_verifiers_are_set_through_the_socket_and_audited() {
 }
 
 #[tokio::test]
-async fn pairing_codes_work_and_a_token_secret_frame_is_consumed_and_wiped() {
+async fn pairing_codes_and_installed_tokens_work_with_their_lifetimes() {
     let env = Env::start().await;
     let mut adm = admin(&env).await;
 
@@ -390,18 +390,48 @@ async fn pairing_codes_work_and_a_token_secret_frame_is_consumed_and_wiped() {
             .await
     );
 
-    // CreatePairingToken: the token is a secret frame, never a protobuf field. A valid token
-    // is read and wiped; installing it needs an hx-crypto API that does not exist yet, so the
-    // honest answer is UNIMPLEMENTED (see the round report). A malformed one is refused.
+    // CreatePairingToken: the token is a secret frame, never a protobuf field. It is read,
+    // parsed, installed with the requested (capped) lifetime and wiped; the first device pairs
+    // with it exactly once.
     let token = hx_crypto::PairingToken::generate().unwrap().to_text();
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let r = adm
         .call(
-            C::CreatePairingToken(pb::CreatePairingTokenRequest { expires_in_s: 300 }),
+            C::CreatePairingToken(pb::CreatePairingTokenRequest { expires_in_s: 120 }),
             Some(token.as_bytes()),
         )
         .await
         .unwrap();
-    assert_eq!(error_code(r), ErrorCode::Unimplemented);
+    let R::CreatePairingToken(t) = r else {
+        panic!("expected a token result, got {r:?}")
+    };
+    assert!(
+        (before + 120..=before + 125).contains(&t.expires_at_unix_s),
+        "the requested lifetime is honoured: {}",
+        t.expires_at_unix_s
+    );
+    let tablet = new_key();
+    within(hx_crypto::pair_device(
+        &target,
+        &tablet,
+        &hx_crypto::PairingCredential::parse(&token).unwrap(),
+        &Default::default(),
+    ))
+    .await
+    .expect("paired with the installed token")
+    .finish()
+    .await;
+    let again = hx_crypto::pair_device(
+        &target,
+        &new_key(),
+        &hx_crypto::PairingCredential::parse(&token).unwrap(),
+        &Default::default(),
+    )
+    .await;
+    assert!(again.is_err(), "a token is single use");
     let r = adm
         .call(
             C::CreatePairingToken(pb::CreatePairingTokenRequest { expires_in_s: 300 }),

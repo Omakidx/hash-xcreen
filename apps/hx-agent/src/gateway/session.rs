@@ -548,6 +548,37 @@ impl Session {
         }
     }
 
+    /// Marks "the answer was already sent" (never a wire value).
+    const ANSWERED: pb::RevokeStatus = pb::RevokeStatus::Unspecified;
+
+    /// A device revokes itself: the answer is sent **before** the commit, because the
+    /// authenticator closes a revoked device's connections at once and would swallow it. If
+    /// the checks fail the failure is the answer.
+    async fn revoke_self(&mut self, request_id: u32) -> pb::RevokeStatus {
+        match self
+            .mgr
+            .devices
+            .begin_revoke(self.device.id, self.device.id)
+            .await
+        {
+            Err(status) => status,
+            Ok(ticket) => {
+                let ok = pb::ControlMessage::new(Ctl::DeviceMgmt(pb::DeviceMgmt {
+                    request_id,
+                    body: Some(pb::device_mgmt::Body::RevokeResult(pb::RevokeResult {
+                        status: pb::RevokeStatus::Ok as i32,
+                    })),
+                }));
+                if self.send(ok).await.is_ok() {
+                    // Let the peer's transport read it before the connection can be closed.
+                    let _ = self.conn.ping(GOODBYE_FLUSH).await;
+                }
+                let _ = ticket.commit().await;
+                Self::ANSWERED
+            }
+        }
+    }
+
     async fn device_mgmt(&mut self, m: pb::DeviceMgmt) -> Flow {
         use pb::device_mgmt::Body as B;
         let violation = |why: &'static str| Flow::End(Some((CloseCode::ProtocolError, why)));
@@ -570,6 +601,9 @@ impl Session {
                 // The per-device rate limit and the cooling-off rule live in the service, so
                 // they hold across every connection of the device.
                 let status = match device_id(&r.device_id) {
+                    Some(target) if target == self.device.id => {
+                        self.revoke_self(m.request_id).await
+                    }
                     Some(target) => {
                         self.mgr
                             .devices
@@ -578,6 +612,13 @@ impl Session {
                     }
                     None => pb::RevokeStatus::NotFound,
                 };
+                if status == Self::ANSWERED {
+                    return if self.mgr.devices.is_active(&self.device.id) {
+                        Flow::Continue
+                    } else {
+                        Flow::End(Some((CloseCode::Unauthorized, "device revoked")))
+                    };
+                }
                 // FAILED because the asker itself was revoked meanwhile: answer, then close.
                 requester_gone = status == pb::RevokeStatus::Failed
                     && !self.mgr.devices.is_active(&self.device.id);

@@ -134,7 +134,7 @@ async fn pair_then_pin_login(pref: hx_transport::TransportPreference) {
     .map(|_| ())
     .unwrap_err();
     assert!(
-        matches!(&err, CryptoError::Refused { message, .. } if message == "not authorized"),
+        matches!(&err, CryptoError::Refused { reason, .. } if *reason == pb::RefuseReason::Unauthorized),
         "{err}"
     );
 
@@ -321,6 +321,14 @@ async fn a_privd_outage_is_never_a_wrong_pin() {
     assert_eq!(rec.failed_pins, 0, "nothing was counted");
     assert!(!rec.is_revoked());
     env.privd.set_down(false);
+    // Retrying at once is "too soon" (the wait the client was told is enforced) and not counted.
+    assert!(matches!(
+        within(a.submit(&hx_crypto::Pin::new(PIN).unwrap()))
+            .await
+            .unwrap(),
+        PinReply::Backoff { .. }
+    ));
+    env.clock.advance(Duration::from_secs(3));
     assert_eq!(
         within(a.submit(&hx_crypto::Pin::new(PIN).unwrap()))
             .await
@@ -1126,11 +1134,11 @@ async fn a_device_replaces_its_own_unresponsive_session_even_under_deny() {
     assert!(back.close_info().is_none());
 }
 
-/// F1 (interim): while privd reports the PIN purpose locked, a device is made to wait. Its
-/// reconnects are answered "too soon" without being counted, so it is never driven to
-/// revocation by attempts that were never checked.
+/// F1: while privd reports the PIN purpose locked, a device is told "not available" and the
+/// attempt is given back: reconnecting never counts, never revokes, and (during the wait the
+/// verifier keeps) privd is not asked again.
 #[tokio::test]
-async fn a_locked_pin_purpose_makes_devices_wait_and_never_revokes_them() {
+async fn a_locked_pin_purpose_never_counts_or_revokes_and_waits() {
     let env = Env::start().await;
     let phone = new_key();
     env.pair(&phone, "phone").await;
@@ -1154,22 +1162,28 @@ async fn a_locked_pin_purpose_makes_devices_wait_and_never_revokes_them() {
         PinReply::Wrong { .. }
     ));
     env.clock.advance(Duration::from_secs(5));
-    // The purpose is locked now: this attempt is counted, cannot be checked, and starts a wait.
+    // The purpose is locked now: this attempt cannot be checked and is given back.
     let err = within(a.submit(&hx_crypto::Pin::new(PIN).unwrap()))
         .await
         .unwrap_err();
     assert!(matches!(err, CryptoError::PinNotAvailable), "{err}");
-    let counted = failed(&env);
-    // Seven reconnects with the right PIN inside the wait: all "too soon", none counted.
+    assert_eq!(failed(&env), 1, "only the real wrong PIN counts");
+    let asked = env.privd.with(|s| s.verify_ok + s.verify_fail);
+    // Seven reconnects with the right PIN: each told "not available", none counted, none
+    // revokes, and privd is not asked again while the verifier waits.
     for _ in 0..7 {
         let mut b = env.connect_unauth(&phone, "phone").await;
-        let r = within(b.submit(&hx_crypto::Pin::new(PIN).unwrap()))
+        let err = within(b.submit(&hx_crypto::Pin::new(PIN).unwrap()))
             .await
-            .unwrap();
-        assert!(matches!(r, PinReply::Backoff { .. }), "{r:?}");
-        b.abandon().await;
+            .unwrap_err();
+        assert!(matches!(err, CryptoError::PinNotAvailable), "{err}");
     }
-    assert_eq!(failed(&env), counted, "waiting attempts are not counted");
+    assert_eq!(failed(&env), 1);
+    assert_eq!(
+        env.privd.with(|s| s.verify_ok + s.verify_fail),
+        asked,
+        "no PepperVerify during the wait"
+    );
     assert!(
         !env.gw
             .authenticator()
@@ -1196,8 +1210,45 @@ async fn a_locked_pin_purpose_makes_devices_wait_and_never_revokes_them() {
     )
     .await
     .unwrap();
-    let _ = env.login(&phone, "phone", PIN).await;
-    assert_eq!(failed(&env), 0);
+    assert_eq!(failed(&env), 0, "the operator's reset zeroed the counter");
+}
+
+/// F1: privd dropping the PepperVerify connection six times in a row is an outage, not six
+/// wrong PINs: the device is not revoked and its counter is back at zero.
+#[tokio::test]
+async fn privd_dropping_the_connection_six_times_never_revokes_the_device() {
+    let env = Env::start().await;
+    let phone = new_key();
+    env.pair(&phone, "phone").await;
+    env.set_pin(PIN).await;
+    let id = Env::id_of(&phone);
+    env.privd.with(|s| s.close_after_request = true);
+    let mut c = env.connect_unauth(&phone, "phone").await;
+    for _ in 0..6 {
+        env.clock.advance(Duration::from_secs(5));
+        let r = within(c.submit(&hx_crypto::Pin::new(PIN).unwrap()))
+            .await
+            .unwrap();
+        assert!(matches!(r, PinReply::Backoff { .. }), "{r:?}");
+        // The connection allows five attempt messages; use a fresh one every few.
+        c.abandon().await;
+        c = env.connect_unauth(&phone, "phone").await;
+    }
+    let rec = env.gw.authenticator().registry().get(&id).unwrap().unwrap();
+    assert!(
+        !rec.is_revoked(),
+        "six dropped connections are not six wrong PINs"
+    );
+    assert_eq!(rec.failed_pins, 0, "every attempt was given back");
+    // privd comes back: the very same device logs in.
+    env.privd.with(|s| s.close_after_request = false);
+    env.clock.advance(Duration::from_secs(5));
+    assert_eq!(
+        within(c.submit(&hx_crypto::Pin::new(PIN).unwrap()))
+            .await
+            .unwrap(),
+        PinReply::Accepted
+    );
 }
 
 /// N6: revocations are recorded directly, not through a broadcast that can lag: a burst larger
@@ -1231,28 +1282,47 @@ async fn a_burst_of_revocations_is_audited_in_full() {
     );
 }
 
-/// F2 (lockout path): a revocation caused by the PIN lockout takes the same lock as every other
-/// one, and is audited and announced like them.
+/// A revocation caused by the PIN lockout (made by the authenticator itself) is audited,
+/// announced to the live sessions and closes the device's other sessions, like any other.
 #[tokio::test]
-async fn a_lockout_revocation_is_serialized_with_the_others_and_recorded() {
+async fn a_lockout_revocation_is_recorded_announced_and_closes_sessions() {
     let env = Env::start().await;
     let (a, b) = (new_key(), new_key());
     env.pair(&a, "alice").await;
     env.pair(&b, "bob").await;
-    let gate = env.gw.devices().revoke_gate();
-    let held = gate.lock().await;
-    let devices = env.gw.devices().clone();
-    let id = Env::id_of(&b);
-    let lockout = tokio::spawn(async move { devices.revoke_lockout(id).await });
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(
-        !lockout.is_finished(),
-        "the lockout waits for the revocation lock"
+    env.set_pin(PIN).await;
+    let observer = env.login(&a, "alice", PIN).await;
+    let victim_session = env.login(&b, "bob", PIN).await;
+    let wrong = hx_crypto::Pin::new("111111").unwrap();
+    for _ in 1..=4 {
+        env.clock.advance(Duration::from_secs(40));
+        let mut c = env.connect_unauth(&b, "bob").await;
+        assert!(matches!(
+            within(c.submit(&wrong)).await.unwrap(),
+            PinReply::Wrong { .. }
+        ));
+        c.abandon().await;
+    }
+    env.clock.advance(Duration::from_secs(40));
+    let mut c = env.connect_unauth(&b, "bob").await;
+    assert!(matches!(
+        within(c.submit(&wrong)).await.unwrap_err(),
+        CryptoError::Revoked
+    ));
+    assert_eq!(
+        closed_with(&victim_session).await.code,
+        CloseCode::Unauthorized
     );
-    assert!(env.gw.devices().is_active(&Env::id_of(&b)));
-    drop(held);
-    assert!(within(lockout).await.unwrap().unwrap());
-    assert!(!env.gw.devices().is_active(&Env::id_of(&b)));
+    let ev = next_event(&observer).await;
+    assert_eq!(ev.kind, pb::DeviceEventKind::Revoked as i32);
+    assert!(
+        ev.by_device_id.is_empty(),
+        "the lockout is not a paired device"
+    );
+    assert_eq!(
+        ev.device.unwrap().revoke_reason,
+        pb::DeviceRevokeReason::TooManyPinFailures as i32
+    );
     assert!(
         env.privd
             .wait_for(|s| s.events.iter().any(|e| e.0 == AuditEvent::DeviceRevoked))
