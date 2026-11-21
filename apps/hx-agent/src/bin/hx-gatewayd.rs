@@ -23,8 +23,9 @@ use std::sync::Arc;
 use hx_agent::gateway::admin::{self, AdminPolicy};
 use hx_agent::gateway::cli::{Args, parse_args};
 use hx_agent::gateway::config::{GatewayConfig, SeccompMode};
-use hx_agent::gateway::desktop::UnavailableLink;
 use hx_agent::gateway::harden;
+use hx_agent::gateway::privd_client::PrivdClient;
+use hx_agent::gateway::relay::{RelayConfig, RelayLink};
 use hx_agent::gateway::server::{Gateway, StartOptions, load_identity};
 use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
@@ -98,7 +99,10 @@ async fn run(args: Args) -> Result<(), String> {
     let mut opts = StartOptions::new(
         config.clone(),
         Arc::new(identity),
-        Arc::new(UnavailableLink),
+        RelayLink::new(
+            RelayConfig::from_gateway(&config),
+            Some(PrivdClient::new(&config.privd_socket, Default::default())),
+        ),
     );
     opts.admin_listener = Some(admin_listener(&config)?);
     if let Some(uid) = args.admin_allow_uid {

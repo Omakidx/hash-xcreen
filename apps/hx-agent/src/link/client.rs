@@ -95,6 +95,11 @@ impl LinkClient {
         self.sh.minor
     }
 
+    /// True if `other` is a handle of the same link (clones of one `connect`).
+    pub fn same_link(&self, other: &LinkClient) -> bool {
+        Arc::ptr_eq(&self.sh, &other.sh)
+    }
+
     /// True once the link has ended.
     pub fn is_closed(&self) -> bool {
         self.sh.is_closed()

@@ -12,6 +12,7 @@
 //! privd_socket = "/run/hx/privd.sock"
 //! admin_socket = "/run/hx/gatewayd-admin.sock"
 //! identity_credential = "identity"   # a name under $CREDENTIALS_DIRECTORY, or an absolute path
+//! link_socket = "/run/hx/link/main.sock"  # default: /run/hx/link/<desktop_id>.sock (ipc.md 11)
 //! max_file_bytes = 4294967296     # lower than 4 GiB to cap file transfers (protocol 5.6)
 //! pairing_ttl_s = 900
 //! manage_idle_s = 300
@@ -83,6 +84,11 @@ pub struct GatewayConfig {
     /// path.
     #[serde(default = "default_identity")]
     pub identity_credential: PathBuf,
+    /// The host side of the session link socket that privd's `ProvisionSessionLink` creates;
+    /// `None` is `/run/hx/link/<desktop_id>.sock` (`docs/ipc.md` section 11). Tests point it at
+    /// a socket of their own.
+    #[serde(default)]
+    pub link_socket: Option<PathBuf>,
     /// The largest file transfer offered (protocol 5.6); at most 4 GiB.
     #[serde(default = "default_max_file")]
     pub max_file_bytes: u64,
@@ -165,6 +171,7 @@ impl GatewayConfig {
             privd_socket: default_privd(),
             admin_socket: default_admin(),
             identity_credential: default_identity(),
+            link_socket: None,
             max_file_bytes: default_max_file(),
             pairing_ttl_s: default_pairing_ttl(),
             manage_idle_s: default_manage_idle(),
@@ -172,6 +179,13 @@ impl GatewayConfig {
             mlock: true,
             argon2_min_memory_kib: default_min_memory(),
         }
+    }
+
+    /// The link socket: the configured one, or `/run/hx/link/<desktop_id>.sock`.
+    pub fn link_socket_path(&self) -> PathBuf {
+        self.link_socket
+            .clone()
+            .unwrap_or_else(|| Path::new("/run/hx/link").join(format!("{}.sock", self.desktop_id)))
     }
 
     /// Range checks.
@@ -194,7 +208,11 @@ impl GatewayConfig {
         if !(10..=3600).contains(&self.manage_idle_s) {
             return Err(ConfigError::Invalid("manage_idle_s must be 10 to 3600"));
         }
-        for p in [&self.state_dir, &self.privd_socket, &self.admin_socket] {
+        let link = self.link_socket.iter();
+        for p in [&self.state_dir, &self.privd_socket, &self.admin_socket]
+            .into_iter()
+            .chain(link)
+        {
             if !p.is_absolute() {
                 return Err(ConfigError::Invalid("paths must be absolute"));
             }
