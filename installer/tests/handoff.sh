@@ -105,7 +105,12 @@ wait "$holder" 2>/dev/null
 # tampering
 cp -R "$tmp/rel" "$tmp/t1"
 art=$(ls "$tmp/t1"/hx-*.tar.gz)
-printf 'Z' | dd of="$art" bs=1 seek=100 conv=notrunc 2>/dev/null
+# Change byte 100 to a value it does not already have (writing a fixed 'Z' left the file
+# untouched whenever that byte was already 'Z', about one run in 256).
+b=$(dd if="$art" bs=1 skip=100 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')
+if [ "$b" = 5a ]; then z=Y; else z=Z; fi
+printf '%s' "$z" | dd of="$art" bs=1 seek=100 conv=notrunc 2>/dev/null
+cmp -s "$art" "$tmp/rel/$(basename "$art")" && { echo "FAIL the tamper did not change the tarball"; fail=1; }
 case_run "a tampered tarball (same size) is refused (exit 10)" 10 os-24 yes "$me" "$none" "$R/install.sh" "" 'digest does not match' -- --release-dir "$tmp/t1"
 cp -R "$tmp/rel" "$tmp/t2"
 { cat "$tmp/rel/hx-0.1.0-x86_64.tar.gz"; printf 'x'; } >"$tmp/t2/hx-0.1.0-x86_64.tar.gz"
