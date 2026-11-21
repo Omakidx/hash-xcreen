@@ -279,7 +279,12 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{OpenOptionsExt, symlink};
 
-    fn setup() -> (tempfile::TempDir, FetchDir, std::path::PathBuf, std::path::PathBuf) {
+    fn setup() -> (
+        tempfile::TempDir,
+        FetchDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
         let t = tempfile::tempdir().unwrap();
         let fetch = t.path().join("updates");
         let staging = t.path().join("staging");
@@ -294,7 +299,10 @@ mod tests {
         std::fs::write(fetch.join("artifact.tar.gz"), b"hello artifact").unwrap();
         let s = d.stage_large("artifact.tar.gz", 14, &staging).unwrap();
         assert_eq!(s.len, 14);
-        assert_eq!(s.sha256, super::super::verify::sha256_hex(b"hello artifact"));
+        assert_eq!(
+            s.sha256,
+            super::super::verify::sha256_hex(b"hello artifact")
+        );
         // The fetcher rewrites its file after the copy: the staged bytes do not change.
         std::fs::write(fetch.join("artifact.tar.gz"), b"EVIL EVIL EVIL").unwrap();
         let mut got = String::new();
@@ -316,7 +324,10 @@ mod tests {
             Err(ReadError::NotRegular(_))
         ));
         std::fs::hard_link(&secret, fetch.join("hard")).unwrap();
-        assert!(matches!(d.read_small("hard", 100), Err(ReadError::Linked(_))));
+        assert!(matches!(
+            d.read_small("hard", 100),
+            Err(ReadError::Linked(_))
+        ));
         rustix::fs::mknodat(
             rustix::fs::CWD,
             fetch.join("fifo"),
@@ -325,10 +336,19 @@ mod tests {
             0,
         )
         .unwrap();
-        assert!(matches!(d.read_small("fifo", 100), Err(ReadError::NotRegular(_))));
+        assert!(matches!(
+            d.read_small("fifo", 100),
+            Err(ReadError::NotRegular(_))
+        ));
         std::fs::create_dir(fetch.join("dir")).unwrap();
-        assert!(matches!(d.read_small("dir", 100), Err(ReadError::NotRegular(_))));
-        assert!(matches!(d.read_small("nope", 100), Err(ReadError::Missing(_))));
+        assert!(matches!(
+            d.read_small("dir", 100),
+            Err(ReadError::NotRegular(_))
+        ));
+        assert!(matches!(
+            d.read_small("nope", 100),
+            Err(ReadError::Missing(_))
+        ));
         // A name that tries to leave the directory is not a name at all.
         assert!(d.read_small("../secret", 100).is_err());
         assert!(d.read_small("/etc/passwd", 100).is_err());
@@ -357,7 +377,10 @@ mod tests {
     fn quotas_and_announced_sizes_are_enforced() {
         let (_t, d, fetch, staging) = setup();
         std::fs::write(fetch.join("big"), vec![7u8; 1000]).unwrap();
-        assert!(matches!(d.read_small("big", 999), Err(ReadError::TooBig(_))));
+        assert!(matches!(
+            d.read_small("big", 999),
+            Err(ReadError::TooBig(_))
+        ));
         assert!(matches!(
             d.stage_large("big", 999, &staging),
             Err(ReadError::TooBig(_))

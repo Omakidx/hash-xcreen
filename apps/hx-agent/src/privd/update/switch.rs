@@ -34,12 +34,8 @@ use super::verify::hex;
 use super::version::Version;
 
 /// Files a release must contain to be switched to.
-pub const REQUIRED_BINARIES: &[&str] = &[
-    "hx-privd",
-    "hx-gatewayd",
-    "hx-agent",
-    "hx-update-fetcher",
-];
+pub const REQUIRED_BINARIES: &[&str] =
+    &["hx-privd", "hx-gatewayd", "hx-agent", "hx-update-fetcher"];
 /// The text file holding the version.
 pub const VERSION_FILE: &str = "VERSION";
 
@@ -206,7 +202,8 @@ impl Layout {
             ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
         )
         .map_err(|_| format!("version {version} is not installed"))?;
-        let beneath = ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS;
+        let beneath =
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS;
         for name in REQUIRED_BINARIES.iter().copied().chain([VERSION_FILE]) {
             let fd = rustix::fs::openat2(
                 &vdir,
@@ -259,8 +256,11 @@ impl Layout {
     /// `(from, to)`: the version that was current and the one that is now.
     pub fn swap_back(&self) -> io::Result<(String, String)> {
         let root = self.open()?;
-        let none = |what: &str| io::Error::new(io::ErrorKind::NotFound, format!("no {what} version"));
-        let cur = self.read_link(&root, "current")?.ok_or_else(|| none("current"))?;
+        let none =
+            |what: &str| io::Error::new(io::ErrorKind::NotFound, format!("no {what} version"));
+        let cur = self
+            .read_link(&root, "current")?
+            .ok_or_else(|| none("current"))?;
         let prev = self
             .read_link(&root, "previous")?
             .ok_or_else(|| none("previous"))?;
@@ -368,7 +368,10 @@ mod tests {
         install(t.path(), "1.4.0");
         std::fs::remove_file(t.path().join("1.4.0/hx-agent")).unwrap();
         std::os::unix::fs::symlink("/bin/sh", t.path().join("1.4.0/hx-agent")).unwrap();
-        assert!(l.switch_to("1.4.0").is_err(), "a symlinked binary is refused");
+        assert!(
+            l.switch_to("1.4.0").is_err(),
+            "a symlinked binary is refused"
+        );
         assert_eq!(l.current().unwrap().as_deref(), Some("1.0.0"));
     }
 
@@ -393,11 +396,15 @@ mod tests {
             })
         };
         for i in 0..300 {
-            l.switch_to(if i % 2 == 0 { "1.1.0" } else { "1.0.0" }).unwrap();
+            l.switch_to(if i % 2 == 0 { "1.1.0" } else { "1.0.0" })
+                .unwrap();
         }
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         let seen = reader.join().unwrap();
-        assert!(seen.iter().all(|s| s == "1.0.0" || s == "1.1.0"), "{seen:?}");
+        assert!(
+            seen.iter().all(|s| s == "1.0.0" || s == "1.1.0"),
+            "{seen:?}"
+        );
         // No temporary link is left behind.
         let leftovers: Vec<_> = std::fs::read_dir(t.path())
             .unwrap()
@@ -446,7 +453,10 @@ mod tests {
         drop(fd);
         l.publish(&name, "1.5.0").unwrap();
         assert!(t.path().join("1.5.0").is_dir());
-        let mode = std::fs::metadata(t.path().join("1.5.0")).unwrap().permissions().mode();
+        let mode = std::fs::metadata(t.path().join("1.5.0"))
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o755);
     }
 

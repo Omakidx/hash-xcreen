@@ -256,8 +256,18 @@ fn open_dir(root: BorrowedFd<'_>, comps: &[String], create: bool) -> Result<Owne
             Err(rustix::io::Errno::LOOP) => {
                 return Err(ExtractError::Refused(Refusal::ThroughSymlink));
             }
+            // `O_DIRECTORY|O_NOFOLLOW` on a symlink says ENOTDIR, like a plain file does: look.
             Err(rustix::io::Errno::NOTDIR) => {
-                return Err(ExtractError::Refused(Refusal::Conflict));
+                let is_link = rustix::fs::statat(&cur, c.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+                    .is_ok_and(|st| {
+                        rustix::fs::FileType::from_raw_mode(st.st_mode)
+                            == rustix::fs::FileType::Symlink
+                    });
+                return Err(ExtractError::Refused(if is_link {
+                    Refusal::ThroughSymlink
+                } else {
+                    Refusal::Conflict
+                }));
             }
             Err(e) => return Err(io::Error::from(e).into()),
         };
@@ -324,10 +334,10 @@ pub fn extract_tar_gz(
         if !seen.insert(comps.clone()) {
             return Err(ExtractError::Refused(Refusal::Duplicate));
         }
-        let (name, parents) = comps.split_last().map_or_else(
-            || unreachable!("checked non-empty"),
-            |(n, p)| (n.as_str(), p),
-        );
+        let Some((name, parents)) = comps.split_last() else {
+            return Err(ExtractError::Refused(Refusal::BadName));
+        };
+        let name = name.as_str();
         match kind {
             t if t.is_dir() => {
                 let dir = open_dir(root, &comps, true)?;
@@ -344,7 +354,11 @@ pub fn extract_tar_gz(
                 let fd = rustix::fs::openat2(
                     &parent,
                     name,
-                    OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    OFlags::WRONLY
+                        | OFlags::CREATE
+                        | OFlags::EXCL
+                        | OFlags::NOFOLLOW
+                        | OFlags::CLOEXEC,
                     Mode::from_raw_mode(0o600),
                     resolve_flags(),
                 )
@@ -371,7 +385,6 @@ pub fn extract_tar_gz(
                 }
                 rustix::fs::fchmod(&out, Mode::from_raw_mode(masked_mode(mode, false)))
                     .map_err(io::Error::from)?;
-                out.sync_all()?;
                 regular.insert(comps.clone());
                 stats.files += 1;
             }
@@ -402,9 +415,9 @@ pub fn extract_tar_gz(
                 if !regular.contains(&tcomps) {
                     return Err(ExtractError::Refused(Refusal::LinkEscapes));
                 }
-                let (tname, tparents) = tcomps
-                    .split_last()
-                    .map_or_else(|| unreachable!("regular files have names"), |(n, p)| (n, p));
+                let Some((tname, tparents)) = tcomps.split_last() else {
+                    return Err(ExtractError::Refused(Refusal::LinkEscapes));
+                };
                 let tparent = open_dir(root, tparents, false)?;
                 let parent = open_dir(root, parents, true)?;
                 rustix::fs::linkat(&tparent, tname.as_str(), &parent, name, AtFlags::empty())
@@ -423,6 +436,8 @@ pub fn extract_tar_gz(
             _ => return Err(ExtractError::Refused(Refusal::UnsupportedType)),
         }
     }
+    // One flush for the whole tree (not an fsync per file) before the caller switches to it.
+    rustix::fs::syncfs(root).map_err(io::Error::from)?;
     Ok(stats)
 }
 

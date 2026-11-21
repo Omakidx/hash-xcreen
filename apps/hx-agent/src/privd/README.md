@@ -51,6 +51,9 @@ is an error: privd refuses to start rather than reset a lockout or a window.
 | `ratelimit` | JSON: `PepperVerify` failure times per purpose and the locks, `PepperEnrol` call times, current-password check times | 0600 |
 | `pepper.key` | 32 random bytes, the verifier pepper, **only when there is no systemd credential** (a development run, or a host that has not migrated yet; see "The pepper") | 0600 |
 | `owner-key` | the enrolled owner public key (Phase 2 shape) | 0644 |
+| `updates-state` | JSON: highest accepted manifest timestamp, the verified version, a `pending` update awaiting its health check, the last automatic rollback | 0600 |
+| `staging/` | privd's own verified copies: the staged manifest and signature (the artifact is an unnamed `O_TMPFILE`, never a name here) | dir 0700 |
+| `updates/` | what the fetcher left: **hostile**, root-owned mode 1733, bind-mounted into the fetcher's unit, swept before every fetch | dir 1733 |
 
 Other files privd writes: `/etc/hx/host-firewall.nft` (0600, the generated ruleset, loaded at boot
 by `hx-host-firewall.service`), `/etc/sysctl.d/90-hx-incus.conf` (0644), `/var/log/hx/audit.log`
@@ -153,20 +156,58 @@ waiters and a 10 s wait). `Ping` is answered at once, at most 10 times a second.
 | ProvisionSessionLink | implemented |
 | InstallSession | implemented; `FAILED_PRECONDITION` while the host has no `hx-session` package for the distro |
 | RestartSession | implemented |
-| CheckUpdate, ApplyUpdate, RollbackUpdate | `UNIMPLEMENTED`: self-update is not in this release |
+| CheckUpdate, ApplyUpdate, RollbackUpdate | implemented (see "Self-update"); a build whose `release-keys/` are `UNPROVISIONED` answers `FAILED_PRECONDITION` |
 | DestroyDesktop | implemented |
 | Uninstall | `UNIMPLEMENTED`: installer-level removal of units, credentials and the registry |
 | ResetLockout, EnrolOwnerKey | implemented |
 | UpgradeIncus, BeginSecretUpload, every Phase 2 command | `UNIMPLEMENTED` (reserved) |
 | PepperVerify, PepperEnrol, RecordEvent | implemented |
 
+## Self-update
+
+ipc.md 6.12 is the contract; this is how it is built (code in `update/`, `cmd/update.rs`,
+`cmd/update_resume.rs`, the fetcher in `src/fetcher/`).
+
+* **Fetch.** `systemctl start hx-update-fetcher@manifest-<channel>.service` (or `@artifact-<version>`)
+  runs `hx-update-fetcher` as a dynamic user with no capabilities and only `AF_INET`/`AF_INET6`; the
+  instance is its whole argument vector. It writes `manifest.json`, `manifest.json.minisig` or
+  `artifact.tar.gz` into `/var/lib/hx/updates`, bind-mounted at `/var/lib/hx-update`. privd sweeps the
+  directory with `unlinkat` before every fetch and reads the three fixed names only, through a
+  descriptor opened once and `openat2(RESOLVE_BENEATH|NO_SYMLINKS|NO_MAGICLINKS)`, checking the open
+  file (regular, one link, size). The manifest is read into memory, the artifact is copied into an
+  unnamed `O_TMPFILE` in `staging/` while being hashed; nothing is read twice.
+* **Verify.** minisign (prehashed only) against the keys of `release-keys/current.pub` and `next.pub`,
+  compiled in; then every manifest field; then the freshness counter (`updates-state`); then, at
+  `ApplyUpdate`, size and SHA-256 of the artifact against the signed manifest. A build whose key files
+  say `UNPROVISIONED` verifies nothing. 1E must put the real keys there.
+* **Unpack and switch.** `extract` unpacks the verified `.tar.gz` into `/usr/lib/hx/.incoming-<v>-<rand>`
+  with `openat2`, renames it to `/usr/lib/hx/<v>` after checking it is complete, then points
+  `previous` at the old `current` and `current` at the new one (`symlinkat` + `renameat`, atomic).
+  Two versions are kept; the rest are removed when an update is confirmed.
+* **Re-exec and judge.** The old process records `pending` in `updates-state`, answers
+  `restarting`, restarts gatewayd and then `hx-privd.service` itself (`--no-block`; the socket unit
+  keeps the socket). The **new** process runs `Daemon::resume_update` from `serve`: privd answers on
+  its socket, gatewayd is active with one `MainPID` for 30 s, gatewayd's admin socket answers
+  `Status`, all within 90 s of the switch. Otherwise the links flip back, both units restart again
+  and `needs_attention=UPDATE_ROLLED_BACK` is set. A new privd that starts three times without
+  succeeding is rolled back too, and so is one running a version other than the one switched in.
+* **Not covered by privd.** A new `hx-privd` binary that cannot start at all (a missing library, a
+  bad ELF) is never seen by `resume_update`; systemd's `Restart=on-failure` retries the same binary.
+  The installer should add `StartLimitBurst`/`OnFailure=` pointing at a rollback helper that lives
+  outside `/usr/lib/hx/<version>` (for example a ten-line script that swaps the two links); that is a
+  1E item. Unit files are not part of an artifact: a release that needs a changed unit needs the
+  installer, not self-update.
+* **Tests** never restart a unit or connect to a daemon: `FakeSystemd`, a fake health probe and the
+  test keys are injected through `Daemon::set_update_deps`, which exists only with `test-support`.
+
 ## Unit hardening
 
 `hx-privd.service` runs as root because it drives Incus, loads nftables and writes sysctl drop-ins.
 `systemd-analyze security --offline` rates it 2.8 OK. What is set and why:
 
-* `ProtectSystem=strict` with `ReadWritePaths=/etc/hx /etc/sysctl.d` and `-/run/xtables.lock`: the only
-  host files it writes besides its own `StateDirectory` and `LogsDirectory`. `/etc/hx` and
+* `ProtectSystem=strict` with `ReadWritePaths=/etc/hx /etc/sysctl.d`, `-/run/xtables.lock` and
+  `-/usr/lib/hx` (the release directory self-update unpacks into): the only host files it writes
+  besides its own `StateDirectory` and `LogsDirectory`. `/etc/hx` and
   `/run/xtables.lock` are created by tmpfiles so that the namespace setup cannot fail.
 * `CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_IPC_LOCK` and `IPAddressDeny=any`: nft and
   iptables; `mlockall` as a second line next to `LimitMEMLOCK=infinity`. `CAP_DAC_OVERRIDE` is gone:
@@ -204,7 +245,8 @@ to `incus.service` through a drop-in.
   with a netlink socket of our own.
 * Security-relevant budgets are written on every change (rarer than once a second by construction)
   rather than once a second; in-memory rate buckets are not persisted.
-* `/etc/hx/privd.toml` (ipc.md section 2) is not read: the desktop cap is the compiled-in 1.
+* `/etc/hx/privd.toml` (ipc.md section 2) is read for `[update] channel` only (a private, root-owned
+  file; anything else means `stable`); the desktop cap is the compiled-in 1.
 * `CreateDesktop` warns instead of failing when the host has no `hx-session` package for the distro
   (the packaging of `hx-session` and the signed artifact store are not in this release), so a desktop
   still becomes `ready`; `InstallSession` installs it later. The current-password helper ships in that

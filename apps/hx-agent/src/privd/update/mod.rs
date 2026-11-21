@@ -145,7 +145,9 @@ pub fn read_channel(path: &Path) -> Channel {
         return Channel::Stable;
     };
     if !m.is_file() || m.uid() != rustix::process::geteuid().as_raw() || m.mode() & 0o022 != 0 {
-        crate::privd::log::warn("privd.toml is not a root-owned, private file; using the stable channel");
+        crate::privd::log::warn(
+            "privd.toml is not a root-owned, private file; using the stable channel",
+        );
         return Channel::Stable;
     }
     let mut text = String::new();

@@ -24,9 +24,7 @@ use hx_ipc::privd::snapshot_kind_of;
 use hx_ipc::text::sanitize_text;
 use hx_provision::incus::Transport;
 
-use crate::fetcher::{
-    ARTIFACT_FILE, Job, MANIFEST_FILE, MANIFEST_SIG_FILE, MAX_MANIFEST_BYTES,
-};
+use crate::fetcher::{ARTIFACT_FILE, Job, MANIFEST_FILE, MANIFEST_SIG_FILE, MAX_MANIFEST_BYTES};
 use crate::privd::daemon::{Ctx, Daemon, Reply};
 use crate::privd::error::CmdError;
 use crate::privd::log;
@@ -126,7 +124,9 @@ fn read_staged(path: &Path, max: u64) -> Result<Vec<u8>, CmdError> {
         .map_err(|_| refused("no verified release is staged; run CheckUpdate first"))?;
     let m = f.metadata()?;
     if !m.is_file() || m.len() > max || m.uid() != rustix::process::geteuid().as_raw() {
-        return Err(refused("the staged release is not acceptable; run CheckUpdate again"));
+        return Err(refused(
+            "the staged release is not acceptable; run CheckUpdate again",
+        ));
     }
     let mut buf = Vec::new();
     f.take(max).read_to_end(&mut buf)?;
@@ -466,7 +466,9 @@ pub async fn rollback<T: Transport + Clone + 'static>(
     })?;
     d.audit_notice(&format!("update rollback: {from} -> {to}"));
     schedule_restarts(d, false);
-    Ok(response::Result::RollbackUpdate(pb::RollbackUpdateResult {}))
+    Ok(response::Result::RollbackUpdate(
+        pb::RollbackUpdateResult {},
+    ))
 }
 
 /// `hx-preupdate-<utc>-<4 hex>`, matching ipc.md 6.10.

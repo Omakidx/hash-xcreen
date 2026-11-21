@@ -50,7 +50,11 @@ pub(crate) fn schedule_restarts<T: Transport + Clone + 'static>(
             log::error(&format!("update: {e}"));
             if rollback_if_stuck && let Some(d) = me.upgrade() {
                 let cancel = CancelToken::new();
-                let _g = d.locks.acquire(LockKey::Host, &cancel, LOCK_WAIT).await.ok();
+                let _g = d
+                    .locks
+                    .acquire(LockKey::Host, &cancel, LOCK_WAIT)
+                    .await
+                    .ok();
                 d.rollback_now("privd could not be re-executed").await;
             }
         }
@@ -157,7 +161,9 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
                 ));
             }
             Err(e) => {
-                log::error(&format!("update: the rollback could not flip the link: {e}"));
+                log::error(&format!(
+                    "update: the rollback could not flip the link: {e}"
+                ));
                 self.audit_notice(&format!(
                     "needs_attention=UPDATE_ROLLED_BACK: rollback of {version} failed: {reason}"
                 ));

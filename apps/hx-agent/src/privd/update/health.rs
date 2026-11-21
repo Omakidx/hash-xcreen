@@ -40,7 +40,11 @@ impl Default for HealthPolicy {
 
 /// Runs the check for at most `budget` (the part of the window not yet used). `Err` carries the
 /// reason, in privd's own words.
-pub async fn check(deps: &UpdateDeps, policy: &HealthPolicy, budget: Duration) -> Result<(), String> {
+pub async fn check(
+    deps: &UpdateDeps,
+    policy: &HealthPolicy,
+    budget: Duration,
+) -> Result<(), String> {
     let deadline = Instant::now() + budget;
     let left = || deadline.saturating_duration_since(Instant::now());
 

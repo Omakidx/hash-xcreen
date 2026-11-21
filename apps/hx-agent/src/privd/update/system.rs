@@ -89,7 +89,11 @@ impl SystemdCtl {
         format!("hx-update-fetcher@{}.service", job.instance())
     }
 
-    async fn ctl(&self, args: &[&str], timeout: Duration) -> Result<crate::privd::runner::RunOutput, String> {
+    async fn ctl(
+        &self,
+        args: &[&str],
+        timeout: Duration,
+    ) -> Result<crate::privd::runner::RunOutput, String> {
         let out = self
             .runner
             .run(Program::new(Tool::Systemctl, args).with_timeout(timeout))
@@ -217,7 +221,10 @@ fn probe_privd(path: &std::path::Path) -> Option<()> {
         }),
     )?;
     matches!(next(&s)?, ppb::frame::Frame::HelloAck(_)).then_some(())?;
-    send(&mut s, ppb::frame::Frame::Ping(ppb::Ping { nonce: 0x7570_6461 }))?;
+    send(
+        &mut s,
+        ppb::frame::Frame::Ping(ppb::Ping { nonce: 0x7570_6461 }),
+    )?;
     matches!(next(&s)?, ppb::frame::Frame::Pong(p) if p.nonce == 0x7570_6461).then_some(())
 }
 

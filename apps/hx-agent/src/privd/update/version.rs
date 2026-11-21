@@ -133,7 +133,14 @@ mod tests {
     #[test]
     fn invalid_strings_do_not_parse() {
         for s in [
-            "", "1", "1.2", "1.2.3.4", "1.2.3-", "1.2.3-rc", "1.2.3-gamma.1", "v1.2.3",
+            "",
+            "1",
+            "1.2",
+            "1.2.3.4",
+            "1.2.3-",
+            "1.2.3-rc",
+            "1.2.3-gamma.1",
+            "v1.2.3",
         ] {
             assert!(Version::parse(s).is_none(), "{s}");
         }

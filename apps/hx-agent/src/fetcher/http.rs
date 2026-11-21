@@ -43,9 +43,7 @@ impl Url {
 }
 
 fn path_ok(p: &str) -> bool {
-    p.starts_with('/')
-        && p.len() <= 2048
-        && p.bytes().all(|b| b.is_ascii_graphic() && b != b'#')
+    p.starts_with('/') && p.len() <= 2048 && p.bytes().all(|b| b.is_ascii_graphic() && b != b'#')
 }
 
 fn host_ok(h: &str) -> bool {
@@ -175,6 +173,10 @@ fn connect(cfg: &Config, url: &Url, deadline: Instant) -> Result<Tls, FetchError
         match TcpStream::connect_timeout(&a, t) {
             Ok(tcp) => {
                 let _ = tcp.set_nodelay(true);
+                // The TLS handshake happens inside the first write: bound it too.
+                let slice = remaining(deadline)?.min(IO_SLICE);
+                let _ = tcp.set_read_timeout(Some(slice));
+                let _ = tcp.set_write_timeout(Some(slice));
                 let name = ServerName::try_from(url.host.clone())
                     .map_err(|e| FetchError::Tls(e.to_string()))?;
                 let conn = ClientConnection::new(tls_config(cfg)?, name)
@@ -286,6 +288,7 @@ impl Rd {
 fn tls_or_io(e: io::Error) -> FetchError {
     // rustls reports certificate and protocol failures as `InvalidData`/`Other` io errors.
     match e.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => FetchError::Timeout("network"),
         io::ErrorKind::InvalidData | io::ErrorKind::Other => FetchError::Tls(e.to_string()),
         _ => FetchError::Io(e),
     }
