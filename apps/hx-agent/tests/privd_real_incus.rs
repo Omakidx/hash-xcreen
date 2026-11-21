@@ -418,6 +418,16 @@ async fn run_real(c: Client<UnixTransport>) {
             gid: rustix::process::getgid().as_raw(),
         },
     );
+    // The per-accept group check reads the group file. This process is the "gateway", and the
+    // invoking user is in incus-admin, which the real /etc/group would (rightly) refuse, so the
+    // test points the check at a clean file of its own.
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(&cfg.group_file, format!("hx-gatewayd:x:{me}:\n")).unwrap();
+    std::fs::write(
+        &cfg.passwd_file,
+        format!("hx-gatewayd:x:{me}:{me}::/:/bin/false\n"),
+    )
+    .unwrap();
     cfg.naming = n.clone();
     cfg.instance_prefix = PREFIX.into();
     let image = local_image().await;
