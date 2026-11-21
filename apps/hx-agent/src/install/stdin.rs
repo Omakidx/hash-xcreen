@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! "HXI1" | { kind u8 | len u16 LE | bytes[len] }* | kind 0, len 0
-//! 1 USER_PASSWORD    1..=1024, no \r \n NUL        required
+//! 1 USER_PASSWORD    1..=511, no \r \n NUL         required (libxcrypt reads at most 511)
 //! 2 PIN              6..=16 ASCII digits           required
 //! 3 PAIRING_TOKEN    hxt1-..., at most 1024        optional
 //! 4 OWNER_PUBLIC_KEY 32 bytes                      optional
@@ -158,12 +158,10 @@ fn fill(r: &mut impl Read, buf: &mut [u8]) -> Result<(), InstallError> {
 }
 
 fn check_password(v: &[u8]) -> Result<(), InstallError> {
-    if v.is_empty() || v.len() > 1024 || v.iter().any(|b| matches!(b, 0 | b'\n' | b'\r')) {
-        return Err(bad(
-            "a password is 1 to 1024 bytes with no newline, carriage return or NUL",
-        ));
+    match super::options::password_problem(v) {
+        Some(why) => Err(bad(&why)),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 fn check_pin(v: &[u8]) -> Result<(), InstallError> {
@@ -383,8 +381,12 @@ mod tests {
         assert!(case(1, b"a\nb"));
         assert!(case(1, b"a\rb"));
         assert!(case(1, b"a\0b"));
-        assert!(case(1, &vec![b'a'; 1025]));
-        assert!(!case(1, &vec![b'a'; 1024]));
+        assert!(
+            case(1, &vec![b'a'; 512]),
+            "N5: libxcrypt reads at most 511 bytes"
+        );
+        assert!(case(1, &vec![b'a'; 1024]));
+        assert!(!case(1, &vec![b'a'; 511]));
         assert!(case(2, b"12345"));
         assert!(case(2, b"12345678901234567"));
         assert!(case(2, b"12345a"));

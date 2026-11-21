@@ -87,7 +87,12 @@ fn adopt(n: i32, path: &Path) -> Result<OwnedFd, InstallError> {
     };
     let st = match rustix::fs::fstat(&fd) {
         Ok(st) => st,
-        Err(e) => return Err(refuse(fd, InstallError::internal(format!("--lock-fd: {e}")))),
+        Err(e) => {
+            return Err(refuse(
+                fd,
+                InstallError::internal(format!("--lock-fd: {e}")),
+            ));
+        }
     };
     let Ok(on_disk) = rustix::fs::lstat(path) else {
         return Err(refuse(

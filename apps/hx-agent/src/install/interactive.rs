@@ -223,12 +223,11 @@ pub fn gather(ctx: &mut Ctx<'_>) -> Result<()> {
         ctx,
         "Linux password for the desktop user (input hidden): ",
         "Repeat the password: ",
-        1024,
+        // One more than the limit, so that a too-long one gets the clear message below.
+        super::options::MAX_PASSWORD_BYTES + 1,
     )?;
-    if pw.is_empty() || pw.iter().any(|b| matches!(b, 0 | b'\n' | b'\r')) {
-        return Err(InstallError::usage(
-            "a password is 1 to 1024 bytes with no newline or NUL",
-        ));
+    if let Some(why) = super::options::password_problem(&pw) {
+        return Err(InstallError::usage(why));
     }
     let pin = ask_twice(
         ctx,

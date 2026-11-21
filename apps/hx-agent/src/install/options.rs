@@ -15,6 +15,27 @@ use zeroize::{Zeroize, Zeroizing};
 use super::error::InstallError;
 use super::state::InstallState;
 
+/// The longest Linux password the installer accepts. libxcrypt (`crypt_rn`), and so `hx-pwcheck`
+/// that checks the password later, reads at most 511 bytes: a longer one could be set but never
+/// be checked.
+pub const MAX_PASSWORD_BYTES: usize = 511;
+
+/// Why `pw` cannot be the desktop user's password, or `None` when it can (1 to 511 bytes, no
+/// newline, carriage return or NUL).
+pub fn password_problem(pw: &[u8]) -> Option<String> {
+    if pw.is_empty() || pw.iter().any(|b| matches!(b, 0 | b'\n' | b'\r')) {
+        return Some(
+            "a password is 1 to 511 bytes with no newline, carriage return or NUL".to_owned(),
+        );
+    }
+    (pw.len() > MAX_PASSWORD_BYTES).then(|| {
+        format!(
+            "the password is {} bytes; at most {MAX_PASSWORD_BYTES} are accepted, because the password checker (libxcrypt) reads no more and a longer one could never be checked",
+            pw.len()
+        )
+    })
+}
+
 /// A string secret: redacting `Debug`, wiped on drop.
 pub struct SecretString(pub Zeroizing<String>);
 
@@ -667,6 +688,18 @@ mod tests {
         let c = conflicts(&st, &b, &e);
         assert_eq!(c[0].option, "--docker");
         assert!(c[0].remedy.contains("docker enable"));
+    }
+
+    #[test]
+    fn passwords_are_capped_at_what_libxcrypt_reads() {
+        assert_eq!(MAX_PASSWORD_BYTES, 511);
+        assert!(password_problem(&vec![b'a'; 511]).is_none());
+        let e = password_problem(&vec![b'a'; 512]).unwrap();
+        assert!(e.contains("512 bytes") && e.contains("511") && e.contains("never be checked"));
+        assert!(password_problem(b"").is_some());
+        for bad in [&b"a\nb"[..], b"a\rb", b"a\0b"] {
+            assert!(password_problem(bad).unwrap().contains("1 to 511"));
+        }
     }
 
     #[test]

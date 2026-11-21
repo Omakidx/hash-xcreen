@@ -199,6 +199,9 @@ pub fn desktop_run(ctx: &mut Ctx<'_>) -> Result<Outcome> {
             "the desktop's Linux password is needed to create it: run again with --ssh (secrets on stdin) or --interactive",
         ));
     };
+    if let Some(why) = crate::install::options::password_problem(pw) {
+        return Err(InstallError::usage(why));
+    }
     let Some(user) = ctx.opts.user.clone() else {
         return Err(InstallError::usage(
             "--user is required to create the desktop",

@@ -2015,3 +2015,42 @@ fn the_bootstrap_directory_is_removed_when_the_lock_is_held_or_a_stage_fails() {
         "removed although the install failed after the release"
     );
 }
+
+#[test]
+fn a_password_longer_than_libxcrypt_reads_is_refused_before_any_change() {
+    // N5: 511 bytes is the most that can ever be checked later.
+    let (mut m, dir) = fresh();
+    let lines: Vec<&str> = vec![
+        "", "carol", "", "no", "", "", "", "", "", "no", "", "", "", "",
+    ];
+    let long = vec![b'p'; 512];
+    m.tty = hx_agent::install::testing::ScriptedTty::new(&lines, &[&long, &long]);
+    let mut a = InstallArgs {
+        mode: Some(Mode::Interactive),
+        ..InstallArgs::default()
+    };
+    a.bootstrap_dir = Some(dir.to_string_lossy().into_owned());
+    assert_eq!(m.install(a, None), 2);
+    assert!(m.result()["message"].as_str().unwrap().contains("511"));
+    assert!(m.runner.mutating().is_empty() && m.state().is_none());
+    // Exactly 511 is fine.
+    let (mut m2, dir2) = fresh();
+    let ok = vec![b'p'; 511];
+    m2.tty =
+        hx_agent::install::testing::ScriptedTty::new(&lines, &[&ok, &ok, b"135790", b"135790"]);
+    let mut a = InstallArgs {
+        mode: Some(Mode::Interactive),
+        ..InstallArgs::default()
+    };
+    a.bootstrap_dir = Some(dir2.to_string_lossy().into_owned());
+    assert_eq!(
+        m2.install(a, None),
+        0,
+        "{}",
+        String::from_utf8_lossy(&m2.err)
+    );
+    assert_eq!(
+        m2.daemons.desktop_password.as_deref().map(<[u8]>::len),
+        Some(511)
+    );
+}
