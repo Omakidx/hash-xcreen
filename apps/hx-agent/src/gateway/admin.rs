@@ -87,6 +87,32 @@ impl SetupMirror {
         self.expires_unix > now
     }
 
+    /// Opens a window of `secs` (never more than 24 hours). Opening a window that is already
+    /// open keeps its start, so repeated opens cannot stretch it past 24 hours in total.
+    fn open(&mut self, now: u64, secs: u64) {
+        let secs = secs.min(MAX_SETUP_SECS);
+        if self.is_open(now) {
+            let cap = self.opened_unix + MAX_SETUP_SECS;
+            self.expires_unix = now.saturating_add(secs).min(cap);
+        } else {
+            *self = Self {
+                opened_unix: now,
+                expires_unix: now.saturating_add(secs),
+            };
+        }
+    }
+
+    /// Extends the open window by `secs`, never past 24 hours since it was opened. False if it
+    /// is not open.
+    fn extend(&mut self, now: u64, secs: u64) -> bool {
+        if !self.is_open(now) {
+            return false;
+        }
+        let cap = self.opened_unix + MAX_SETUP_SECS;
+        self.expires_unix = self.expires_unix.saturating_add(secs).min(cap);
+        true
+    }
+
     fn state(&self, now: u64) -> pb::SetupWindowState {
         pb::SetupWindowState {
             open: self.is_open(now),
@@ -541,21 +567,14 @@ async fn handle(
             match pb::SetupWindowAction::try_from(r.action)
                 .unwrap_or(pb::SetupWindowAction::Unspecified)
             {
-                pb::SetupWindowAction::Open => {
-                    *m = SetupMirror {
-                        opened_unix: now,
-                        expires_unix: now + u64::from(r.expires_in_s),
-                    };
-                }
+                pb::SetupWindowAction::Open => m.open(now, u64::from(r.expires_in_s)),
                 pb::SetupWindowAction::Extend => {
-                    if !m.is_open(now) {
+                    if !m.extend(now, u64::from(r.expires_in_s)) {
                         return Err(error(
                             privd_pb::ErrorCode::FailedPrecondition,
                             "the setup window is not open",
                         ));
                     }
-                    let cap = m.opened_unix + MAX_SETUP_SECS;
-                    m.expires_unix = (m.expires_unix + u64::from(r.expires_in_s)).min(cap);
                 }
                 pb::SetupWindowAction::Close => *m = SetupMirror::default(),
                 pb::SetupWindowAction::Unspecified => {
@@ -591,4 +610,49 @@ fn parse_verifier(bytes: &[u8], min_memory_kib: u32) -> Result<VerifierRecord, p
         )
     })?;
     Ok(record)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const H: u64 = 3600;
+
+    #[test]
+    fn open_is_capped_at_24_hours_whatever_is_asked() {
+        let mut m = SetupMirror::default();
+        m.open(1000, u64::MAX);
+        assert_eq!(m.expires_unix, 1000 + 24 * H);
+        let mut m = SetupMirror::default();
+        m.open(1000, 7200);
+        assert_eq!(m.expires_unix, 1000 + 7200);
+    }
+
+    #[test]
+    fn opening_an_open_window_cannot_stretch_it_past_24_hours() {
+        let mut m = SetupMirror::default();
+        m.open(0, 24 * H);
+        // 20 hours later, "open" again for another 24 hours: still ends 24 hours after the start.
+        m.open(20 * H, 24 * H);
+        assert_eq!(m.opened_unix, 0);
+        assert_eq!(m.expires_unix, 24 * H);
+        // Many reopens, never beyond the cap.
+        for t in (21..24).map(|h| h * H) {
+            m.open(t, 24 * H);
+            assert!(m.expires_unix <= 24 * H);
+        }
+        // Once it has expired a new window starts fresh.
+        m.open(30 * H, H);
+        assert_eq!((m.opened_unix, m.expires_unix), (30 * H, 31 * H));
+    }
+
+    #[test]
+    fn extend_is_capped_and_needs_an_open_window() {
+        let mut m = SetupMirror::default();
+        assert!(!m.extend(5, 600));
+        m.open(0, 2 * H);
+        assert!(m.extend(10, 100 * H));
+        assert_eq!(m.expires_unix, 24 * H);
+        assert!(!m.extend(25 * H, 600), "expired");
+    }
 }
