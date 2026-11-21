@@ -225,11 +225,17 @@ where
     let listener = UnixListener::from_std(listener)?;
     if opts.background_tasks {
         // ipc.md 6.4: privd re-runs steps 1 to 3 of SetupHost at start.
-        match daemon.refresh_host().await {
-            Ok(true) => log::info("host ruleset re-applied at start"),
-            Ok(false) => {}
-            Err(e) => log::error(&format!("host refresh at start failed: {e}")),
-        }
+        // In the background and bounded: a slow `ip`, `nft` or Incus must not keep the accept
+        // loop from starting (a Gateway waiting for privd would time out and restart).
+        let d = daemon.clone();
+        tokio::spawn(async move {
+            match tokio::time::timeout(Duration::from_secs(120), d.refresh_host()).await {
+                Ok(Ok(true)) => log::info("host ruleset re-applied at start"),
+                Ok(Ok(false)) => {}
+                Ok(Err(e)) => log::error(&format!("host refresh at start failed: {e}")),
+                Err(_) => log::error("host refresh at start timed out"),
+            }
+        });
         tokio::spawn(background(daemon.clone()));
         // Isolation first: a desktop left with nesting on (or flagged) by a crash or a reboot is
         // stopped now, not when someone next asks for it.

@@ -944,3 +944,52 @@ async fn l6_a_gateway_peer_holding_a_forbidden_group_is_refused_at_accept() {
             .any(|l| l.contains("refused a Gateway connection"))
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn n11_a_slow_host_refresh_at_start_does_not_block_the_accept_loop() {
+    use hx_agent::privd::activation::bind_path;
+    use hx_agent::privd::runner::{RunOutput, Tool};
+    use hx_agent::privd::testing::{FakeIncus, FakeProbe, FakeRunner};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let slow = std::sync::Arc::new(AtomicBool::new(false));
+    let s2 = slow.clone();
+    let runner = FakeRunner::with(move |p| {
+        if p.tool == Tool::Ip && s2.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_secs(3));
+        }
+        RunOutput {
+            code: Some(0),
+            stdout: if p.tool == Tool::Ip {
+                r#"[{"ifname":"eth0","addr_info":[{"family":"inet","local":"203.0.113.9"}]}]"#
+                    .into()
+            } else {
+                String::new()
+            },
+            ..Default::default()
+        }
+    });
+    let h = Harness::start_with(me(), FakeProbe::default(), FakeIncus::new(), runner);
+    // SetupHost records what a refresh would re-apply.
+    ok_or_panic(&admin(&h, Command::SetupHost(Default::default())).await);
+    // A second daemon, "restarted" over the same state, whose refresh takes 3 s.
+    slow.store(true, Ordering::SeqCst);
+    let d2 = h.restart_daemon();
+    let path = h.dir.path().join("second.sock");
+    let listener = bind_path(&path).unwrap();
+    tokio::spawn(hx_agent::privd::serve(
+        d2,
+        listener,
+        hx_agent::privd::ServeOptions {
+            background_tasks: true,
+        },
+        std::future::pending::<()>(),
+    ));
+    let started = Instant::now();
+    let mut c = RawClient::connect(&path);
+    c.hello();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the first Hello waited {:?} for the refresh",
+        started.elapsed()
+    );
+}
