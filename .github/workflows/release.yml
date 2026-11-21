@@ -41,7 +41,7 @@ jobs:
       dry_run: ${{ steps.meta.outputs.dry_run }}
       sde: ${{ steps.meta.outputs.sde }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned toolchain
         run: rustup toolchain install
       - name: Version, channel and mode
@@ -69,7 +69,7 @@ jobs:
             echo "dry_run=$dry_run"
             echo "sde=$(git show -s --format=%ct HEAD)"
           } >>"$GITHUB_OUTPUT"
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2
         with:
           tool: cargo-deny,cargo-audit
       - run: cargo deny check
@@ -86,7 +86,7 @@ jobs:
     needs: gate
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned toolchain and the musl target
         run: |
           rustup toolchain install
@@ -94,7 +94,6 @@ jobs:
           sudo apt-get update
           # ring needs a C compiler for musl
           sudo apt-get install -y --no-install-recommends musl-tools
-      - uses: Swatinem/rust-cache@v2
       - name: Build
         env:
           DRY_RUN: ${{ needs.gate.outputs.dry_run }}
@@ -127,7 +126,7 @@ jobs:
           done
           ls -l "$out"
           # all bins are bins of one crate, so one CARGO_PKG_VERSION by construction
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: agent-bins
           path: agent-bins
@@ -156,7 +155,7 @@ jobs:
           # ffmpeg-sys-next links them through pkg-config, and clang/libclang generate its bindings.
           apt-get install -y --no-install-recommends ca-certificates curl git build-essential clang libclang-dev pkg-config dpkg-dev \
             libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libx264-dev libcrypt-dev
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install rustup (pinned) and the pinned toolchain
         run: |
           set -eu
@@ -194,7 +193,7 @@ jobs:
         env:
           DISTRO: ${{ matrix.distro }}
         run: sh packaging/hx-session/check-recipe-covers-depends.sh --deb "out/$DISTRO/hx-session.deb" --distro "$DISTRO"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: session-${{ matrix.distro }}
           path: out/${{ matrix.distro }}/hx-session.deb
@@ -214,7 +213,7 @@ jobs:
           - { distro: debian-12, image: "debian:12" }
           - { distro: debian-13, image: "debian:13" }
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: session-${{ matrix.distro }}
       - name: Install in a clean container and resolve every library
@@ -237,12 +236,12 @@ jobs:
     needs: [gate, agent, session-smoke]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: agent-bins
           path: in/agent
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: session-*
           path: in/session
@@ -264,7 +263,7 @@ jobs:
             --bin-dir in/agent --session-dir sessions
           sh release/verify-with-installer.sh dist/install.sh dist/manifest-x86_64.json dist/manifest-x86_64.json.minisig
           rm -rf dist/private
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dry-run-release-dir
           path: dist
@@ -276,12 +275,12 @@ jobs:
     needs: [gate, agent, session-smoke]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: agent-bins
           path: in/agent
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: session-*
           path: in/session
@@ -301,7 +300,7 @@ jobs:
           sh release/assemble.sh --version "$VERSION" --bin-dir in/agent --session-dir sessions \
             --out dist --source-date-epoch "$SDE"
           cp installer/install.sh dist/install.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: assembled
           path: |
@@ -315,8 +314,8 @@ jobs:
     runs-on: ubuntu-24.04
     environment: release-signing
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: assembled
           path: assembled
@@ -361,7 +360,7 @@ jobs:
           sh release/verify-with-installer.sh assembled/dist/install.sh \
             assembled/dist/manifest-x86_64.json assembled/dist/manifest-x86_64.json.minisig
           cmp installer/install.sh assembled/dist/install.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: signed
           path: |
@@ -378,12 +377,12 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: signed
           path: signed
       # Audit only: no server verifies these (no gh or Sigstore client on the host).
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: |
             signed/dist/*.tar.gz
@@ -398,7 +397,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: signed
           path: signed

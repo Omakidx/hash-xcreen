@@ -75,8 +75,11 @@ case_run "text progress forwards no --json; option order kept" 0 os-deb13 yes "$
     -- --user bob --release-dir "$R" --port 8443
 case_run "--release-dir=dir and --channel=stable forms" 0 os-24 yes "$me" "$none" "$R/install.sh" "" 'STUB-FD9:open' \
     -- --release-dir="$R" --channel=stable
-case_run "a 100-day-old manifest only warns" 0 os-24 yes "$me" "$none" "$tmp/rel-old/install.sh" "" 'older than 90 days' \
+case_run "a 100-day-old manifest is refused (exit 10)" 10 os-24 yes "$me" "$none" "$tmp/rel-old/install.sh" "" 'older than 90 days' \
     -- --release-dir "$tmp/rel-old"
+case_run "--allow-old-release accepts it with a warning, and does not forward the flag" 0 os-24 yes "$me" "$none" "$tmp/rel-old/install.sh" "" \
+    'older than 90 days (--allow-old-release given)' 'STUB-ARGV:install --bootstrap-dir ' ' --lock-fd 9 --channel stable --pair' \
+    -- --release-dir "$tmp/rel-old" --allow-old-release --pair
 
 cat >"$tmp/installed-agent" <<'EOF'
 #!/bin/sh
@@ -94,6 +97,48 @@ if [ "$me" != 0 ]; then
     case_run "a release dir not owned by root is refused (exit 9)" 9 os-24 yes 0 "$none" "$R/install.sh" "" 'owned by root' -- --release-dir "$R"
 fi
 case_run "a release dir that is not absolute is a usage error" 2 os-24 yes "$me" "$none" "$R/install.sh" "" 'absolute' -- --release-dir relative/dir
+
+# modes: group-write or other-write is refused, on the directory and on the files in it
+for mode in 0775 0757 0777; do
+    rm -rf "$tmp/m"
+    cp -R "$tmp/rel" "$tmp/m"
+    chmod "$mode" "$tmp/m"
+    case_run "a release dir of mode $mode is refused (exit 9)" 9 os-24 yes "$me" "$none" "$R/install.sh" "" 'not writable by group or others' -- --release-dir "$tmp/m"
+done
+for f in manifest-x86_64.json manifest-x86_64.json.minisig hx-0.1.0-x86_64.tar.gz; do
+    for mode in 0664 0646; do
+        rm -rf "$tmp/m"
+        cp -R "$tmp/rel" "$tmp/m"
+        chmod "$mode" "$tmp/m/$f"
+        case_run "$f of mode $mode is refused (exit 9)" 9 os-24 yes "$me" "$none" "$R/install.sh" "" 'not an acceptable regular file' -- --release-dir "$tmp/m"
+    done
+done
+# a FIFO in place of the artifact is refused without being opened (it would hang forever)
+rm -rf "$tmp/m"
+cp -R "$tmp/rel" "$tmp/m"
+rm "$tmp/m/hx-0.1.0-x86_64.tar.gz"
+mkfifo "$tmp/m/hx-0.1.0-x86_64.tar.gz"
+case_run "a FIFO in place of the tarball is refused (exit 9)" 9 os-24 yes "$me" "$none" "$R/install.sh" "" 'not an acceptable regular file' -- --release-dir "$tmp/m"
+# an oversized artifact is never copied whole: one byte over the manifest's size is refused
+rm -rf "$tmp/m"
+cp -R "$tmp/rel" "$tmp/m"
+printf x >>"$tmp/m/hx-0.1.0-x86_64.tar.gz"
+case_run "a tarball larger than the manifest says is refused (exit 9)" 9 os-24 yes "$me" "$none" "$R/install.sh" "" 'not an acceptable regular file' -- --release-dir "$tmp/m"
+
+# the download path with a curl that does not enforce --max-filesize
+dl() { # mode
+    "$shell" "$here/download-case.sh" "$R/install.sh" "$R" "$fake" "$1" 2>&1
+}
+out=$(dl ok)
+rc=$?
+if [ "$rc" = 0 ] && printf '%s' "$out" | grep -qF 'STUB-ARGV:install --bootstrap-dir ' && grep -qx 'CURL-FIRST:-q' "$fake/curl.log" &&
+    [ "$(grep -vc 'CURL-FIRST:-q' "$fake/curl.log")" = 0 ]; then echo "ok   download: every curl call starts with -q (no ~/.curlrc)"; else echo "FAIL download ok: rc=$rc"; printf '%s\n' "$out" | sed 's/^/     | /'; fail=1; fi
+out=$(dl big-manifest)
+rc=$?
+if [ "$rc" = 1 ] && printf '%s' "$out" | grep -qF 'cannot download the release manifest'; then echo "ok   download: a manifest over 1 MiB is refused without curl's help"; else echo "FAIL big manifest: rc=$rc"; printf '%s\n' "$out" | sed 's/^/     | /'; fail=1; fi
+out=$(dl big-artifact)
+rc=$?
+if [ "$rc" = 1 ] && printf '%s' "$out" | grep -qF 'cannot download the release tarball'; then echo "ok   download: a tarball one byte over the manifest size is refused without curl's help"; else echo "FAIL big artifact: rc=$rc"; printf '%s\n' "$out" | sed 's/^/     | /'; fail=1; fi
 
 # the lock: held by someone else -> exit 11
 flock "$lock" sleep 4 &
@@ -113,8 +158,9 @@ printf '%s' "$z" | dd of="$art" bs=1 seek=100 conv=notrunc 2>/dev/null
 cmp -s "$art" "$tmp/rel/$(basename "$art")" && { echo "FAIL the tamper did not change the tarball"; fail=1; }
 case_run "a tampered tarball (same size) is refused (exit 10)" 10 os-24 yes "$me" "$none" "$R/install.sh" "" 'digest does not match' -- --release-dir "$tmp/t1"
 cp -R "$tmp/rel" "$tmp/t2"
-{ cat "$tmp/rel/hx-0.1.0-x86_64.tar.gz"; printf 'x'; } >"$tmp/t2/hx-0.1.0-x86_64.tar.gz"
-case_run "a tarball of the wrong size is refused (exit 10)" 10 os-24 yes "$me" "$none" "$R/install.sh" "" 'wrong size' -- --release-dir "$tmp/t2"
+n=$(wc -c <"$tmp/rel/hx-0.1.0-x86_64.tar.gz")
+head -c $((n - 1)) "$tmp/rel/hx-0.1.0-x86_64.tar.gz" >"$tmp/t2/hx-0.1.0-x86_64.tar.gz"
+case_run "a tarball smaller than the manifest says is refused (exit 10)" 10 os-24 yes "$me" "$none" "$R/install.sh" "" 'wrong size' -- --release-dir "$tmp/t2"
 cp -R "$tmp/rel" "$tmp/t3"
 sed 's/"size":/"size":1/' "$tmp/rel/manifest-x86_64.json" >"$tmp/t3/manifest-x86_64.json"
 case_run "a tampered manifest is refused (exit 10)" 10 os-24 yes "$me" "$none" "$R/install.sh" "" 'signature is not valid' -- --release-dir "$tmp/t3"

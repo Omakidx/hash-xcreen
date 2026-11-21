@@ -86,3 +86,59 @@ fn the_gate_rejects_a_tag_that_is_not_the_workspace_version() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("workspace version"));
 }
+
+/// Runs `release/gate.sh --dry-run --workflow <file>` on a workflow text.
+fn gate_on_workflow(text: &str) -> (bool, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let wf = dir.path().join("release.yml");
+    std::fs::write(&wf, text).unwrap();
+    let out = Command::new("sh")
+        .arg(repo().join("release/gate.sh"))
+        .args(["--dry-run", "--workflow"])
+        .arg(&wf)
+        .output()
+        .unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+const SHA: &str = "11d5960a326750d5838078e36cf38b85af677262";
+
+#[test]
+fn the_gate_requires_every_action_pinned_to_a_full_commit_sha() {
+    let ok = format!("jobs:\n  a:\n    steps:\n      - uses: actions/checkout@{SHA} # v4\n");
+    assert!(gate_on_workflow(&ok).0, "a pinned workflow must pass");
+    for bad in [
+        "      - uses: actions/checkout@v4\n".to_string(),
+        format!("      - uses: actions/checkout@{}\n", &SHA[..39]),
+        format!("      - uses: actions/checkout@{SHA}0\n"),
+        "      - uses: docker://rhysd/actionlint:1.7.7\n".to_string(),
+        "      - uses: ./local-action\n".to_string(),
+        format!("      - uses: actions/checkout@{SHA}\n      - uses: actions/upload-artifact@v4\n"),
+    ] {
+        let (passed, stderr) = gate_on_workflow(&format!("jobs:\n  a:\n    steps:\n{bad}"));
+        assert!(!passed, "must refuse: {bad}");
+        assert!(stderr.contains("not pinned"), "{stderr}");
+    }
+}
+
+#[test]
+fn the_gate_refuses_a_build_cache_in_the_release_workflow() {
+    for cache in [
+        format!("      - uses: Swatinem/rust-cache@{SHA}\n"),
+        format!("      - uses: actions/cache@{SHA}\n"),
+        format!("      - uses: actions/cache/restore@{SHA}\n"),
+    ] {
+        let (passed, stderr) = gate_on_workflow(&format!("jobs:\n  a:\n    steps:\n{cache}"));
+        assert!(!passed, "must refuse: {cache}");
+        assert!(stderr.contains("build cache"), "{stderr}");
+    }
+}
+
+#[test]
+fn the_shipped_release_workflow_is_pinned_and_uncached() {
+    let text = std::fs::read_to_string(repo().join(".github/workflows/release.yml")).unwrap();
+    assert!(gate_on_workflow(&text).0);
+}
