@@ -159,6 +159,8 @@ pub struct Daemon<T: Transport + Clone + 'static> {
     pub(crate) host_probe: Mutex<Option<(u64, bool, bool)>>,
     /// The collaborators of self-update (keys, systemd, health probes); replaceable in tests.
     update_deps: Mutex<Arc<UpdateDeps>>,
+    /// Serialises the read-decide-write of `uninstall-state` (`cmd::uninstall`).
+    pub(crate) uninstall_gate: Mutex<()>,
     /// This daemon's own `Arc`, so that a command can hand work to a task that outlives it (the
     /// restarts after `ApplyUpdate` answers).
     pub(crate) me: Weak<Self>,
@@ -229,6 +231,7 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
             suppressed: std::sync::atomic::AtomicU64::new(0),
             host_probe: Mutex::new(None),
             update_deps: Mutex::new(Arc::new(update_deps)),
+            uninstall_gate: Mutex::new(()),
             me: me.clone(),
         }))
     }
@@ -351,6 +354,7 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
         id: &str,
         allow_stuck: bool,
     ) -> Result<Guard, CmdError> {
+        self.refuse_while_uninstalling()?;
         let g = self
             .locks
             .acquire_as(
@@ -360,6 +364,7 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
                 ctx.role == Role::Admin,
             )
             .await?;
+        self.refuse_while_uninstalling()?;
         if !allow_stuck && self.flags_for(id).contains(&Flag::StuckOperation) {
             return Err(CmdError::precondition(
                 ErrorDetail::NeedsAttention,
@@ -431,14 +436,19 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
 
     /// Takes the host lock.
     pub async fn lock_host(&self, ctx: &Ctx) -> Result<Guard, CmdError> {
-        self.locks
+        self.refuse_while_uninstalling()?;
+        let g = self
+            .locks
             .acquire_as(
                 LockKey::Host,
                 &ctx.cancel,
                 LOCK_WAIT,
                 ctx.role == Role::Admin,
             )
-            .await
+            .await?;
+        // A command that waited for the lock while an uninstall began must not run after it.
+        self.refuse_while_uninstalling()?;
+        Ok(g)
     }
 
     /// The registered desktop's instance and metadata. `NOT_FOUND` when privd does not know the id
@@ -716,6 +726,16 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
                 .admit("gateway:read", 1000, 20)
                 .map_err(|ms| CmdError::exhausted("too many read requests per second", ms))?;
         }
+        // Once an uninstall has begun (`/var/lib/hx/uninstall-state`), only Uninstall itself and
+        // Admin reads are served (ipc.md 6.13). This comes before the phase gates, so that a
+        // Gateway is told `UNINSTALLING` and not "the host is not set up". Locks check it again
+        // for commands already past this point.
+        if ctx.role != Role::Unspecified
+            && !matches!(cmd, Command::Uninstall(_))
+            && (ctx.role != Role::Admin || info.class != hx_ipc::privd::CommandClass::R)
+        {
+            self.refuse_while_uninstalling()?;
+        }
         let phase = self.phase();
         auth::authorize(ctx.role, req, phase)?;
         // Sealed secrets need HPKE (Phase 2). A slot marked sealed must never be used as if it
@@ -800,9 +820,7 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
             Command::ApplyUpdate(r) => update::apply(self, ctx, r).await,
             Command::RollbackUpdate(_) => update::rollback(self, ctx).await,
             Command::DestroyDesktop(r) => desktop::destroy_desktop(self, ctx, r).await,
-            Command::Uninstall(_) => Err(CmdError::unimplemented(
-                "uninstall is not available in this release",
-            )),
+            Command::Uninstall(r) => uninstall::uninstall(self, ctx, r).await,
             Command::ResetLockout(r) => admin::reset_lockout(self, ctx, r),
             Command::EnrolOwnerKey(r) => admin::enrol_owner_key(self, r),
             Command::PepperVerify(r) => pepper_cmds::verify(self, ctx, r).await,
