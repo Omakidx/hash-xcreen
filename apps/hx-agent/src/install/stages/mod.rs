@@ -150,7 +150,8 @@ pub const TABLE: &[Stage] = &[
     Stage {
         id: "host",
         applies: all,
-        always: false,
+        // SetupHost converges in privd: it is sent on every run.
+        always: true,
         check: never,
         run: setup::host_run,
     },

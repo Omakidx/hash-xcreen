@@ -269,7 +269,13 @@ fn drain(mut r: impl Read, cap: usize) -> Zeroizing<Vec<u8>> {
 
 impl Runner for RealRunner {
     fn run(&mut self, call: &Call) -> io::Result<Output> {
-        let path = resolve(call.tool)?;
+        run_path(resolve(call.tool)?, call)
+    }
+}
+
+/// Runs the program at `path` with the call's argv and the cleared environment.
+fn run_path(path: PathBuf, call: &Call) -> io::Result<Output> {
+    {
         let mut cmd = Command::new(path);
         cmd.args(&call.args)
             .env_clear()
@@ -364,6 +370,34 @@ mod tests {
         }
         // 13 tools: adding one is a deliberate change of this number and of the design.
         assert_eq!(Tool::ALL.len(), 13);
+    }
+
+    #[test]
+    fn a_child_gets_a_cleared_environment_and_only_the_constants() {
+        // `/usr/bin/env` stands in for a tool: the point is what the child sees.
+        let call = Call::new(Tool::Ip, &[]).with_env(APT_ENV);
+        let out = run_path(PathBuf::from("/usr/bin/env"), &call).unwrap();
+        let mut seen: Vec<String> = out.out_text().lines().map(str::to_owned).collect();
+        seen.sort();
+        let mut want = vec![
+            format!("PATH={CHILD_PATH}"),
+            "LC_ALL=C".to_owned(),
+            "DEBIAN_FRONTEND=noninteractive".to_owned(),
+            "NEEDRESTART_MODE=a".to_owned(),
+            "APT_LISTCHANGES_FRONTEND=none".to_owned(),
+        ];
+        want.sort();
+        assert_eq!(seen, want, "nothing of this process's environment leaks");
+    }
+
+    #[test]
+    fn standard_input_reaches_the_child_and_a_timeout_kills_it() {
+        let call = Call::new(Tool::Ip, &[]).with_stdin(Zeroizing::new(b"secret-in".to_vec()));
+        let out = run_path(PathBuf::from("/usr/bin/cat"), &call).unwrap();
+        assert_eq!(&*out.stdout, b"secret-in");
+        let slow = Call::new(Tool::Ip, &["5"]).timeout_secs(0);
+        let e = run_path(PathBuf::from("/usr/bin/sleep"), &slow).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]

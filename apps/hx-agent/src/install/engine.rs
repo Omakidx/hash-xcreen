@@ -16,7 +16,9 @@ use super::state::StageError;
 
 fn fail(ctx: &mut Ctx<'_>, id: &str, n: usize, of: usize, ms: u64, e: &InstallError) -> u8 {
     let now = (ctx.now)();
-    if id != "preflight" {
+    // The test hook stops after a stage that has finished: its record stays `done`. A failing
+    // preflight changed nothing and records nothing.
+    if id != "preflight" && e.code != super::error::Code::TestHook {
         ctx.state.record(
             id,
             "failed",

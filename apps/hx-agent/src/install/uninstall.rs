@@ -479,22 +479,21 @@ pub fn run(
             }
             "U4" => {
                 say("U4: removing the port rule\n");
-                if d.host {
-                    if let Some(rec) = installed.as_ref().and_then(|s| s.created.port_rule.clone())
-                    {
-                        port::remove(d.runner, &rec)?;
-                        if rec.backend == "nft" {
-                            let _ = d.runner.run(&Call::new(
-                                Tool::Systemctl,
-                                &["disable", "--now", "hx-agent-port.service"],
-                            ));
-                        }
-                        if rec.backend == "manual" {
-                            report.notes.push(format!(
-                                "the firewall rule for port {} was opened by hand; remove it by hand",
-                                rec.port
-                            ));
-                        }
+                if d.host
+                    && let Some(rec) = installed.as_ref().and_then(|s| s.created.port_rule.clone())
+                {
+                    port::remove(d.runner, &rec)?;
+                    if rec.backend == "nft" {
+                        let _ = d.runner.run(&Call::new(
+                            Tool::Systemctl,
+                            &["disable", "--now", "hx-agent-port.service"],
+                        ));
+                    }
+                    if rec.backend == "manual" {
+                        report.notes.push(format!(
+                            "the firewall rule for port {} was opened by hand; remove it by hand",
+                            rec.port
+                        ));
                     }
                 }
             }

@@ -883,6 +883,56 @@ mod tests {
     }
 
     #[test]
+    fn install_accepts_exactly_the_documented_options() {
+        for v in VALUED {
+            assert!(INSTALL_VALUED.contains(v), "{v}");
+        }
+        for f in FLAGS {
+            assert!(INSTALL_FLAGS.contains(f), "{f}");
+        }
+        let extra: Vec<&&str> = INSTALL_VALUED
+            .iter()
+            .filter(|v| !VALUED.contains(v))
+            .collect();
+        assert_eq!(extra[..3], [&"--token", &"--bootstrap-dir", &"--lock-fd"]);
+    }
+
+    #[test]
+    fn install_modes_are_exclusive_and_token_is_a_mode() {
+        let Cmd::Install(a) = p(&[
+            "install", "--ssh", "--user", "alice", "--port", "8443", "--docker",
+        ])
+        .unwrap()
+        .cmd
+        else {
+            panic!()
+        };
+        assert_eq!(a.mode, Some(Mode::Ssh));
+        assert_eq!(a.raw.values["--user"], "alice");
+        assert!(a.raw.flags.contains("--docker"));
+        assert!(
+            p(&["install", "--ssh"]).unwrap().json,
+            "--ssh implies --json"
+        );
+        assert!(!p(&["install", "--pair"]).unwrap().json);
+        let Cmd::Install(t) = p(&["install", "--token", "hxt1-abc"]).unwrap().cmd else {
+            panic!()
+        };
+        assert_eq!(t.mode, Some(Mode::Token));
+        assert!(
+            !format!("{t:?}").contains("hxt1-abc"),
+            "the token never prints"
+        );
+        let Cmd::Install(n) = p(&["install"]).unwrap().cmd else {
+            panic!()
+        };
+        assert_eq!(n.mode, None, "no mode: resume the recorded one");
+        assert!(p(&["install", "--interactive", "--token", "x"]).is_err());
+        assert!(p(&["install", "--user", "a", "--user", "b"]).is_err());
+        assert!(p(&["install", "--password", "x"]).is_err());
+    }
+
+    #[test]
     fn unknown_things_are_usage_errors() {
         assert!(p(&["frobnicate"]).is_err());
         assert!(p(&["devices"]).is_err());
