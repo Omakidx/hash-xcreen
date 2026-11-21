@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use hx_provision::lower::lower;
 use hx_provision::{
     Action, Addon, ApplyError, Catalog, Desktop, Distro, ExecError, ExecOutput, ExecRequest,
-    Executor, FilePush, Preset, Progress, RecipeId, Secrets, Stage, Step, StepFailure, apply_stage,
+    Executor, FilePush, Preset, Progress, RecipeId, Secret, Secrets, Stage, Step, StepFailure, apply_stage,
 };
 
 const PASSWORD: &str = "correct horse battery staple 9!";
@@ -19,7 +19,16 @@ struct Recorder {
 
 impl Executor for Recorder {
     async fn exec(&self, request: &ExecRequest) -> Result<ExecOutput, ExecError> {
-        self.log.lock().unwrap().push(Action::Exec(request.clone()));
+        // `ExecRequest` is deliberately not `Clone`: rebuild it, copying the secret explicitly.
+        let copy = ExecRequest {
+            label: request.label.clone(),
+            argv: request.argv.clone(),
+            env: request.env.clone(),
+            cwd: request.cwd.clone(),
+            stdin: request.stdin.as_ref().map(|s| Secret::from_slice(s.expose())),
+            timeout: request.timeout,
+        };
+        self.log.lock().unwrap().push(Action::Exec(copy));
         let code = self
             .fail
             .iter()

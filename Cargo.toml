@@ -22,6 +22,7 @@ rustix = { version = "1", default-features = false, features = ["std"] }
 thiserror = "2"
 x11rb = { version = "0.13", default-features = false }
 yuvutils-rs = "0.8" # default features keep the SSE/AVX conversion paths
+zeroize = "1"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

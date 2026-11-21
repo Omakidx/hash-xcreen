@@ -13,16 +13,28 @@
 use std::future::Future;
 use std::time::{Duration, Instant};
 
+use zeroize::{ZeroizeOnDrop, Zeroizing};
+
 use crate::lower::lower;
 use crate::plan::{Plan, Stage, Step};
 
-/// A secret byte string. Redacted in `Debug`; zeroed on drop (best effort, no `unsafe`).
-#[derive(Clone, PartialEq, Eq)]
-pub struct Secret(Vec<u8>);
+/// A secret byte string. Redacted in `Debug`, **not `Clone`**, and zeroized on drop (the whole
+/// allocation, spare capacity included, through the `zeroize` crate's volatile writes).
+///
+/// There is deliberately no way to copy one: a secret that is handed over is moved. The types that
+/// hold secrets ([`Secrets`], [`ExecRequest`], [`Action`]) are therefore not `Clone` either.
+#[derive(PartialEq, Eq)]
+pub struct Secret(Zeroizing<Vec<u8>>);
 
 impl Secret {
     pub(crate) fn new(bytes: Vec<u8>) -> Self {
-        Self(bytes)
+        Self(Zeroizing::new(bytes))
+    }
+
+    /// A secret holding a copy of `bytes`. The caller remains responsible for zeroizing its own
+    /// buffer.
+    pub fn from_slice(bytes: &[u8]) -> Self {
+        Self::new(bytes.to_vec())
     }
 
     /// The secret bytes. Callers must not log them.
@@ -37,11 +49,7 @@ impl std::fmt::Debug for Secret {
     }
 }
 
-impl Drop for Secret {
-    fn drop(&mut self) {
-        self.0.iter_mut().for_each(|b| *b = 0);
-    }
-}
+impl ZeroizeOnDrop for Secret {}
 
 /// Longest accepted password, in bytes.
 pub const MAX_PASSWORD_BYTES: usize = 1024;
@@ -60,8 +68,9 @@ pub enum SecretError {
     BadCharacter,
 }
 
-/// Run-time secrets handed over by the caller. None of it is ever written to a recipe.
-#[derive(Debug, Clone, Default)]
+/// Run-time secrets handed over by the caller. None of it is ever written to a recipe. Not
+/// `Clone`; the secrets inside are zeroized when this is dropped.
+#[derive(Debug, Default)]
 pub struct Secrets {
     user_password: Option<Secret>,
 }
@@ -92,8 +101,10 @@ impl Secrets {
     }
 }
 
-/// One command to run in the container.
-#[derive(Clone, PartialEq, Eq)]
+impl ZeroizeOnDrop for Secrets {}
+
+/// One command to run in the container. Not `Clone` (it may carry a [`Secret`]).
+#[derive(PartialEq, Eq)]
 pub struct ExecRequest {
     /// Short label for progress and errors (never contains secrets).
     pub label: String,
@@ -141,7 +152,7 @@ pub struct FilePush {
 }
 
 /// What the runner asks the executor to do.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Action {
     /// Run a command.
     Exec(ExecRequest),
