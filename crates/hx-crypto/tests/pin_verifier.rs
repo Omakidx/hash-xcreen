@@ -453,6 +453,49 @@ async fn locked_sets_the_verifiers_wait_and_attempts_during_it_are_not_counted()
 }
 
 #[tokio::test]
+async fn is_backing_off_covers_wrong_pin_backoff_locked_and_unavailable_holds() {
+    // Wrong PIN: 1 s after the first failure.
+    let v = Scripted::new(PinVerdict::Wrong, Duration::ZERO);
+    let e = env(AuthenticatorConfig::default(), &v).await;
+    assert!(!e.auth.is_backing_off(&e.id()));
+    let r = within(e.open().await.submit(&pin("000000"))).await;
+    assert!(matches!(r, Ok(PinReply::Wrong { .. })), "{r:?}");
+    assert!(e.auth.is_backing_off(&e.id()));
+    assert_eq!(e.auth.backoff_remaining(&e.id()), Duration::from_secs(1));
+    e.clock.advance(Duration::from_millis(999));
+    assert!(e.auth.is_backing_off(&e.id()));
+    e.clock.advance(Duration::from_millis(1));
+    assert!(!e.auth.is_backing_off(&e.id()));
+    // Other devices are unaffected.
+    assert!(
+        !e.auth
+            .is_backing_off(&IdentityKey::generate().expect("k").public().device_id())
+    );
+
+    // Locked: the verifier's wait.
+    e.auth.set_pin_verifier(Scripted::new(
+        PinVerdict::Locked {
+            retry_after: Some(Duration::from_secs(9)),
+        },
+        Duration::ZERO,
+    ));
+    let r = within(e.open().await.submit(&pin("000000"))).await;
+    assert!(matches!(r, Err(Error::PinNotAvailable)), "{r:?}");
+    assert_eq!(e.auth.backoff_remaining(&e.id()), Duration::from_secs(9));
+    e.clock.advance(Duration::from_secs(9));
+    assert!(!e.auth.is_backing_off(&e.id()));
+
+    // Unavailable: the 2 s hold; an operator reset drops it.
+    e.auth
+        .set_pin_verifier(Scripted::new(PinVerdict::Unavailable, Duration::ZERO));
+    let r = within(e.open().await.submit(&pin("000000"))).await;
+    assert!(matches!(r, Ok(PinReply::Backoff { .. })), "{r:?}");
+    assert!(e.auth.is_backing_off(&e.id()));
+    e.auth.reset_lockout(&e.id()).await.expect("reset");
+    assert!(!e.auth.is_backing_off(&e.id()));
+}
+
+#[tokio::test]
 async fn locked_without_a_wait_holds_the_device_for_the_default() {
     let v = Scripted::new(LOCKED, Duration::ZERO);
     let e = env(AuthenticatorConfig::default(), &v).await;

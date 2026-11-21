@@ -436,6 +436,25 @@ impl Authenticator {
         Ok(done)
     }
 
+    /// How long the device must still wait before its PIN is tried again: the backoff after a
+    /// wrong PIN, the hold after [`PinVerdict::Unavailable`] or [`PinVerdict::Locked`].
+    /// Zero when no wait is running. Memory only, never blocks (a map lookup), so an admin
+    /// listing can call it for every device.
+    pub fn backoff_remaining(&self, id: &DeviceId) -> Duration {
+        let now = self.inner.clock.now();
+        self.inner
+            .not_before
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(id)
+            .map_or(Duration::ZERO, |t| t.saturating_duration_since(now))
+    }
+
+    /// True while [`backoff_remaining`](Self::backoff_remaining) is not zero.
+    pub fn is_backing_off(&self, id: &DeviceId) -> bool {
+        !self.backoff_remaining(id).is_zero()
+    }
+
     /// Run a registry change and its announcement as one blocking unit: once started it
     /// completes even if the awaiting future is cancelled, so a persisted revocation is
     /// never left unannounced.
@@ -759,15 +778,7 @@ impl Authenticator {
                     .await;
                 return Err(Error::Revoked);
             }
-            let now = self.inner.clock.now();
-            let wait = self
-                .inner
-                .not_before
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .get(&device.id)
-                .map(|t| t.saturating_duration_since(now))
-                .unwrap_or(Duration::ZERO);
+            let wait = self.backoff_remaining(&device.id);
             let left = cfg.max_pin_failures.saturating_sub(current.failed_pins);
             if !wait.is_zero() {
                 self.send_result(conn, AuthStatus::Backoff, left, wait)
