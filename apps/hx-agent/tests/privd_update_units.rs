@@ -313,7 +313,7 @@ fn the_fetchers_directory_is_a_size_capped_tmpfs() {
     let size = opts.iter().find_map(|o| o.strip_prefix("size=")).unwrap();
     assert_eq!(size, "300M");
     // At least the artifact quota, and not unbounded.
-    assert!(300 * 1024 * 1024 >= fetcher::MAX_ARTIFACT_BYTES + 2 * fetcher::MAX_MANIFEST_BYTES);
+    const { assert!(300 * 1024 * 1024 >= fetcher::MAX_ARTIFACT_BYTES + 2 * fetcher::MAX_MANIFEST_BYTES) };
     assert!(opts.iter().any(|o| o == "nr_inodes=64"));
     for o in ["mode=1733", "nosuid", "nodev", "noexec", "uid=0"] {
         assert!(opts.iter().any(|x| x == o), "{o}");

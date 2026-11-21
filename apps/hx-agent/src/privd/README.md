@@ -200,6 +200,16 @@ ipc.md 6.12 is the contract; this is how it is built (code in `update/`, `cmd/up
 * **Tests** never restart a unit or connect to a daemon: `FakeSystemd`, a fake health probe and the
   test keys are injected through `Daemon::set_update_deps`, which exists only with `test-support`.
 
+### What 1E (the installer and release pipeline) must provide
+
+* **Keys.** Real minisign public keys in `release-keys/current.pub` and `next.pub`, embedded in the installer too, and a **release-only build gate that fails while either file's content is `UNPROVISIONED`** (current at least).
+* **Build.** Release binaries with `cargo build -p hx-agent --bins` only. Never `--all-targets`, `--tests` or `--workspace` with dev-dependencies: they unify the crate's own dev-dependency features (`test-support`) into the binaries.
+* **Versions.** `CARGO_PKG_VERSION` of the built binaries equals the manifest `version` and the artifact's `VERSION` file (the health check compares what privd and gatewayd report with the pending version).
+* **Layout.** `/usr/lib/hx/<version>/` from the same artifact, root 0755, with **relative** `current` and `previous` symlinks; `/usr/lib/hx/current/<binary>` in every unit.
+* **Units.** Install `hx-update-fetcher@.service`, `var-lib-hx-updates.mount` and the updated `tmpfiles.d/hx.conf`; add an installer-written `hx-update-fetcher@.service.d/resolvers.conf` with `IPAddressAllow=` for the host's real upstream resolvers (the shipped unit allows only systemd-resolved's stubs; on Google Cloud the link-local metadata resolver needs this too).
+* **Safety net.** An `OnFailure=` helper on `hx-privd.service`, installed **outside** `/usr/lib/hx/<version>`, that restores `pending.previous` from `updates-state` explicitly (as `Daemon::rollback_now` does: set `current` to the recorded version, never flip), plus `StartLimitBurst` and `StartLimitIntervalSec` that allow at least `MAX_ATTEMPTS` (3) starts before systemd gives up.
+* **Release hosting.** `channel-<stable|beta>/manifest-<arch>.json` and `.minisig`, and `v<version>/hx-<version>-<arch>.tar.gz`, under the repository's releases.
+
 ## Unit hardening
 
 `hx-privd.service` runs as root because it drives Incus, loads nftables and writes sysctl drop-ins.
