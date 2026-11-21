@@ -137,7 +137,7 @@ pub(super) fn run(
         admin_socket: env.config.admin_socket.clone(),
         expected_uid: env.config.expected_peer_uid,
     };
-    let mut cleaner = SelfExecCleaner;
+    let mut cleaner = SelfExecCleaner::new();
     let json_mode = env.json;
     let euid = env.euid;
     let now = env.now;

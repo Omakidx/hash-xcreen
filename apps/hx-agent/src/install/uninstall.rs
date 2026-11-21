@@ -39,7 +39,7 @@ use super::fsx::read_text;
 use super::paths::{self, Paths};
 use super::runner::{Call, Runner, Tool};
 use super::stages::port;
-use super::state::{self, InstallState};
+use super::state;
 use super::units::{self, Dest, FIREWALL_UNITS, GATEWAY_UNITS};
 use crate::privd::state::write_atomic;
 
@@ -54,14 +54,62 @@ pub trait Cleaner {
 }
 
 /// The real cleaner: runs this binary as the owner with `__empty-dir`.
-#[derive(Debug, Default)]
-pub struct SelfExecCleaner;
+///
+/// The binary is found by its path, or, if that path is gone (the release directory was removed
+/// under it), through a descriptor of the running executable that was opened at construction and
+/// is inherited by the child (`/proc/self/fd/N`). U5 also empties gatewayd's state **before** it
+/// removes `/usr/lib/hx`, so the path normally still exists.
+#[derive(Debug)]
+pub struct SelfExecCleaner {
+    exe_fd: Option<std::os::fd::OwnedFd>,
+    exe_path: Option<PathBuf>,
+}
+
+impl Default for SelfExecCleaner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SelfExecCleaner {
+    /// Opens `/proc/self/exe` now and remembers where the executable is.
+    pub fn new() -> Self {
+        let file = std::fs::File::open("/proc/self/exe").ok();
+        Self::with_exe(file, std::env::current_exe().ok())
+    }
+
+    /// A cleaner for a given executable (tests).
+    pub fn with_exe(file: Option<std::fs::File>, path: Option<PathBuf>) -> Self {
+        let exe_fd = file.map(std::os::fd::OwnedFd::from).inspect(|fd| {
+            // Inherited by the child: no close-on-exec.
+            let _ = rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::empty());
+        });
+        Self {
+            exe_fd,
+            exe_path: path,
+        }
+    }
+
+    fn program(&self) -> io::Result<PathBuf> {
+        use std::os::fd::AsRawFd;
+        if let Some(p) = self.exe_path.as_ref().filter(|p| p.exists()) {
+            return Ok(p.clone());
+        }
+        match &self.exe_fd {
+            Some(fd) => Ok(PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()))),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "the agent executable is gone",
+            )),
+        }
+    }
+}
 
 impl Cleaner for SelfExecCleaner {
     fn empty_as_owner(&mut self, dir: &Path, uid: u32, gid: u32) -> io::Result<()> {
         use std::os::unix::process::CommandExt;
         // `uid` makes std drop the supplementary groups before `setuid` when running as root.
-        let st = std::process::Command::new(std::env::current_exe()?)
+        let st = std::process::Command::new(self.program()?)
             .arg("__empty-dir")
             .arg(dir)
             .env_clear()
@@ -237,19 +285,71 @@ fn gateway_ids(paths: &Paths) -> Option<(u32, u32)> {
     })
 }
 
-/// Paths the state may name, below the roots the installer writes to. Anything else in a
-/// tampered state file is ignored.
-fn allowed(p: &str) -> bool {
-    const PREFIXES: [&str; 7] = [
-        "/etc/hx/",
-        "/usr/local/lib/systemd/system/",
-        "/usr/local/lib/sysusers.d/",
-        "/usr/local/lib/tmpfiles.d/",
-        "/etc/logrotate.d/hx-",
-        "/usr/lib/hx-rescue/",
-        "/etc/systemd/system/",
-    ];
-    p.starts_with('/') && !p.contains("..") && PREFIXES.iter().any(|x| p.starts_with(x))
+/// The files the installer writes, as an EXACT set of absolute paths (never a prefix, never read
+/// from the state: a tampered `install-state.json` cannot add to it). In keep mode the firewall
+/// ruleset and its two units stay.
+pub fn exact_files(keep: bool) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    for f in units::FILES {
+        if keep && f.dest == Dest::Unit && FIREWALL_UNITS.contains(&f.name) {
+            continue;
+        }
+        let dir = match f.dest {
+            Dest::Unit => paths::UNIT_DIR,
+            Dest::Sysusers => paths::SYSUSERS_DIR,
+            Dest::Tmpfiles => paths::TMPFILES_DIR,
+            Dest::Logrotate => paths::LOGROTATE_DIR,
+        };
+        v.push(format!("{dir}/{}", f.name));
+    }
+    for n in EXTRA_UNIT_FILES {
+        v.push(format!("{}/{n}", paths::UNIT_DIR));
+    }
+    for p in [
+        paths::PORT_DROPIN,
+        paths::RESOLVERS_DROPIN,
+        paths::RESCUE_BIN,
+        paths::GATEWAYD_TOML,
+        paths::PRIVD_TOML,
+        "/etc/hx/creds/pepper.cred",
+        "/etc/hx/creds/pepper.cred.tmp",
+        "/etc/hx/creds/identity.cred",
+        "/etc/hx/creds/identity.cred.tmp",
+    ] {
+        v.push(p.to_owned());
+    }
+    if !keep {
+        v.push(paths::HOST_FIREWALL.to_owned());
+    }
+    v
+}
+
+/// The installer's own drop-in directories: the only directories that are `rmdir`'d (and only
+/// when empty).
+const DROPIN_DIRS: [&str; 2] = [
+    "/etc/systemd/system/hx-gatewayd-public.socket.d",
+    "/etc/systemd/system/hx-update-fetcher@.service.d",
+];
+
+/// Unlinks one file (never a directory, never through a link at the last component): the parent
+/// is opened and the name is removed relative to that descriptor.
+fn unlink_file(abs: &Path) -> io::Result<()> {
+    let (Some(parent), Some(name)) = (abs.parent(), abs.file_name()) else {
+        return Ok(());
+    };
+    let pfd = match rustix::fs::open(
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    match rustix::fs::unlinkat(&pfd, name, AtFlags::empty()) {
+        Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 fn remove_path(p: &Path) -> io::Result<()> {
@@ -261,40 +361,48 @@ fn remove_path(p: &Path) -> io::Result<()> {
     }
 }
 
-fn u5_files(d: &mut UninstallDeps<'_>, keep: bool, installed: Option<&InstallState>) -> Result<()> {
+fn u5_files(d: &mut UninstallDeps<'_>, keep: bool) -> Result<()> {
     let p = d.paths.clone();
-    // The files the installer recorded.
-    if let Some(st) = installed {
-        for f in st.created.files.iter().chain(st.created.dropins.iter()) {
-            let firewall_file = f == paths::HOST_FIREWALL
-                || FIREWALL_UNITS.iter().any(|u| f.ends_with(&format!("/{u}")));
-            if allowed(f) && !(keep && firewall_file) {
-                if f.starts_with("/etc/hx/") {
-                    // /etc/hx is handled as a whole below.
-                    continue;
-                }
-                remove_path(&p.at(f))?;
+    // gatewayd's state FIRST: it is emptied by a child that runs this very binary, which lives in
+    // /usr/lib/hx/current until the last step below. As that user (rule 15).
+    let state_dir = p.at(paths::GATEWAYD_STATE);
+    if std::fs::symlink_metadata(&state_dir).is_ok() {
+        match gateway_ids(&p) {
+            Some((uid, gid)) => {
+                d.cleaner
+                    .empty_as_owner(&state_dir, uid, gid)
+                    .map_err(|e| {
+                        InstallError::tool(format!(
+                            "cannot empty gatewayd's state as its user: {e}"
+                        ))
+                    })?;
+            }
+            None => {
+                return Err(InstallError::tool(
+                    "the hx-gatewayd user is gone but its state directory remains; refusing to walk it as root",
+                ));
             }
         }
+        let parent = state_dir.parent().unwrap_or(Path::new("/"));
+        let pfd = rustix::fs::open(
+            parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| InstallError::tool(format!("cannot open {}: {e}", parent.display())))?;
+        let name = state_dir.file_name().unwrap_or_default();
+        rustix::fs::unlinkat(&pfd, name, AtFlags::REMOVEDIR).map_err(|e| {
+            InstallError::tool(format!("cannot remove gatewayd's state directory: {e}"))
+        })?;
     }
-    // The units, snippets and drop-in directories of the table, whether or not the state lists them.
-    for f in units::FILES {
-        let keep_it = keep && f.dest == Dest::Unit && FIREWALL_UNITS.contains(&f.name);
-        if !keep_it {
-            let dir = match f.dest {
-                Dest::Unit => paths::UNIT_DIR,
-                Dest::Sysusers => paths::SYSUSERS_DIR,
-                Dest::Tmpfiles => paths::TMPFILES_DIR,
-                Dest::Logrotate => paths::LOGROTATE_DIR,
-            };
-            remove_path(&p.child(dir, f.name))?;
-        }
+    // The files the installer wrote: an exact set, unlinked one by one.
+    for f in exact_files(keep) {
+        unlink_file(&p.at(&f))?;
     }
-    for n in EXTRA_UNIT_FILES {
-        remove_path(&p.child(paths::UNIT_DIR, n))?;
+    for dir in DROPIN_DIRS {
+        // Only when empty; anything else in there is not ours.
+        let _ = std::fs::remove_dir(p.at(dir));
     }
-    remove_path(&p.at("/etc/systemd/system/hx-gatewayd-public.socket.d"))?;
-    remove_path(&p.at("/etc/systemd/system/hx-update-fetcher@.service.d"))?;
     // privd's directories. The fetcher can write to the updates directory: it is removed with
     // rmdir only (its tmpfs is unmounted by U3), never walked by root.
     let updates = p.at("/var/lib/hx/updates");
@@ -328,37 +436,6 @@ fn u5_files(d: &mut UninstallDeps<'_>, keep: bool, installed: Option<&InstallSta
         }
     } else {
         remove_path(&etc)?;
-    }
-    // gatewayd's state, as that user (rule 15).
-    let state_dir = p.at(paths::GATEWAYD_STATE);
-    if std::fs::symlink_metadata(&state_dir).is_ok() {
-        match gateway_ids(&p) {
-            Some((uid, gid)) => {
-                d.cleaner
-                    .empty_as_owner(&state_dir, uid, gid)
-                    .map_err(|e| {
-                        InstallError::tool(format!(
-                            "cannot empty gatewayd's state as its user: {e}"
-                        ))
-                    })?;
-            }
-            None => {
-                return Err(InstallError::tool(
-                    "the hx-gatewayd user is gone but its state directory remains; refusing to walk it as root",
-                ));
-            }
-        }
-        let parent = state_dir.parent().unwrap_or(Path::new("/"));
-        let pfd = rustix::fs::open(
-            parent,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|e| InstallError::tool(format!("cannot open {}: {e}", parent.display())))?;
-        let name = state_dir.file_name().unwrap_or_default();
-        rustix::fs::unlinkat(&pfd, name, AtFlags::REMOVEDIR).map_err(|e| {
-            InstallError::tool(format!("cannot remove gatewayd's state directory: {e}"))
-        })?;
     }
     Ok(())
 }
@@ -499,7 +576,7 @@ pub fn run(
             }
             "U5" => {
                 say("U5: removing files\n");
-                u5_files(&mut d, keep_desktop, installed.as_ref())?;
+                u5_files(&mut d, keep_desktop)?;
             }
             "U6" => {
                 say("U6: removing the hx-gatewayd user\n");
@@ -628,12 +705,41 @@ mod tests {
     }
 
     #[test]
-    fn the_state_may_only_name_paths_the_installer_writes() {
-        assert!(allowed("/etc/hx/gatewayd.toml"));
-        assert!(allowed("/usr/local/lib/systemd/system/hx-privd.service"));
-        assert!(!allowed("/etc/passwd"));
-        assert!(!allowed("/etc/hx/../passwd"));
-        assert!(!allowed("relative"));
-        assert!(!allowed("/usr/lib/hx"));
+    fn the_removal_set_is_exact_and_holds_only_files() {
+        let all = exact_files(false);
+        assert!(all.iter().any(|f| f == paths::PORT_DROPIN));
+        assert!(all.iter().any(|f| f == paths::RESOLVERS_DROPIN));
+        assert!(all.iter().any(|f| f == paths::RESCUE_BIN));
+        assert!(all.iter().any(|f| f == paths::HOST_FIREWALL));
+        for f in &all {
+            assert!(
+                f.starts_with('/') && !f.contains("..") && !f.ends_with('/'),
+                "{f}"
+            );
+            assert!(!f.ends_with(".d") && !f.ends_with(".wants"), "{f}");
+        }
+        let keep = exact_files(true);
+        assert!(
+            !keep
+                .iter()
+                .any(|f| f == paths::HOST_FIREWALL || f.ends_with("hx-host-firewall.service"))
+        );
+    }
+
+    #[test]
+    fn unlinking_never_removes_a_directory_or_follows_the_last_link() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("dir");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("keep"), b"x").unwrap();
+        assert!(unlink_file(&dir).is_err(), "a directory is refused");
+        assert!(dir.join("keep").exists());
+        let target = d.path().join("target");
+        std::fs::write(&target, b"x").unwrap();
+        let link = d.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        unlink_file(&link).unwrap();
+        assert!(target.exists() && !link.exists());
+        unlink_file(&d.path().join("missing")).unwrap();
     }
 }

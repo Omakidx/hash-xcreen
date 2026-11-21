@@ -19,12 +19,19 @@ use install_engine_common::*;
 #[derive(Default)]
 struct FakeCleaner {
     calls: Vec<(String, u32, u32)>,
+    /// A path that must still exist whenever the cleaner is called (the agent binary's release
+    /// directory: the real cleaner re-executes the agent from it).
+    watch: Option<std::path::PathBuf>,
+    watched_existed: Vec<bool>,
 }
 
 impl Cleaner for FakeCleaner {
     fn empty_as_owner(&mut self, dir: &Path, uid: u32, gid: u32) -> io::Result<()> {
         self.calls
             .push((dir.to_string_lossy().into_owned(), uid, gid));
+        if let Some(w) = &self.watch {
+            self.watched_existed.push(w.exists());
+        }
         empty_dir_beneath(dir)
     }
 }
@@ -52,7 +59,10 @@ fn uninstall(
     keep: bool,
     euid: u32,
 ) -> (Result<Report, UninstallError>, FakeCleaner, String) {
-    let mut cleaner = FakeCleaner::default();
+    let mut cleaner = FakeCleaner {
+        watch: Some(m.paths.at(paths::USR_LIB_HX)),
+        ..FakeCleaner::default()
+    };
     let mut said = String::new();
     let mut progress = |_: &hx_agent::cli::privd::ProgressLine| {};
     let r = {
@@ -477,4 +487,84 @@ fn the_cleaner_never_follows_links_out_of_gatewayds_tree() {
     ok(uninstall(&mut m, false, 0).0);
     assert!(outside.join("precious").exists());
     assert!(!exists(&m, "/var/lib/hx-gatewayd"));
+}
+
+#[test]
+fn gatewayds_state_is_emptied_while_the_agent_binary_still_exists() {
+    // M1: the real cleaner re-executes the agent from /usr/lib/hx, so U5 must empty gatewayd's
+    // state before it removes that directory.
+    let mut m = installed();
+    let (r, cleaner, _) = uninstall(&mut m, false, 0);
+    ok(r);
+    assert_eq!(
+        cleaner.watched_existed,
+        [true],
+        "/usr/lib/hx existed when the cleaner ran"
+    );
+    assert!(!exists(&m, "/usr/lib/hx") && !exists(&m, "/var/lib/hx-gatewayd"));
+}
+
+#[test]
+fn the_real_cleaner_runs_even_when_the_binary_was_unlinked() {
+    use hx_agent::install::uninstall::SelfExecCleaner;
+    let d = tempfile::tempdir().unwrap();
+    // A stand-in executable that exits 0 whatever it is given.
+    let exe = d.path().join("agent");
+    std::fs::copy("/usr/bin/true", &exe).unwrap();
+    let file = std::fs::File::open(&exe).unwrap();
+    let mut c = SelfExecCleaner::with_exe(Some(file), Some(exe.clone()));
+    let uid = rustix::process::getuid().as_raw();
+    let gid = rustix::process::getgid().as_raw();
+    let dir = d.path().join("g");
+    std::fs::create_dir(&dir).unwrap();
+    c.empty_as_owner(&dir, uid, gid).expect("by path");
+    // The path is gone (release directory removed): the descriptor still runs it.
+    std::fs::remove_file(&exe).unwrap();
+    assert!(!exe.exists());
+    c.empty_as_owner(&dir, uid, gid)
+        .expect("through the descriptor of the unlinked binary");
+    // With neither, it is an error, not a hang or a panic.
+    let mut none = SelfExecCleaner::with_exe(None, Some(exe));
+    assert!(none.empty_as_owner(&dir, uid, gid).is_err());
+}
+
+#[test]
+fn a_state_naming_directories_or_foreign_units_removes_nothing_of_them() {
+    // L3: the removal set is exact; the state cannot widen it.
+    let mut m = installed();
+    let sys = path(&m, "/etc/systemd/system");
+    std::fs::create_dir_all(sys.join("multi-user.target.wants")).unwrap();
+    std::fs::write(sys.join("multi-user.target.wants/sshd.service"), b"x").unwrap();
+    std::fs::write(sys.join("x.service"), b"x").unwrap();
+    let other_d = sys.join("other.service.d");
+    std::fs::create_dir_all(&other_d).unwrap();
+    std::fs::write(other_d.join("a.conf"), b"x").unwrap();
+    let mut st = m.state().unwrap();
+    st.created.files.extend([
+        "/etc/systemd/system/".into(),
+        "/etc/systemd/system".into(),
+        "/etc/systemd/system/multi-user.target.wants".into(),
+        "/etc/systemd/system/x.service".into(),
+        "/etc/systemd/system/other.service.d".into(),
+    ]);
+    st.created
+        .dropins
+        .push("/etc/systemd/system/other.service.d/a.conf".into());
+    hx_agent::install::state::save(&m.paths.at(paths::STATE_FILE), &st).unwrap();
+    ok(uninstall(&mut m, false, 0).0);
+    assert!(sys.join("multi-user.target.wants/sshd.service").exists());
+    assert!(sys.join("x.service").exists());
+    assert!(other_d.join("a.conf").exists());
+    // Our own drop-in directory is gone because it was empty after its file went.
+    assert!(!sys.join("hx-gatewayd-public.socket.d").exists());
+}
+
+#[test]
+fn our_dropin_directory_stays_if_something_else_is_in_it() {
+    let mut m = installed();
+    let d = path(&m, "/etc/systemd/system/hx-gatewayd-public.socket.d");
+    std::fs::write(d.join("90-admin.conf"), b"[Socket]\n").unwrap();
+    ok(uninstall(&mut m, false, 0).0);
+    assert!(d.join("90-admin.conf").exists());
+    assert!(!d.join("50-port.conf").exists());
 }
