@@ -1337,6 +1337,49 @@ async fn a_lockout_revocation_is_recorded_announced_and_closes_sessions() {
     );
 }
 
+/// The lockout revocation is serialized with the gateway's other revocations: it waits for the
+/// revocation lock (the guard installed in the authenticator) and goes ahead when it is free.
+#[tokio::test]
+async fn a_lockout_revocation_waits_for_the_revocation_lock() {
+    let env = Env::start().await;
+    let (a, b) = (new_key(), new_key());
+    env.pair(&a, "alice").await;
+    env.pair(&b, "bob").await;
+    env.set_pin(PIN).await;
+    let wrong = hx_crypto::Pin::new("111111").unwrap();
+    for _ in 1..=4 {
+        env.clock.advance(Duration::from_secs(40));
+        let mut c = env.connect_unauth(&b, "bob").await;
+        assert!(matches!(
+            within(c.submit(&wrong)).await.unwrap(),
+            PinReply::Wrong { .. }
+        ));
+        c.abandon().await;
+    }
+    env.clock.advance(Duration::from_secs(40));
+    // Someone else is revoking: the lock is held.
+    let held = env.gw.devices().revoke_gate().lock_owned().await;
+    let mut c = env.connect_unauth(&b, "bob").await;
+    let fifth = tokio::spawn(async move { within(c.submit(&wrong)).await });
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(
+        env.gw.devices().is_active(&Env::id_of(&b)),
+        "the lockout revocation waits for the lock"
+    );
+    drop(held);
+    assert!(matches!(
+        fifth.await.unwrap().unwrap_err(),
+        CryptoError::Revoked
+    ));
+    assert!(!env.gw.devices().is_active(&Env::id_of(&b)));
+    // Recorded once, under the same lock.
+    assert!(
+        env.privd
+            .wait_for(|s| s.events.iter().any(|e| e.0 == AuditEvent::DeviceRevoked))
+            .await
+    );
+}
+
 // ------------------------------------------------------------------ N7: cooling-off
 
 async fn reinstated_event(conn: &hx_transport::Connection) -> pb::DeviceEvent {

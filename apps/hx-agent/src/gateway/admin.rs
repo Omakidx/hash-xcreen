@@ -444,9 +444,9 @@ async fn handle(
                     let info = device_info(r, false);
                     let state = if r.is_revoked() {
                         pb::DeviceState::Revoked
-                    } else if r.failed_pins > 0 {
-                        // "Locked": PIN failures that no success has cleared yet (the
-                        // authenticator's backoff clock is private to it).
+                    } else if st.auth.is_backing_off(&r.id) {
+                        // "Locked": the authenticator holds this device's PIN back right now
+                        // (a wrong-PIN backoff, an unavailable verifier or a locked purpose).
                         pb::DeviceState::Locked
                     } else {
                         pb::DeviceState::Active
