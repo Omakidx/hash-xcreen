@@ -698,7 +698,9 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
     /// Charges one failed verification to `purpose` (shared by `PepperVerify` and the
     /// current-password check). Returns whether this failure locked the purpose.
     pub(crate) fn charge_failure(&self, purpose: Purpose) -> bool {
-        let newly = lock(&self.limiter).record_failure(purpose);
+        // If the charge cannot be saved it stays in memory and the limiter refuses everything that
+        // depends on it until a save works (see `limiter::Unsaved`).
+        let newly = lock(&self.limiter).record_failure(purpose).unwrap_or(false);
         if newly {
             self.after_lock(purpose);
         }

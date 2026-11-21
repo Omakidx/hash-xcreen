@@ -24,7 +24,8 @@ pub fn reset_lockout<T: Transport + Clone + 'static>(
     d.limiter
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .reset(purpose);
+        .reset(purpose)
+        .map_err(|_| CmdError::unavailable("the reset cannot be saved"))?;
     let flag = match purpose {
         Purpose::Pin => Flag::PinLocked,
         Purpose::Password => Flag::PasswordLocked,

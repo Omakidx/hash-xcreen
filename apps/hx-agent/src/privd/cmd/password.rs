@@ -16,7 +16,7 @@ use hx_provision::password::{PasswordChange, change_user_password};
 
 use crate::privd::daemon::{Ctx, Daemon, Reply};
 use crate::privd::error::CmdError;
-use crate::privd::limiter::Purpose;
+use crate::privd::limiter::{Purpose, Refused};
 use crate::privd::state::PhaseKind;
 
 fn utf8(secret: &hx_ipc::secret::Secret, what: &'static str) -> Result<String, CmdError> {
@@ -71,8 +71,14 @@ pub async fn set_user_password<T: Transport + Clone + 'static>(
             if lim.is_locked(Purpose::Password) {
                 return Err(CmdError::locked("the password purpose is locked"));
             }
-            lim.admit_current_check()
-                .map_err(|ms| CmdError::exhausted("too many current-password checks today", ms))?;
+            lim.admit_current_check().map_err(|r| match r {
+                Refused::Wait(ms) => {
+                    CmdError::exhausted("too many current-password checks today", ms)
+                }
+                Refused::Unsaved => {
+                    CmdError::unavailable("the failure budget cannot be saved; try again later")
+                }
+            })?;
         }
         secrets = secrets
             .with_current_password(&utf8(c, "set_user_password: slot 1")?)

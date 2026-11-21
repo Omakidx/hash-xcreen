@@ -14,9 +14,13 @@ use hx_provision::incus::Transport;
 
 use crate::privd::daemon::{Ctx, Daemon, Reply};
 use crate::privd::error::CmdError;
-use crate::privd::limiter::Purpose;
+use crate::privd::limiter::{Purpose, Refused};
 use crate::privd::pepper;
 use crate::privd::state::PhaseKind;
+
+fn unsaved() -> CmdError {
+    CmdError::unavailable("the failure budget cannot be saved; try again later")
+}
 
 fn purpose_of(p: i32, what: &'static str) -> Result<Purpose, CmdError> {
     Purpose::from_pb(p).ok_or_else(|| CmdError::invalid(what))
@@ -38,20 +42,32 @@ pub async fn verify<T: Transport + Clone + 'static>(
     }
     // Check the lock, compare and count the failure under one lock, so that concurrent callers
     // cannot overshoot the cap.
-    let (ok, newly_locked) = {
+    let (ok, newly_locked, saved) = {
         let mut lim = d.limiter.lock().unwrap_or_else(|e| e.into_inner());
         if lim.is_locked(purpose) {
             return Err(CmdError::locked("this verifier purpose is locked"));
         }
+        // Fail closed: while a past charge could not be written, nothing is verified.
+        lim.ensure_saved().map_err(|_| unsaved())?;
         let ok = d
             .pepper
             .verify(purpose, secret.expose(), &r.expected_verifier);
-        let newly = !ok && lim.record_failure(purpose);
-        (ok, newly)
+        if ok {
+            (ok, false, true)
+        } else {
+            match lim.record_failure(purpose) {
+                Ok(newly) => (ok, newly, true),
+                // The charge is kept in memory; the answer is withheld.
+                Err(_) => (ok, lim.is_locked(purpose), false),
+            }
+        }
     };
     drop(secret);
     if newly_locked {
         d.after_lock(purpose);
+    }
+    if !saved {
+        return Err(unsaved());
     }
     d.audit_notice(&format!(
         "pepper_verify purpose={} ok={ok}",
@@ -84,7 +100,10 @@ pub async fn enrol<T: Transport + Clone + 'static>(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .admit_enrol(during_setup)
-            .map_err(|ms| CmdError::exhausted("PepperEnrol allowance used up", ms))?;
+            .map_err(|r| match r {
+                Refused::Wait(ms) => CmdError::exhausted("PepperEnrol allowance used up", ms),
+                Refused::Unsaved => unsaved(),
+            })?;
     }
     let mac = d.pepper.mac(purpose, secret.expose());
     drop(secret);

@@ -116,8 +116,31 @@ fn recent(v: &[u64], now: u64, window: u64) -> usize {
         .count()
 }
 
+/// The security budgets could not be written to disk. privd then **fails closed**: the charge stays
+/// in memory, and `PepperVerify`, `PepperEnrol` and the current-password check are refused
+/// (`UNAVAILABLE`) until a save succeeds, so a full disk cannot be used to make a restart forget a
+/// lockout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unsaved;
+
+/// Why an allowance was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refused {
+    /// Over the allowance; milliseconds until a slot frees up.
+    Wait(u32),
+    /// The budget cannot be persisted ([`Unsaved`]).
+    Unsaved,
+}
+
+impl From<Unsaved> for Refused {
+    fn from(_: Unsaved) -> Self {
+        Refused::Unsaved
+    }
+}
+
 /// Rate limits and security budgets.
 pub struct Limiter {
+    unsaved: bool,
     clock: Arc<dyn Clock>,
     store: StateStore,
     persisted: Persisted,
@@ -129,6 +152,7 @@ impl Limiter {
     pub fn load(clock: Arc<dyn Clock>, store: StateStore) -> std::io::Result<Self> {
         let persisted = store.load_json("ratelimit")?;
         Ok(Self {
+            unsaved: false,
             clock,
             store,
             persisted,
@@ -136,11 +160,25 @@ impl Limiter {
         })
     }
 
-    fn save(&self) {
-        if let Err(e) = self.store.save_json("ratelimit", &self.persisted) {
-            // The in-memory budget still holds for this process; a write failure is loud.
-            crate::privd::log::error(&format!("cannot persist the rate-limit state: {e}"));
+    fn save(&mut self) -> Result<(), Unsaved> {
+        match self.store.save_json("ratelimit", &self.persisted) {
+            Ok(()) => {
+                self.unsaved = false;
+                Ok(())
+            }
+            Err(e) => {
+                // The in-memory budget still holds; nothing that depends on it may proceed.
+                crate::privd::log::error(&format!("cannot persist the rate-limit state: {e}"));
+                self.unsaved = true;
+                Err(Unsaved)
+            }
         }
+    }
+
+    /// Fails while an earlier change could not be written and still cannot be (it retries the
+    /// save). Call it before any operation that relies on the persisted budgets.
+    pub fn ensure_saved(&mut self) -> Result<(), Unsaved> {
+        if self.unsaved { self.save() } else { Ok(()) }
     }
 
     /// A copy of the persisted budgets (tests, status).
@@ -183,7 +221,7 @@ impl Limiter {
 
     /// Records one failed verification of `p`. Returns `true` if this failure locked the purpose.
     /// Persisted before it returns.
-    pub fn record_failure(&mut self, p: Purpose) -> bool {
+    pub fn record_failure(&mut self, p: Purpose) -> Result<bool, Unsaved> {
         let now = self.clock.unix_secs();
         let (hour_cap, day_cap) = failure_caps(p);
         let v = self.persisted.failures(p);
@@ -195,20 +233,21 @@ impl Limiter {
         if newly {
             *self.persisted.locked_mut(p) = true;
         }
-        self.save();
-        newly
+        self.save()?;
+        Ok(newly)
     }
 
     /// Admin's `ResetLockout`: clears the failures and the lock of `p`.
-    pub fn reset(&mut self, p: Purpose) {
+    pub fn reset(&mut self, p: Purpose) -> Result<(), Unsaved> {
         self.persisted.failures(p).clear();
         *self.persisted.locked_mut(p) = false;
-        self.save();
+        self.save()
     }
 
     /// The Gateway's `PepperEnrol` allowance: `during_setup` selects 60 per hour, otherwise 5 per
     /// day. `Err` carries the milliseconds until the next slot. Counts and persists on success.
-    pub fn admit_enrol(&mut self, during_setup: bool) -> Result<(), u32> {
+    pub fn admit_enrol(&mut self, during_setup: bool) -> Result<(), Refused> {
+        self.ensure_saved()?;
         let now = self.clock.unix_secs();
         self.persisted
             .enrol
@@ -228,15 +267,18 @@ impl Limiter {
         if used.len() >= max {
             let oldest = used.iter().copied().min().unwrap_or(now);
             let wait_s = (oldest + window).saturating_sub(now).max(1);
-            return Err(u32::try_from(wait_s * 1000).unwrap_or(u32::MAX));
+            return Err(Refused::Wait(
+                u32::try_from(wait_s * 1000).unwrap_or(u32::MAX),
+            ));
         }
         self.persisted.enrol.push(now);
-        self.save();
+        self.save()?;
         Ok(())
     }
 
     /// A current-password check: 20 per day. Counts and persists on success.
-    pub fn admit_current_check(&mut self) -> Result<(), u32> {
+    pub fn admit_current_check(&mut self) -> Result<(), Refused> {
+        self.ensure_saved()?;
         let now = self.clock.unix_secs();
         self.persisted
             .current_checks
@@ -250,10 +292,12 @@ impl Limiter {
                 .min()
                 .unwrap_or(now);
             let wait_s = (oldest + DAY).saturating_sub(now).max(1);
-            return Err(u32::try_from(wait_s * 1000).unwrap_or(u32::MAX));
+            return Err(Refused::Wait(
+                u32::try_from(wait_s * 1000).unwrap_or(u32::MAX),
+            ));
         }
         self.persisted.current_checks.push(now);
-        self.save();
+        self.save()?;
         Ok(())
     }
 }
@@ -291,10 +335,13 @@ mod tests {
     fn pin_locks_at_ten_failures_in_an_hour_and_never_before() {
         let (mut l, _c, _d) = limiter();
         for i in 1..=9 {
-            assert!(!l.record_failure(Purpose::Pin), "failure {i}");
+            assert!(!l.record_failure(Purpose::Pin).unwrap(), "failure {i}");
             assert!(!l.is_locked(Purpose::Pin));
         }
-        assert!(l.record_failure(Purpose::Pin), "the tenth failure locks");
+        assert!(
+            l.record_failure(Purpose::Pin).unwrap(),
+            "the tenth failure locks"
+        );
         assert!(l.is_locked(Purpose::Pin));
         // The other purpose is independent.
         assert!(!l.is_locked(Purpose::Password));
@@ -304,9 +351,9 @@ mod tests {
     fn password_locks_at_five_failures_in_an_hour() {
         let (mut l, _c, _d) = limiter();
         for _ in 0..4 {
-            assert!(!l.record_failure(Purpose::Password));
+            assert!(!l.record_failure(Purpose::Password).unwrap());
         }
-        assert!(l.record_failure(Purpose::Password));
+        assert!(l.record_failure(Purpose::Password).unwrap());
         assert!(l.is_locked(Purpose::Password));
     }
 
@@ -318,7 +365,7 @@ mod tests {
         let mut locked_at = None;
         'outer: for hour in 0..6 {
             for n in 0..9 {
-                if l.record_failure(Purpose::Pin) {
+                if l.record_failure(Purpose::Pin).unwrap() {
                     locked_at = Some(hour * 9 + n + 1);
                     break 'outer;
                 }
@@ -332,23 +379,23 @@ mod tests {
     fn failures_older_than_the_window_do_not_count() {
         let (mut l, c, _d) = limiter();
         for _ in 0..9 {
-            l.record_failure(Purpose::Pin);
+            l.record_failure(Purpose::Pin).unwrap();
         }
         c.advance_secs(3_601);
         // Nine are older than an hour: one more is the tenth of the day but the first of the hour.
-        assert!(!l.record_failure(Purpose::Pin));
+        assert!(!l.record_failure(Purpose::Pin).unwrap());
     }
 
     #[test]
     fn reset_clears_failures_and_lock() {
         let (mut l, _c, _d) = limiter();
         for _ in 0..5 {
-            l.record_failure(Purpose::Password);
+            l.record_failure(Purpose::Password).unwrap();
         }
         assert!(l.is_locked(Purpose::Password));
-        l.reset(Purpose::Password);
+        l.reset(Purpose::Password).unwrap();
         assert!(!l.is_locked(Purpose::Password));
-        assert!(!l.record_failure(Purpose::Password));
+        assert!(!l.record_failure(Purpose::Password).unwrap());
     }
 
     #[test]
@@ -359,10 +406,10 @@ mod tests {
         {
             let mut l = Limiter::load(clock.clone(), StateStore::open(&dir).unwrap()).unwrap();
             for _ in 0..10 {
-                l.record_failure(Purpose::Pin);
+                l.record_failure(Purpose::Pin).unwrap();
             }
             for _ in 0..3 {
-                l.record_failure(Purpose::Password);
+                l.record_failure(Purpose::Password).unwrap();
             }
             l.admit_enrol(false).unwrap();
         }
@@ -370,8 +417,8 @@ mod tests {
         assert!(l.is_locked(Purpose::Pin));
         assert!(!l.is_locked(Purpose::Password));
         // Two more password failures still reach the cap of five: the earlier three were kept.
-        assert!(!l.record_failure(Purpose::Password));
-        assert!(l.record_failure(Purpose::Password));
+        assert!(!l.record_failure(Purpose::Password).unwrap());
+        assert!(l.record_failure(Purpose::Password).unwrap());
         assert_eq!(l.persisted().enrol.len(), 1);
     }
 

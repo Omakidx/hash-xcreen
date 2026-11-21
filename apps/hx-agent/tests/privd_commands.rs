@@ -2138,3 +2138,55 @@ async fn m2_get_host_info_forks_iptables_and_nft_at_most_once_every_five_seconds
     ok(run(&h, Role::Admin, Command::GetHostInfo(Default::default())).await);
     assert_eq!(runner.calls().len(), 4);
 }
+
+#[tokio::test]
+async fn m3_when_the_budget_cannot_be_saved_pepper_commands_fail_closed() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Harness::start(GW);
+    make_ready(&h).await;
+    let input = [3u8; 32];
+    let mac = enrol_mac(enrol(&h, Role::Admin, pb::LockoutPurpose::Pin, &input).await);
+    let state = h.dir.path().join("state");
+    // The disk "fills": the state directory stops accepting files.
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let r = verify(
+        &h.daemon,
+        Role::Gateway,
+        pb::LockoutPurpose::Pin,
+        &[9; 32],
+        &mac,
+    )
+    .await;
+    assert_eq!(
+        code(&r),
+        ErrorCode::Unavailable,
+        "a failing guess is not answered"
+    );
+    // And nothing is verified or enrolled until a save works, not even the right input.
+    let r = verify(
+        &h.daemon,
+        Role::Gateway,
+        pb::LockoutPurpose::Pin,
+        &input,
+        &mac,
+    )
+    .await;
+    assert_eq!(code(&r), ErrorCode::Unavailable);
+    let r = enrol(&h, Role::Gateway, pb::LockoutPurpose::Pin, &input).await;
+    assert_eq!(code(&r), ErrorCode::Unavailable);
+    // The disk recovers: the charge made while it was full was kept and is now written.
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(verdict(
+        verify(
+            &h.daemon,
+            Role::Gateway,
+            pb::LockoutPurpose::Pin,
+            &input,
+            &mac
+        )
+        .await
+    ));
+    let saved = std::fs::read_to_string(state.join("ratelimit")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&saved).unwrap();
+    assert_eq!(v["pin_failures"].as_array().unwrap().len(), 1);
+}
