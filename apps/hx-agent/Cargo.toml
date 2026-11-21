@@ -33,7 +33,7 @@ hx-transport.workspace = true
 libc = "0.2" # seccomp numbers (gateway) and SO_PEERGROUPS (privd::peergroups)
 listenfd = "1.0.2"
 prost.workspace = true
-rustix = { workspace = true, features = ["fs", "mm", "process", "net", "rand"] }
+rustix = { workspace = true, features = ["fs", "mm", "process", "net", "rand", "termios"] }
 seccompiler = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
