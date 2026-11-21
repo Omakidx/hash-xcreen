@@ -63,6 +63,7 @@ Everything is written in Rust. The desktop client uses Slint.
 ```
 crates/
   hx-proto      protobuf control messages, binary media headers, versioning
+  hx-ipc        internal IPC: framing and schemas for hx-privd, the gatewayd admin socket and the session link
   hx-transport  QUIC (quinn), WebTransport, WebSocket fallback behind one interface
   hx-crypto     identity keys, SPAKE2 pairing, PIN/password hashing helpers
   hx-capture    capture + input backends (X11 first; KWin and Mutter later)
