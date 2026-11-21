@@ -63,6 +63,15 @@ impl RemoteProvider for Text {
     }
 }
 
+/// Any one format a local application offers.
+struct Offered(&'static str, Vec<u8>);
+
+impl RemoteProvider for Offered {
+    fn fetch(&self, mime: &str, _max: u64) -> Option<Vec<u8>> {
+        (mime == self.0).then(|| self.1.clone())
+    }
+}
+
 /// Waits (up to `secs`) until the engine sees a local offer that has `mime`.
 fn wait_offer(a: &Clipboard, mime: &str, secs: u64) -> bool {
     let end = Instant::now() + Duration::from_secs(secs);
@@ -107,12 +116,7 @@ async fn video_cursor_and_stream_info_reach_the_client() {
     assert!(info.fps > 0 && info.fps <= 240);
 
     // An IDR first (KEY | RESYNC), then P frames, numbered upward, with intact headers.
-    let first = c.next_frame(15).await;
-    assert!(
-        first.header.is_key() && first.header.is_resync(),
-        "{:?}",
-        first.header
-    );
+    let first = c.first_idr(15).await;
     assert!(!serial_gt(info.first_frame, first.header.frame_number));
     assert_eq!(first.header.codec, VideoCodec::H264);
     assert!(is_annexb(&first.payload) && first.payload.len() == first.header.payload_len as usize);
@@ -513,6 +517,66 @@ async fn clipboard_text_travels_both_ways_and_the_policy_applies() {
     assert!(c.next_transfer(2).await.is_none(), "nothing leaves");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn clipboard_images_and_files_copied_in_the_desktop_reach_the_client() {
+    let Some(rig) = Rig::start(RigOptions::default()).await else {
+        return;
+    };
+    let dev = rig.device("laptop").await;
+    let mut c = rig.client(&dev, "laptop").await;
+    c.view(|_| {}).await;
+    c.next_frame(15).await;
+    let a = app(&rig.x);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // An image from the client becomes the local image selection.
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png.extend((0..200_000u32).map(|i| (i * 31 % 251) as u8));
+    c.send_transfer(TransferKind::Clipboard, "image/png", "", &png)
+        .await
+        .expect("image accepted");
+    assert!(wait_offer(&a, "image/png", 5), "the session owns the image");
+    assert_eq!(
+        a.fetch_local(Selection::Clipboard, "image/png").unwrap(),
+        png
+    );
+
+    // An image copied in the desktop reaches the client as image/png.
+    let mut local = b"\x89PNG\r\n\x1a\n".to_vec();
+    local.extend((0..70_000u32).map(|i| (i * 13 % 247) as u8));
+    a.offer_remote(
+        Selection::Clipboard,
+        vec!["image/png".to_owned()],
+        Arc::new(Offered("image/png", local.clone())),
+    )
+    .unwrap();
+    let t = c.next_transfer(10).await.expect("an image transfer");
+    assert_eq!(t.kind, TransferKind::Clipboard);
+    assert_eq!(t.header.mime, "image/png");
+    assert_eq!(t.body, local);
+
+    // Files copied in the desktop (a text/uri-list) are pushed to the client as file transfers.
+    let file = rig.dir.join("copied.bin");
+    let content: Vec<u8> = (0..5_000u32).map(|i| (i % 249) as u8).collect();
+    std::fs::write(&file, &content).unwrap();
+    a.offer_remote(
+        Selection::Clipboard,
+        vec![MIME_URI_LIST.to_owned()],
+        Arc::new(Offered(
+            MIME_URI_LIST,
+            format!("file://{}\r\n", file.display()).into_bytes(),
+        )),
+    )
+    .unwrap();
+    let t = c.next_transfer(10).await.expect("a file transfer");
+    assert_eq!(t.kind, TransferKind::File);
+    assert_eq!(
+        (t.header.name.as_str(), t.header.size),
+        ("copied.bin", 5_000)
+    );
+    assert_eq!(t.body, content);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Files
 
@@ -710,8 +774,7 @@ async fn takeover_by_a_second_device_gets_a_new_epoch_an_idr_and_cuts_the_old_in
         })
         .await
         .expect("StreamInfo for the new client");
-    let first = b.next_frame(15).await;
-    assert!(first.header.is_key() && first.header.is_resync());
+    let first = b.first_idr(15).await;
     assert!(!serial_gt(info.first_frame, first.header.frame_number));
     assert!(
         serial_gt(first.header.frame_number, last_a),
@@ -824,8 +887,7 @@ async fn the_last_client_leaving_stops_the_stream_and_the_link_is_kept_then_clos
     assert!(rig.relay.keeper().is_up(), "kept during the idle time");
     let mut b = rig.client(&laptop, "laptop").await;
     b.view(|_| {}).await;
-    let f = b.next_frame(15).await;
-    assert!(f.header.is_key(), "a fresh stream starts with an IDR");
+    b.first_idr(15).await; // a fresh stream starts with an IDR
     // Leaving again and staying away closes the link after the keep time.
     b.conn.close(CloseCode::NoError, "bye").await;
     drop(b);
@@ -875,9 +937,11 @@ async fn a_restarted_session_ends_the_stream_with_a_fixed_text_and_the_client_re
     loop {
         let mut b = rig.client(&laptop, "laptop").await;
         b.view(|_| {}).await;
-        if let Some(f) = b.wait_frame(6, |f| Some(f.header)).await {
-            assert!(f.is_key(), "video restarts from an IDR");
-            break;
+        if b.wait_frame(6, |f| f.header.is_key().then_some(()))
+            .await
+            .is_some()
+        {
+            break; // video restarts from an IDR
         }
         assert!(Instant::now() < end, "no reconnect");
         tokio::time::sleep(Duration::from_millis(500)).await;

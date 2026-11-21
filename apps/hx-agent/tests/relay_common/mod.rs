@@ -290,6 +290,21 @@ impl Client {
             .expect("the connection is alive")
     }
 
+    /// The IDR that answers a start (`KEY | RESYNC`). Frame streams race, so a P frame that
+    /// follows the IDR may be read first (the client's reorder window releases the first frame
+    /// it sees): up to 4 frames before the IDR are tolerated, none may be older than it.
+    pub async fn first_idr(&mut self, secs: u64) -> VideoFrame {
+        let mut before = 0;
+        loop {
+            let f = self.next_frame(secs).await;
+            if f.header.is_key() && f.header.is_resync() {
+                return f;
+            }
+            before += 1;
+            assert!(before <= 4, "no IDR among the first frames");
+        }
+    }
+
     /// The first control message `pick` accepts, within `secs`.
     pub async fn wait_ctl<T>(
         &mut self,
