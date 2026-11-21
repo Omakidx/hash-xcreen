@@ -10,3 +10,37 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+hx-crypto.workspace = true
+hx-ipc = { workspace = true, features = ["privd", "link"] }
+hx-proto.workspace = true
+hx-provision.workspace = true
+hx-transport.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "signal"] }
+tracing.workspace = true
+# hx-privd (ipc.md Part 1)
+getrandom = "0.4"
+libc = "0.2" # SO_PEERGROUPS (privd::peergroups, the second audited unsafe block)
+prost.workspace = true
+hkdf = "0.12"
+hmac = "0.12"
+rustix = { workspace = true, features = ["net", "fs", "process", "mm"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2.6.1"
+bytes.workspace = true
+zeroize.workspace = true
+tempfile = { version = "3", optional = true }
+
+[features]
+# Test-only constructors (inject the gateway uid, fakes). A release build never enables it: only
+# the crate's own dev-dependency on itself switches it on.
+test-support = ["dep:tempfile"]
+
+[dev-dependencies]
+hx-agent = { path = ".", features = ["test-support"] }
+hyper = "1" # the real-Incus test builds one raw `Request`
+tempfile = "3"
