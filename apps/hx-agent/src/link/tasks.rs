@@ -261,7 +261,16 @@ async fn media_loop(sh: &Arc<Shared>, lane: &mut LaneReader) -> Fail {
 /// How long a key frame waits for its `stream_format` (the lanes race).
 const FORMAT_WAIT: Duration = Duration::from_secs(2);
 
-async fn format_for(sh: &Arc<Shared>, n: u32, key: bool) -> Result<Arc<StreamFormat>, Fail> {
+/// The format in force for frame `n`. The lanes race, so a key frame can arrive before the
+/// `stream_format` that announces its (new) size: a key frame waits, within [`FORMAT_WAIT`],
+/// until the format in force for it matches the size its SPS announces. A frame that still
+/// does not match then, or any other frame without a format, is a violation.
+async fn format_for(
+    sh: &Arc<Shared>,
+    n: u32,
+    key: bool,
+    sps: Option<(u32, u32)>,
+) -> Result<Arc<StreamFormat>, Fail> {
     let deadline = tokio::time::Instant::now() + FORMAT_WAIT;
     loop {
         let notified = sh.fmt_notify.notified();
@@ -271,24 +280,44 @@ async fn format_for(sh: &Arc<Shared>, n: u32, key: bool) -> Result<Arc<StreamFor
             let f = lock(&sh.formats);
             (f.in_force(n), !f.is_empty())
         };
-        if let Some(f) = found {
-            return Ok(f);
-        }
-        if !key {
-            return Err(violation(if any {
-                "a frame older than every announced stream_format"
-            } else {
-                "a frame before any stream_format"
-            }));
-        }
-        if timeout(
-            deadline.saturating_duration_since(tokio::time::Instant::now()),
-            notified,
-        )
-        .await
-        .is_err()
-        {
-            return Err(violation("a key frame without a stream_format"));
+        let mismatch = |f: &StreamFormat, d: (u32, u32)| {
+            violation(format!(
+                "the SPS announces {}x{} but stream_format says {}x{}",
+                d.0, d.1, f.width, f.height
+            ))
+        };
+        match (&found, key, sps) {
+            (Some(f), true, Some(d)) if (f.width, f.height) != d => {
+                // Possibly the announcement is still in flight on ctl.
+                if timeout(
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                    notified,
+                )
+                .await
+                .is_err()
+                {
+                    return Err(mismatch(f, d));
+                }
+            }
+            (Some(f), _, _) => return Ok(f.clone()),
+            (None, false, _) => {
+                return Err(violation(if any {
+                    "a frame older than every announced stream_format"
+                } else {
+                    "a frame before any stream_format"
+                }));
+            }
+            (None, true, _) => {
+                if timeout(
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                    notified,
+                )
+                .await
+                .is_err()
+                {
+                    return Err(violation("a key frame without a stream_format"));
+                }
+            }
         }
     }
 }
@@ -327,7 +356,7 @@ async fn on_video(sh: &Arc<Shared>, v: hx_ipc::link::frames::VideoFrame) -> Resu
             return Ok(());
         }
     }
-    let fmt = format_for(sh, n, key).await?;
+    let fmt = format_for(sh, n, key, checked.sps.map(|s| (s.width, s.height))).await?;
     if let (true, Some(sps)) = (key, checked.sps)
         && (sps.width, sps.height) != (fmt.width, fmt.height)
     {

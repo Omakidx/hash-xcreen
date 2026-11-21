@@ -743,6 +743,7 @@ dependencies = [
  "hx-provision",
  "hx-session",
  "hx-transport",
+ "prost",
  "rustix",
  "thiserror",
  "tokio",

@@ -373,6 +373,26 @@ impl StopHandle {
     }
 }
 
+/// Pushes local files to the connected gateway: the path the clipboard watcher takes for the
+/// files of a local copy. For tests and tooling; cheap to clone and `Send`.
+#[derive(Clone)]
+pub struct SessionSender {
+    hub: Arc<Hub>,
+}
+
+impl SessionSender {
+    /// Sends the local file at `path` as a file transfer on the live link. Blocks until the
+    /// transfer is written, aborted or the link ends.
+    pub fn send_file(&self, path: &Path) -> Result<(), String> {
+        let ctx = lock(&self.hub.state)
+            .live
+            .as_ref()
+            .map(|l| l.ctx.clone())
+            .ok_or("no live link")?;
+        bulk::send_path(&ctx, path).map_err(|e| format!("{e:?}"))
+    }
+}
+
 /// A server running on its own thread (tests, embedding).
 pub struct ServerHandle {
     stop: StopHandle,
@@ -381,16 +401,16 @@ pub struct ServerHandle {
 }
 
 impl ServerHandle {
-    /// Pushes the local file at `path` to the connected gateway as a file transfer: the path
-    /// the clipboard watcher takes for the files of a local copy. Blocks until the transfer is
-    /// written. For tests and tooling.
+    /// A cloneable handle for pushing local files to the connected gateway.
+    pub fn sender(&self) -> SessionSender {
+        SessionSender {
+            hub: self.hub.clone(),
+        }
+    }
+
+    /// Pushes the local file at `path` to the connected gateway (see [`SessionSender`]).
     pub fn send_file(&self, path: &Path) -> Result<(), String> {
-        let ctx = lock(&self.hub.state)
-            .live
-            .as_ref()
-            .map(|l| l.ctx.clone())
-            .ok_or("no live link")?;
-        bulk::send_path(&ctx, path).map_err(|e| format!("{e:?}"))
+        self.sender().send_file(path)
     }
 
     /// A handle that can stop the server from elsewhere.
