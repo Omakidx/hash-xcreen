@@ -56,7 +56,7 @@ pub(super) fn begin(env: &mut Env<'_>, secs: u32) -> Result<Outcome, CliError> {
         R::BeginSetup(r) => r.expires_at_unix_s,
         _ => return Err(unexpected("BeginSetup")),
     };
-    let state = mirror(env, apb::SetupWindowAction::Open, remaining(env, expires))
+    let state = mirror(env, apb::SetupWindowAction::Open, secs)
         .map_err(|e| mirror_failed("opened the setup window", e))?;
     Ok(Outcome::ok(
         format!(
