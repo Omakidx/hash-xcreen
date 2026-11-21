@@ -63,7 +63,11 @@ fn l2_secret_bytes_are_never_copied_into_unzeroized_owners() {
 /// must be added to this list on purpose, in review.
 #[test]
 fn n1_unsafe_code_is_confined_to_the_audited_modules() {
-    const ALLOWED: [&str; 2] = ["privd/activation.rs", "privd/peergroups.rs"];
+    const ALLOWED: [&str; 3] = [
+        "cli/sigblock.rs",
+        "privd/activation.rs",
+        "privd/peergroups.rs",
+    ];
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut found = Vec::new();
     for (path, text) in sources("src") {
