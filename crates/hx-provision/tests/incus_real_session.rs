@@ -691,6 +691,61 @@ async fn run_one(c: &Client<UnixTransport>, recipe: &str, full: bool) {
     )
     .await;
     evidence!("unit files and drop-ins", "{dropins}");
+    // Everything Incus's own drop-in sets, in full: nothing in it may weaken what the unit asks
+    // for beyond the keys we know (and re-enable NoNewPrivileges for).
+    let (_, lxc, _) = sh(c, "cat /run/systemd/system/service.d/zzz-lxc-service.conf").await;
+    evidence!(
+        "/run/systemd/system/service.d/zzz-lxc-service.conf",
+        "{lxc}"
+    );
+    let known_off = [
+        "ProcSubset=all",
+        "ProtectProc=default",
+        "ProtectControlGroups=no",
+        "ProtectKernelTunables=no",
+        "NoNewPrivileges=no",
+        "LoadCredential=",
+        "PrivateNetwork=no",
+        "PrivateTmp=no",
+        "ProtectClock=no",
+        "PrivateUsers=no",
+        "MemoryDenyWriteExecute=no",
+        "ProtectHostname=no",
+    ];
+    for line in lxc
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && *l != "[Service]")
+    {
+        assert!(
+            known_off.contains(&line)
+                || line.starts_with("ProtectKernelModules=")
+                || line.starts_with("ProtectKernelLogs=")
+                || line.starts_with("ProtectHome=")
+                || line.starts_with("ProtectSystem=")
+                || line.starts_with("LockPersonality=")
+                || line.starts_with("RestrictAddressFamilies=")
+                || line.starts_with("RestrictNamespaces="),
+            "unexpected setting in Incus's service.d drop-in: {line}"
+        );
+        // It must not loosen anything hx-session.service sets itself.
+        for ours in [
+            "ProtectSystem=",
+            "ProtectHome=",
+            "LockPersonality=",
+            "RestrictAddressFamilies=",
+        ] {
+            if let Some(v) = line.strip_prefix(ours) {
+                assert!(
+                    (ours == "ProtectSystem=" && matches!(v, "strict" | "full" | "yes"))
+                        || (ours == "ProtectHome=" && matches!(v, "read-only" | "yes" | "tmpfs"))
+                        || (ours == "LockPersonality=" && v == "yes")
+                        || (ours == "RestrictAddressFamilies=" && v.contains("AF_UNIX")),
+                    "Incus's drop-in loosens {line}"
+                );
+            }
+        }
+    }
     let (_, show, _) = sh(
         c,
         "systemctl show hx-session.service -p ActiveState -p SubState -p User -p MainPID -p KillMode -p Restart -p RestartUSec -p NoNewPrivileges -p CapabilityBoundingSet -p RestrictAddressFamilies -p ProtectSystem -p ProtectHome -p ReadWritePaths -p LockPersonality -p SystemCallFilter -p TasksMax -p MemoryMax -p PrivateNetwork -p PrivateTmp -p StartLimitIntervalUSec -p StartLimitBurst -p FragmentPath | cut -c1-150",
@@ -1010,6 +1065,41 @@ async fn api_checks(c: &Client<UnixTransport>) {
         c.add_session_link(INSTANCE, &link).await.unwrap(),
         LinkOutcome::Unchanged
     );
+    // PATCH vs PUT semantics for a device: what does a PATCH with a partial device leave behind?
+    let t = UnixTransport::new(socket());
+    let mut stale = link.device();
+    stale.insert("proxy_protocol".into(), "true".into());
+    stale.insert("uid".into(), "5".into());
+    raw(
+        &t,
+        hyper::Method::PATCH,
+        &format!("/1.0/instances/{INSTANCE}"),
+        serde_json::json!({"devices": {"hx-link": stale}}),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let patched = raw(
+        &t,
+        hyper::Method::PATCH,
+        &format!("/1.0/instances/{INSTANCE}"),
+        serde_json::json!({"devices": {"hx-link": {"type": "proxy", "bind": "host",
+            "listen": "unix:/run/hx/link/main.sock", "connect": "unix:/run/hx-session/link.sock",
+            "security.uid": "1000", "security.gid": "1000"}}}),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let after_patch = c.get_instance(INSTANCE).await.unwrap().unwrap().devices["hx-link"].clone();
+    evidence!(
+        "a PATCH with a partial hx-link device leaves",
+        "{after_patch:?} (response {})",
+        patched["status"]
+    );
+    // Whatever PATCH does, add_session_link must end with exactly the wanted device.
+    let outcome = c.add_session_link(INSTANCE, &link).await.unwrap();
+    let now = c.get_instance(INSTANCE).await.unwrap().unwrap().devices["hx-link"].clone();
+    evidence!("add_session_link after stale keys", "{outcome:?}: {now:?}");
+    assert_eq!(now, link.device(), "no stale key survives a replace");
+    assert!(!now.contains_key("proxy_protocol"));
     assert!(c.remove_session_link(INSTANCE).await.unwrap());
     assert!(
         !c.get_instance(INSTANCE)
