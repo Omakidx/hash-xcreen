@@ -2343,3 +2343,37 @@ async fn l8_the_link_directory_is_checked_before_the_proxy_device_is_added() {
     let v = d.run_self_checks();
     assert!(v.iter().any(|x| x.0.contains("expected 750")), "{v:?}");
 }
+
+#[tokio::test]
+async fn n5_a_command_refused_by_its_own_rule_does_not_burn_a_mutating_slot() {
+    let h = Harness::start(GW);
+    make_ready(&h).await;
+    add_desktop(&h);
+    // RecordEvent allows 60 an hour and is not "mutating"; StartDesktop allows 6 a minute per
+    // desktop and is. Use up StartDesktop's own rule, then keep calling it: every refused call
+    // must leave the shared 30-a-minute window alone.
+    let start = || {
+        Command::StartDesktop(pb::StartDesktopRequest {
+            desktop_id: "main".into(),
+        })
+    };
+    for _ in 0..6 {
+        ok(run(&h, Role::Gateway, start()).await);
+    }
+    for _ in 0..100 {
+        assert_eq!(
+            code(&run(&h, Role::Gateway, start()).await),
+            ErrorCode::ResourceExhausted
+        );
+    }
+    // 6 admitted so far of 30: 24 more mutating commands still pass.
+    let finish = || Command::FinishSetup(Default::default());
+    for i in 0..24 {
+        ok(run(&h, Role::Gateway, finish()).await);
+        let _ = i;
+    }
+    assert_eq!(
+        code(&run(&h, Role::Gateway, finish()).await),
+        ErrorCode::ResourceExhausted
+    );
+}

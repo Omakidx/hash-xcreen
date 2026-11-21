@@ -654,14 +654,15 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
     fn admit_rate(&self, role: Role, cmd: &Command) -> Result<(), CmdError> {
         let name = command_info(cmd).name;
         let role_name = audit::role_name(role);
-        let mut l = lock(&self.limiter);
+        let mut rules: Vec<(String, u64, usize)> = Vec::new();
+        let mut mutating = false;
         if role == Role::Gateway && auth::counts_as_mutating(cmd) {
-            l.admit(
-                &format!("{role_name}:mutating"),
+            mutating = true;
+            rules.push((
+                format!("{role_name}:mutating"),
                 60_000,
                 auth::MUTATING_PER_MINUTE,
-            )
-            .map_err(|ms| CmdError::exhausted("too many commands per minute", ms))?;
+            ));
         }
         if let Some(rule) = auth::rate_rule(cmd) {
             let key = if rule.per_desktop {
@@ -672,10 +673,17 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
             } else {
                 format!("{role_name}:{name}")
             };
-            l.admit(&key, rule.window_ms, rule.max)
-                .map_err(|ms| CmdError::exhausted(format!("{name} is rate limited"), ms))?;
+            rules.push((key, rule.window_ms, rule.max));
         }
-        Ok(())
+        // All windows or none: a command refused by its own rule must not use up a slot of the
+        // shared per-minute window.
+        lock(&self.limiter).admit_all(&rules).map_err(|(i, ms)| {
+            if mutating && i == 0 {
+                CmdError::exhausted("too many commands per minute", ms)
+            } else {
+                CmdError::exhausted(format!("{name} is rate limited"), ms)
+            }
+        })
     }
 
     async fn execute(&self, cmd: &Command, ctx: &mut Ctx) -> Result<Reply, CmdError> {

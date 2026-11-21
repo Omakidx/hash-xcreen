@@ -186,9 +186,9 @@ impl Limiter {
         &self.persisted
     }
 
-    /// Takes one slot of the sliding window `key` (`max` per `window_ms`). `Err` carries the
-    /// milliseconds until a slot frees up. A refused call consumes nothing.
-    pub fn admit(&mut self, key: &str, window_ms: u64, max: usize) -> Result<(), u32> {
+    /// Milliseconds until a slot of the window `key` is free, `None` if one is free now. Prunes
+    /// old entries; consumes nothing.
+    fn wait_for(&mut self, key: &str, window_ms: u64, max: usize) -> Option<u32> {
         let now = self.clock.unix_ms();
         let q = self.windows.entry(key.to_string()).or_default();
         while q
@@ -200,13 +200,45 @@ impl Limiter {
         if q.len() >= max {
             let oldest = q.front().copied().unwrap_or(now);
             let wait = (oldest + window_ms).saturating_sub(now).max(1);
-            return Err(u32::try_from(wait).unwrap_or(u32::MAX));
+            return Some(u32::try_from(wait).unwrap_or(u32::MAX));
         }
-        q.push_back(now);
+        None
+    }
+
+    fn take(&mut self, key: &str) {
+        let now = self.clock.unix_ms();
+        self.windows
+            .entry(key.to_string())
+            .or_default()
+            .push_back(now);
         // Bound the map: a key per desktop id is already bounded by the id syntax and the
         // registry, but never let it grow without limit.
         if self.windows.len() > 1024 {
             self.windows.retain(|_, q| !q.is_empty());
+        }
+    }
+
+    /// Takes one slot of the sliding window `key` (`max` per `window_ms`). `Err` carries the
+    /// milliseconds until a slot frees up. A refused call consumes nothing.
+    pub fn admit(&mut self, key: &str, window_ms: u64, max: usize) -> Result<(), u32> {
+        if let Some(ms) = self.wait_for(key, window_ms, max) {
+            return Err(ms);
+        }
+        self.take(key);
+        Ok(())
+    }
+
+    /// Takes one slot from **every** window of `rules` (`(key, window_ms, max)`), or none: if any
+    /// is full the error names the first full one (its index and wait) and no window is charged,
+    /// so a command refused by its own rule does not use up the shared per-minute slot.
+    pub fn admit_all(&mut self, rules: &[(String, u64, usize)]) -> Result<(), (usize, u32)> {
+        for (i, (key, window, max)) in rules.iter().enumerate() {
+            if let Some(ms) = self.wait_for(key, *window, *max) {
+                return Err((i, ms));
+            }
+        }
+        for (key, _, _) in rules {
+            self.take(key);
         }
         Ok(())
     }
@@ -329,6 +361,20 @@ mod tests {
         }
         // Other keys are independent.
         l.admit("other", 60_000, 3).unwrap();
+    }
+
+    #[test]
+    fn n5_admit_all_charges_every_window_or_none() {
+        let (mut l, _clock, _d) = limiter();
+        let rules = |own: &str| vec![("mut".to_string(), 60_000, 3), (own.to_string(), 60_000, 1)];
+        l.admit_all(&rules("a")).unwrap();
+        // The command's own window ("a") is full: refused, and the shared one is not charged.
+        assert_eq!(l.admit_all(&rules("a")).unwrap_err().0, 1);
+        assert_eq!(l.admit_all(&rules("a")).unwrap_err().0, 1);
+        l.admit_all(&rules("b")).unwrap();
+        l.admit_all(&rules("c")).unwrap();
+        // Three shared slots were used, by the three admitted calls only.
+        assert_eq!(l.admit_all(&rules("d")).unwrap_err().0, 0);
     }
 
     #[test]
