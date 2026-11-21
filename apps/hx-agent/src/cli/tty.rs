@@ -13,7 +13,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 
-use rustix::termios::{LocalModes, OptionalActions, tcgetattr, tcsetattr};
+use rustix::termios::{LocalModes, OptionalActions, SpecialCodeIndex, tcgetattr, tcsetattr};
 use zeroize::Zeroizing;
 
 use super::error::CliError;
@@ -79,7 +79,17 @@ impl Drop for Restore {
 impl Prompter for TtyPrompter {
     fn secret(&mut self, prompt: &str, max: usize) -> Result<Zeroizing<Vec<u8>>, CliError> {
         let mut tty = open_tty(&self.path)?;
+        // Termination signals wait until the terminal is restored (declared before the guard, so
+        // it is dropped after it).
+        let _blocked = crate::cli::sigblock::Blocked::new();
         let saved = tcgetattr(&tty).map_err(|e| CliError::Declined(format!("terminal: {e}")))?;
+        // With ISIG off the interrupt, quit and suspend characters of this terminal arrive as
+        // ordinary bytes: they abort the prompt, they are never part of a secret.
+        let abort: [u8; 3] = [
+            saved.special_codes[SpecialCodeIndex::VINTR],
+            saved.special_codes[SpecialCodeIndex::VQUIT],
+            saved.special_codes[SpecialCodeIndex::VSUSP],
+        ];
         let mut hidden = saved.clone();
         hidden
             .local_modes
@@ -103,7 +113,9 @@ impl Prompter for TtyPrompter {
                 Ok(0) => break Ok(()),
                 Ok(_) => match one[0] {
                     b'\n' | b'\r' => break Ok(()),
-                    0x03 => break Err(CliError::Declined("interrupted".into())),
+                    b if b == 0x03 || (b != 0 && abort.contains(&b)) => {
+                        break Err(CliError::Declined("interrupted".into()));
+                    }
                     // Ctrl-D with nothing typed ends the prompt; Backspace and line editing are
                     // handled by the terminal in canonical mode.
                     0x04 if buf.is_empty() => break Ok(()),

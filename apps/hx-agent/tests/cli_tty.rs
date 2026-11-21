@@ -149,3 +149,55 @@ fn without_a_terminal_there_is_no_answer() {
     let err = TtyPrompter::at(&missing).line("q: ").unwrap_err();
     assert_eq!(err.exit_code(), exit::DECLINED);
 }
+
+#[test]
+fn n3_quit_and_suspend_characters_abort_instead_of_entering_the_secret() {
+    for byte in [0x1c_u8, 0x1a] {
+        let mut p = pty();
+        let before = p.modes();
+        let path = p.path.clone();
+        let t = std::thread::spawn(move || TtyPrompter::at(path).secret("pw: ", 32));
+        p.read_until("pw: ");
+        p.wait_until_echo_is(false);
+        p.master.write_all(&[b'a', byte, b'b', b'\n']).unwrap();
+        let err = t.join().unwrap().unwrap_err();
+        assert_eq!(err.exit_code(), exit::DECLINED, "{byte:#x}: {err}");
+        assert_eq!(p.modes(), before);
+    }
+}
+
+/// The bits of `SigBlk` in /proc for one thread.
+fn blocked_signals(task: &str) -> u64 {
+    let status = std::fs::read_to_string(format!("/proc/{task}/status")).unwrap();
+    let line = status.lines().find(|l| l.starts_with("SigBlk:")).unwrap();
+    u64::from_str_radix(line["SigBlk:".len()..].trim(), 16).unwrap()
+}
+
+#[test]
+fn n3_termination_signals_are_blocked_while_the_prompt_has_echo_off_and_released_after() {
+    let mut p = pty();
+    let path = p.path.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let t = std::thread::spawn(move || {
+        // "<pid>/task/<tid>" of this thread, to read its signal mask from the outside.
+        let me = std::fs::read_link("/proc/thread-self").unwrap();
+        tx.send(me.to_string_lossy().into_owned()).unwrap();
+        let r = TtyPrompter::at(path).secret("pw: ", 32);
+        (r, blocked_signals("thread-self"))
+    });
+    let task = rx.recv().unwrap();
+    p.read_until("pw: ");
+    p.wait_until_echo_is(false);
+    let during = blocked_signals(&task);
+    // SIGHUP 1, SIGINT 2, SIGQUIT 3, SIGTERM 15, SIGTSTP 20: bit (signal - 1).
+    for sig in [1u32, 2, 3, 15, 20] {
+        assert!(
+            during & (1 << (sig - 1)) != 0,
+            "signal {sig} is not blocked: {during:#x}"
+        );
+    }
+    p.master.write_all(b"x\n").unwrap();
+    let (r, after) = t.join().unwrap();
+    r.unwrap();
+    assert_eq!(after & 0x8_400F, 0, "the block is lifted again: {after:#x}");
+}

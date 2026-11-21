@@ -40,6 +40,7 @@ pub mod error;
 pub mod gatewayd;
 mod help;
 pub mod privd;
+mod sigblock;
 pub mod text;
 pub mod tty;
 mod verifier;
