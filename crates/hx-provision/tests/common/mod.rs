@@ -76,6 +76,18 @@ pub struct State {
     /// Type answered for any other path, when set.
     pub default_file_type: Option<String>,
     pub instance_patches: u32,
+    /// Purge the operation of every `PATCH /1.0/instances/<n>` (its `/wait` answers 404).
+    pub purge_patch_ops: bool,
+    /// Bodies of accepted `PUT /1.0/instances/<n>`.
+    pub put_bodies: Vec<Value>,
+    /// Accept (and purge, if `purge_patch_ops`) but do not apply `PATCH`es after this many.
+    pub drop_patches_after: Option<u32>,
+    /// Version of each instance definition, answered as `ETag` and checked on `PUT`.
+    pub versions: HashMap<String, u64>,
+    /// `ETag` to put on the response being built.
+    pub last_etag: Option<String>,
+    /// Answer the next conditional `PUT` with 412 after bumping the version (a concurrent change).
+    pub conflict_once: bool,
     /// Descriptions of networks, by name (set from the create request).
     pub descriptions: HashMap<String, String>,
     /// Instance-local devices by instance name, as `PATCH`/`PUT` set them.
@@ -121,6 +133,12 @@ impl State {
             file_types: HashMap::new(),
             default_file_type: None,
             instance_patches: 0,
+            purge_patch_ops: false,
+            put_bodies: Vec::new(),
+            drop_patches_after: None,
+            versions: HashMap::new(),
+            last_etag: None,
+            conflict_once: false,
             descriptions: HashMap::new(),
             devices: HashMap::new(),
             config: HashMap::new(),
@@ -292,6 +310,8 @@ impl State {
             }
             ("GET", ["1.0", "instances", n]) => match self.instances.get(*n) {
                 Some(s) => {
+                    let v = *self.versions.entry(n.to_string()).or_insert(1);
+                    self.last_etag = Some(format!("\"{v}\""));
                     let devices = self.devices.get(*n).cloned().unwrap_or_default();
                     let mut expanded = self.expanded_devices.clone();
                     expanded.extend(devices.clone());
@@ -308,6 +328,27 @@ impl State {
                 if !self.instances.contains_key(*n) {
                     return not_found("instance");
                 }
+                let v = *self.versions.entry(n.to_string()).or_insert(1);
+                if self.conflict_once {
+                    self.conflict_once = false;
+                    self.versions.insert(n.to_string(), v + 1);
+                    return (
+                        412,
+                        json!({"type":"error","error_code":412,"error":"ETag doesn't match"})
+                            .to_string(),
+                    );
+                }
+                if let Some(m) = r.headers.get("if-match")
+                    && *m != format!("\"{v}\"")
+                {
+                    return (
+                        412,
+                        json!({"type":"error","error_code":412,"error":"ETag doesn't match"})
+                            .to_string(),
+                    );
+                }
+                self.versions.insert(n.to_string(), v + 1);
+                self.put_bodies.push(body.clone());
                 let devs: BTreeMap<String, BTreeMap<String, String>> =
                     serde_json::from_value(body["devices"].clone()).unwrap_or_default();
                 self.devices.insert(n.to_string(), devs);
@@ -319,15 +360,24 @@ impl State {
             }
             ("PATCH", ["1.0", "instances", n]) => {
                 self.instance_patches += 1;
-                if let Ok(devs) = serde_json::from_value::<BTreeMap<String, BTreeMap<String, String>>>(
-                    body["devices"].clone(),
-                ) {
+                let dropped = self
+                    .drop_patches_after
+                    .is_some_and(|k| self.instance_patches > k);
+                if !dropped
+                    && let Ok(devs) = serde_json::from_value::<
+                        BTreeMap<String, BTreeMap<String, String>>,
+                    >(body["devices"].clone())
+                {
                     self.devices.entry(n.to_string()).or_default().extend(devs);
                 }
-                if let Ok(cfg) =
-                    serde_json::from_value::<BTreeMap<String, String>>(body["config"].clone())
+                if !dropped
+                    && let Ok(cfg) =
+                        serde_json::from_value::<BTreeMap<String, String>>(body["config"].clone())
                 {
                     self.config.entry(n.to_string()).or_default().extend(cfg);
+                }
+                if !dropped {
+                    *self.versions.entry(n.to_string()).or_insert(1) += 1;
                 }
                 if self.fail_second_instance_patch && self.instance_patches == 2 {
                     return (
@@ -335,7 +385,16 @@ impl State {
                         json!({"type":"error","error_code":500,"error":"busy"}).to_string(),
                     );
                 }
-                self.new_op(Value::Null, 0)
+                let out = self.new_op(Value::Null, 0);
+                if self.purge_patch_ops {
+                    let id = if self.next == 1 {
+                        OP_ID.to_string()
+                    } else {
+                        format!("00000000-0000-4000-8000-{:012}", self.next)
+                    };
+                    self.forgotten_ops.insert(id);
+                }
+                out
             }
             ("PUT", ["1.0", "instances", n, "state"]) => {
                 let st = match body["action"].as_str() {
@@ -557,7 +616,7 @@ impl Fake {
                                 headers,
                                 body,
                             };
-                            let (status, text, ftype) = {
+                            let (status, text, ftype, etag) = {
                                 let mut s = st.lock().unwrap();
                                 s.log.push(rec.clone());
                                 let ft = (rec.method == "GET" && rec.path.contains("/files?path="))
@@ -568,14 +627,16 @@ impl Fake {
                                             .or_else(|| s.default_file_type.clone())
                                             .unwrap_or_else(|| "file".to_string())
                                     });
+                                s.last_etag = None;
                                 let (status, text) = s.handle(&rec);
-                                (status, text, ft)
+                                (status, text, ft, s.last_etag.take())
                             };
                             Ok::<_, std::convert::Infallible>(
                                 Response::builder()
                                     .status(status)
                                     .header("X-Incus-Type", ftype.unwrap_or_default())
                                     .header("Content-Type", "application/json")
+                                    .header("ETag", etag.unwrap_or_default())
                                     .body(Full::new(Bytes::from(text)))
                                     .unwrap(),
                             )

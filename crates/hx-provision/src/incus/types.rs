@@ -154,6 +154,9 @@ pub struct Instance {
     /// Instance-level configuration.
     #[serde(default)]
     pub config: BTreeMap<String, String>,
+    /// Free-text description (kept when an instance's definition is replaced).
+    #[serde(default)]
+    pub description: String,
     /// CPU architecture (needed to replace an instance's definition).
     #[serde(default)]
     pub architecture: String,

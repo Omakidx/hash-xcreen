@@ -330,6 +330,7 @@ impl<T: Transport> Client<T> {
         path: String,
         body: Option<&impl Serialize>,
         timeout: Duration,
+        headers: Vec<(&'static str, String)>,
     ) -> Result<Response, IncusError> {
         let (body, content_type) = match body {
             Some(b) => (
@@ -345,7 +346,7 @@ impl<T: Transport> Client<T> {
             .send(Request {
                 method,
                 path,
-                headers: Vec::new(),
+                headers,
                 body,
                 content_type,
                 max_response: None,
@@ -361,8 +362,99 @@ impl<T: Transport> Client<T> {
         body: Option<&impl Serialize>,
         timeout: Duration,
     ) -> Result<Envelope, IncusError> {
-        let r = self.send_json(method, path, body, timeout).await?;
+        let r = self
+            .send_json(method, path, body, timeout, Vec::new())
+            .await?;
         parse_envelope(r.status, &r.body)
+    }
+
+    /// The instance and its `ETag`, for a conditional write (`If-Match`).
+    async fn instance_with_etag(
+        &self,
+        name: &str,
+    ) -> Result<Option<(Instance, Option<String>)>, IncusError> {
+        let r = self
+            .send_json(
+                Method::GET,
+                format!("/1.0/instances/{name}"),
+                None::<&Value>,
+                REQUEST_TIMEOUT,
+                Vec::new(),
+            )
+            .await?;
+        match parse_envelope(r.status, &r.body) {
+            Ok(env) => Ok(Some((
+                decode("instance", env.metadata)?,
+                r.headers.get("etag").cloned(),
+            ))),
+            Err(e) if e.is_not_found() => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Replace an instance's device set (`PUT` of the whole definition, which is the only way to
+    /// delete or fully replace a device: `PATCH` merges device options key by key). The write is
+    /// conditional on the `ETag` of the definition it was computed from, so a concurrent change
+    /// (for example `disable_docker`) is not overwritten: on `412` the definition is read again and
+    /// `edit` re-applied, up to three times.
+    async fn put_instance_devices(
+        &self,
+        name: &str,
+        what: &str,
+        edit: impl Fn(
+            &mut std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+        ) -> bool,
+    ) -> Result<bool, IncusError> {
+        for _ in 0..3 {
+            let Some((inst, etag)) = self.instance_with_etag(name).await? else {
+                return Err(IncusError::Api {
+                    code: 404,
+                    message: format!("instance `{name}` not found"),
+                });
+            };
+            let mut devices = inst.devices.clone();
+            if !edit(&mut devices) {
+                return Ok(false);
+            }
+            let body = json!({
+                "architecture": inst.architecture,
+                "config": inst.config,
+                "description": inst.description,
+                "devices": devices,
+                "profiles": inst.profiles,
+                "ephemeral": false,
+            });
+            let headers: Vec<(&'static str, String)> =
+                etag.into_iter().map(|e| ("If-Match", e)).collect();
+            let r = self
+                .send_json(
+                    Method::PUT,
+                    format!("/1.0/instances/{name}"),
+                    Some(&body),
+                    REQUEST_TIMEOUT,
+                    headers,
+                )
+                .await?;
+            match parse_envelope(r.status, &r.body) {
+                Ok(env) if env.kind == "async" => {
+                    match self
+                        .wait_operation(&op_path(&env)?, Duration::from_secs(60), what)
+                        .await
+                    {
+                        Ok(_) => return Ok(true),
+                        // Settled by the caller's re-read.
+                        Err(IncusError::Purged(_)) => return Ok(true),
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(_) => return Ok(true),
+                Err(IncusError::Api { code: 412, .. }) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(IncusError::Operation(format!(
+            "{what}: the instance kept changing underneath (412 three times)"
+        )))
     }
 
     /// A call whose answer is the metadata itself.
@@ -412,6 +504,32 @@ impl<T: Transport> Client<T> {
         self.wait_operation(&op_path(&env)?, deadline, what).await
     }
 
+    /// [`Client::run`] for a call whose intended result can be read back. When the daemon has
+    /// already purged the operation ([`IncusError::Purged`]) its outcome is unknown, so `verify`
+    /// re-reads the state and says whether the intended result is in place; if not, the call is
+    /// an error. Nothing is ever assumed to have succeeded.
+    async fn run_verified(
+        &self,
+        method: Method,
+        path: String,
+        body: Option<&Value>,
+        deadline: Duration,
+        what: &str,
+        verify: impl AsyncFnOnce() -> Result<bool, IncusError>,
+    ) -> Result<(), IncusError> {
+        match self.run(method, path, body, deadline, what).await {
+            Ok(_) => Ok(()),
+            Err(IncusError::Purged(w)) => {
+                if verify().await? {
+                    Ok(())
+                } else {
+                    Err(IncusError::Purged(w))
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Wait for an operation to finish. On timeout the operation is cancelled (best effort).
     pub(crate) async fn wait_operation(
         &self,
@@ -458,17 +576,13 @@ impl<T: Transport> Client<T> {
                 Ok(e) => e,
                 Err(e) if is_wait_timeout(&e) => continue,
                 Err(e) if e.is_not_found() => {
-                    // The daemon no longer knows the operation: it finished and was purged before
-                    // we asked (seen on a real daemon for an instance restart). Its result is
-                    // gone; callers that care verify the outcome (readiness, instance state), and
-                    // a command whose exit status is missing fails in `exec`.
+                    // The daemon no longer knows the operation: it ended and was purged before we
+                    // asked (seen on a real daemon for an instance restart), or it failed and was
+                    // purged. Its result is gone and is NOT assumed to be success: this is a
+                    // distinct error, and every mutating call re-reads the state it changed
+                    // (`run_verified`).
                     self.untrack(tracked);
-                    return Ok(Operation {
-                        id: tracked.to_string(),
-                        status: "Success".into(),
-                        status_code: 200,
-                        ..Operation::default()
-                    });
+                    return Err(IncusError::Purged(what.to_string()));
                 }
                 // Other errors keep the operation tracked.
                 Err(e) => return Err(e),
@@ -690,15 +804,15 @@ impl<T: Transport> Client<T> {
         deadline: Duration,
     ) -> Result<(), IncusError> {
         checked("instance", &spec.name)?;
-        self.run(
+        self.run_verified(
             Method::POST,
             "/1.0/instances".into(),
             Some(&spec.to_json()),
             deadline,
             "instance creation",
+            async || Ok(self.get_instance(&spec.name).await?.is_some()),
         )
         .await
-        .map(drop)
     }
 
     /// Merge keys into an instance's configuration (`PATCH`). Some keys need a restart.
@@ -708,15 +822,20 @@ impl<T: Transport> Client<T> {
         config: &std::collections::BTreeMap<String, String>,
     ) -> Result<(), IncusError> {
         let name = checked("instance", name)?;
-        self.run(
+        self.run_verified(
             Method::PATCH,
             format!("/1.0/instances/{name}"),
             Some(&json!({"config": config})),
             Duration::from_secs(60),
             "instance update",
+            async || {
+                Ok(self
+                    .get_instance(name)
+                    .await?
+                    .is_some_and(|i| config.iter().all(|(k, v)| i.config.get(k) == Some(v))))
+            },
         )
         .await
-        .map(drop)
     }
 
     /// Change CPU, memory and root-disk limits of an instance, running or not (ipc.md 6.8).
@@ -774,12 +893,21 @@ impl<T: Transport> Client<T> {
             body["devices"] = json!({"root": root});
             applied.changed.push("devices.root.size");
         }
-        self.run(
+        let want_root_size = update.disk_gib.map(|d| format!("{d}GiB"));
+        self.run_verified(
             Method::PATCH,
             format!("/1.0/instances/{name}"),
             Some(&body),
             Duration::from_secs(120),
             "applying limits",
+            async || {
+                Ok(self.get_instance(name).await?.is_some_and(|i| {
+                    config.iter().all(|(k, v)| i.config.get(k) == Some(v))
+                        && want_root_size.as_ref().is_none_or(|s| {
+                            i.devices.get("root").and_then(|r| r.get("size")) == Some(s)
+                        })
+                }))
+            },
         )
         .await?;
         // Memory and the root disk quota take effect at once on a running container, verified on
@@ -826,14 +954,36 @@ impl<T: Transport> Client<T> {
             Some(_) => LinkOutcome::Replaced,
             None => LinkOutcome::Added,
         };
-        self.run(
-            Method::PATCH,
-            format!("/1.0/instances/{name}"),
-            Some(&json!({"devices": {SESSION_LINK_DEVICE: want}})),
-            Duration::from_secs(60),
-            "adding the session link device",
-        )
-        .await?;
+        let in_place = async || {
+            Ok(self
+                .get_instance(name)
+                .await?
+                .is_some_and(|i| i.devices.get(SESSION_LINK_DEVICE) == Some(&want)))
+        };
+        if outcome == LinkOutcome::Replaced {
+            // Replace the whole device: a PATCH merges option by option and would keep a stale
+            // key (say `proxy_protocol`) of the old device.
+            self.put_instance_devices(name, "replacing the session link device", |d| {
+                d.insert(SESSION_LINK_DEVICE.to_string(), want.clone());
+                true
+            })
+            .await?;
+            if !in_place().await? {
+                return Err(IncusError::Purged(
+                    "replacing the session link device".into(),
+                ));
+            }
+        } else {
+            self.run_verified(
+                Method::PATCH,
+                format!("/1.0/instances/{name}"),
+                Some(&json!({"devices": {SESSION_LINK_DEVICE: want}})),
+                Duration::from_secs(60),
+                "adding the session link device",
+                in_place,
+            )
+            .await?;
+        }
         Ok(outcome)
     }
 
@@ -847,26 +997,25 @@ impl<T: Transport> Client<T> {
         if !current.devices.contains_key(SESSION_LINK_DEVICE) {
             return Ok(false);
         }
-        let mut devices = current.devices.clone();
-        devices.remove(SESSION_LINK_DEVICE);
         // PATCH merges device maps and cannot delete a key, so write the instance's definition
-        // back with the device left out (what `incus config device remove` does).
-        let body = json!({
-            "architecture": current.architecture,
-            "config": current.config,
-            "devices": devices,
-            "profiles": current.profiles,
-            "ephemeral": false,
-        });
-        self.run(
-            Method::PUT,
-            format!("/1.0/instances/{name}"),
-            Some(&body),
-            Duration::from_secs(60),
-            "removing the session link device",
-        )
-        .await?;
-        Ok(true)
+        // back with the device left out (what `incus config device remove` does), conditional on
+        // its ETag so that a concurrent change is not lost.
+        let wrote = self
+            .put_instance_devices(name, "removing the session link device", |d| {
+                d.remove(SESSION_LINK_DEVICE).is_some()
+            })
+            .await?;
+        if wrote
+            && self
+                .get_instance(name)
+                .await?
+                .is_some_and(|i| i.devices.contains_key(SESSION_LINK_DEVICE))
+        {
+            return Err(IncusError::Purged(
+                "removing the session link device".into(),
+            ));
+        }
+        Ok(wrote)
     }
 
     /// Start, stop or restart. `force` kills instead of asking init to shut down.
@@ -879,15 +1028,21 @@ impl<T: Transport> Client<T> {
     ) -> Result<(), IncusError> {
         let name = checked("instance", name)?;
         let body = json!({"action": action.as_str(), "timeout": timeout.as_secs(), "force": force, "stateful": false});
-        self.run(
+        self.run_verified(
             Method::PUT,
             format!("/1.0/instances/{name}/state"),
             Some(&body),
             timeout + Duration::from_secs(60),
             action.as_str(),
+            async || {
+                let running = self.instance_state(name).await?.is_running();
+                Ok(match action {
+                    StateAction::Start | StateAction::Restart => running,
+                    StateAction::Stop => !running,
+                })
+            },
         )
         .await
-        .map(drop)
     }
 
     /// Run state of an instance.
@@ -903,15 +1058,15 @@ impl<T: Transport> Client<T> {
     /// Delete a stopped instance.
     pub async fn delete_instance(&self, name: &str) -> Result<(), IncusError> {
         let name = checked("instance", name)?;
-        self.run(
+        self.run_verified(
             Method::DELETE,
             format!("/1.0/instances/{name}"),
             None,
             Duration::from_secs(180),
             "instance deletion",
+            async || Ok(self.get_instance(name).await?.is_none()),
         )
         .await
-        .map(drop)
     }
 
     // --- files -----------------------------------------------------------------------------
@@ -1089,30 +1244,42 @@ impl<T: Transport> Client<T> {
         let name = checked("instance", instance)?;
         checked("snapshot", snapshot)?;
         let body = json!({"name": snapshot, "stateful": false});
-        self.run(
+        self.run_verified(
             Method::POST,
             format!("/1.0/instances/{name}/snapshots"),
             Some(&body),
             Duration::from_secs(300),
             "snapshot creation",
+            async || {
+                Ok(self
+                    .list_snapshots(name)
+                    .await?
+                    .iter()
+                    .any(|s| s.name == snapshot))
+            },
         )
         .await
-        .map(drop)
     }
 
     /// Delete a snapshot.
     pub async fn delete_snapshot(&self, instance: &str, snapshot: &str) -> Result<(), IncusError> {
         let name = checked("instance", instance)?;
         let snap = checked("snapshot", snapshot)?;
-        self.run(
+        self.run_verified(
             Method::DELETE,
             format!("/1.0/instances/{name}/snapshots/{snap}"),
             None,
             Duration::from_secs(300),
             "snapshot deletion",
+            async || {
+                Ok(!self
+                    .list_snapshots(name)
+                    .await?
+                    .iter()
+                    .any(|s| s.name == snap))
+            },
         )
         .await
-        .map(drop)
     }
 
     /// List an instance's snapshots.
