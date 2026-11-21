@@ -28,8 +28,23 @@ pub trait Prompter {
     fn line(&mut self, prompt: &str) -> Result<String, CliError>;
 }
 
-/// The controlling terminal.
-pub struct TtyPrompter;
+/// A terminal device: `/dev/tty` (the controlling terminal) in production; tests point it at
+/// the slave side of a pseudo-terminal.
+pub struct TtyPrompter {
+    path: std::path::PathBuf,
+}
+
+impl TtyPrompter {
+    /// The controlling terminal of the process, `/dev/tty`.
+    pub fn controlling() -> Self {
+        Self::at("/dev/tty")
+    }
+
+    /// A specific terminal device.
+    pub fn at(path: impl Into<std::path::PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
 
 fn no_tty(e: std::io::Error) -> CliError {
     CliError::Declined(format!(
@@ -38,11 +53,14 @@ fn no_tty(e: std::io::Error) -> CliError {
     ))
 }
 
-fn open_tty() -> Result<File, CliError> {
+fn open_tty(path: &std::path::Path) -> Result<File, CliError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // O_NOCTTY: opening a terminal here must never make it the controlling terminal.
     OpenOptions::new()
         .read(true)
         .write(true)
-        .open("/dev/tty")
+        .custom_flags(rustix::fs::OFlags::NOCTTY.bits() as i32)
+        .open(path)
         .map_err(no_tty)
 }
 
@@ -60,7 +78,7 @@ impl Drop for Restore {
 
 impl Prompter for TtyPrompter {
     fn secret(&mut self, prompt: &str, max: usize) -> Result<Zeroizing<Vec<u8>>, CliError> {
-        let mut tty = open_tty()?;
+        let mut tty = open_tty(&self.path)?;
         let saved = tcgetattr(&tty).map_err(|e| CliError::Declined(format!("terminal: {e}")))?;
         let mut hidden = saved.clone();
         hidden
@@ -109,7 +127,7 @@ impl Prompter for TtyPrompter {
     }
 
     fn line(&mut self, prompt: &str) -> Result<String, CliError> {
-        let mut tty = open_tty()?;
+        let mut tty = open_tty(&self.path)?;
         let _ = tty.write_all(prompt.as_bytes());
         let _ = tty.flush();
         let mut line = Vec::new();
@@ -129,17 +147,5 @@ impl Prompter for TtyPrompter {
             }
         }
         Ok(String::from_utf8_lossy(&line).trim().to_owned())
-    }
-}
-
-/// A prompter that always says there is no terminal (used where asking is not allowed).
-pub struct NoPrompter;
-
-impl Prompter for NoPrompter {
-    fn secret(&mut self, _prompt: &str, _max: usize) -> Result<Zeroizing<Vec<u8>>, CliError> {
-        Err(CliError::Declined("no terminal to ask on".into()))
-    }
-    fn line(&mut self, _prompt: &str) -> Result<String, CliError> {
-        Err(CliError::Declined("no terminal to ask on".into()))
     }
 }

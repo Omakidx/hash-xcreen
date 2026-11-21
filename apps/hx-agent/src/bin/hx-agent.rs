@@ -35,7 +35,7 @@ fn main() -> ExitCode {
         .collect();
     let mut out = io::stdout();
     let mut err = io::stderr();
-    let mut prompt = TtyPrompter;
+    let mut prompt = TtyPrompter::controlling();
     let mut env = Env {
         config: Config::production(),
         euid,

@@ -48,6 +48,7 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 zeroize.workspace = true
 
 [dev-dependencies]
+rustix = { workspace = true, features = ["pty", "termios", "fs"] } # a pseudo-terminal for the hidden-prompt test
 crossbeam-channel.workspace = true
 hx-capture.workspace = true
 hx-session.workspace = true

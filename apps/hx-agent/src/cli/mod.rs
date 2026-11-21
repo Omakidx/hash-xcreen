@@ -47,7 +47,7 @@ pub mod wire;
 
 pub use args::{Cmd, Parsed};
 pub use error::{CliError, exit};
-pub use tty::{NoPrompter, Prompter, TtyPrompter};
+pub use tty::{Prompter, TtyPrompter};
 
 use std::path::PathBuf;
 
