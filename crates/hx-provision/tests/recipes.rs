@@ -205,6 +205,15 @@ fn embedded_recipes_equal_the_files_on_disk_and_none_is_missing() {
     let mut emb: Vec<&str> = embedded.paths().collect();
     emb.sort();
     assert_eq!(on_disk.iter().map(String::as_str).collect::<Vec<_>>(), emb);
+    // ...byte for byte (a stale build cache cannot hide an edit: this reads the files fresh)...
+    for rel in &on_disk {
+        let disk_text = std::fs::read_to_string(recipes_dir().join(rel)).unwrap();
+        assert_eq!(
+            hx_provision::RecipeSource::read(&embedded, rel).unwrap(),
+            disk_text,
+            "embedded `{rel}` differs from recipes/{rel}"
+        );
+    }
     // ...and resolving from disk gives the same plan.
     let disk = Catalog::from_dir(recipes_dir());
     for rid in RecipeId::all() {
