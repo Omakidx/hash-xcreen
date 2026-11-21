@@ -33,7 +33,7 @@ fn main() -> ExitCode {
     }
     // Files this process creates (none today) are private.
     rustix::process::umask(rustix::fs::Mode::from_bits_truncate(0o077));
-    let args: Vec<String> = std::env::args_os()
+    let mut args: Vec<String> = std::env::args_os()
         .skip(1)
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
@@ -50,5 +50,9 @@ fn main() -> ExitCode {
         now: system_now,
         json: false,
     };
-    ExitCode::from(cli::run(&args, &mut env))
+    let code = cli::run(&args, &mut env);
+    // A token given with `--token` was moved into zeroizing memory by the command; this wipes
+    // what is left of it in our copies of the arguments.
+    zeroize::Zeroize::zeroize(&mut args);
+    ExitCode::from(code)
 }

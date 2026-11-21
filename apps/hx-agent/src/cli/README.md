@@ -116,8 +116,23 @@ written to the auth log and the journal. A token is single use and expires (15 m
 bounds but does not remove that exposure. The command prints that warning every time. The default,
 `pairing token` without options, is the hidden prompt (decision 14 of ipc.md section 22).
 
-The CLI process disables core dumps and `PR_SET_DUMPABLE`, and locks its memory when it can, before
-it reads anything.
+### What is and is not protected in memory
+
+The CLI process disables core dumps and `PR_SET_DUMPABLE` and, as root, locks its memory
+(`mlockall`) before it reads anything; if the lock fails it says so on stderr before any prompt, and
+a typed secret could then be swapped out. A typed secret, a generated token, the Argon2id input and
+the token from `--token` are kept in zeroizing buffers that are wiped on drop, Argon2id wipes its
+memory blocks (`zeroize` feature), and the copies of the command line made while parsing are wiped.
+These copies remain, and nothing here can remove them:
+
+* the **original argv** of the process (the kernel keeps it; `/proc/<pid>/cmdline`, the shell
+  history and, under `sudo`, the auth log hold a `--token` value);
+* a **generated token or pairing code in `--json` output**, which is built as a JSON value and
+  written through the usual output buffers (in text mode both are written to the terminal straight
+  from a zeroizing buffer, once);
+* the kernel's terminal and pipe buffers, and the operator's scrollback.
+
+A token is single use and short lived, which bounds these exposures.
 
 ## Untrusted text
 

@@ -614,3 +614,81 @@ fn n2_a_failed_mlockall_is_reported_before_any_prompt() {
     assert!(hx_agent::cli::lock_memory_or_warn(&mut quiet, || Ok(())));
     assert!(quiet.is_empty());
 }
+
+// ----------------------------------------------------------------------------------------- N4
+
+fn token_stand_in(code: &'static str) -> AdminHandler {
+    Arc::new(move |req, _s| {
+        Box::pin(async move {
+            use apb::request::Command as C;
+            use apb::response::Result as A;
+            match req.command.expect("a command") {
+                C::CreatePairingToken(_) => A::CreatePairingToken(apb::CreatePairingTokenResult {
+                    expires_at_unix_s: 1_900_000_900,
+                }),
+                C::CreatePairingCode(_) => A::CreatePairingCode(apb::CreatePairingCodeResult {
+                    code: code.into(),
+                    expires_at_unix_s: 1_900_000_900,
+                }),
+                _ => admin_error(pb::ErrorCode::Unimplemented, "no"),
+            }
+        })
+    })
+}
+
+#[tokio::test]
+async fn n4_generated_token_and_code_are_printed_once_in_text_and_json() {
+    let dir = private_tempdir();
+    let a = ScriptedAdmin::start(dir.path(), "a.sock", "0.1.0", token_stand_in("ABCD-2345")).await;
+    let mut cfg = unreachable_config(dir.path());
+    cfg.admin_socket = a.path.clone();
+    // Text: label, secret, then the result line; the secret once.
+    let r = cli(&cfg, &["pairing", "token", "--generate"], &[], &[]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let token = r
+        .stdout
+        .lines()
+        .find(|l| l.starts_with("hxt1-"))
+        .expect("a token line")
+        .to_owned();
+    assert_eq!(r.stdout.matches(&token).count(), 1, "{}", r.stdout);
+    assert!(
+        r.stdout.contains("the token above is installed"),
+        "{}",
+        r.stdout
+    );
+    // The token that was printed is the one that was sent.
+    assert_eq!(a.secrets.lock().unwrap()[0].2, token.as_bytes());
+    let r = cli(&cfg, &["pairing", "code"], &[], &[]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert_eq!(r.stdout.matches("ABCD-2345").count(), 1, "{}", r.stdout);
+    assert!(
+        r.stdout.starts_with("pairing code: ABCD-2345\n"),
+        "{}",
+        r.stdout
+    );
+    // JSON still carries them (a value has to be built).
+    let j = cli(&cfg, &["pairing", "code", "--json"], &[], &[])
+        .await
+        .json();
+    assert_eq!(j["data"]["code"], "ABCD-2345");
+    let j = cli(
+        &cfg,
+        &["pairing", "token", "--generate", "--json"],
+        &[],
+        &[],
+    )
+    .await
+    .json();
+    assert!(j["data"]["token"].as_str().unwrap().starts_with("hxt1-"));
+}
+
+#[test]
+fn n4_argon2_wipes_its_memory_blocks() {
+    let cargo = include_str!("../Cargo.toml");
+    let line = cargo
+        .lines()
+        .find(|l| l.starts_with("argon2 = "))
+        .expect("argon2 dependency");
+    assert!(line.contains("\"zeroize\""), "{line}");
+}

@@ -24,6 +24,15 @@ use crate::cli::{Env, Outcome};
 /// Longest token the admin socket accepts.
 const MAX_TOKEN: usize = hx_ipc::admin::MAX_PAIRING_TOKEN_BYTES;
 
+/// Writes `label` and a secret line to stdout without building a plain `String` of the secret.
+fn print_secret(env: &mut Env<'_>, label: &str, secret: &str) {
+    let out = &mut *env.out;
+    let _ = out.write_all(label.as_bytes());
+    let _ = out.write_all(secret.as_bytes());
+    let _ = out.write_all(b"\n");
+    let _ = out.flush();
+}
+
 pub(super) fn code(env: &mut Env<'_>, ttl_s: u32) -> Result<Outcome, CliError> {
     let mut c = admin(env)?;
     let mut r = match c.call(
@@ -35,19 +44,25 @@ pub(super) fn code(env: &mut Env<'_>, ttl_s: u32) -> Result<Outcome, CliError> {
         R::CreatePairingCode(r) => r,
         _ => return Err(unexpected("CreatePairingCode")),
     };
-    // The code is for the operator's eyes: it is printed once and the reply's copy is wiped.
-    let shown = peer(&r.code, 32);
+    // The code is for the operator's eyes: it is printed once and the reply's copy is wiped. In
+    // text mode it goes to the terminal straight from a zeroizing buffer; the JSON form has to
+    // build a value, which is plain memory (the code is single use and short lived).
+    let shown = Zeroizing::new(peer(&r.code, 32));
     let expires = r.expires_at_unix_s;
     wipe_code(&mut r);
-    let text = format!(
-        "pairing code: {shown}\nvalid until {} (about {} minutes), single use\nenter it in the app; it is not stored anywhere else\n",
-        time(expires),
-        (expires.saturating_sub((env.now)()) / 60).max(1)
+    let minutes = (expires.saturating_sub((env.now)()) / 60).max(1);
+    let tail = format!(
+        "valid until {} (about {minutes} minutes), single use\nenter it in the app; it is not stored anywhere else\n",
+        time(expires)
     );
-    Ok(Outcome::ok(
-        text,
-        json!({"code": shown, "expires_at_unix_s": expires}),
-    ))
+    if env.json {
+        return Ok(Outcome::ok(
+            tail,
+            json!({"code": shown.as_str(), "expires_at_unix_s": expires}),
+        ));
+    }
+    print_secret(env, "pairing code: ", &shown);
+    Ok(Outcome::ok(tail, json!({"expires_at_unix_s": expires})))
 }
 
 const ARGV_WARNING: &str = "warning: --token is the WEAKER way to give a token. It is visible in the process list \
@@ -102,10 +117,21 @@ pub(super) fn token(
     );
     let mut data = json!({"installed": true, "expires_at_unix_s": expires});
     if show {
-        out.push_str(&format!(
-            "token (shown once, not stored by hx-agent):\n{trimmed}\n"
-        ));
-        data["token"] = json!(trimmed);
+        if env.json {
+            // A JSON value is plain memory; the token is single use and short lived.
+            data["token"] = json!(trimmed);
+        } else {
+            // Straight from the zeroizing buffer to the terminal.
+            print_secret(
+                env,
+                "token (shown once, not stored by hx-agent):\n",
+                trimmed,
+            );
+            out = format!(
+                "the token above is installed; valid until {}, single use\n",
+                time(expires)
+            );
+        }
     }
     Ok(Outcome::ok(out, data))
 }

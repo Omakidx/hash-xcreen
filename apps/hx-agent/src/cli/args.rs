@@ -11,6 +11,7 @@
 use std::collections::{HashMap, HashSet};
 
 use hx_ipc::privd::pb::LockoutPurpose;
+use zeroize::Zeroize;
 
 use super::error::CliError;
 
@@ -132,11 +133,36 @@ fn usage(m: impl Into<String>) -> CliError {
     CliError::Usage(m.into())
 }
 
+/// Copies of the command line made while parsing. They may hold a token given with `--token`, so
+/// they are wiped when dropped (the original argv, which the kernel and `/proc` keep, is not ours
+/// to wipe).
+struct Scrubbed(Vec<String>);
+
+impl std::ops::Deref for Scrubbed {
+    type Target = [String];
+    fn deref(&self) -> &[String] {
+        &self.0
+    }
+}
+
+impl Drop for Scrubbed {
+    fn drop(&mut self) {
+        self.0.iter_mut().for_each(Zeroize::zeroize);
+    }
+}
+
 #[derive(Default)]
 struct Opts {
     flags: HashSet<&'static str>,
     values: HashMap<&'static str, String>,
     pos: Vec<String>,
+}
+
+impl Drop for Opts {
+    fn drop(&mut self) {
+        self.values.values_mut().for_each(Zeroize::zeroize);
+        self.pos.iter_mut().for_each(Zeroize::zeroize);
+    }
 }
 
 impl Opts {
@@ -277,18 +303,19 @@ fn unsigned<T: std::str::FromStr + PartialOrd + Default>(
 /// Parses the arguments after the program name.
 pub fn parse(all: &[String]) -> Result<Parsed, CliError> {
     let json = all.iter().any(|a| a == "--json");
-    let args: Vec<String> = all.iter().filter(|a| *a != "--json").cloned().collect();
+    let args = Scrubbed(all.iter().filter(|a| *a != "--json").cloned().collect());
     let help = args.iter().any(|a| a == "-h" || a == "--help");
     let cmd = parse_cmd(&args, help)?;
     Ok(Parsed { json, cmd })
 }
 
 fn parse_cmd(args: &[String], help: bool) -> Result<Cmd, CliError> {
-    let args_no_help: Vec<String> = args
-        .iter()
-        .filter(|a| *a != "-h" && *a != "--help")
-        .cloned()
-        .collect();
+    let args_no_help = Scrubbed(
+        args.iter()
+            .filter(|a| *a != "-h" && *a != "--help")
+            .cloned()
+            .collect(),
+    );
     let Some(verb) = args_no_help.first().map(String::as_str) else {
         return Ok(Cmd::Help(None));
     };
@@ -296,9 +323,11 @@ fn parse_cmd(args: &[String], help: bool) -> Result<Cmd, CliError> {
         return Ok(Cmd::Help(Some(verb.to_owned())));
     }
     let rest = &args_no_help[1..];
-    let group = |names: &[&str]| -> Result<(String, Vec<String>), CliError> {
+    let group = |names: &[&str]| -> Result<(String, Scrubbed), CliError> {
         match rest.first() {
-            Some(sub) if names.contains(&sub.as_str()) => Ok((sub.clone(), rest[1..].to_vec())),
+            Some(sub) if names.contains(&sub.as_str()) => {
+                Ok((sub.clone(), Scrubbed(rest[1..].to_vec())))
+            }
             Some(_) => Err(usage(format!(
                 "unknown {verb} command (expected one of: {})",
                 names.join(", ")

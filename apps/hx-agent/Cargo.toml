@@ -20,7 +20,7 @@ test-support = ["dep:tempfile"]
 gateway-test-hooks = []
 
 [dependencies]
-argon2 = "0.6.0"
+argon2 = { version = "0.6.0", features = ["zeroize"] } # wipes its memory blocks (the CLI hashes typed secrets)
 bytes.workspace = true
 getrandom = "0.4"
 hkdf = "0.12"
