@@ -49,6 +49,9 @@ pub struct State {
     pub start_calls: u32,
     /// `ProvisionSessionLink` calls.
     pub provision_calls: u32,
+    /// Process a request fully, then close the connection without answering (privd dying
+    /// mid-call).
+    pub close_after_request: bool,
     /// Delay before answering `StartDesktop` (milliseconds).
     pub start_delay_ms: u64,
     /// Delay before answering `PepperVerify` (milliseconds).
@@ -414,6 +417,11 @@ fn serve(mut stream: UnixStream, state: Arc<Mutex<State>>, conn: u32) {
                 result: Some(result),
             })),
         };
+        if state.lock().unwrap().close_after_request {
+            // The registered clone keeps the descriptor open: shut the socket down for real.
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return;
+        }
         let with_fd = std::mem::take(&mut state.lock().unwrap().send_fd_with_next_response);
         if with_fd {
             send_with_fd(&stream, frame);

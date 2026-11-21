@@ -145,6 +145,9 @@ pub struct PepperMac {
     pub version: u8,
 }
 
+/// Prefix of the error for a failed write of the request frame itself.
+const REQUEST_WRITE: &str = "request write";
+
 /// Bound on the liveness ping of [`PrivdClient::ensure_connected`].
 const PING_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -267,16 +270,17 @@ impl Conn {
         };
         let bytes = privd::encode_message(&frame, Side::Server)
             .map_err(|e| PrivdError::InvalidRequest(e.to_string()))?;
+        // Only a failure here, before privd can have seen the whole request, is safe to retry.
         self.write(&bytes)
             .await
-            .map_err(|e| PrivdError::Unavailable(format!("write: {}", e.kind())))?;
+            .map_err(|e| PrivdError::Unavailable(format!("{REQUEST_WRITE}: {}", e.kind())))?;
         for (i, s) in secrets.iter().enumerate() {
             // Zeroizing buffer: the frame copy of the secret is wiped when this drops.
             let framed = privd::encode_secret(request_id, i as u8, s.bytes)
                 .map_err(|e| PrivdError::InvalidRequest(e.to_string()))?;
             self.write(&framed)
                 .await
-                .map_err(|e| PrivdError::Unavailable(format!("write: {}", e.kind())))?;
+                .map_err(|e| PrivdError::Unavailable(format!("send: {}", e.kind())))?;
         }
         loop {
             match self.recv().await? {
@@ -305,7 +309,7 @@ impl Conn {
                         .map_err(|e| PrivdError::InvalidRequest(e.to_string()))?;
                     self.write(&bytes)
                         .await
-                        .map_err(|e| PrivdError::Unavailable(format!("write: {}", e.kind())))?;
+                        .map_err(|e| PrivdError::Unavailable(format!("send: {}", e.kind())))?;
                 }
                 Incoming::Message(pb::Frame {
                     frame: Some(pb::frame::Frame::Pong(_)),
@@ -632,5 +636,5 @@ async fn connect_until(inner: &Inner, until: Instant) -> Result<Conn, PrivdError
 fn write_failed(
     outcome: &Result<Result<pb::response::Result, PrivdError>, tokio::time::error::Elapsed>,
 ) -> bool {
-    matches!(outcome, Ok(Err(PrivdError::Unavailable(m))) if m.starts_with("write:"))
+    matches!(outcome, Ok(Err(PrivdError::Unavailable(m))) if m.starts_with(REQUEST_WRITE))
 }

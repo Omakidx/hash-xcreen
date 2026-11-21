@@ -271,3 +271,26 @@ async fn audit_labels_are_sanitized_and_bounded() {
     assert!(label.len() <= 64, "{}", label.len());
     assert!(!label.contains('\u{1b}') && !label.contains('\u{202e}'));
 }
+
+/// N2: a call whose request was fully sent is never repeated when the connection then breaks:
+/// privd may have acted, and a repeated PepperVerify would be charged twice.
+#[tokio::test]
+async fn a_request_that_was_fully_sent_is_not_retried_when_the_connection_breaks() {
+    let (_d, fake) = setup();
+    let c = client(&fake);
+    c.pepper_verify(LockoutPurpose::Pin, &[0u8; 32], &[1u8; 32])
+        .await
+        .unwrap();
+    fake.with(|s| s.close_after_request = true);
+    let err = c
+        .pepper_verify(LockoutPurpose::Pin, &[0u8; 32], &[1u8; 32])
+        .await
+        .unwrap_err();
+    assert!(err.is_retryable(), "{err}");
+    let verifies = fake
+        .commands()
+        .iter()
+        .filter(|c| *c == "PepperVerify")
+        .count();
+    assert_eq!(verifies, 2, "the broken call was sent once, not retried");
+}
