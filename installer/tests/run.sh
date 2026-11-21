@@ -49,6 +49,25 @@ out=$("$shell" "$here/selftest-case.sh" "$inst")
 if [ "$out" = "selftest=ok
 broken=rejected" ]; then echo "ok   selftest (and it rejects a broken verifier)"; else echo "FAIL selftest: $out"; fail=1; fi
 
+# fetch: the hard cap does not depend on curl (curl before 8.4 ignores --max-filesize without a
+# Content-Length), for the manifest cap (1 MiB) and for an artifact-sized cap, and curl gets -q first.
+for max in 1048576 40960; do
+    for case in "under 0 yes" "exact 0 yes" "over1 1 no" "runaway 1 no"; do
+        set -- $case
+        out=$("$shell" "$here/fetch-case.sh" "$inst" "$1" "$max")
+        want_rc=$2
+        want_file=$3
+        got_rc=$(printf '%s\n' "$out" | sed -n 's/^rc=//p')
+        got_file=$(printf '%s\n' "$out" | sed -n 's/^file=\([a-z]*\).*/\1/p')
+        first=$(printf '%s\n' "$out" | sed -n 's/^first=//p')
+        if [ "$got_rc" = "$want_rc" ] && [ "$got_file" = "$want_file" ] && [ "$first" = -q ]; then
+            echo "ok   fetch cap $max: $1 (rc $want_rc, file kept: $want_file, curl -q first)"
+        else
+            echo "FAIL fetch cap $max: $1: $out"; fail=1
+        fi
+    done
+done
+
 # The shipped repository file refuses to run as a release while no key is provisioned.
 if "$shell" "$inst" --help >/dev/null 2>&1; then echo "ok   --help"; else echo "FAIL --help"; fail=1; fi
 usage_rc=0

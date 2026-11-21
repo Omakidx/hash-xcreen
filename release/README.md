@@ -42,3 +42,31 @@ Checklist, to be done once before the first real release:
       (`gate.sh` and `apps/hx-agent/tests/installer_keys.rs` check they match).
 - [ ] **Rehearse** with the `workflow_dispatch` dry run before tagging: it builds every artifact and
       signs with a per-run test key, but does not exercise the real signing step.
+
+## Trust root of the one-liner, and what `install.sh` refuses
+
+`curl ... | sudo sh -s -- --pair` runs a script that is itself unsigned: TLS to github.com is the only
+protection for that first step. Every later step is signature-checked (the manifest with the
+embedded release keys, then the tarball by size and SHA-256, then `hx-agent` again with its
+compiled-in keys). To check the script before running it, download it with its signature and verify
+with minisign against the release public key published in the repository
+(`apps/hx-agent/release-keys/current.pub`):
+
+```sh
+curl -O https://github.com/Omakidx/hash-xcreen/releases/download/channel-stable/install.sh
+curl -O https://github.com/Omakidx/hash-xcreen/releases/download/channel-stable/install.sh.minisig
+minisign -Vm install.sh -P <the public key line of current.pub>
+sudo sh install.sh --pair ...
+```
+
+`install.sh` also:
+
+- refuses a manifest older than 90 days (a possible replay of a superseded release) unless
+  `--allow-old-release` is given. There is no minimum-version floor: after the install, privd keeps
+  the highest manifest timestamp it has accepted and refuses anything older, so a replay can only
+  matter for the very first install, which the 90-day rule bounds;
+- ignores `~/.curlrc` (`curl -q` first) and enforces its download caps without curl (1 MiB for the
+  manifest, the manifest's size for the tarball), because curl before 8.4 does not enforce
+  `--max-filesize` without a Content-Length;
+- with `--release-dir`, refuses a directory or file that is group- or other-writable or not owned by
+  root, and copies only regular files, bounded by those caps (a FIFO or a huge file is refused).

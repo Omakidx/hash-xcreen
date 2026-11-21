@@ -15,6 +15,15 @@
 #   5. execs `hx-agent install`, which verifies everything again with its compiled-in keys and
 #      does the real work. The lock stays held across the exec.
 #
+# TRUST ROOT. With `curl ... | sudo sh` this script itself is unsigned: TLS to github.com is all
+# that protects the first step (every later step is signature-checked). To check the script
+# before running it, download it with its signature and verify with minisign and the release
+# public key published in the repository (apps/hx-agent/release-keys/current.pub):
+#     curl -O https://github.com/Omakidx/hash-xcreen/releases/download/channel-stable/install.sh
+#     curl -O https://github.com/Omakidx/hash-xcreen/releases/download/channel-stable/install.sh.minisig
+#     minisign -Vm install.sh -P <the public key line of current.pub>
+#     sudo sh install.sh --pair ...
+#
 # It reads no environment variable of its own (curl honours http_proxy / https_proxy / the
 # `*_proxy` family by itself). Everything it needs is fixed below. The whole script is wrapped in
 # `main "$@"` on its last line, so a download cut short never runs half a script.
@@ -24,6 +33,8 @@
 #   --release-dir <abs dir>   use manifest-x86_64.json, its .minisig and the tarball from this
 #                             directory instead of downloading (still fully verified)
 #   --progress text|json      json: JSON Lines stage events on stdout, forwarded as --json
+#   --allow-old-release       accept a manifest older than 90 days (refused by default: it
+#                             may be a replay of an old, superseded release)
 #   -h, --help
 #
 # Exit codes (hx-agent install shares them): 0 ok, 1 failed, 2 usage, 7 not root,
@@ -70,6 +81,7 @@ MAX_ARTIFACT=268435456
 CHANNEL='stable'
 PROGRESS='text'
 RELEASE_DIR=''
+ALLOW_OLD=0
 BOOT=''
 VERR=''
 
@@ -301,7 +313,8 @@ openssl_major() {
 
 usage() {
     cat <<'EOF'
-usage: install.sh [--channel stable|beta] [--release-dir DIR] [--progress text|json] [OPTIONS]
+usage: install.sh [--channel stable|beta] [--release-dir DIR] [--progress text|json]
+                  [--allow-old-release] [OPTIONS]
 
 Downloads the signed hash-xcreen release, verifies it and runs `hx-agent install`.
 Run as root (for example `curl -fsSL <url>/install.sh | sudo sh -s -- --pair`).
@@ -363,15 +376,51 @@ manifest_check() {
         return 1
     }
     if [ "$M_TS" -lt $((_now - 90 * 86400)) ]; then
-        note 'warning: the release manifest is older than 90 days'
+        if [ "$ALLOW_OLD" -ne 1 ]; then
+            VERR='the release manifest is older than 90 days (--allow-old-release installs it anyway)'
+            return 1
+        fi
+        note 'warning: the release manifest is older than 90 days (--allow-old-release given)'
     fi
     return 0
 }
 
-fetch() { # url dest max-bytes
-    curl --proto '=https' --proto-redir '=https' --tlsv1.2 --max-redirs 5 \
-        --connect-timeout 20 --max-time 1800 --max-filesize "$3" \
-        -fsSL -o "$2" "$1" </dev/null
+# insecure <path>: true when the group-write or the other-write bit is set, or the owner is not
+# EXPECT_UID (a 0775 or 0757 mode is refused, not just 0777).
+insecure() {
+    [ -n "$(find "$1" -maxdepth 0 \( -perm -0020 -o -perm -0002 -o ! -user "$EXPECT_UID" \) 2>/dev/null)" ]
+}
+
+# copy_capped <src> <dst> <max-bytes>: a regular file (not a FIFO, device or link; refused BEFORE it
+# is opened), owned by EXPECT_UID and not group- or other-writable, of at most <max-bytes>; the copy
+# itself is bounded too, so nothing can hang or fill /run.
+copy_capped() {
+    [ -f "$1" ] && [ ! -L "$1" ] || return 1
+    insecure "$1" && return 1
+    [ "$(wc -c <"$1")" -le "$3" ] || return 1
+    head -c $(($3 + 1)) <"$1" >"$2" || return 1
+    [ "$(wc -c <"$2")" -le "$3" ]
+}
+
+# fetch <url> <dest> <max-bytes>. `-q` first: ~/.curlrc is ignored. curl before 8.4 (Debian 12 has
+# 7.88.1) does not enforce --max-filesize without a Content-Length, so the cap is also enforced
+# without curl: the subshell's file-size limit (ulimit -f, 512-byte blocks) stops a runaway write,
+# and the size is checked afterwards.
+fetch() {
+    _blocks=$((($3 + 511) / 512 + 1))
+    (
+        ulimit -f "$_blocks" || exit 1
+        curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 --max-redirs 5 \
+            --connect-timeout 20 --max-time 1800 --max-filesize "$3" \
+            -fsSL -o "$2" "$1" </dev/null
+    ) || {
+        rm -f "$2"
+        return 1
+    }
+    [ -f "$2" ] && [ "$(wc -c <"$2")" -le "$3" ] || {
+        rm -f "$2"
+        return 1
+    }
 }
 
 # ----- main ----------------------------------------------------------------------------------
@@ -416,6 +465,7 @@ main() {
             --channel=*) CHANNEL=${_a#--channel=} ;;
             --release-dir=*) RELEASE_DIR=${_a#--release-dir=} ;;
             --progress=*) PROGRESS=${_a#--progress=} ;;
+            --allow-old-release) ALLOW_OLD=1 ;;
             -h | --help)
                 usage
                 exit 0
@@ -488,7 +538,7 @@ main() {
     fi
 
     # ---- the verification tools and the self-test ----
-    check_tools sed grep tr wc dd od base64 cat cut cp date openssl sha256sum tar gzip find ||
+    check_tools sed grep tr wc dd od base64 cat cut cp head date openssl sha256sum tar gzip find ||
         die 9 bootstrap-preflight PREFLIGHT 'a required tool is missing'
     [ -n "$RELEASE_DIR" ] || check_tools curl ||
         die 9 bootstrap-preflight PREFLIGHT 'curl is required'
@@ -509,15 +559,15 @@ main() {
     if [ -n "$RELEASE_DIR" ]; then
         [ -d "$RELEASE_DIR" ] && [ ! -L "$RELEASE_DIR" ] ||
             die 9 bootstrap-preflight PREFLIGHT 'the release directory is not a directory'
-        [ -n "$(find "$RELEASE_DIR" -maxdepth 0 -user "$EXPECT_UID" ! -perm -0022 2>/dev/null)" ] ||
-            die 9 bootstrap-preflight PREFLIGHT 'the release directory must be owned by root and not writable by others'
+        ! insecure "$RELEASE_DIR" ||
+            die 9 bootstrap-preflight PREFLIGHT 'the release directory must be owned by root and not writable by group or others'
         for _f in manifest-x86_64.json manifest-x86_64.json.minisig; do
             [ -f "$RELEASE_DIR/$_f" ] && [ ! -L "$RELEASE_DIR/$_f" ] ||
                 die 1 bootstrap-download IO 'the release directory lacks the manifest or its signature'
         done
-        cp "$RELEASE_DIR/manifest-x86_64.json" "$BOOT/manifest.json" &&
-            cp "$RELEASE_DIR/manifest-x86_64.json.minisig" "$BOOT/manifest.json.minisig" ||
-            die 1 bootstrap-download IO 'cannot copy from the release directory'
+        copy_capped "$RELEASE_DIR/manifest-x86_64.json" "$BOOT/manifest.json" "$MAX_MANIFEST" &&
+            copy_capped "$RELEASE_DIR/manifest-x86_64.json.minisig" "$BOOT/manifest.json.minisig" 4096 ||
+            die 9 bootstrap-preflight PREFLIGHT 'a manifest file of the release directory is not an acceptable regular file'
     else
         _base="$BASE_URL/channel-$CHANNEL"
         fetch "$_base/manifest-x86_64.json" "$BOOT/manifest.json" "$MAX_MANIFEST" ||
@@ -540,10 +590,10 @@ main() {
     note "release $M_VERSION ($CHANNEL)"
 
     if [ -n "$RELEASE_DIR" ]; then
-        [ -f "$RELEASE_DIR/$M_ARTIFACT" ] && [ ! -L "$RELEASE_DIR/$M_ARTIFACT" ] ||
+        [ -e "$RELEASE_DIR/$M_ARTIFACT" ] ||
             die 1 bootstrap-download IO 'the release directory lacks the release tarball'
-        cp "$RELEASE_DIR/$M_ARTIFACT" "$BOOT/artifact.tar.gz" ||
-            die 1 bootstrap-download IO 'cannot copy the release tarball'
+        copy_capped "$RELEASE_DIR/$M_ARTIFACT" "$BOOT/artifact.tar.gz" "$M_SIZE" ||
+            die 9 bootstrap-preflight PREFLIGHT 'the release tarball is not an acceptable regular file'
     else
         fetch "$BASE_URL/v$M_VERSION/$M_ARTIFACT" "$BOOT/artifact.tar.gz" "$M_SIZE" ||
             die 1 bootstrap-download DOWNLOAD 'cannot download the release tarball'
