@@ -1,0 +1,4 @@
+UNPROVISIONED
+# Replace this file with the minisign public key file (`minisign -G` writes it) of the CURRENT
+# release signing key before a release build (docs/ipc.md 6.12, "Embedded keys"). A build that
+# embeds no key refuses every update (CheckUpdate answers FAILED_PRECONDITION).

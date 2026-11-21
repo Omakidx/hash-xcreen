@@ -1,0 +1,29 @@
+# The fetcher's directory as a size-capped tmpfs (docs/ipc.md 6.12).
+#
+# A process that can write into a directory can fill the disk under it; LimitFSIZE caps one file
+# and only the fetcher's own bookkeeping caps the rest. A tmpfs makes the quota the kernel's:
+# 300 MiB (a 256 MiB artifact and two small manifest files), 64 inodes (no inode flood), nothing
+# executable, no devices, no setuid. Contents also vanish at reboot, which is right for scratch
+# data that privd treats as hostile. (A loop image would survive a reboot and cost a file and a
+# mount for no gain; a per-job StateDirectory= would leave the cleaning to systemd but give the
+# directory a uid privd does not know and cannot clear without CAP_DAC_OVERRIDE.)
+#
+# Mode 1733: owned by root (privd sweeps it), the fetcher's dynamic user may create names but not
+# list or remove other users' files. privd checks owner and mode on every use.
+
+[Unit]
+Description=hash-xcreen update fetcher directory (size-capped tmpfs)
+Documentation=https://github.com/Omakidx/hash-xcreen/blob/main/docs/ipc.md
+After=systemd-tmpfiles-setup.service
+Requires=systemd-tmpfiles-setup.service
+# The mount point is created by tmpfiles (tmpfiles.d/hx.conf).
+ConditionPathIsDirectory=/var/lib/hx/updates
+
+[Mount]
+What=tmpfs
+Where=/var/lib/hx/updates
+Type=tmpfs
+Options=size=300M,nr_inodes=64,mode=1733,uid=0,gid=0,nosuid,nodev,noexec
+
+[Install]
+WantedBy=local-fs.target

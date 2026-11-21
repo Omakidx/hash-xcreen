@@ -1,0 +1,118 @@
+//! The release signing keys embedded in the binary (architecture 5.5 and 13).
+//!
+//! Two minisign public keys are compiled in: the **current** key signs releases, the **next** key
+//! is published in advance so that a rotation needs no flag day (a release signed by either is
+//! accepted; once the next key has signed a release, the following release embeds it as current
+//! and a fresh next). The files are `release-keys/current.pub` and `release-keys/next.pub`, each
+//! either a minisign public key file or the word `UNPROVISIONED`. A build whose keys are all
+//! unprovisioned accepts nothing: `CheckUpdate` answers `FAILED_PRECONDITION` rather than falling
+//! back to any default. Installer 1E embeds the same two keys.
+//!
+//! Tests inject their own key through [`UpdateKeys::from_public_keys`], which exists only with
+//! the `test-support` feature (a release build never has it).
+
+use minisign_verify::{PublicKey, Signature};
+
+use super::verify::VerifyError;
+
+const CURRENT: &str = include_str!("../../../release-keys/current.pub");
+const NEXT: &str = include_str!("../../../release-keys/next.pub");
+
+/// The keys a release signature is checked against.
+#[derive(Clone)]
+pub struct UpdateKeys {
+    keys: Vec<PublicKey>,
+}
+
+/// The base64 key line of a minisign public key file, or `None` for `UNPROVISIONED` and anything
+/// that holds no key line.
+fn key_line(text: &str) -> Option<&str> {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("untrusted comment:"))?;
+    (line != "UNPROVISIONED").then_some(line)
+}
+
+fn parse_key(text: &str) -> Option<PublicKey> {
+    PublicKey::from_base64(key_line(text)?).ok()
+}
+
+impl UpdateKeys {
+    /// The keys compiled into this binary (the unprovisioned or malformed ones are left out).
+    pub fn embedded() -> Self {
+        Self {
+            keys: [CURRENT, NEXT].into_iter().filter_map(parse_key).collect(),
+        }
+    }
+
+    /// True when no key is available: every update is refused.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// How many keys are present.
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Keys from minisign public key text (the `.pub` file or its base64 line). Test-only.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_public_keys(keys: &[&str]) -> Result<Self, VerifyError> {
+        let keys = keys
+            .iter()
+            .map(|k| parse_key(k).ok_or(VerifyError::BadKey))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { keys })
+    }
+
+    /// Verifies `sig_text` (a `.minisig` file) over exactly `data` against each embedded key.
+    /// Only prehashed signatures (`ED`, what minisign writes by default) are accepted; the
+    /// legacy form is refused. The trusted comment's global signature is checked too.
+    pub fn verify(&self, data: &[u8], sig_text: &str) -> Result<(), VerifyError> {
+        if self.keys.is_empty() {
+            return Err(VerifyError::NoKeys);
+        }
+        let sig = Signature::decode(sig_text).map_err(|_| VerifyError::BadSignatureFile)?;
+        for k in &self.keys {
+            if k.verify(data, &sig, false).is_ok() {
+                return Ok(());
+            }
+        }
+        Err(VerifyError::SignatureMismatch)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_key_files_are_a_key_or_unprovisioned() {
+        for (name, text) in [("current", CURRENT), ("next", NEXT)] {
+            match key_line(text) {
+                None => assert!(text.contains("UNPROVISIONED"), "{name}"),
+                Some(_) => assert!(parse_key(text).is_some(), "{name} is not a valid key"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_build_without_keys_verifies_nothing() {
+        let none = UpdateKeys { keys: Vec::new() };
+        assert!(none.is_empty());
+        assert_eq!(none.verify(b"x", "y"), Err(VerifyError::NoKeys));
+    }
+
+    #[test]
+    fn key_files_are_parsed_leniently_but_garbage_is_not_a_key() {
+        assert!(key_line("UNPROVISIONED\n").is_none());
+        assert!(key_line("# note\nUNPROVISIONED\n").is_none());
+        assert_eq!(
+            key_line("untrusted comment: x\nRWQabc\n").unwrap(),
+            "RWQabc"
+        );
+        assert!(parse_key("RWQnotbase64!!").is_none());
+        assert!(parse_key("").is_none());
+    }
+}
