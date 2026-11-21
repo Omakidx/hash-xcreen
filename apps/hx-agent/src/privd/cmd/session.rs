@@ -11,7 +11,7 @@
 //! trusts nothing the container prints: the version is read back and validated.
 
 use std::io::Read;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::time::Duration;
 
 use hx_ipc::privd::pb::{self, ErrorDetail, response};
@@ -92,18 +92,38 @@ pub async fn provision_link<T: Transport + Clone + 'static>(
     ))
 }
 
-/// Reads the package once from a path privd controls: `O_NOFOLLOW`, a regular file owned by the
-/// effective uid and not writable by group or others, within the size quota. `Ok(None)` when it
-/// does not exist.
-pub fn read_package(path: &std::path::Path) -> Result<Option<Vec<u8>>, CmdError> {
-    let f = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(OFlags::NOFOLLOW.bits() as i32)
-        .open(path)
-    {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
+/// Reads the package once: `rel` (for example `session/ubuntu-24.04/hx-session.deb`) is opened
+/// with `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS)` under a descriptor of
+/// `root` (`/usr/lib/hx/current`: that one symlink, the release switch, is followed on purpose;
+/// nothing below it may be a symlink). The file must be regular, owned by the effective uid, not
+/// writable by group or others and within the size quota. `Ok(None)` when it does not exist.
+pub fn read_package(root: &std::path::Path, rel: &str) -> Result<Option<Vec<u8>>, CmdError> {
+    let dir = rustix::fs::open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|e| match e {
+        rustix::io::Errno::NOENT => CmdError::internal("the release directory is missing"),
+        e => CmdError::from(std::io::Error::from(e)),
+    })?;
+    let f = match rustix::fs::openat2(
+        &dir,
+        rel,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+        rustix::fs::ResolveFlags::BENEATH
+            | rustix::fs::ResolveFlags::NO_SYMLINKS
+            | rustix::fs::ResolveFlags::NO_MAGICLINKS,
+    ) {
+        Ok(fd) => std::fs::File::from(fd),
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR | rustix::io::Errno::XDEV) => {
+            return Err(CmdError::internal(
+                "the hx-session package path passes through a symlink",
+            ));
+        }
+        Err(e) => return Err(std::io::Error::from(e).into()),
     };
     let m = f.metadata()?;
     if !m.is_file()
@@ -175,12 +195,14 @@ pub async fn install_inner<T: Transport + Clone + 'static>(
 ) -> Result<Option<String>, CmdError> {
     let recipe = recipe_from_text(recipe_text)
         .ok_or_else(|| CmdError::internal("the desktop has no valid recipe recorded"))?;
-    let path = d
-        .cfg
-        .session_store
-        .join(recipe.distro.as_str())
-        .join(PACKAGE_FILE);
-    let Some(bytes) = read_package(&path)? else {
+    let store = &d.cfg.session_store;
+    let root = store.parent().unwrap_or(store);
+    let rel = format!(
+        "{}/{}/{PACKAGE_FILE}",
+        store.file_name().and_then(|n| n.to_str()).unwrap_or("session"),
+        recipe.distro.as_str()
+    );
+    let Some(bytes) = read_package(root, &rel)? else {
         return Ok(None);
     };
     let target = format!("{CONTAINER_DIR}/{PACKAGE_FILE}");
@@ -305,18 +327,32 @@ mod tests {
     #[test]
     fn the_package_must_be_ours_private_and_bounded() {
         let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("hx-session.deb");
-        assert_eq!(read_package(&p).unwrap(), None);
+        let sub = d.path().join("session/ubuntu-24.04");
+        std::fs::create_dir_all(&sub).unwrap();
+        let rel = "session/ubuntu-24.04/hx-session.deb";
+        let p = sub.join("hx-session.deb");
+        assert_eq!(read_package(d.path(), "session/debian-12/hx-session.deb").unwrap(), None);
         std::fs::write(&p, b"deb").unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(read_package(&p).unwrap().as_deref(), Some(&b"deb"[..]));
+        assert_eq!(read_package(d.path(), rel).unwrap().as_deref(), Some(&b"deb"[..]));
         // Group- or world-writable: refused.
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o666)).unwrap();
-        assert!(read_package(&p).is_err());
-        // A symlink is not followed.
+        assert!(read_package(d.path(), rel).is_err());
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let l = d.path().join("link.deb");
+        // A symlinked file is not followed.
+        let l = sub.join("link.deb");
         std::os::unix::fs::symlink(&p, &l).unwrap();
-        assert!(read_package(&l).is_err());
+        assert!(read_package(d.path(), "session/ubuntu-24.04/link.deb").is_err());
+        // Neither is a symlinked directory (the case a chained-symlink archive would plant).
+        let evil = d.path().join("evil");
+        std::fs::create_dir(&evil).unwrap();
+        std::fs::write(evil.join("hx-session.deb"), b"evil").unwrap();
+        std::os::unix::fs::symlink(&evil, d.path().join("session/debian-13")).unwrap();
+        assert!(read_package(d.path(), "session/debian-13/hx-session.deb").is_err());
+        // `root` itself may be the `current` symlink.
+        let cur = tempfile::tempdir().unwrap();
+        let link = cur.path().join("current");
+        std::os::unix::fs::symlink(d.path(), &link).unwrap();
+        assert_eq!(read_package(&link, rel).unwrap().as_deref(), Some(&b"deb"[..]));
     }
 }

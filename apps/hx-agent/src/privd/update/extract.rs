@@ -14,9 +14,11 @@
 //! * absolute paths, any `..` component, a NUL in a name, empty, `.` or over-long components,
 //!   non-UTF-8 names, more than 24 levels;
 //! * a duplicate entry (the same normalised path twice);
-//! * a symlink whose target is absolute, has a NUL, or climbs out of the extraction root; a hard
-//!   link whose target is not a regular file already extracted (so it cannot name anything
-//!   outside, nor a symlink);
+//! * **any symlink entry** (the layout has none; a lexical "stays inside" check is not enough,
+//!   because two inside-looking links can chain out of the root); a hard link whose target is not
+//!   a regular file already extracted (so it cannot name anything outside, nor a symlink);
+//! * GNU long-name, long-link and pax headers (names are the 255 bytes of ustar's name and
+//!   prefix fields; the archive reader would otherwise read such a header whole into memory);
 //! * device nodes, fifos, sockets, sparse files, global pax headers and every other entry type;
 //! * a write whose parent path passes through a symlink.
 //!
@@ -85,6 +87,10 @@ pub enum Refusal {
     UnsupportedType,
     /// The parent path passes through a symlink.
     ThroughSymlink,
+    /// A symlink entry (none is allowed).
+    SymlinkEntry,
+    /// A GNU long-name, long-link or pax header (refused unread).
+    LongHeader,
     /// A file where a directory is needed, or the reverse.
     Conflict,
 }
@@ -101,6 +107,8 @@ impl std::fmt::Display for Refusal {
             Self::SpecialFile => "device node, fifo or socket",
             Self::UnsupportedType => "unsupported entry type",
             Self::ThroughSymlink => "path passes through a symlink",
+            Self::SymlinkEntry => "symlink entry",
+            Self::LongHeader => "long-name or pax header",
             Self::Conflict => "a file and a directory share a path",
         })
     }
@@ -202,32 +210,6 @@ fn components(raw: &[u8]) -> Result<Vec<String>, Refusal> {
     Ok(out)
 }
 
-/// Whether a symlink at `entry` (components) with `target` stays inside the root when resolved
-/// lexically from the link's own directory.
-fn symlink_target_ok(entry: &[String], target: &[u8]) -> Result<(), Refusal> {
-    if target.contains(&0) {
-        return Err(Refusal::NulInName);
-    }
-    let t = std::str::from_utf8(target).map_err(|_| Refusal::LinkEscapes)?;
-    if t.is_empty() || t.starts_with('/') {
-        return Err(Refusal::LinkEscapes);
-    }
-    let mut depth = entry.len().saturating_sub(1) as i64;
-    for c in t.split('/') {
-        match c {
-            "" | "." => {}
-            ".." => {
-                depth -= 1;
-                if depth < 0 {
-                    return Err(Refusal::LinkEscapes);
-                }
-            }
-            _ => depth += 1,
-        }
-    }
-    Ok(())
-}
-
 fn resolve_flags() -> ResolveFlags {
     ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS
 }
@@ -307,7 +289,12 @@ pub fn extract_tar_gz(
         hit: hit.clone(),
     };
     let mut ar = tar::Archive::new(stream);
-    let entries = ar.entries().map_err(|e| map_stream_error(&e, &hit))?;
+    // Raw: the reader does no preprocessing, so a long-name or pax header comes back as an entry
+    // that is refused below without its body being read into memory.
+    let entries = ar
+        .entries()
+        .map_err(|e| map_stream_error(&e, &hit))?
+        .raw(true);
     let mut seen: HashSet<Vec<String>> = HashSet::new();
     let mut regular: HashSet<Vec<String>> = HashSet::new();
     let mut stats = Stats::default();
@@ -321,8 +308,15 @@ pub fn extract_tar_gz(
         if stats.entries > limits.max_entries {
             return Err(ExtractError::TooManyEntries);
         }
-        let comps = components(&entry.path_bytes()).map_err(ExtractError::Refused)?;
         let kind = entry.header().entry_type();
+        if kind.is_gnu_longname()
+            || kind.is_gnu_longlink()
+            || kind.is_pax_local_extensions()
+            || kind.is_pax_global_extensions()
+        {
+            return Err(ExtractError::Refused(Refusal::LongHeader));
+        }
+        let comps = components(&entry.path_bytes()).map_err(ExtractError::Refused)?;
         let mode = entry.header().mode().unwrap_or(0o644);
         // The root itself ("./") is a no-op; any other path may appear once only.
         if comps.is_empty() {
@@ -388,20 +382,7 @@ pub fn extract_tar_gz(
                 regular.insert(comps.clone());
                 stats.files += 1;
             }
-            t if t.is_symlink() => {
-                let target = entry
-                    .link_name_bytes()
-                    .ok_or(ExtractError::Refused(Refusal::LinkEscapes))?;
-                symlink_target_ok(&comps, &target).map_err(ExtractError::Refused)?;
-                let target = std::str::from_utf8(&target)
-                    .map_err(|_| ExtractError::Refused(Refusal::LinkEscapes))?
-                    .to_string();
-                let parent = open_dir(root, parents, true)?;
-                rustix::fs::symlinkat(target.as_str(), &parent, name).map_err(|e| match e {
-                    rustix::io::Errno::EXIST => ExtractError::Refused(Refusal::Conflict),
-                    e => io::Error::from(e).into(),
-                })?;
-            }
+            t if t.is_symlink() => return Err(ExtractError::Refused(Refusal::SymlinkEntry)),
             t if t.is_hard_link() => {
                 let target = entry
                     .link_name_bytes()
@@ -466,34 +447,6 @@ mod tests {
         assert_eq!(comps(&"a/".repeat(25)), Err(Refusal::BadName));
         assert_eq!(components(b"a\0b"), Err(Refusal::NulInName));
         assert_eq!(components(b"a\xffb"), Err(Refusal::BadName));
-    }
-
-    #[test]
-    fn symlink_targets_stay_inside() {
-        let e = |p: &str| comps(p).unwrap();
-        assert!(symlink_target_ok(&e("bin/tool"), b"../lib/tool").is_ok());
-        assert!(symlink_target_ok(&e("tool"), b"sub/x").is_ok());
-        assert!(symlink_target_ok(&e("a/b/tool"), b"../../x").is_ok());
-        assert_eq!(
-            symlink_target_ok(&e("tool"), b"../x"),
-            Err(Refusal::LinkEscapes)
-        );
-        assert_eq!(
-            symlink_target_ok(&e("a/tool"), b"../../x"),
-            Err(Refusal::LinkEscapes)
-        );
-        assert_eq!(
-            symlink_target_ok(&e("a/tool"), b"/etc/passwd"),
-            Err(Refusal::LinkEscapes)
-        );
-        assert_eq!(
-            symlink_target_ok(&e("a/tool"), b"x\0y"),
-            Err(Refusal::NulInName)
-        );
-        assert_eq!(
-            symlink_target_ok(&e("a/tool"), b""),
-            Err(Refusal::LinkEscapes)
-        );
     }
 
     #[test]

@@ -102,25 +102,50 @@ fn parent_components_are_refused() {
 }
 
 #[test]
-fn a_nul_in_a_name_is_refused() {
-    // A NUL cannot sit in the 100-byte name field (a C string ends there), but a pax `path`
-    // record can carry one.
-    let e = TarEntry::file("placeholder", b"x", 0o644).with_pax_path(b"good\0../../evil");
-    let (t, r) = refused(&[e]);
-    assert_eq!(r, Refusal::NulInName);
+fn pax_and_long_name_headers_are_refused_so_a_nul_or_a_huge_name_cannot_be_expressed() {
+    // A NUL, an over-long component and a bad UTF-8 name can only come in a pax `path` record.
+    for p in [&b"good\0../../evil"[..], &b"x"[..], &[b'x'; 300][..], b"caf\xc3\xa9\xff"] {
+        let e = TarEntry::file("placeholder", b"x", 0o644).with_pax_path(p);
+        let (t, r) = refused(&[e]);
+        assert_eq!(r, Refusal::LongHeader);
+        nothing_outside(&t);
+    }
+}
+
+#[test]
+fn a_two_megabyte_long_name_is_refused_before_it_is_read() {
+    // GNU long-name header ('L') announcing 2 MiB, with the data present: refused by type, so
+    // the reader never allocates it.
+    let mut tar = Vec::new();
+    let mut h = TarEntry::special("././@LongLink", b'L');
+    h.data = Vec::new();
+    let mut hdr = tar_bytes(&[h]);
+    hdr.truncate(512);
+    // size field (offset 124, 12 bytes): 2 MiB in octal; fix the checksum.
+    hdr[124..136].copy_from_slice(format!("{:011o}\0", 2 * 1024 * 1024).as_bytes());
+    hdr[148..156].fill(b' ');
+    let sum: u64 = hdr.iter().map(|b| u64::from(*b)).sum();
+    hdr[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    tar.extend_from_slice(&hdr);
+    tar.extend(std::iter::repeat_n(b'a', 2 * 1024 * 1024));
+    tar.extend_from_slice(&[0u8; 1024]);
+    let (t, r) = run_with(&gz(&tar), &Limits::default());
+    assert!(matches!(r, Err(ExtractError::Refused(Refusal::LongHeader))), "{r:?}");
     nothing_outside(&t);
+    // 'K' (long link) and 'x' / 'g' (pax) headers likewise.
+    for kind in *b"Kxg" {
+        let (_t, r) = run(&[TarEntry::special("h", kind)]);
+        assert!(matches!(r, Err(ExtractError::Refused(Refusal::LongHeader))), "{}", kind as char);
+    }
 }
 
 #[test]
 fn bad_names_are_refused() {
-    for p in ["a//b", "a/./b", &"x".repeat(256), &"d/".repeat(30)] {
-        let long = TarEntry::file("placeholder", b"x", 0o644).with_pax_path(p.as_bytes());
-        let (t, r) = refused(&[long]);
-        assert_eq!(r, Refusal::BadName, "{p:?}");
+    for p in ["a//b", "a/./b", "a/b/../c"] {
+        let (t, r) = run(&[TarEntry::file(p, b"x", 0o644)]);
+        assert!(matches!(r, Err(ExtractError::Refused(_))), "{p:?}: {r:?}");
         nothing_outside(&t);
     }
-    let e = TarEntry::file("placeholder", b"x", 0o644).with_pax_path(b"caf\xc3\xa9\xff");
-    assert_eq!(refused(&[e]).1, Refusal::BadName);
 }
 
 #[test]
@@ -155,59 +180,31 @@ fn a_file_and_a_directory_cannot_share_a_path() {
 }
 
 #[test]
-fn symlinks_that_leave_the_root_are_refused() {
-    for target in [
-        "/etc/passwd",
-        "../outside",
-        "a/../../outside",
-        "../../../../../../etc/shadow",
-        "",
-    ] {
-        let (t, r) = refused(&[TarEntry::symlink("link", target)]);
-        assert_eq!(r, Refusal::LinkEscapes, "{target:?}");
+fn symlink_entries_are_refused_whatever_they_point_at() {
+    for target in ["/etc/passwd", "../outside", "a/../../outside", "x", "lib", ".", ""] {
+        let (t, r) = refused(&[TarEntry::dir("lib"), TarEntry::symlink("link", target)]);
+        assert_eq!(r, Refusal::SymlinkEntry, "{target:?}");
+        assert!(!t.path().join("root/link").exists());
         nothing_outside(&t);
     }
-    let (t, r) = refused(&[TarEntry::dir("d"), TarEntry::symlink("d/link", "../../x")]);
-    assert_eq!(r, Refusal::LinkEscapes);
-    nothing_outside(&t);
 }
 
 #[test]
-fn symlinks_that_stay_inside_are_created_and_never_followed_by_later_entries() {
-    let (t, r) = run(&[
-        TarEntry::dir("lib"),
-        TarEntry::file("lib/real", b"x", 0o755),
-        TarEntry::symlink("bin", "lib"),
-        TarEntry::symlink("lib/alias", "real"),
-    ]);
-    r.unwrap();
-    let root = t.path().join("root");
-    assert_eq!(
-        std::fs::read_link(root.join("bin")).unwrap(),
-        Path::new("lib")
-    );
-    // A later entry whose path runs through the symlink is refused, not written through it.
+fn chained_symlinks_that_each_look_inside_cannot_reach_outside() {
+    // The reviewer's case: a/b/c/d/l -> ../../../.. (lexically back at the root), then
+    // x -> a/b/c/d/l/../../../../etc (lexically never above the root) resolves to /etc.
     let (t, r) = refused(&[
-        TarEntry::dir("lib"),
-        TarEntry::symlink("bin", "lib"),
-        TarEntry::file("bin/payload", b"x", 0o644),
+        TarEntry::dir("a"),
+        TarEntry::dir("a/b"),
+        TarEntry::dir("a/b/c"),
+        TarEntry::dir("a/b/c/d"),
+        TarEntry::symlink("a/b/c/d/l", "../../../.."),
+        TarEntry::symlink("x", "a/b/c/d/l/../../../../etc"),
     ]);
-    assert_eq!(r, Refusal::ThroughSymlink);
-    assert!(!t.path().join("root/lib/payload").exists());
-    // Including a directory entry and a hard link through it.
-    let (_t, r) = refused(&[TarEntry::symlink("bin", "."), TarEntry::dir("bin/sub")]);
-    assert_eq!(r, Refusal::ThroughSymlink);
-}
-
-#[test]
-fn a_symlink_planted_to_point_outside_cannot_be_used_even_if_created_by_other_means() {
-    // The classic two-step: a symlink to `..` that the lexical check refuses, so the second
-    // entry never gets to write; here the first one is refused.
-    let (t, r) = refused(&[
-        TarEntry::symlink("up", ".."),
-        TarEntry::file("up/escape", b"x", 0o644),
-    ]);
-    assert_eq!(r, Refusal::LinkEscapes);
+    assert_eq!(r, Refusal::SymlinkEntry);
+    // The first link was never created, so nothing can resolve through it.
+    assert!(!t.path().join("root/a/b/c/d/l").exists());
+    assert!(!t.path().join("root/x").exists());
     nothing_outside(&t);
 }
 
@@ -230,10 +227,6 @@ fn hard_links_must_name_an_extracted_regular_file_inside_the_root() {
         (vec![TarEntry::hardlink("h", "/etc/passwd")], "absolute"),
         (vec![TarEntry::hardlink("h", "../x")], "parent"),
         (vec![TarEntry::hardlink("h", "missing")], "missing"),
-        (
-            vec![TarEntry::symlink("s", "x"), TarEntry::hardlink("h", "s")],
-            "a symlink",
-        ),
         (
             vec![TarEntry::dir("d"), TarEntry::hardlink("h", "d")],
             "a directory",
