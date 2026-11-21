@@ -131,8 +131,24 @@ pub(super) fn password(
             "a password is 1 to 1024 bytes with no newline or NUL".into(),
         ));
     }
+    // Everything that can be checked or prepared comes BEFORE the Linux password changes:
+    // gatewayd must be reachable (so the old password cannot stay valid for re-pairing because
+    // the gateway was down), and the verifier is built now (`PepperEnrol` stores nothing).
+    let mut a = admin(env)?;
     let mut p = privd(env)?;
+    let record = verifier::enrol(
+        &mut p,
+        LockoutPurpose::Password,
+        &pw,
+        env.config.verifier_params,
+    )?;
     if !verifier_only {
+        if !env.json {
+            let _ = env.err.write_all(
+                b"changing the password now; if this is interrupted or times out it may already have changed
+",
+            );
+        }
         match p.call(
             Command::SetUserPassword(pb::SetUserPasswordRequest {
                 desktop_id: id.to_owned(),
@@ -142,32 +158,30 @@ pub(super) fn password(
                 bytes: &pw,
             }],
             &mut |_| {},
-        )? {
-            R::SetUserPassword(_) => {}
-            _ => return Err(unexpected("SetUserPassword")),
+        ) {
+            Ok(R::SetUserPassword(_)) => {}
+            Ok(_) => return Err(unexpected("SetUserPassword")),
+            // The request was sent: a lost connection or a local timeout says nothing about
+            // whether privd changed the password.
+            Err(CliError::Unavailable(m)) => {
+                return Err(CliError::Unavailable(format!(
+                    "{m}; the Linux password MAY ALREADY HAVE CHANGED: if so, run hx-agent desktop password --verifier-only with the new password, otherwise run this command again"
+                )));
+            }
+            Err(e) => return Err(e),
         }
     }
-    // Refresh gatewayd's verifier. If this fails the Linux password is already changed, so say
-    // so and how to finish.
-    let refreshed = (|| -> Result<(), CliError> {
-        let record = verifier::enrol(
-            &mut p,
-            LockoutPurpose::Password,
-            &pw,
-            env.config.verifier_params,
-        )?;
-        let mut a = admin(env)?;
-        match a.call(
-            apb::request::Command::SetPasswordVerifier(apb::SetPasswordVerifierRequest {
-                verifier: record.into(),
-            }),
-            None,
-        )? {
-            apb::response::Result::SetPasswordVerifier(_) => Ok(()),
-            _ => Err(admin_unexpected("SetPasswordVerifier")),
-        }
-    })();
     drop(pw);
+    let refreshed = match a.call(
+        apb::request::Command::SetPasswordVerifier(apb::SetPasswordVerifierRequest {
+            verifier: record.into(),
+        }),
+        None,
+    ) {
+        Ok(apb::response::Result::SetPasswordVerifier(_)) => Ok(()),
+        Ok(_) => Err(admin_unexpected("SetPasswordVerifier")),
+        Err(e) => Err(e),
+    };
     match refreshed {
         Ok(()) => Ok(Outcome::ok(
             if verifier_only {
@@ -180,7 +194,7 @@ pub(super) fn password(
             json!({"desktop": id, "password_changed": !verifier_only, "verifier_refreshed": true}),
         )),
         Err(e) => Err(CliError::Failed(format!(
-            "{}the gateway's password verifier was NOT refreshed ({}); re-pairing by password will fail until you run: hx-agent desktop password --verifier-only",
+            "{}the gateway's password verifier was NOT refreshed ({}); the gateway still accepts the OLD password for re-pairing until you run: hx-agent desktop password --verifier-only",
             if verifier_only {
                 ""
             } else {

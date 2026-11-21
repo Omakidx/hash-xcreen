@@ -85,17 +85,17 @@ async fn a_linux_password_travels_only_as_a_secret_frame() {
     // Argon2id output, not the password.
     let secrets = p.secrets.lock().unwrap().clone();
     assert_eq!(secrets.len(), 2, "{secrets:?}");
-    assert_eq!((secrets[0].1, secrets[0].2.as_slice()), (0, pw));
-    assert_eq!(secrets[1].2.len(), 32);
-    assert_ne!(secrets[1].2.as_slice(), pw);
+    assert_eq!((secrets[1].1, secrets[1].2.as_slice()), (0, pw));
+    assert_eq!(secrets[0].2.len(), 32);
+    assert_ne!(secrets[0].2.as_slice(), pw);
     let reqs = p.requests.lock().unwrap().clone();
     assert_eq!(
-        reqs[0].secret_slots[0].kind,
+        reqs[1].secret_slots[0].kind,
         pb::SecretKind::UserPassword as i32
     );
-    assert!(!reqs[0].secret_slots[0].sealed);
+    assert!(!reqs[1].secret_slots[0].sealed);
     assert_eq!(
-        reqs[1].secret_slots[0].kind,
+        reqs[0].secret_slots[0].kind,
         pb::SecretKind::MacInput as i32
     );
 

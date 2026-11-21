@@ -310,6 +310,11 @@ impl ScriptedPrivd {
                                 }
                                 requests.lock().unwrap().push(req.clone());
                                 let reply = handler(req.clone(), got).await;
+                                // A handler can make the stand-in vanish without answering.
+                                if matches!(&reply.result, pb::response::Result::Error(e) if e.message == DROP)
+                                {
+                                    return;
+                                }
                                 for mut p in reply.progress {
                                     p.request_id = req.request_id;
                                     let f = pb::Frame {
@@ -499,6 +504,9 @@ async fn asend(stream: &mut UnixStream, f: &apb::Frame) -> Result<(), ()> {
     let bytes = ipc_admin::encode_message(f, Side::Client).map_err(|_| ())?;
     stream.write_all(&bytes).await.map_err(|_| ())
 }
+
+/// An error message that makes a stand-in close the connection instead of answering.
+pub const DROP: &str = "__drop_the_connection__";
 
 pub fn privd_error(code: pb::ErrorCode, message: &str) -> pb::response::Result {
     pb::response::Result::Error(pb::Error {
