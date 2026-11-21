@@ -3,6 +3,11 @@
 # written by hx-privd's SetupHost to /etc/hx/host-firewall.nft; this oneshot loads it at boot,
 # before Incus can start a desktop. The rules act only on packets that enter from our bridge, so
 # loading them before the bridge exists is harmless.
+#
+# The installer (1E) installs and enables this unit. hx-privd only writes the ruleset file and
+# loads it with `nft -f`: its sandbox cannot write unit directories, so it never installs units.
+# `Uninstall` in keep mode leaves this unit, the ruleset file and the table in place, so that a
+# desktop that keeps running stays isolated.
 
 [Unit]
 Description=hash-xcreen host firewall (isolates desktops from the host)
