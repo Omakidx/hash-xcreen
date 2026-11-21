@@ -1259,3 +1259,182 @@ async fn a_lockout_revocation_is_serialized_with_the_others_and_recorded() {
             .await
     );
 }
+
+// ------------------------------------------------------------------ N7: cooling-off
+
+async fn reinstated_event(conn: &hx_transport::Connection) -> pb::DeviceEvent {
+    recv_until(conn, |m| match m {
+        Ctl::DeviceMgmt(pb::DeviceMgmt {
+            request_id: 0,
+            body: Some(Mgmt::Event(e)),
+        }) if e.kind == pb::DeviceEventKind::Reinstated as i32 => Some(e.clone()),
+        _ => None,
+    })
+    .await
+}
+
+/// A thief with a device and its PIN revokes the owner's phone; the owner's laptop revokes the
+/// thief within a minute: the thief's revocation is undone and the phone is back.
+#[tokio::test]
+async fn the_owners_counter_revocation_wins_within_the_cooling_off_period() {
+    let env = Env::start().await;
+    let (phone, laptop, thief) = (new_key(), new_key(), new_key());
+    env.pair(&phone, "phone").await;
+    env.pair(&laptop, "laptop").await;
+    env.pair(&thief, "thief").await;
+    env.set_pin(PIN).await;
+    let cl = env.login(&laptop, "laptop", PIN).await;
+    let ct = env.login(&thief, "thief", PIN).await;
+
+    assert_eq!(
+        revoke(&ct, 1, Env::id_of(&phone).as_bytes()).await,
+        pb::RevokeStatus::Ok
+    );
+    let ev = next_event(&cl).await;
+    assert_eq!(ev.kind, pb::DeviceEventKind::Revoked as i32);
+    assert!(!env.gw.devices().is_active(&Env::id_of(&phone)));
+
+    env.clock.advance(Duration::from_secs(20));
+    assert_eq!(
+        revoke(&cl, 2, Env::id_of(&thief).as_bytes()).await,
+        pb::RevokeStatus::Ok
+    );
+    // The phone's revocation is undone and the live sessions are told.
+    let ev = reinstated_event(&cl).await;
+    assert_eq!(
+        ev.device.unwrap().device_id.as_ref(),
+        Env::id_of(&phone).as_bytes()
+    );
+    assert!(
+        env.gw.devices().is_active(&Env::id_of(&phone)),
+        "the phone is back"
+    );
+    assert!(!env.gw.devices().is_active(&Env::id_of(&thief)));
+    assert_eq!(closed_with(&ct).await.code, CloseCode::Unauthorized);
+    let _ = env.login(&phone, "phone", PIN).await;
+    assert!(
+        env.privd
+            .wait_for(|s| s.events.iter().any(|e| e.0 == AuditEvent::DeviceReinstated))
+            .await
+    );
+}
+
+#[tokio::test]
+async fn after_the_cooling_off_period_a_revocation_stands() {
+    let env = Env::start().await;
+    let (phone, laptop, thief) = (new_key(), new_key(), new_key());
+    env.pair(&phone, "phone").await;
+    env.pair(&laptop, "laptop").await;
+    env.pair(&thief, "thief").await;
+    env.set_pin(PIN).await;
+    let cl = env.login(&laptop, "laptop", PIN).await;
+    let ct = env.login(&thief, "thief", PIN).await;
+    assert_eq!(
+        revoke(&ct, 1, Env::id_of(&phone).as_bytes()).await,
+        pb::RevokeStatus::Ok
+    );
+    env.clock.advance(Duration::from_secs(61));
+    assert_eq!(
+        revoke(&cl, 2, Env::id_of(&thief).as_bytes()).await,
+        pb::RevokeStatus::Ok
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !env.gw.devices().is_active(&Env::id_of(&phone)),
+        "too late to undo it"
+    );
+}
+
+#[tokio::test]
+async fn signing_out_a_device_undoes_nothing() {
+    let env = Env::start().await;
+    let (phone, laptop, tablet) = (new_key(), new_key(), new_key());
+    env.pair(&phone, "phone").await;
+    env.pair(&laptop, "laptop").await;
+    env.pair(&tablet, "tablet").await;
+    env.set_pin(PIN).await;
+    let ct = env.login(&tablet, "tablet", PIN).await;
+    assert_eq!(
+        revoke(&ct, 1, Env::id_of(&phone).as_bytes()).await,
+        pb::RevokeStatus::Ok
+    );
+    // The tablet then signs itself out: a sign-out is not a counter-measure.
+    assert_eq!(
+        revoke(&ct, 2, Env::id_of(&tablet).as_bytes()).await,
+        pb::RevokeStatus::Ok
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!env.gw.devices().is_active(&Env::id_of(&phone)));
+    assert!(env.gw.devices().is_active(&Env::id_of(&laptop)));
+}
+
+#[tokio::test]
+async fn an_operators_revocation_is_never_undone() {
+    let env = Env::start().await;
+    let (phone, laptop, thief) = (new_key(), new_key(), new_key());
+    env.pair(&phone, "phone").await;
+    env.pair(&laptop, "laptop").await;
+    env.pair(&thief, "thief").await;
+    env.set_pin(PIN).await;
+    let ct = env.login(&thief, "thief", PIN).await;
+    // The thief revokes the laptop; the operator revokes the laptop is already done, so the
+    // operator revokes the phone first (reason USER too) and only then the thief revokes it
+    // again: nothing to undo for the phone, because the thief did not revoke it.
+    env.gw
+        .devices()
+        .revoke_by_operator(Env::id_of(&phone))
+        .await
+        .unwrap();
+    assert_eq!(
+        revoke(&ct, 1, Env::id_of(&laptop).as_bytes()).await,
+        pb::RevokeStatus::Ok
+    );
+    env.gw
+        .devices()
+        .revoke_by_operator(Env::id_of(&thief))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !env.gw.devices().is_active(&Env::id_of(&phone)),
+        "the operator's stands"
+    );
+    assert!(
+        env.gw.devices().is_active(&Env::id_of(&laptop)),
+        "the thief's is undone"
+    );
+}
+
+/// The revoke limit is per device, not per connection: a second connection does not reset it.
+#[tokio::test]
+async fn the_revoke_limit_holds_across_a_devices_connections() {
+    let env = Env::start().await;
+    let a = new_key();
+    env.pair(&a, "alice").await;
+    env.set_pin(PIN).await;
+    let c1 = env.login(&a, "alice", PIN).await;
+    let c2 = env.login(&a, "alice", PIN).await;
+    for i in 1..=5u32 {
+        assert_eq!(
+            revoke(&c1, i, &[i as u8; 16]).await,
+            pb::RevokeStatus::NotFound
+        );
+        assert_eq!(
+            revoke(&c2, i, &[i as u8 + 50; 16]).await,
+            pb::RevokeStatus::NotFound
+        );
+    }
+    assert_eq!(
+        revoke(&c1, 100, &[99; 16]).await,
+        pb::RevokeStatus::RateLimited
+    );
+    assert_eq!(
+        revoke(&c2, 100, &[98; 16]).await,
+        pb::RevokeStatus::RateLimited
+    );
+    env.clock.advance(Duration::from_secs(61));
+    assert_eq!(
+        revoke(&c2, 101, &[97; 16]).await,
+        pb::RevokeStatus::NotFound
+    );
+}

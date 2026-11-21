@@ -177,7 +177,7 @@ impl Gateway {
         );
         let privd = PrivdClient::new(&config.privd_socket, Default::default());
         let live = LiveSessions::new();
-        let devices = DeviceService::new(auth.clone(), privd.clone(), live.clone());
+        let devices = DeviceService::new(auth.clone(), privd.clone(), live.clone(), clock.clone());
         let login = Login::new(
             registry.clone(),
             verifiers.clone(),

@@ -14,11 +14,12 @@
 //! * Audit events are best effort with a few retries: a compromised gateway can omit or forge
 //!   them (ipc.md 6.15); the log is a tripwire, not a guarantee.
 
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hx_crypto::{Authenticator, DeviceId, DeviceRecord, RevokeReason};
+use hx_crypto::{Authenticator, Clock, DeviceId, DeviceRecord, RevokeReason};
 use hx_ipc::privd::pb::AuditEvent;
 use hx_proto::channel::MAX_DEVICE_LIST;
 use hx_proto::message::sanitize_device_name;
@@ -49,8 +50,23 @@ pub struct DeviceService {
     /// the "keep one active device" and "requester still active" checks are only sound if
     /// nothing else revokes between the check and the write.
     revoke_lock: Arc<tokio::sync::Mutex<()>>,
+    clock: Arc<dyn Clock>,
+    /// When each device asked to revoke (the rate limit holds per device, across connections).
+    revoke_times: Mutex<HashMap<DeviceId, VecDeque<std::time::Instant>>>,
+    /// Revocations of *other* devices that a device made recently, for the cooling-off rule.
+    recent: Mutex<HashMap<DeviceId, Vec<(DeviceId, std::time::Instant)>>>,
     version: AtomicU64,
 }
+
+/// Revoke requests one device may make per [`REVOKE_WINDOW`], over all its connections
+/// (protocol 5.9).
+pub const REVOKES_PER_WINDOW: usize = 10;
+/// The window of [`REVOKES_PER_WINDOW`].
+pub const REVOKE_WINDOW: Duration = Duration::from_secs(60);
+/// The cooling-off period (protocol 5.9): if a device is revoked less than this long after it
+/// revoked other devices, those revocations are undone. A thief with a stolen device and its
+/// PIN can revoke the owner's other devices, but the owner's counter-revocation wins.
+pub const COOLING_OFF: Duration = Duration::from_secs(60);
 
 /// Maps a registry record to its wire form. The name is sanitized again here: it was cleaned
 /// at pairing, but a registry file is data, not trust.
@@ -84,7 +100,12 @@ pub fn device_info(rec: &DeviceRecord, current: bool) -> pb::DeviceInfo {
 
 impl DeviceService {
     /// Creates the service.
-    pub fn new(auth: Authenticator, privd: PrivdClient, live: Arc<LiveSessions>) -> Arc<Self> {
+    pub fn new(
+        auth: Authenticator,
+        privd: PrivdClient,
+        live: Arc<LiveSessions>,
+        clock: Arc<dyn Clock>,
+    ) -> Arc<Self> {
         let (tx, _) = broadcast::channel(64);
         Arc::new(Self {
             auth,
@@ -92,6 +113,9 @@ impl DeviceService {
             live,
             tx,
             revoke_lock: Arc::new(tokio::sync::Mutex::new(())),
+            clock,
+            revoke_times: Mutex::new(HashMap::new()),
+            recent: Mutex::new(HashMap::new()),
             version: AtomicU64::new(1),
         })
     }
@@ -130,7 +154,7 @@ impl DeviceService {
     /// that a slow consumer could lag behind): audit event, closing of the device's live
     /// sessions, and the notice to the clients. `by` is the paired device that asked, or
     /// `None` for the operator and the PIN lockout; it belongs to this very revocation.
-    fn record_revoked(&self, id: DeviceId, by: Option<DeviceId>) {
+    async fn record_revoked(&self, id: DeviceId, by: Option<DeviceId>) {
         self.bump_version();
         let Ok(Some(rec)) = self.auth.registry().get(&id) else {
             return;
@@ -160,6 +184,69 @@ impl DeviceService {
             device: device_info(&rec, false),
             by,
         }));
+        // Cooling-off: a device revoked by someone else soon after it revoked others loses
+        // those revocations (a self-revoke is a sign-out, not a counter-measure).
+        if by != Some(id) {
+            self.undo_revocations_by(id).await;
+        }
+    }
+
+    /// Undoes the recent revocations that `culprit` made (it was itself just revoked): the
+    /// devices come back as active, are audited and announced as reinstated.
+    async fn undo_revocations_by(&self, culprit: DeviceId) {
+        let now = self.clock.now();
+        let victims: Vec<DeviceId> = {
+            let mut recent = self.recent.lock().unwrap_or_else(|p| p.into_inner());
+            recent
+                .remove(&culprit)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(_, at)| now.saturating_duration_since(*at) < COOLING_OFF)
+                .map(|(t, _)| t)
+                .collect()
+        };
+        for target in victims {
+            // Only a revocation that a device made is undone, never an operator's or a lockout.
+            let user_revoked = matches!(
+                self.auth.registry().get(&target),
+                Ok(Some(r)) if r.revoked.is_some_and(|v| v.reason == RevokeReason::User)
+            );
+            if !user_revoked || target == culprit {
+                continue;
+            }
+            match self.auth.reinstate(&target).await {
+                Ok(true) => {
+                    tracing::warn!(
+                        culprit = %super::util::short_id(&culprit),
+                        target = %super::util::short_id(&target),
+                        "cooling-off: a revocation made by a since-revoked device was undone"
+                    );
+                    if let Ok(Some(rec)) = self.auth.registry().get(&target) {
+                        self.announce_reinstated(&rec);
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => tracing::error!(error = %e, "undoing a revocation failed"),
+            }
+        }
+    }
+
+    /// Counts one revoke request of `requester` against the per-device limit. False if over.
+    fn allow_revoke_request(&self, requester: DeviceId) -> bool {
+        let now = self.clock.now();
+        let mut m = self.revoke_times.lock().unwrap_or_else(|p| p.into_inner());
+        let q = m.entry(requester).or_default();
+        while q
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) >= REVOKE_WINDOW)
+        {
+            q.pop_front();
+        }
+        if q.len() >= REVOKES_PER_WINDOW {
+            return false;
+        }
+        q.push_back(now);
+        true
     }
 
     /// Revokes `id` after too many wrong PINs, serialized with every other revocation. True if
@@ -173,7 +260,7 @@ impl DeviceService {
             .revoke(&id, RevokeReason::TooManyPinFailures)
             .await?;
         if done {
-            self.record_revoked(id, None);
+            self.record_revoked(id, None).await;
         }
         Ok(done)
     }
@@ -261,6 +348,9 @@ impl DeviceService {
         target: DeviceId,
     ) -> pb::RevokeStatus {
         use pb::RevokeStatus as S;
+        if !self.allow_revoke_request(requester) {
+            return S::RateLimited;
+        }
         let _serial = self.revoke_lock.lock().await;
         let records = match self.records() {
             Ok(r) => r,
@@ -288,7 +378,15 @@ impl DeviceService {
         }
         match self.auth.revoke(&target, RevokeReason::User).await {
             Ok(true) => {
-                self.record_revoked(target, Some(requester));
+                if target != requester {
+                    self.recent
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .entry(requester)
+                        .or_default()
+                        .push((target, self.clock.now()));
+                }
+                self.record_revoked(target, Some(requester)).await;
                 S::Ok
             }
             Ok(false) => S::AlreadyRevoked,
@@ -314,7 +412,7 @@ impl DeviceService {
         }
         let sessions = self.live.count_for(&target);
         if self.auth.revoke(&target, RevokeReason::User).await? {
-            self.record_revoked(target, None);
+            self.record_revoked(target, None).await;
         }
         Ok(Some(sessions))
     }

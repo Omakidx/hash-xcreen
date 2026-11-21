@@ -39,10 +39,9 @@
 //!
 //! Steps (1), (2) and (4) run in the link, behind [`super::desktop`]'s seam.
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use hx_crypto::{Clock, DeviceId, DeviceRecord};
 use hx_ipc::privd::pb::AuditEvent;
@@ -63,10 +62,6 @@ use super::privd_client::PrivdClient;
 use super::takeover::{Refusal, TakeoverLimiter, TakeoverPolicy};
 use super::util::{device_id, log_text, short_id};
 
-/// Revoke requests a connection may make per window (protocol 5.9).
-pub const REVOKES_PER_WINDOW: usize = 10;
-/// The window of [`REVOKES_PER_WINDOW`].
-pub const REVOKE_WINDOW: Duration = Duration::from_secs(60);
 /// How long delivery of a `Goodbye` is awaited (protocol 5.7).
 pub const GOODBYE_FLUSH: Duration = Duration::from_secs(1);
 /// How long a device's own old connection has to answer before it counts as dead.
@@ -185,7 +180,6 @@ impl SessionManager {
             device,
             client: None,
             token: 0,
-            revokes: VecDeque::new(),
         };
         s.run(revocations).await;
         s.cleanup().await;
@@ -374,7 +368,6 @@ struct Session {
     features: Features,
     client: Option<Arc<dyn LinkClient>>,
     token: u64,
-    revokes: VecDeque<Instant>,
 }
 
 impl Session {
@@ -574,27 +567,16 @@ impl Session {
                 }
             },
             Some(B::Revoke(r)) => {
-                let now = Instant::now();
-                while self
-                    .revokes
-                    .front()
-                    .is_some_and(|t| now.duration_since(*t) >= REVOKE_WINDOW)
-                {
-                    self.revokes.pop_front();
-                }
-                let status = if self.revokes.len() >= REVOKES_PER_WINDOW {
-                    pb::RevokeStatus::RateLimited
-                } else {
-                    self.revokes.push_back(now);
-                    match device_id(&r.device_id) {
-                        Some(target) => {
-                            self.mgr
-                                .devices
-                                .revoke_by_device(self.device.id, target)
-                                .await
-                        }
-                        None => pb::RevokeStatus::NotFound,
+                // The per-device rate limit and the cooling-off rule live in the service, so
+                // they hold across every connection of the device.
+                let status = match device_id(&r.device_id) {
+                    Some(target) => {
+                        self.mgr
+                            .devices
+                            .revoke_by_device(self.device.id, target)
+                            .await
                     }
+                    None => pb::RevokeStatus::NotFound,
                 };
                 // FAILED because the asker itself was revoked meanwhile: answer, then close.
                 requester_gone = status == pb::RevokeStatus::Failed
