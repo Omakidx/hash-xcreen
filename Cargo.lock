@@ -734,14 +734,26 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 name = "hx-agent"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "getrandom 0.4.3",
+ "hkdf",
+ "hmac",
+ "hx-agent",
  "hx-crypto",
  "hx-ipc",
  "hx-proto",
  "hx-provision",
  "hx-transport",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

@@ -1,0 +1,117 @@
+//! Where privd's files live, and the identity it serves.
+//!
+//! [`PrivdConfig::production`] is the only constructor reachable from the binary: every path is a
+//! compiled-in constant, and the gateway uid comes from the passwd entry of the compiled-in user
+//! name. There is no configuration file, environment variable or argument that changes any of
+//! this. (The tests build their own with `for_tests`, behind the `test-support` feature.)
+
+use std::path::PathBuf;
+
+use hx_provision::host::Naming;
+
+use super::identity::{FileMeta, GatewayIdentity, IdentityError, resolve_gateway_from};
+
+/// uid and gid of the desktop user inside the container, from the recipe (ipc.md 6.11).
+pub const DESKTOP_IDS: (u32, u32) = (1000, 1000);
+
+/// Everything privd needs to know about the host, fixed at construction.
+#[derive(Debug, Clone)]
+pub struct PrivdConfig {
+    /// The privd socket (`/run/hx/privd.sock`).
+    pub socket_path: PathBuf,
+    /// Mode and owner the socket must have (self-check).
+    pub expected_socket: FileMeta,
+    /// Root-only state directory (`/var/lib/hx`).
+    pub state_dir: PathBuf,
+    /// Persisted host firewall ruleset (`/etc/hx/host-firewall.nft`).
+    pub firewall_file: PathBuf,
+    /// Sysctl drop-in (`/etc/sysctl.d/90-hx-incus.conf`).
+    pub sysctl_file: PathBuf,
+    /// Append-only audit log (`/var/log/hx/audit.log`).
+    pub audit_log: PathBuf,
+    /// The Incus socket.
+    pub incus_socket: PathBuf,
+    /// Incus's data directory (pool free space is read from it).
+    pub incus_dir: PathBuf,
+    /// privd's verified `hx-session` packages (`/usr/lib/hx/session/<distro>/`).
+    pub session_store: PathBuf,
+    /// Time zone database for `Settings::with_timezone_in`.
+    pub zoneinfo_dir: PathBuf,
+    /// Passwd file.
+    pub passwd_file: PathBuf,
+    /// Group file.
+    pub group_file: PathBuf,
+    /// Names of Incus objects.
+    pub naming: Naming,
+    /// Prefix of instance names: instance = prefix + desktop id (`hx-` in production; tests of
+    /// a real Incus use their own so that every object they create is recognisable).
+    pub instance_prefix: String,
+    /// The gateway's uid and gid.
+    pub gateway: GatewayIdentity,
+    /// Most desktops that may exist (v1: 1).
+    pub max_desktops: usize,
+}
+
+impl PrivdConfig {
+    /// The production configuration. Fails if the gateway user does not exist or has uid 0.
+    pub fn production() -> Result<Self, IdentityError> {
+        let passwd_file = PathBuf::from("/etc/passwd");
+        let gateway = resolve_gateway_from(&passwd_file)?;
+        Ok(Self {
+            socket_path: "/run/hx/privd.sock".into(),
+            expected_socket: FileMeta {
+                mode: 0o660,
+                uid: 0,
+                gid: gateway.gid,
+            },
+            state_dir: "/var/lib/hx".into(),
+            firewall_file: "/etc/hx/host-firewall.nft".into(),
+            sysctl_file: "/etc/sysctl.d/90-hx-incus.conf".into(),
+            audit_log: "/var/log/hx/audit.log".into(),
+            incus_socket: "/var/lib/incus/unix.socket".into(),
+            incus_dir: "/var/lib/incus".into(),
+            session_store: "/usr/lib/hx/session".into(),
+            zoneinfo_dir: "/usr/share/zoneinfo".into(),
+            passwd_file,
+            group_file: "/etc/group".into(),
+            naming: Naming::production(),
+            instance_prefix: "hx-".into(),
+            gateway,
+            max_desktops: 1,
+        })
+    }
+
+    /// A configuration rooted in `dir` with an injected gateway identity, for tests and the
+    /// ignored real-Incus test. Not available without the `test-support` feature, and nothing in
+    /// the binary calls it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_tests(dir: &std::path::Path, gateway: GatewayIdentity) -> Self {
+        Self {
+            socket_path: dir.join("privd.sock"),
+            expected_socket: FileMeta {
+                mode: 0o755,
+                uid: rustix::process::getuid().as_raw(),
+                gid: rustix::process::getgid().as_raw(),
+            },
+            state_dir: dir.join("state"),
+            firewall_file: dir.join("host-firewall.nft"),
+            sysctl_file: dir.join("90-hx-incus.conf"),
+            audit_log: dir.join("audit.log"),
+            incus_socket: dir.join("incus.sock"),
+            incus_dir: dir.join("incus"),
+            session_store: dir.join("session"),
+            zoneinfo_dir: "/usr/share/zoneinfo".into(),
+            passwd_file: dir.join("passwd"),
+            group_file: dir.join("group"),
+            naming: Naming::production(),
+            instance_prefix: "hx-".into(),
+            gateway,
+            max_desktops: 1,
+        }
+    }
+
+    /// The Incus instance name of a desktop id (`hx-<id>`); the caller never supplies one.
+    pub fn instance_name(&self, desktop_id: &str) -> String {
+        format!("{}{desktop_id}", self.instance_prefix)
+    }
+}
