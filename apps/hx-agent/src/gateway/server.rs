@@ -367,7 +367,9 @@ const CREDENTIALS_ROOT: &str = "/run/credentials/";
 
 /// Is `path` lexically under systemd's credentials tree (no `..`)?
 fn in_credentials_dir(path: &Path) -> bool {
+    // `Path::starts_with` compares whole components, so `/run/credentialsX` does not match.
     path.starts_with(CREDENTIALS_ROOT)
+        && path != Path::new(CREDENTIALS_ROOT)
         && path
             .components()
             .all(|c| !matches!(c, std::path::Component::ParentDir))
