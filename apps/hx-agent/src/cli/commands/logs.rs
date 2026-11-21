@@ -315,6 +315,7 @@ impl AuditDir {
     }
 
     /// Device and inode of what the name refers to now (without following a symlink).
+    #[allow(clippy::unnecessary_cast)] // st_dev and st_ino are not u64 on every target
     fn ident(&self) -> Option<(u64, u64)> {
         rustix::fs::statat(&self.dir, self.name.as_os_str(), AtFlags::SYMLINK_NOFOLLOW)
             .ok()
