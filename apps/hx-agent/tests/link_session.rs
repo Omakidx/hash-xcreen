@@ -1063,7 +1063,7 @@ async fn link_loss_restart_supersede_and_goodbye() {
             }
             LinkEvent::Closed(c) => {
                 assert!(goodbye, "goodbye precedes the close");
-                assert_eq!(c.class, FailureClass::Closed);
+                assert_eq!(c.class, FailureClass::SessionGoodbye);
                 break;
             }
             LinkEvent::Frame(f) => {

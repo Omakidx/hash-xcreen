@@ -419,6 +419,40 @@ mod tests {
     }
 
     #[test]
+    fn repeated_session_goodbyes_back_off_and_end_in_unavailable() {
+        // Review M4: a goodbye used to be `Closed`, which has no backoff and no fault, so a
+        // hostile session could force unthrottled redials.
+        let t0 = Instant::now();
+        let mut p = ReconnectPolicy::new();
+        let waits: Vec<_> = (0..4)
+            .map(|i| {
+                p.on_failure(secs(t0, i), FailureClass::SessionGoodbye)
+                    .redial_after
+                    .as_secs()
+            })
+            .collect();
+        assert_eq!(waits, [1, 2, 4, 8]);
+        // The fifth within ten minutes asks for a restart, like any fault; three such rounds
+        // make the desktop unavailable.
+        assert!(
+            p.on_failure(secs(t0, 4), FailureClass::SessionGoodbye)
+                .ask_restart
+        );
+        for round in 1..3u64 {
+            for i in 0..5 {
+                p.on_failure(secs(t0, round * 100 + i), FailureClass::SessionGoodbye);
+            }
+        }
+        let mut last = None;
+        for i in 0..5 {
+            last = Some(p.on_failure(secs(t0, 400 + i), FailureClass::SessionGoodbye));
+        }
+        assert_eq!(last.unwrap().state, DesktopState::SessionUnavailable);
+        assert!(FailureClass::SessionGoodbye.is_fault());
+        assert!(!FailureClass::Closed.is_fault());
+    }
+
+    #[test]
     fn outdated_asks_for_an_install_and_a_deliberate_close_needs_no_redial() {
         let t0 = Instant::now();
         let mut p = ReconnectPolicy::new();

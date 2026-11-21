@@ -52,7 +52,8 @@
 //!   [`SessionInfo::software`] are log-only). The only text that may reach a client is a file
 //!   name in a [`TransferEvent::Open`], which has passed the protocol.md validation.
 //! * Report [`LinkEvent::Closed`] to [`DesktopLink::on_closed`] and send the client
-//!   `Goodbye(INTERNAL_ERROR)` for any class except [`FailureClass::Closed`].
+//!   `Goodbye(INTERNAL_ERROR)` for any class except [`FailureClass::Closed`] (an owner's
+//!   own close).
 //!
 //! # Structure and bounds
 //!

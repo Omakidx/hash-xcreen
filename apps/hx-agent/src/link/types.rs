@@ -227,14 +227,23 @@ pub enum FailureClass {
     /// The link stopped working without the session misbehaving: it went silent (liveness), a
     /// write on `ctl` stalled, the connection broke while running. Counts as a fault.
     Fault,
-    /// Closed on purpose: the owner closed the link, or the session said goodbye.
+    /// The session said goodbye. Unlike an owner's close this is the session's doing, so it
+    /// counts as a fault and is redialled with backoff: a hostile session cannot make the
+    /// gateway redial without throttle by saying goodbye in a loop (review M4). A real shutdown
+    /// of the daemon costs one fault.
+    SessionGoodbye,
+    /// Closed on purpose by the owner of the link (a close, or every handle dropped).
     Closed,
 }
 
 impl FailureClass {
-    /// True for the classes that count toward "5 faults in 10 minutes" (violations and faults).
+    /// True for the classes that count toward "5 faults in 10 minutes" (violations, faults and
+    /// a session goodbye).
     pub fn is_fault(self) -> bool {
-        matches!(self, FailureClass::Violation | FailureClass::Fault)
+        matches!(
+            self,
+            FailureClass::Violation | FailureClass::Fault | FailureClass::SessionGoodbye
+        )
     }
 }
 

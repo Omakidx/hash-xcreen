@@ -125,7 +125,10 @@ fn on_session_message(sh: &Arc<Shared>, m: pb::SessionToGateway) -> Result<(), F
         M::Goodbye(g) => {
             sh.inbox
                 .push_event(LinkEvent::SessionGoodbye { code: g.code });
-            return Err((FailureClass::Closed, "the session said goodbye".into()));
+            return Err((
+                FailureClass::SessionGoodbye,
+                "the session said goodbye".into(),
+            ));
         }
     }
     Ok(())
