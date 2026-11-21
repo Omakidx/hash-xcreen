@@ -34,9 +34,11 @@ groups = ["sudo", "audio", "video"]
 linger = true
 
 [services]
-system_enable = ["hx-xorg.service"]
+# hx-session.socket is the only session unit that is enabled: systemd holds the socket and starts
+# hx-session.service (no [Install] section) on the first connection.
+system_enable = ["hx-xorg.service", "hx-session.socket"]
 # Enabled for every user manager (the desktop user's lingering manager starts them at boot).
-user_enable_global = ["hx-session.service", "pipewire.socket", "pipewire-pulse.socket", "wireplumber.service"]
+user_enable_global = ["hx-xsession.service", "pipewire.socket", "pipewire-pulse.socket", "wireplumber.service"]
 
 [[file]]
 path = "/etc/hx/xorg-dummy.conf"
@@ -94,8 +96,10 @@ RestartSec=2
 WantedBy=multi-user.target
 '''
 
+# The XFCE session. A *user* unit of the desktop user's lingering manager. It was called
+# hx-session.service until ipc.md 6.11 gave that name to the streaming daemon (below).
 [[file]]
-path = "/etc/systemd/user/hx-session.service"
+path = "/etc/systemd/user/hx-xsession.service"
 content = '''
 [Unit]
 Description=XFCE session on :0
@@ -110,6 +114,99 @@ RestartSec=2
 
 [Install]
 WantedBy=default.target
+'''
+
+# ---- hx-session: the streaming daemon (ipc.md 6.11, 11 and 21 item 3) -------------------------
+#
+# The daemon binary and its package are not part of the image: privd installs the hx-session
+# package (InstallSession) at SESSION_BINARY = /usr/lib/hx-session/hx-session (see
+# crates/hx-provision/src/session.rs; a test keeps this path and that constant equal).
+#
+# Socket: /run/hx-session is root:root 0755 (made by tmpfiles at boot, so the desktop user can
+# neither rename nor replace the socket path); the socket is created by this system unit, owned by
+# the desktop uid (the group is that user's primary group) with mode 0600, and handed to the
+# service on the first connection. `Accept=no`: one daemon handles all connections.
+[[file]]
+path = "/etc/tmpfiles.d/hx-session.conf"
+content = '''
+# Root-owned directory for the session socket; the unprivileged user cannot replace entries in it.
+d /run/hx-session 0755 root root -
+# Where hx-session may write received files (the only ReadWritePaths of hx-session.service).
+# Owned by the desktop user; ~/Received links here.
+d /var/lib/hx-session 0755 root root -
+d /var/lib/hx-session/received 0700 {{uid}} - -
+'''
+
+[[file]]
+path = "/etc/systemd/system/hx-session.socket"
+content = '''
+[Unit]
+Description=hash-xcreen session link socket
+After=systemd-tmpfiles-setup.service
+Wants=systemd-tmpfiles-setup.service
+
+[Socket]
+ListenStream=/run/hx-session/link.sock
+SocketUser={{uid}}
+SocketMode=0600
+DirectoryMode=0755
+Accept=no
+
+[Install]
+WantedBy=sockets.target
+'''
+
+# Runs as the desktop user, outside its login session (no PAM session): DISPLAY, XAUTHORITY and
+# XDG_RUNTIME_DIR are explicit. Started by the socket; there is deliberately no [Install] section.
+#
+# Not set, on purpose: PrivateNetwork (it would hide Xorg's abstract socket), PrivateTmp (it would
+# hide /tmp/.X11-unix), PrivateDevices (later GPU encode and audio need /dev/dri and /dev/snd).
+# Restart policy: five-second back-off and a start-rate window that a crash loop only exhausts
+# after about a minute, so a brief fault does not leave the unit in the failed state; when it
+# does, RestartSession runs `systemctl reset-failed` first (ipc.md 6.11).
+# hx-session must never launch user-facing programs; KillMode=control-group makes sure that
+# anything it does start dies with it.
+[[file]]
+path = "/etc/systemd/system/hx-session.service"
+content = '''
+[Unit]
+Description=hash-xcreen session daemon (screen capture and streaming for {{user}})
+Requires=hx-session.socket
+After=hx-session.socket hx-xorg.service user@{{uid}}.service
+Wants=hx-xorg.service
+StartLimitIntervalSec=120
+StartLimitBurst=20
+
+[Service]
+Type=simple
+User={{uid}}
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/run/hx-xorg/Xauthority
+Environment=XDG_RUNTIME_DIR=/run/user/{{uid}}
+ExecStart=/usr/lib/hx-session/hx-session
+KillMode=control-group
+Restart=on-failure
+RestartSec=5
+TasksMax=512
+MemoryMax=2G
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/hx-session/received
+LockPersonality=yes
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+UMask=0077
 '''
 
 # Virtual output so PipeWire has a sink to capture even without sound hardware.
@@ -129,6 +226,14 @@ context.objects = [
   }
 ]
 '''
+
+# Files received through hx-session land in /var/lib/hx-session/received (the one directory that
+# hx-session.service may write); the link makes them visible in the home directory. The link
+# target is absolute, so renaming the account (which moves the home) does not break it.
+[[step]]
+name = "received-link"
+as_user = true
+run = 'ln -sfn /var/lib/hx-session/received "$HOME/Received"'
 
 # Last build step: drop apt caches and lists so the published image is smaller.
 # (The post stage runs `apt-get update` itself before upgrading.)

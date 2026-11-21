@@ -15,7 +15,8 @@ getting a desktop (architecture section 4.3):
 ```
 recipes/
   <distro>-<desktop>-<preset>.toml     one file per shipped combination (the "recipes")
-  fragments/xfce-desktop.toml          headless Xorg + XFCE + PipeWire (distro independent)
+  fragments/xfce-desktop.toml          headless Xorg + XFCE + PipeWire + the hx-session units (distro independent)
+  fragments/settings.toml              post steps for hostname, timezone, locale, keyboard
   fragments/distro-<distro>.toml       base image, vars, browser, per-distro apt repositories
   fragments/preset-<preset>.toml       basic, developer
   addons/docker.toml                   opt-in add-ons, chosen at resolve time
@@ -85,6 +86,20 @@ is supplied by the caller at run time and reaches the container only as the stdi
 the vendor installers in `post_step` do not.
 
 An escaped `\{{` produces a literal `{{` (for example in a Go template inside a script).
+
+## Units inside the desktop
+
+| Unit | Kind | Runs | Notes |
+|---|---|---|---|
+| `hx-xorg.service` | system | headless Xorg on `:0` | cookie in `/run/hx-xorg/Xauthority`, owned by the desktop uid |
+| `hx-xsession.service` | user (lingering manager) | `xfce4-session` | formerly `hx-session.service`; renamed when that name went to the streaming daemon |
+| `hx-session.socket` | system | creates `/run/hx-session/link.sock` | owner = desktop uid, mode 0600; the directory is root:root 0755 (tmpfiles), so the user cannot replace the path |
+| `hx-session.service` | system, `User=1000`, started by the socket | `/usr/lib/hx-session/hx-session` | hardened (`NoNewPrivileges`, empty capability set, `AF_UNIX` only, `ProtectSystem=strict`, the only writable path is `/var/lib/hx-session/received`, `KillMode=control-group`); **no** `PrivateNetwork`, `PrivateTmp` or `PrivateDevices` |
+
+The binary is not in the image: the `hx-session` package installs it at
+`/usr/lib/hx-session/hx-session` (the `hx_provision::session` constants are the source of truth and
+a test keeps the units in step). The same package ships `/usr/lib/hx-session/hx-pwcheck`, the
+current-password checker. `~/Received` links to `/var/lib/hx-session/received`.
 
 ## Adding a recipe
 

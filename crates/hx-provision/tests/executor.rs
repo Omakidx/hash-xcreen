@@ -408,7 +408,7 @@ fn file_and_user_steps_lower_to_quoted_commands() {
     let s = script_of(&lower(svc, &Secrets::none()).unwrap()[0]).to_string();
     assert!(
         s.contains("systemctl enable 'docker.service'")
-            && s.contains("systemctl --global enable 'hx-session.service'")
+            && s.contains("systemctl --global enable 'hx-xsession.service'")
     );
     assert!(s.contains("loginctl enable-linger 'desk'"));
 }
