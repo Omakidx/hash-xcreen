@@ -269,7 +269,7 @@ pub fn config_run(ctx: &mut Ctx<'_>) -> Result<Outcome> {
             "the nameserver(s) {list} in resolv.conf were not allowed for the update fetcher (loopback, link-local and multicast addresses are never allowed: the allowance has no port limit); CheckUpdate needs systemd-resolved or a private resolver"
         );
         ctx.warn("config", &note);
-        if !ctx.state.notes.iter().any(|n| *n == note) {
+        if !ctx.state.notes.contains(&note) {
             ctx.state.notes.push(note);
         }
     }
