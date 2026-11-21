@@ -1,6 +1,6 @@
 # Spike 1C: Incus proxy-device semantics for the session link
 
-Status: run complete (2026-11-21), local Incus 6.0.0 with an isolated idmap. **Verdict: PASS, with two amendments to the wording of ipc.md §11 (section 7) and two items that were not run (section 8).** Verified first, before any code builds on the link, as ipc.md §22 decision 10 requires. Contract under test: [ipc.md](../ipc.md) §11 ("Must be verified first"), items 1 to 4.
+Status: run complete (2026-11-21), local Incus 6.0.0 with an isolated idmap. **Verdict: PASS (items 1 and 3 hold; items 2 and 4 hold except the sub-items not run), with two amendments to the wording of ipc.md §11 (section 7) and two items that were not run (section 8).** Verified first, before any code builds on the link, as ipc.md §22 decision 10 requires. Contract under test: [ipc.md](../ipc.md) §11 ("Must be verified first"), items 1 to 4.
 
 ## 1. Goal
 
@@ -100,7 +100,7 @@ incus config device add hx3a-link hx-link proxy bind=host \
 
 ## 6. Verdict
 
-PASS. All four items hold on Incus 6.0.0 with an isolated idmap, within the limits listed in section 8. No design change is required, and the link side of `hx-ipc` may be built as specified.
+PASS. Items 1 and 3 hold on Incus 6.0.0 with an isolated idmap. Items 2 and 4 hold except the sub-items listed in section 8 that were not run (host reboot, Incus daemon restart, the unprivileged-user-namespace attack as uid 1000), to be repeated on the first real VPS. No design change is required, and the link side of `hx-ipc` may be built as specified.
 
 ## 7. Amendments to ipc.md §11 (small, no design change)
 
