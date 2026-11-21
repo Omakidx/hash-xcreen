@@ -4,6 +4,8 @@
 //! an operation, which the client waits for (`GET /1.0/operations/<id>/wait`) up to a deadline and
 //! cancels when the deadline passes.
 
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -13,6 +15,7 @@ use serde_json::{Value, json};
 
 use super::error::IncusError;
 use super::link::{LinkOutcome, SESSION_LINK_DEVICE, SessionLink};
+use super::operation::{OperationEnd, OperationId};
 use super::transport::{Request, Response, Transport, UnixTransport};
 use super::types::{
     Acl, ExecResult, ExecSpec, Instance, InstanceCreate, InstanceState, Network, Operation,
@@ -147,17 +150,19 @@ fn op_path(env: &Envelope) -> Result<String, IncusError> {
 }
 
 /// Typed client for the parts of the Incus API that provisioning uses.
+///
+/// A client remembers the background operations it is currently waiting for (see
+/// [`Client::in_flight_operations`]); clones share that memory, [`Client::scoped`] starts a new one.
 #[derive(Debug, Clone)]
 pub struct Client<T: Transport> {
     transport: T,
+    in_flight: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl Client<UnixTransport> {
     /// Connect to the daemon's unix socket (default `/var/lib/incus/unix.socket`).
     pub fn unix(path: impl Into<std::path::PathBuf>) -> Self {
-        Self {
-            transport: UnixTransport::new(path),
-        }
+        Self::new(UnixTransport::new(path))
     }
 
     /// Connect to the default socket.
@@ -169,7 +174,142 @@ impl Client<UnixTransport> {
 impl<T: Transport> Client<T> {
     /// Use any transport (tests).
     pub fn new(transport: T) -> Self {
-        Self { transport }
+        Self {
+            transport,
+            in_flight: Arc::default(),
+        }
+    }
+
+    /// A client for the same daemon with its **own** set of in-flight operations. `hx-privd`
+    /// makes one per request, so that cancelling a request cancels only the operations that
+    /// request started.
+    pub fn scoped(&self) -> Self
+    where
+        T: Clone,
+    {
+        Self::new(self.transport.clone())
+    }
+
+    // --- operations (cancel and wait; ipc.md 4) ------------------------------------------------
+
+    fn track(&self, id: &str) {
+        if let Ok(mut s) = self.in_flight.lock() {
+            s.insert(id.to_string());
+        }
+    }
+
+    fn untrack(&self, id: &str) {
+        if let Ok(mut s) = self.in_flight.lock() {
+            s.remove(id);
+        }
+    }
+
+    /// The background operations this client (and its clones) started and has not seen end.
+    ///
+    /// Dropping a future from this crate does **not** stop its Incus operation, and does not
+    /// remove it from this list: that is the point. After a cancel, call
+    /// [`Client::cancel_in_flight`] (or [`Client::cancel_operation`] and
+    /// [`Client::wait_operation_end`] per id). An operation is listed from the moment its id is
+    /// known; one that the daemon created while the request was still on the wire when the future
+    /// was dropped is not known to the client (check the instance state during cleanup).
+    pub fn in_flight_operations(&self) -> Vec<OperationId> {
+        self.in_flight
+            .lock()
+            .map(|s| s.iter().cloned().map(OperationId).collect())
+            .unwrap_or_default()
+    }
+
+    /// Ask the daemon to cancel an operation (`DELETE /1.0/operations/<id>`). `Ok(false)`: it no
+    /// longer exists (already finished). The operation may take a moment to end; follow with
+    /// [`Client::wait_operation_end`].
+    pub async fn cancel_operation(&self, id: &OperationId) -> Result<bool, IncusError> {
+        match self
+            .envelope(
+                Method::DELETE,
+                format!("/1.0/operations/{}", id.0),
+                None::<&Value>,
+                Duration::from_secs(10),
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) if e.is_not_found() => {
+                self.untrack(&id.0);
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Wait until an operation has ended, for at most `timeout` (`IncusError::Timeout` if it has
+    /// not). An operation the daemon no longer knows has ended ([`OperationEnd::Gone`]).
+    pub async fn wait_operation_end(
+        &self,
+        id: &OperationId,
+        timeout: Duration,
+    ) -> Result<OperationEnd, IncusError> {
+        let started = Instant::now();
+        loop {
+            let left = timeout.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                return Err(IncusError::Timeout {
+                    what: format!("operation {} to end", id.0),
+                    after: timeout,
+                });
+            }
+            let secs = (left.as_secs_f64().ceil() as u64).clamp(1, WAIT_SLICE.as_secs());
+            match self
+                .envelope(
+                    Method::GET,
+                    format!("/1.0/operations/{}/wait?timeout={secs}", id.0),
+                    None::<&Value>,
+                    Duration::from_secs(secs) + Duration::from_secs(20),
+                )
+                .await
+            {
+                Ok(env) => {
+                    let op = Operation::from_value(&env.metadata)?;
+                    if op.is_terminal() {
+                        self.untrack(&id.0);
+                        return Ok(match op.status_code {
+                            200 => OperationEnd::Success,
+                            401 => OperationEnd::Cancelled,
+                            _ => OperationEnd::Failed(op.err),
+                        });
+                    }
+                }
+                Err(e) if e.is_not_found() => {
+                    self.untrack(&id.0);
+                    return Ok(OperationEnd::Gone);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Cancel every in-flight operation of this client and wait until all have ended, for at most
+    /// `wait` in total (ipc.md 4 uses 30 s). Returns how many were cancelled. `Err` carries the
+    /// operations that did not end in time: the caller must not start new work on the same
+    /// instance (`STUCK_OPERATION`).
+    pub async fn cancel_in_flight(&self, wait: Duration) -> Result<usize, Vec<OperationId>> {
+        let ids = self.in_flight_operations();
+        let deadline = Instant::now() + wait;
+        for id in &ids {
+            // An operation that cannot be cancelled is still waited for below.
+            let _ = self.cancel_operation(id).await;
+        }
+        let mut stuck = Vec::new();
+        for id in &ids {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if self.wait_operation_end(id, left).await.is_err() {
+                stuck.push(id.clone());
+            }
+        }
+        if stuck.is_empty() {
+            Ok(ids.len())
+        } else {
+            Err(stuck)
+        }
     }
 
     // --- plumbing ------------------------------------------------------------------------
@@ -270,6 +410,10 @@ impl<T: Transport> Client<T> {
         what: &str,
     ) -> Result<Operation, IncusError> {
         let started = Instant::now();
+        let tracked = path.strip_prefix("/1.0/operations/").unwrap_or_default();
+        if !tracked.is_empty() {
+            self.track(tracked);
+        }
         loop {
             let elapsed = started.elapsed();
             if elapsed >= deadline {
@@ -299,9 +443,20 @@ impl<T: Transport> Client<T> {
                     None::<&Value>,
                     Duration::from_secs(secs) + Duration::from_secs(20),
                 )
-                .await?;
+                .await;
+            let env = match env {
+                Ok(e) => e,
+                Err(e) => {
+                    // An operation the daemon no longer knows has ended; keep other errors tracked.
+                    if e.is_not_found() {
+                        self.untrack(tracked);
+                    }
+                    return Err(e);
+                }
+            };
             let op = Operation::from_value(&env.metadata)?;
             if op.is_terminal() {
+                self.untrack(tracked);
                 return match op.status_code {
                     200 => Ok(op),
                     401 => Err(IncusError::Operation(format!("{what}: cancelled"))),

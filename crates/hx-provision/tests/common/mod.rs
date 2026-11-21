@@ -89,6 +89,12 @@ pub struct State {
     pub overrides: HashMap<String, (u16, String)>,
     /// Never complete operations.
     pub stuck_ops: bool,
+    /// Operations a `DELETE` has been received for (they then wait as `Cancelled`).
+    pub cancelled_ops: std::collections::HashSet<String>,
+    /// Operations the daemon has purged (404).
+    pub forgotten_ops: std::collections::HashSet<String>,
+    /// Accept `DELETE /operations/<id>` but never end the operation.
+    pub refuse_cancel: bool,
 }
 
 impl State {
@@ -118,6 +124,9 @@ impl State {
             next: 0,
             overrides: HashMap::new(),
             stuck_ops: false,
+            cancelled_ops: Default::default(),
+            forgotten_ops: Default::default(),
+            refuse_cancel: false,
         }
     }
 }
@@ -357,6 +366,14 @@ impl State {
                 sync(Value::Array(items))
             }
             ("GET", ["1.0", "operations", id, "wait"]) => {
+                if self.forgotten_ops.contains(*id) {
+                    return not_found("operation");
+                }
+                if self.cancelled_ops.contains(*id) {
+                    return sync(
+                        json!({"id":id,"status":"Cancelled","status_code":401,"metadata":null,"err":""}),
+                    );
+                }
                 if self.stuck_ops {
                     return sync(
                         json!({"id":id,"status":"Running","status_code":103,"metadata":null,"err":""}),
@@ -374,7 +391,15 @@ impl State {
                     None => not_found("operation"),
                 }
             }
-            ("DELETE", ["1.0", "operations", _]) => sync(Value::Null),
+            ("DELETE", ["1.0", "operations", id]) => {
+                if self.forgotten_ops.contains(*id) {
+                    return not_found("operation");
+                }
+                if !self.refuse_cancel {
+                    self.cancelled_ops.insert(id.to_string());
+                }
+                sync(Value::Null)
+            }
             _ => (
                 599,
                 format!("fake incus: unhandled {} {}", r.method, r.path),

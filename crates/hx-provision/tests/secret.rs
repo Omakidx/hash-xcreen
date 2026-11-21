@@ -10,7 +10,7 @@ trait AmbiguousIfClone<A> {
     fn method() {}
 }
 impl<T: ?Sized> AmbiguousIfClone<()> for T {}
-impl<T: ?Sized + Clone> AmbiguousIfClone<u8> for T {}
+impl<T: Clone> AmbiguousIfClone<u8> for T {}
 
 macro_rules! assert_not_clone {
     ($($t:ty),+ $(,)?) => { $( let _ = <$t as AmbiguousIfClone<_>>::method; )+ };

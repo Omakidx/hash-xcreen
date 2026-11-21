@@ -8,6 +8,7 @@
 mod client;
 mod error;
 mod link;
+mod operation;
 mod transport;
 mod types;
 mod version;
@@ -18,6 +19,7 @@ pub use link::{
     LinkOutcome, SESSION_LINK_CONNECT, SESSION_LINK_DEVICE, SESSION_LINK_HOST_DIR,
     SESSION_LINK_MODE, SessionLink,
 };
+pub use operation::{OperationEnd, OperationId};
 pub use transport::{MAX_BODY, Request, Response, Transport, UnixTransport};
 pub use types::{
     Acl, AclAction, AclRule, ExecResult, ExecSpec, IMAGES_SERVER, ImageSource, Instance,
