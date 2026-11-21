@@ -169,6 +169,26 @@ impl<T: Transport> Executor for IncusExecutor<'_, T> {
                     .push_dir(&self.instance, WORK_DIR, 0o700)
                     .await
                     .map_err(backend)?;
+                // `push_dir` leaves an existing directory alone, so check what is there: a
+                // secret goes only into a real directory that is root-owned and 0700 (a container
+                // that ran user code could have pre-created it with other owner or mode).
+                match self
+                    .client
+                    .stat_path(&self.instance, WORK_DIR)
+                    .await
+                    .map_err(backend)?
+                {
+                    Some(st) if st.kind == "directory" && st.uid == 0 && st.mode == 0o700 => {}
+                    other => {
+                        return Err(ExecError::Backend(format!(
+                            "{WORK_DIR} is not a root-owned 0700 directory ({}); refusing to write a secret into it",
+                            other.map_or("missing".to_string(), |s| format!(
+                                "{} uid {} mode {:o}",
+                                s.kind, s.uid, s.mode
+                            ))
+                        )));
+                    }
+                }
                 let path = format!("{WORK_DIR}/{}", unique_name("stdin"));
                 if let Err(e) = self
                     .client

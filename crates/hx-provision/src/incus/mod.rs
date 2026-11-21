@@ -15,7 +15,7 @@ mod transport;
 mod types;
 mod version;
 
-pub use client::Client;
+pub use client::{Client, PathStat};
 pub use error::IncusError;
 pub use limits::{LimitsApplied, LimitsUpdate, MAX_CPU, MAX_DISK_GIB, MAX_MEMORY_MIB};
 pub use link::{

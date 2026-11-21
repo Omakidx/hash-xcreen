@@ -1197,6 +1197,75 @@ impl<T: Transport> Client<T> {
         }
     }
 
+    /// Owner, mode and type of a path in an instance (`GET .../files`, the `X-Incus-*` headers),
+    /// without reading its content. `Ok(None)` when it does not exist.
+    pub async fn stat_path(
+        &self,
+        instance: &str,
+        path: &str,
+    ) -> Result<Option<PathStat>, IncusError> {
+        let name = checked("instance", instance)?;
+        if !path.starts_with('/') || path.contains('\0') {
+            return Err(IncusError::InvalidArgument(format!(
+                "file path `{path}` must be absolute"
+            )));
+        }
+        let r = self
+            .transport
+            .send(Request {
+                method: Method::GET,
+                path: format!("/1.0/instances/{name}/files?path={}", encode_query(path)),
+                headers: Vec::new(),
+                body: Bytes::new(),
+                content_type: None,
+                // Only the headers matter, but for a directory the body is its listing: allow a
+                // modest one. Anything larger is reported as `kind: "unknown"` (fail closed for
+                // the caller that wants a private directory).
+                max_response: Some(64 * 1024),
+                timeout: READ_FILE_TIMEOUT,
+            })
+            .await;
+        let r = match r {
+            Ok(r) => r,
+            Err(IncusError::TooLarge { .. }) => {
+                return Ok(Some(PathStat {
+                    kind: "unknown".into(),
+                    uid: u32::MAX,
+                    gid: u32::MAX,
+                    mode: 0,
+                }));
+            }
+            Err(e) => return Err(e),
+        };
+        if r.status >= 400 {
+            return match parse_envelope(r.status, &r.body) {
+                Err(e) if e.is_not_found() => Ok(None),
+                Err(e) => Err(e),
+                Ok(_) => Err(IncusError::Protocol(
+                    "error status with a success body".into(),
+                )),
+            };
+        }
+        let num = |k: &str| r.headers.get(k).and_then(|v| v.trim().parse::<u32>().ok());
+        let (Some(uid), Some(gid), Some(mode)) = (
+            num("x-incus-uid"),
+            num("x-incus-gid"),
+            r.headers
+                .get("x-incus-mode")
+                .and_then(|v| u32::from_str_radix(v.trim(), 8).ok()),
+        ) else {
+            return Err(IncusError::Protocol(format!(
+                "no owner or mode headers for `{path}`"
+            )));
+        };
+        Ok(Some(PathStat {
+            kind: r.headers.get("x-incus-type").cloned().unwrap_or_default(),
+            uid,
+            gid,
+            mode: mode & 0o7777,
+        }))
+    }
+
     /// Delete a file in an instance (a missing file is not an error).
     pub async fn delete_file(&self, instance: &str, path: &str) -> Result<(), IncusError> {
         let name = checked("instance", instance)?;
@@ -1324,6 +1393,19 @@ impl<T: Transport> Client<T> {
             })
             .collect()
     }
+}
+
+/// Owner, mode and type of a path in an instance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathStat {
+    /// `file`, `directory` or `symlink`.
+    pub kind: String,
+    /// Owner uid as seen inside the instance (`u32::MAX` when not read).
+    pub uid: u32,
+    /// Owner gid as seen inside the instance (`u32::MAX` when not read).
+    pub gid: u32,
+    /// Permission bits (`0o7777` mask).
+    pub mode: u32,
 }
 
 /// Owner of a secret request body: zeroized when the last `Bytes` that refers to it is dropped.

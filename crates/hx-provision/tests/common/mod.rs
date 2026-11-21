@@ -78,6 +78,10 @@ pub struct State {
     pub instance_patches: u32,
     /// Purge the operation of every `PATCH /1.0/instances/<n>` (its `/wait` answers 404).
     pub purge_patch_ops: bool,
+    /// Directories pushed (or preset), by path: (uid, gid, mode). An existing one is kept.
+    pub dirs: HashMap<String, (u32, u32, u32)>,
+    /// Extra headers for the response being built.
+    pub last_headers: Vec<(String, String)>,
     /// Bodies of accepted `PUT /1.0/instances/<n>`.
     pub put_bodies: Vec<Value>,
     /// Accept (and purge, if `purge_patch_ops`) but do not apply `PATCH`es after this many.
@@ -134,6 +138,8 @@ impl State {
             default_file_type: None,
             instance_patches: 0,
             purge_patch_ops: false,
+            dirs: HashMap::new(),
+            last_headers: Vec::new(),
             put_bodies: Vec::new(),
             drop_patches_after: None,
             versions: HashMap::new(),
@@ -414,6 +420,18 @@ impl State {
                 let p = query_path(&r.path);
                 if r.headers.get("x-incus-type").map(String::as_str) != Some("directory") {
                     self.files.insert(p.clone(), r.body.clone());
+                } else {
+                    let num = |k: &str| r.headers.get(k).and_then(|v| v.parse::<u32>().ok());
+                    let mode = r
+                        .headers
+                        .get("x-incus-mode")
+                        .and_then(|v| u32::from_str_radix(v, 8).ok())
+                        .unwrap_or(0o755);
+                    self.dirs.entry(p.clone()).or_insert((
+                        num("x-incus-uid").unwrap_or(0),
+                        num("x-incus-gid").unwrap_or(0),
+                        mode,
+                    ));
                 }
                 if self.fail_stdin_push_after_store && p.contains("/stdin-") {
                     return (
@@ -422,6 +440,18 @@ impl State {
                     );
                 }
                 sync(Value::Null)
+            }
+            ("GET", ["1.0", "instances", _, "files"])
+                if self.dirs.contains_key(&query_path(&r.path))
+                    && !self.files.contains_key(&query_path(&r.path)) =>
+            {
+                let (u, g, m) = self.dirs[&query_path(&r.path)];
+                self.last_headers = vec![
+                    ("X-Incus-uid".into(), u.to_string()),
+                    ("X-Incus-gid".into(), g.to_string()),
+                    ("X-Incus-mode".into(), format!("{m:04o}")),
+                ];
+                (200, "[]".to_string())
             }
             ("GET", ["1.0", "instances", _, "files"]) => match self.files.get(&query_path(&r.path))
             {
@@ -616,11 +646,16 @@ impl Fake {
                                 headers,
                                 body,
                             };
-                            let (status, text, ftype, etag) = {
+                            let (status, text, ftype, etag, extra) = {
                                 let mut s = st.lock().unwrap();
                                 s.log.push(rec.clone());
                                 let ft = (rec.method == "GET" && rec.path.contains("/files?path="))
                                     .then(|| {
+                                        if s.dirs.contains_key(&query_path(&rec.path))
+                                            && !s.files.contains_key(&query_path(&rec.path))
+                                        {
+                                            return "directory".to_string();
+                                        }
                                         s.file_types
                                             .get(&query_path(&rec.path))
                                             .cloned()
@@ -628,12 +663,22 @@ impl Fake {
                                             .unwrap_or_else(|| "file".to_string())
                                     });
                                 s.last_etag = None;
+                                s.last_headers.clear();
                                 let (status, text) = s.handle(&rec);
-                                (status, text, ft, s.last_etag.take())
+                                (
+                                    status,
+                                    text,
+                                    ft,
+                                    s.last_etag.take(),
+                                    std::mem::take(&mut s.last_headers),
+                                )
                             };
+                            let mut builder = Response::builder().status(status);
+                            for (k, v) in &extra {
+                                builder = builder.header(k.as_str(), v.as_str());
+                            }
                             Ok::<_, std::convert::Infallible>(
-                                Response::builder()
-                                    .status(status)
+                                builder
                                     .header("X-Incus-Type", ftype.unwrap_or_default())
                                     .header("Content-Type", "application/json")
                                     .header("ETag", etag.unwrap_or_default())
