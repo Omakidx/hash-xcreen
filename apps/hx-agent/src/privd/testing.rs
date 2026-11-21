@@ -768,6 +768,17 @@ impl Harness {
             },
         );
         let socket = cfg.socket_path.clone();
+        // Clean account files: the per-accept group check reads the group file.
+        std::fs::write(
+            &cfg.passwd_file,
+            format!("root:x:0:0::/root:/bin/sh\nhx-gatewayd:x:{gateway_uid}:{gateway_uid}::/:/usr/sbin/nologin\n"),
+        )
+        .expect("passwd");
+        std::fs::write(
+            &cfg.group_file,
+            format!("root:x:0:\nhx-gatewayd:x:{gateway_uid}:\n"),
+        )
+        .expect("group");
         let audit = Arc::new(MemoryAudit::default());
         let clock = Arc::new(ManualClock::new(1_800_000_000));
         let daemon = Daemon::new(

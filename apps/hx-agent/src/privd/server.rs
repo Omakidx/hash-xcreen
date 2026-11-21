@@ -295,6 +295,14 @@ async fn serve_connection<T: Transport + Clone + 'static>(d: Arc<Daemon<T>>, str
         d.audit_notice(&format!("refused a connection from uid {}", peer.uid));
         return;
     };
+    if role == Role::Gateway
+        && let Err(why) = d.check_gateway_peer(&stream, peer.gid)
+    {
+        log::error(&format!("refused a Gateway connection: {why}"));
+        d.audit_notice(&format!("refused a Gateway connection: {why}"));
+        d.set_flag(None, super::state::Flag::HostAccountPolicy, true);
+        return;
+    }
     let Some(_slot) = d.admit_connection(role) else {
         log::warn("too many connections for this role; closing");
         return;

@@ -911,3 +911,36 @@ async fn l1_a_cancel_during_the_create_post_stage_waits_for_the_sweep_before_the
     );
     assert!(h.incus.instance_names().is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn l6_a_gateway_peer_holding_a_forbidden_group_is_refused_at_accept() {
+    let h = Harness::start(me());
+    let mut ok_client = h.connect();
+    assert_eq!(ok_client.hello().role(), Role::Gateway);
+    // One of this process's own gids becomes a forbidden group in the account files.
+    let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut gids = hx_agent::privd::peergroups::peer_groups(&a).unwrap();
+    gids.push(rustix::process::getgid().as_raw());
+    let gid = gids[0];
+    std::fs::write(
+        h.dir.path().join("group"),
+        format!("root:x:0:\nhx-gatewayd:x:{}:\ndocker:x:{gid}:\n", me()),
+    )
+    .unwrap();
+    let mut c = h.connect();
+    c.send(F::Hello(pb::Hello {
+        major: hx_ipc::privd::VERSION_MAJOR,
+        minor: 0,
+        software: "x".into(),
+    }));
+    assert!(
+        closed(&mut c),
+        "no reply for a peer holding a forbidden group"
+    );
+    assert!(
+        h.audit
+            .lines()
+            .iter()
+            .any(|l| l.contains("refused a Gateway connection"))
+    );
+}

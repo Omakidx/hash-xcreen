@@ -188,6 +188,17 @@ pub fn check_accounts(passwd: &[PasswdEntry], groups: &[GroupEntry]) -> Vec<Viol
         out.push(Violation(format!("user `{GATEWAY_USER}` does not exist")));
         return out;
     };
+    // Another passwd entry on the gateway's uid is the same user under another name (and other
+    // groups): the static checks above would not see its memberships.
+    for e in passwd
+        .iter()
+        .filter(|e| e.uid == gw.uid && e.name != GATEWAY_USER)
+    {
+        out.push(Violation(format!(
+            "`{}` shares the gateway's uid {}",
+            e.name, gw.uid
+        )));
+    }
     for g in groups {
         if g.gid == gw.gid {
             continue;
@@ -262,6 +273,23 @@ pub fn check_privd_socket(meta: &FileMeta, expected: &FileMeta) -> Option<Violat
     None
 }
 
+/// The gids of the forbidden groups, from group-file text.
+pub fn forbidden_gids(groups: &[GroupEntry]) -> Vec<u32> {
+    groups
+        .iter()
+        .filter(|g| FORBIDDEN_GROUPS.contains(&g.name.as_str()))
+        .map(|g| g.gid)
+        .collect()
+}
+
+/// Whether the Incus socket carries a POSIX ACL (an extra grant that the mode bits do not show:
+/// `getfacl` could give the gateway access while `ls` shows 0660 root:incus-admin).
+pub fn socket_has_acl(path: &Path) -> bool {
+    ["system.posix_acl_access", "system.posix_acl_default"]
+        .iter()
+        .any(|name| rustix::fs::lgetxattr_query(path, *name).is_ok())
+}
+
 /// Runs every self-check against the files named in `cfg`. An empty list means the host account
 /// policy holds. The daemon refuses to start otherwise, and re-runs this daily and after updates
 /// (a failure sets `needs_attention=HOST_ACCOUNT_POLICY`).
@@ -290,6 +318,11 @@ pub fn run_self_checks(cfg: &PrivdConfig) -> Vec<Violation> {
         cfg.gateway,
         &gids,
     ));
+    if socket_has_acl(&cfg.incus_socket) {
+        out.push(Violation(
+            "the Incus socket carries a POSIX ACL; remove it (setfacl -b)".into(),
+        ));
+    }
     match FileMeta::of(&cfg.socket_path) {
         Ok(m) => out.extend(check_privd_socket(&m, &cfg.expected_socket)),
         Err(e) => out.push(Violation(format!("cannot stat the privd socket: {e}"))),
@@ -323,6 +356,31 @@ mod tests {
             resolve_gateway("hx-gatewayd:x:0:0::/:/bin/sh\n"),
             Err(IdentityError::Root)
         ));
+    }
+
+    #[test]
+    fn a_second_passwd_entry_on_the_gateway_uid_is_a_violation() {
+        let passwd = parse_passwd(&format!("{PASSWD}shadowgw:x:998:998::/:/bin/sh\n"));
+        let v = check_accounts(&passwd, &group(""));
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(v[0].0.contains("shadowgw") && v[0].0.contains("uid"));
+    }
+
+    #[test]
+    fn forbidden_gids_come_from_the_group_file() {
+        let g = group("docker:x:999:\n");
+        let f = forbidden_gids(&g);
+        assert!(f.contains(&999) && f.contains(&50) && f.contains(&27));
+        assert!(!f.contains(&998));
+    }
+
+    #[test]
+    fn a_plain_socket_file_has_no_acl() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("s");
+        std::fs::write(&p, b"").unwrap();
+        assert!(!socket_has_acl(&p));
+        assert!(!socket_has_acl(&d.path().join("missing")));
     }
 
     #[test]

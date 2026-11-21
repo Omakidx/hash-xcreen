@@ -29,6 +29,7 @@ pub mod hardening;
 pub mod identity;
 pub mod limiter;
 pub mod log;
+pub mod peergroups;
 pub mod pepper;
 pub mod probe;
 pub mod progress;

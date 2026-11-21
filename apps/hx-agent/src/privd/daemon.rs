@@ -584,6 +584,25 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
         ok
     }
 
+    /// The accept-time check for a Gateway peer (ipc.md 3): refuse a process that holds one of the
+    /// forbidden groups, as the kernel recorded them at `connect` (`SO_PEERGROUPS`), whatever the
+    /// account files say. Fails closed: groups that cannot be read refuse the connection.
+    pub fn check_gateway_peer(
+        &self,
+        stream: impl std::os::fd::AsFd,
+        primary_gid: u32,
+    ) -> Result<(), String> {
+        let text = std::fs::read_to_string(&self.cfg.group_file)
+            .map_err(|e| format!("cannot read the group file: {e}"))?;
+        let forbidden = identity::forbidden_gids(&identity::parse_group(&text));
+        let groups = super::peergroups::peer_groups(stream)
+            .map_err(|e| format!("cannot read the peer's groups: {e}"))?;
+        match super::peergroups::forbidden_peer_group(&groups, primary_gid, &forbidden) {
+            Some(g) => Err(format!("the peer holds the forbidden group {g}")),
+            None => Ok(()),
+        }
+    }
+
     /// Reopens the audit file (SIGHUP, after `logrotate`).
     pub fn reopen_audit(&self) {
         self.audit.reopen();
