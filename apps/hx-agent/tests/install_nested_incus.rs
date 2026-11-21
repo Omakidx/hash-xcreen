@@ -648,8 +648,7 @@ fn refusals(l1: &L1) {
     let out = l1.install(22, &[]);
     assert_ne!(out.exit, 0, "port 22 must be refused");
     assert!(
-        !l1.exec(&format!("test -e /var/lib/hx/install-state.json"))
-            .ok(),
+        !l1.exec("test -e /var/lib/hx/install-state.json").ok(),
         "a refused run must leave no state"
     );
     let port22 = out.exit;
@@ -1369,7 +1368,9 @@ const ABSENT: &[&str] = &[
     "/var/lib/hx-uninstall.json",
 ];
 
-fn leftover_paths(l1: &L1, extra_absent: &[&str]) -> Vec<String> {
+/// What the installer created and uninstall left behind. In keep mode the host firewall ruleset
+/// and its two units are meant to stay (design D6), so they are not leftovers there.
+fn leftover_paths(l1: &L1, extra_absent: &[&str], keep: bool) -> Vec<String> {
     let mut v = Vec::new();
     for p in ABSENT.iter().chain(extra_absent) {
         if l1.exec(&format!("test -e {p} || test -L {p}")).ok() {
@@ -1382,70 +1383,41 @@ fn leftover_paths(l1: &L1, extra_absent: &[&str]) -> Vec<String> {
     let units =
         l1.exec_ok("systemctl list-unit-files 'hx-*' --no-legend 2>/dev/null | awk '{print $1}'");
     for u in units.lines().filter(|u| !u.is_empty()) {
+        if keep && matches!(u, "hx-host-firewall.service" | "hx-docker-user.service") {
+            continue;
+        }
         v.push(format!("unit file {u}"));
     }
     v
 }
 
+/// The harness's own unit drop-ins go before an uninstall (they are not the installer's, and the
+/// empty-leftovers check must not count them).
+fn rm_dropins(l1: &L1) {
+    l1.exec_ok(&format!("rm -f /etc/systemd/system/hx-gatewayd.service.d/{DROPIN} /etc/systemd/system/hx-privd.service.d/{DROPIN}; rmdir /etc/systemd/system/hx-gatewayd.service.d /etc/systemd/system/hx-privd.service.d 2>/dev/null; systemctl daemon-reload"));
+}
+
+/// A second full install after the first was uninstalled: the same steps the first one needed
+/// (the dir pool and the proxies of deviations 2, 6 and 7), then the whole thing.
+fn reinstall(l1: &L1) -> RunOut {
+    dropins(l1);
+    let a = l1.install(443, &["--test-fail-after", "incus"]);
+    assert_eq!(a.exit, 1, "{:?}\n{}", a.lines.last(), a.stderr);
+    after_incus(l1);
+    let b = l1.install(443, &["--test-fail-after", "host"]);
+    assert_eq!(b.exit, 1, "{:?}\n{}", b.lines.last(), b.stderr);
+    assert_eq!(b.result().expect("result")["code"], "TEST_HOOK");
+    desktop_profile_proxy(l1);
+    l1.install(443, &[])
+}
+
+/// Both modes need an installed desktop, and a kept desktop is not adopted by a new install (its
+/// registry in /var/lib/hx is gone), so: destroy mode first, a fresh install, then keep mode.
 fn uninstall_both(l1: &L1) {
     let id = l1.d.id;
-    // The harness's own drop-ins go first (they are not the installer's).
-    let rm_dropins = || {
-        l1.exec_ok(&format!("rm -f /etc/systemd/system/hx-gatewayd.service.d/{DROPIN} /etc/systemd/system/hx-privd.service.d/{DROPIN}; rmdir /etc/systemd/system/hx-gatewayd.service.d /etc/systemd/system/hx-privd.service.d 2>/dev/null; systemctl daemon-reload"))
-    };
-    rm_dropins();
+    rm_dropins(l1);
 
-    // ---- keep mode ----
-    let t0 = Instant::now();
-    let k = l1.exec(&format!("{AGENT} uninstall --keep-desktop --yes 2>&1"));
-    assert_eq!(
-        k.code, 0,
-        "uninstall --keep-desktop: {} {}",
-        k.stdout, k.stderr
-    );
-    let left = leftover_paths(l1, &[]);
-    assert!(
-        left.is_empty(),
-        "leftovers after uninstall --keep-desktop: {left:?}\n{}",
-        k.stdout
-    );
-    let inner = l1.exec_ok("incus list -f csv -c n");
-    assert!(
-        inner.lines().any(|l| l == "hx-main"),
-        "keep mode keeps the desktop: {inner}"
-    );
-    let kept_fw = l1.exec_ok("ls /etc/hx 2>&1; true");
-    pass(
-        id,
-        "uninstall --keep-desktop",
-        format!(
-            "{} s, no leftover (units, files, state, user); desktop kept (inner instances: {}); /etc/hx keeps: {}",
-            t0.elapsed().as_secs(),
-            inner.trim().replace('\n', ","),
-            kept_fw.trim().replace('\n', ",")
-        ),
-    );
-
-    // ---- install again over the kept desktop, then destroy mode ----
-    dropins(l1);
-    let re = l1.install(443, &[]);
-    assert_eq!(
-        re.exit,
-        0,
-        "reinstall over a kept desktop: {:?}\n{}",
-        re.lines.last(),
-        re.stderr
-    );
-    pass(
-        id,
-        "reinstall over a kept desktop",
-        format!(
-            "exit 0 in {} s ({} stages did work)",
-            re.wall.as_secs(),
-            re.stages().iter().filter(|s| s.1 == "done").count()
-        ),
-    );
-    rm_dropins();
+    // ---- destroy mode ----
     let t0 = Instant::now();
     let dd = l1.exec(&format!("{AGENT} uninstall --destroy-desktop --yes 2>&1"));
     assert_eq!(
@@ -1453,7 +1425,7 @@ fn uninstall_both(l1: &L1) {
         "uninstall --destroy-desktop: {} {}",
         dd.stdout, dd.stderr
     );
-    let left = leftover_paths(l1, &["/etc/hx"]);
+    let left = leftover_paths(l1, &["/etc/hx"], false);
     assert!(
         left.is_empty(),
         "leftovers after uninstall --destroy-desktop: {left:?}\n{}",
@@ -1487,8 +1459,67 @@ fn uninstall_both(l1: &L1) {
         id,
         "uninstall --destroy-desktop",
         format!(
-            "{} s, no leftover; no hx-* instance, profile, network, pool or ACL in the inner Incus; table inet hx gone",
+            "{} s, no leftover; no hx-* instance, profile, network, pool (the marked dir pool the harness made included) or ACL in the inner Incus; table inet hx gone",
             t0.elapsed().as_secs()
+        ),
+    );
+
+    // ---- a fresh install, then keep mode ----
+    let re = reinstall(l1);
+    assert_eq!(
+        re.exit,
+        0,
+        "reinstall after a destroy: {:?}\n{}",
+        re.lines.last(),
+        re.stderr
+    );
+    pass(
+        id,
+        "reinstall after uninstall",
+        format!(
+            "exit 0 in {} s (a new desktop was built)",
+            re.wall.as_secs()
+        ),
+    );
+    rm_dropins(l1);
+    let t0 = Instant::now();
+    let k = l1.exec(&format!("{AGENT} uninstall --keep-desktop --yes 2>&1"));
+    assert_eq!(
+        k.code, 0,
+        "uninstall --keep-desktop: {} {}",
+        k.stdout, k.stderr
+    );
+    let left = leftover_paths(l1, &[], true);
+    assert!(
+        left.is_empty(),
+        "leftovers after uninstall --keep-desktop: {left:?}\n{}",
+        k.stdout
+    );
+    // Keep mode keeps the host firewall: the ruleset file and both units.
+    for kept in [
+        "/etc/hx/host-firewall.nft",
+        "/usr/local/lib/systemd/system/hx-host-firewall.service",
+        "/usr/local/lib/systemd/system/hx-docker-user.service",
+    ] {
+        assert!(
+            l1.exec(&format!("test -e {kept}")).ok(),
+            "keep mode must keep {kept}"
+        );
+    }
+    let inner = l1.exec_ok("incus list -f csv -c n");
+    assert!(
+        inner.lines().any(|l| l == "hx-main"),
+        "keep mode keeps the desktop: {inner}"
+    );
+    let kept_fw = l1.exec_ok("ls /etc/hx 2>&1; true");
+    pass(
+        id,
+        "uninstall --keep-desktop",
+        format!(
+            "{} s, no leftover (units, files, state, user); desktop kept (inner instances: {}); /etc/hx keeps: {}",
+            t0.elapsed().as_secs(),
+            inner.trim().replace('\n', ","),
+            kept_fw.trim().replace('\n', ",")
         ),
     );
 }
