@@ -367,8 +367,8 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
         if !(flagged || (nesting && meta.docker_ack.is_none())) {
             return;
         }
-        if inst.status.eq_ignore_ascii_case("running") {
-            if let Err(e) = client
+        if inst.status.eq_ignore_ascii_case("running")
+            && let Err(e) = client
                 .set_state(
                     &name,
                     hx_provision::incus::StateAction::Stop,
@@ -376,9 +376,8 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
                     Duration::from_secs(30),
                 )
                 .await
-            {
-                log::error(&format!("cannot stop `{name}` for isolation: {e}"));
-            }
+        {
+            log::error(&format!("cannot stop `{name}` for isolation: {e}"));
         }
         if !flagged {
             self.set_flag(Some(id), Flag::IsolationNotRestored, true);
