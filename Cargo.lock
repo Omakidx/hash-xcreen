@@ -738,6 +738,7 @@ dependencies = [
  "bytes",
  "getrandom 0.4.3",
  "hmac",
+ "hx-agent",
  "hx-crypto",
  "hx-ipc",
  "hx-proto",

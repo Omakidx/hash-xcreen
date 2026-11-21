@@ -11,6 +11,11 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Test-only hooks of the hx-gatewayd binary (`--admin-allow-uid`). Never enabled in a release
+# build: the crate's own tests turn it on through the dev-dependency on itself below.
+gateway-test-hooks = []
+
 [dependencies]
 argon2 = "0.6.0"
 bytes.workspace = true
@@ -33,6 +38,7 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 zeroize.workspace = true
 
 [dev-dependencies]
+hx-agent = { path = ".", features = ["gateway-test-hooks"] }
 hmac = "0.12"
 prost.workspace = true
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }

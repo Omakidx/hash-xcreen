@@ -22,6 +22,7 @@
 //! | [`admin`] | the root-only admin socket (ipc.md 9) |
 //! | [`live`] | the set of live sessions and its caps |
 //! | [`config`] | the configuration file |
+//! | [`cli`] | the command line, with the test-only flag behind a feature |
 //! | [`harden`] | `mlockall`, no core dumps, the seccomp allowlist |
 //!
 //! # Secrets
@@ -32,6 +33,7 @@
 //! logged. The pepper never enters this process.
 
 pub mod admin;
+pub mod cli;
 pub mod config;
 pub mod desktop;
 pub mod devices;

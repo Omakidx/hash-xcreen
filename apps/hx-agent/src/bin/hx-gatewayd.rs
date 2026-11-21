@@ -21,6 +21,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use hx_agent::gateway::admin::{self, AdminPolicy};
+use hx_agent::gateway::cli::{Args, parse_args};
 use hx_agent::gateway::config::{GatewayConfig, SeccompMode};
 use hx_agent::gateway::desktop::UnavailableLink;
 use hx_agent::gateway::harden;
@@ -28,40 +29,6 @@ use hx_agent::gateway::server::{Gateway, StartOptions, load_identity};
 use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::filter::LevelFilter;
-
-const DEFAULT_CONFIG: &str = "/etc/hx/gatewayd.toml";
-
-struct Args {
-    config: PathBuf,
-    /// Debug builds only: lets one unprivileged uid use the admin socket, for tests that cannot
-    /// run as root. Release builds refuse the flag.
-    admin_allow_uid: Option<u32>,
-}
-
-fn parse_args() -> Result<Args, String> {
-    let mut args = Args {
-        config: DEFAULT_CONFIG.into(),
-        admin_allow_uid: None,
-    };
-    let mut it = std::env::args().skip(1);
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--config" => {
-                args.config = it.next().ok_or("--config needs a path")?.into();
-            }
-            "--admin-allow-uid" if cfg!(debug_assertions) => {
-                let v = it.next().ok_or("--admin-allow-uid needs a uid")?;
-                args.admin_allow_uid = Some(v.parse().map_err(|_| "bad uid")?);
-            }
-            "--version" => {
-                println!("{} {}", env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION"));
-                std::process::exit(0);
-            }
-            other => return Err(format!("unknown argument {other:?}")),
-        }
-    }
-    Ok(args)
-}
 
 fn init_logging() {
     let level = match std::env::var("HX_LOG").as_deref() {
@@ -174,13 +141,20 @@ async fn run(args: Args) -> Result<(), String> {
 fn main() -> ExitCode {
     init_logging();
     harden::install_panic_hook();
-    let args = match parse_args() {
+    let args = match parse_args(
+        std::env::args().skip(1),
+        cfg!(feature = "gateway-test-hooks"),
+    ) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("hx-gatewayd: {e}");
             return ExitCode::from(2);
         }
     };
+    if args.version {
+        println!("{} {}", env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("hx-gatewayd")
