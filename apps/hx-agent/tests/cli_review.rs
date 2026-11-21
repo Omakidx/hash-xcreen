@@ -230,3 +230,50 @@ async fn l3_the_journal_line_is_labelled_by_the_trusted_unit_not_the_identifier(
         "{l}"
     );
 }
+
+// ----------------------------------------------------------------------------------------- L4
+
+#[tokio::test]
+async fn l4_a_fifo_at_the_audit_path_is_refused_promptly() {
+    let dir = private_tempdir();
+    let cfg = unreachable_config(dir.path());
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &cfg.audit_log,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_bits_truncate(0o600),
+        0,
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let r = cli(&cfg, &["logs", "--audit"], &[], &[]).await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(r.stderr.contains("regular file"), "{}", r.stderr);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "the open must not hang"
+    );
+    let r = cli(&cfg, &["logs", "--audit", "--follow"], &[], &[]).await;
+    assert_eq!(r.code, 1, "{r:?}");
+}
+
+#[tokio::test]
+async fn l4_a_symlinked_audit_directory_is_refused() {
+    let dir = private_tempdir();
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::set_permissions(&real, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    write_audit(&real.join("audit.log"), "forged-line\n");
+    let link = dir.path().join("hx");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let mut cfg = unreachable_config(dir.path());
+    cfg.audit_log = link.join("audit.log");
+    let r = cli(&cfg, &["logs", "--audit"], &[], &[]).await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(
+        r.stderr.contains("refusing to read the audit log"),
+        "{}",
+        r.stderr
+    );
+    assert!(!r.stdout.contains("forged-line"));
+}

@@ -13,9 +13,14 @@
 //! Every line is cut to a bounded length and sanitized before it is printed: a line is data, and
 //! must never be able to move the cursor, retitle the window or forge a second line.
 
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::MetadataExt;
+
+use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+use rustix::io::Errno;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::Ordering;
@@ -215,50 +220,96 @@ fn read_journal(cfg: &Config, lines: u32) -> Result<Vec<String>, CliError> {
     Ok(out)
 }
 
-/// The audit log opened safely: `None` if it does not exist yet.
-fn open_audit(path: &Path, owner: u32) -> Result<Option<File>, CliError> {
-    let bad = |m: &str| CliError::Failed(format!("refusing to read the audit log: {m}"));
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        match std::fs::symlink_metadata(dir) {
-            Ok(m) => {
-                if !m.is_dir() || m.uid() != owner || m.mode() & 0o022 != 0 {
-                    return Err(bad(
-                        "its directory is not a root-owned directory closed to others",
-                    ));
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => {
-                return Err(CliError::Failed(format!(
-                    "audit log directory: {}",
-                    e.kind()
-                )));
-            }
-        }
-    }
-    let f = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-        .open(path)
-    {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+/// The audit log's directory, held open. The file is only ever opened **relative to this
+/// descriptor**, so nothing can be swapped between the check of the directory and the open of
+/// the file (on Ubuntu `/var/log` is group-writable by `syslog`, whose members can rename
+/// `/var/log/hx`), and a rotation is followed under the same directory, never through the path.
+struct AuditDir {
+    dir: OwnedFd,
+    name: OsString,
+    owner: u32,
+}
+
+fn refused(m: &str) -> CliError {
+    CliError::Failed(format!("refusing to read the audit log: {m}"))
+}
+
+/// Opens the audit directory (`O_DIRECTORY|O_NOFOLLOW`) and checks it by `fstat`: owned by
+/// `owner`, not writable by group or others. `None` if it does not exist yet.
+fn audit_dir(path: &Path, owner: u32) -> Result<Option<AuditDir>, CliError> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(CliError::failed("the audit log path has no directory"));
+    };
+    let dir = match rustix::fs::open(
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(None),
         Err(e) => {
-            return Err(CliError::Failed(format!(
-                "cannot open the audit log (a symlink is refused): {}",
-                e.kind()
+            return Err(refused(&format!(
+                "its directory cannot be opened (a symlink or a non-directory is refused): {e}"
             )));
         }
     };
-    let m = f
-        .metadata()
-        .map_err(|e| CliError::Failed(format!("audit log: {}", e.kind())))?;
-    if !m.is_file() || m.uid() != owner || m.mode() & 0o022 != 0 {
-        return Err(bad(
-            "the file is not a root-owned regular file closed to others",
+    let st = rustix::fs::fstat(&dir)
+        .map_err(|e| CliError::Failed(format!("audit log directory: {e}")))?;
+    if st.st_uid != owner || (st.st_mode as u32) & 0o022 != 0 {
+        return Err(refused(
+            "its directory is not a root-owned directory closed to others",
         ));
     }
-    Ok(Some(f))
+    Ok(Some(AuditDir {
+        dir,
+        name: name.to_owned(),
+        owner,
+    }))
+}
+
+impl AuditDir {
+    /// Opens the file relative to the directory: `O_NOFOLLOW` (no symlink), `O_NONBLOCK` (a FIFO
+    /// cannot hang the open) and then `fstat` of what was opened: a regular file owned by the
+    /// expected uid and not writable by group or others. `None` if it does not exist.
+    fn open(&self) -> Result<Option<File>, CliError> {
+        let fd = match rustix::fs::openat(
+            &self.dir,
+            self.name.as_os_str(),
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => return Ok(None),
+            Err(e) => {
+                return Err(refused(&format!(
+                    "the file cannot be opened (a symlink is refused): {e}"
+                )));
+            }
+        };
+        let st = rustix::fs::fstat(&fd).map_err(|e| CliError::Failed(format!("audit log: {e}")))?;
+        let regular = FileType::from_raw_mode(st.st_mode as _) == FileType::RegularFile;
+        if !regular || st.st_uid != self.owner || (st.st_mode as u32) & 0o022 != 0 {
+            return Err(refused(
+                "the file is not a root-owned regular file closed to others",
+            ));
+        }
+        Ok(Some(File::from(fd)))
+    }
+
+    /// Device and inode of what the name refers to now (without following a symlink).
+    fn ident(&self) -> Option<(u64, u64)> {
+        rustix::fs::statat(&self.dir, self.name.as_os_str(), AtFlags::SYMLINK_NOFOLLOW)
+            .ok()
+            .map(|st| (st.st_dev as u64, st.st_ino as u64))
+    }
+}
+
+/// The audit log opened safely: `None` if it does not exist yet.
+fn open_audit(path: &Path, owner: u32) -> Result<Option<File>, CliError> {
+    match audit_dir(path, owner)? {
+        Some(d) => d.open(),
+        None => Ok(None),
+    }
 }
 
 /// The last `n` lines of the file, sanitized.
@@ -368,20 +419,22 @@ fn follow_logs(env: &mut Env<'_>, lines: u32, journal: bool, audit: bool) -> Res
         drop(tx);
     }
     // The audit log: the last lines first, then whatever is appended.
-    let mut file: Option<File> = None;
-    let mut offset = 0u64;
-    let mut ident: Option<(u64, u64)> = None;
-    let mut partial: Vec<u8> = Vec::new();
-    if audit && let Some(mut f) = open_audit(&env.config.audit_log, env.config.audit_owner_uid)? {
-        for l in audit_tail(&mut f, lines as usize)? {
-            emit(env, "audit", &l);
+    let mut follow = AuditFollow::default();
+    if audit {
+        follow.dir = audit_dir(&env.config.audit_log, env.config.audit_owner_uid)?;
+        if let Some(d) = &follow.dir
+            && let Some(mut f) = d.open()?
+        {
+            for l in audit_tail(&mut f, lines as usize)? {
+                emit(env, "audit", &l);
+            }
+            let m = f
+                .metadata()
+                .map_err(|e| CliError::Failed(format!("audit log: {}", e.kind())))?;
+            follow.offset = m.len();
+            follow.ident = Some((m.dev(), m.ino()));
+            follow.file = Some(f);
         }
-        let m = f
-            .metadata()
-            .map_err(|e| CliError::Failed(format!("audit log: {}", e.kind())))?;
-        offset = m.len();
-        ident = Some((m.dev(), m.ino()));
-        file = Some(f);
     }
     loop {
         if env.stop.load(Ordering::Relaxed) {
@@ -399,7 +452,7 @@ fn follow_logs(env: &mut Env<'_>, lines: u32, journal: bool, audit: bool) -> Res
             }
         }
         if audit {
-            poll_audit(env, &mut file, &mut offset, &mut ident, &mut partial)?;
+            poll_audit(env, &mut follow)?;
         }
     }
     if let Some(mut c) = child {
@@ -409,58 +462,66 @@ fn follow_logs(env: &mut Env<'_>, lines: u32, journal: bool, audit: bool) -> Res
     Ok(())
 }
 
-/// Emits lines appended to the audit log since the last poll, following a rotation.
-fn poll_audit(
-    env: &mut Env<'_>,
-    file: &mut Option<File>,
-    offset: &mut u64,
-    ident: &mut Option<(u64, u64)>,
-    partial: &mut Vec<u8>,
-) -> Result<(), CliError> {
-    let path = env.config.audit_log.clone();
-    let owner = env.config.audit_owner_uid;
-    // Re-stat the path (not the open file): a rotation replaces the file under the same name.
-    let now = std::fs::symlink_metadata(&path)
-        .ok()
-        .map(|m| (m.dev(), m.ino()));
-    if now != *ident {
-        *file = open_audit(&path, owner)?;
-        *offset = 0;
-        partial.clear();
-        *ident = file
+/// What `--follow` remembers of the audit log.
+#[derive(Default)]
+struct AuditFollow {
+    dir: Option<AuditDir>,
+    file: Option<File>,
+    offset: u64,
+    ident: Option<(u64, u64)>,
+    partial: Vec<u8>,
+}
+
+/// Emits lines appended to the audit log since the last poll, following a rotation. The file is
+/// always (re)opened relative to the directory descriptor held since the start.
+fn poll_audit(env: &mut Env<'_>, st: &mut AuditFollow) -> Result<(), CliError> {
+    if st.dir.is_none() {
+        // The directory did not exist when following began.
+        st.dir = audit_dir(&env.config.audit_log, env.config.audit_owner_uid)?;
+    }
+    let Some(dir) = st.dir.as_ref() else {
+        return Ok(());
+    };
+    // Look at the name (not the open file): a rotation replaces the file under the same name.
+    if dir.ident() != st.ident {
+        st.file = dir.open()?;
+        st.offset = 0;
+        st.partial.clear();
+        st.ident = st
+            .file
             .as_ref()
             .and_then(|f| f.metadata().ok())
             .map(|m| (m.dev(), m.ino()));
     }
-    let Some(f) = file.as_mut() else {
+    let Some(f) = st.file.as_mut() else {
         return Ok(());
     };
     let len = f
         .metadata()
         .map_err(|e| CliError::Failed(format!("audit log: {}", e.kind())))?
         .len();
-    if len < *offset {
+    if len < st.offset {
         // Truncated in place.
-        *offset = 0;
-        partial.clear();
+        st.offset = 0;
+        st.partial.clear();
     }
-    if len == *offset {
+    if len == st.offset {
         return Ok(());
     }
     let io = |e: std::io::Error| CliError::Failed(format!("audit log: {}", e.kind()));
-    f.seek(SeekFrom::Start(*offset)).map_err(io)?;
+    f.seek(SeekFrom::Start(st.offset)).map_err(io)?;
     let mut data = Vec::new();
     f.take(TAIL_WINDOW).read_to_end(&mut data).map_err(io)?;
-    *offset += data.len() as u64;
-    partial.extend_from_slice(&data);
-    while let Some(i) = partial.iter().position(|b| *b == b'\n') {
-        let rest = partial.split_off(i + 1);
-        let line = std::mem::replace(partial, rest);
+    st.offset += data.len() as u64;
+    st.partial.extend_from_slice(&data);
+    while let Some(i) = st.partial.iter().position(|b| *b == b'\n') {
+        let rest = st.partial.split_off(i + 1);
+        let line = std::mem::replace(&mut st.partial, rest);
         let text = peer(&String::from_utf8_lossy(&line[..line.len() - 1]), MAX_LINE);
         emit(env, "audit", &text);
     }
     // A partial line that grows without a newline is cut, not accumulated.
-    partial.truncate(MAX_LINE);
+    st.partial.truncate(MAX_LINE);
     Ok(())
 }
 
