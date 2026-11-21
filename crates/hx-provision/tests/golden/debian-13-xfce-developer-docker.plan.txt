@@ -4,6 +4,8 @@ var codename=trixie
 var desktop=xfce
 var distro=debian
 var distro_version=13
+var libavcodec_pkg=libavcodec61
+var libavutil_pkg=libavutil59
 var preset=developer
 var uid=1000
 var user=desk
@@ -16,7 +18,7 @@ incus_config security.syscalls.intercept.setxattr=true
 03 apt-repo vscode fingerprint=BC528686B50D79E339D3721CEB3E94ADBE1229CF
 04 apt-repo docker fingerprint=9DC858229FC7DD38854AE2D88D81803C0EBFCD88
 05 command vscode-debconf
-06 apt-install sudo curl ca-certificates gnupg xdg-utils locales xserver-xorg-core xserver-xorg-video-dummy xauth x11-xserver-utils x11-utils dbus-x11 dbus-user-session libpam-systemd xfce4-session xfwm4 xfdesktop4 xfce4-panel xfce4-settings xfconf xfce4-terminal xfce4-notifyd thunar mousepad adwaita-icon-theme fonts-dejavu-core pipewire pipewire-pulse wireplumber pipewire-bin pulseaudio-utils firefox-esr code git build-essential pkg-config unzip jq python3 less openssh-client docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+06 apt-install sudo curl ca-certificates gnupg xdg-utils locales xserver-xorg-core xserver-xorg-video-dummy xauth x11-xserver-utils x11-utils dbus-x11 dbus-user-session libpam-systemd xfce4-session xfwm4 xfdesktop4 xfce4-panel xfce4-settings xfconf xfce4-terminal xfce4-notifyd thunar mousepad adwaita-icon-theme fonts-dejavu-core pipewire pipewire-pulse wireplumber pipewire-bin pulseaudio-utils libavcodec61 libavutil59 firefox-esr code git build-essential pkg-config unzip jq python3 less openssh-client docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 07 ensure-user desk uid=1000 groups=sudo,audio,video,docker
 08 write-file /etc/hx/xorg-dummy.conf mode=0644 owner=root:root sha256=2c4b8728bcb56ee0e5912d9b5abdfa1adad51a881454ac38436890fb918ff6ae
 09 write-file /etc/systemd/system/hx-xorg.service mode=0644 owner=root:root sha256=0caac8be5bb8177bafdf5cdd717441d5b2ea264fc46416ff801f27dc5aebfd39

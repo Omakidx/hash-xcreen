@@ -1,0 +1,24 @@
+# Known-answer cases of install.sh's signature check (installer/tests/run.sh) and, where the last
+# column says `same`, of privd's UpdateKeys (apps/hx-agent/tests/installer_sh.rs).
+#
+# name  current-key  next-key  message  signature  expect  reason  privd
+#
+# keys: a, b, c = key-<x>.pub; UNPROV = UNPROVISIONED; garbage = a malformed key line.
+# message: a file of this directory, or msg.tampered (= msg.bin with an "x" appended).
+# reason: a fragment of install.sh's VERR text, `_` standing for a space (`-` for ok cases).
+# privd: `same` = privd's verifier must reach the same verdict; `skip` = shell-only policy.
+valid-current           a        UNPROV  msg.bin       valid-a.minisig                 ok    -                          same
+valid-next-key          a        b       msg.bin       valid-b.minisig                 ok    -                          same
+valid-next-key-only     UNPROV   b       msg.bin       valid-b.minisig                 ok    -                          same
+valid-current-of-two    a        b       msg.bin       valid-a.minisig                 ok    -                          same
+tampered-message        a        UNPROV  msg.tampered  valid-a.minisig                 fail  signature_does_not_verify  same
+legacy-ed               a        UNPROV  msg.bin       legacy-a.minisig                fail  legacy                     same
+wrong-key-id            a        b       msg.bin       valid-c.minisig                 fail  unknown_key                same
+wrong-key-only          b        UNPROV  msg.bin       valid-a.minisig                 fail  unknown_key                same
+bad-trusted-comment     a        UNPROV  msg.bin       bad-trusted-comment-a.minisig   fail  trusted_comment_does_not   same
+flipped-signature       a        UNPROV  msg.bin       flipped-sig-a.minisig           fail  signature_does_not_verify  same
+crlf-line-endings       a        UNPROV  msg.bin       crlf-a.minisig                  fail  CR_or_NUL                  skip
+non-ascii-comment       a        UNPROV  msg.bin       nonascii-comment-a.minisig      fail  printable_ASCII            skip
+extra-line              a        UNPROV  msg.bin       extra-line-a.minisig            fail  four_lines                 skip
+no-key-provisioned      UNPROV   UNPROV  msg.bin       valid-a.minisig                 fail  embeds_no_release          same
+malformed-embedded-key  garbage  UNPROV  msg.bin       valid-a.minisig                 fail  malformed                  same
