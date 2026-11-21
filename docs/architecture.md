@@ -183,7 +183,8 @@ MODE (at most one):
   --interactive   prompts on /dev/tty; ends with a pairing code
   --pair          one-liner: token prompted on /dev/tty (hidden) right after preflight,
                   installed at stage pairing-token; the installer ends there
-  --token <t>     unattended; weaker; warning printed
+  --token <t>     unattended; weaker; warning printed; otherwise like --pair:
+                  installed at stage pairing-token; the installer ends there
   --ssh           secrets from stdin (ipc.md §5.4); stdin must not be a tty; --json implied
   (none)          resume or reconcile an existing install with its recorded mode and
                   options; refused on a fresh host (exit 2)
@@ -262,7 +263,7 @@ Every stage has a `check()` and a `run()`. It is skipped only when it is recorde
 | 18 | `finish` | privd, gatewayd | `FinishSetup` and `SetupWindow{close}` |
 | 19 | `done` | installer | Mark the install complete |
 
-- **The port is opened before pairing** (stage 11 comes before every pairing step), because in the one-liner path the app must reach the agent before anything else exists. In the `--pair` path the installer **ends after `pairing-token`** (stages 13 to 18 do not run in 1E): the setup window stays open, and the app creates the desktop through gatewayd during `SETUP_OPEN` once the post-pairing setup messages exist (1G; the dependency is noted in execution-phase.md). In the `--ssh` and `--interactive` paths every stage runs, as `Admin`; the token or code is issued **last**, so its 15-minute life starts after the desktop build.
+- **The port is opened before pairing** (stage 11 comes before every pairing step), because in the one-liner path the app must reach the agent before anything else exists. In the `--pair` and `--token` paths the installer **ends after `pairing-token`** (neither carries a password or PIN) (stages 13 to 18 do not run in 1E): the setup window stays open, and the app creates the desktop through gatewayd during `SETUP_OPEN` once the post-pairing setup messages exist (1G; the dependency is noted in execution-phase.md). In the `--ssh` and `--interactive` paths every stage runs, as `Admin`; the token or code is issued **last**, so its 15-minute life starts after the desktop build.
 - **How port 443 reaches gatewayd.** A socket unit, `hx-gatewayd-public.socket`, listens on `[::]:<port>` for TCP and UDP (`BindIPv6Only=both`) and hands both sockets to gatewayd by socket activation; the port comes from an installer drop-in (`--port`). The unprivileged gatewayd binds nothing and keeps an empty capability set, no sysctl is changed and no NAT is added ([ipc.md](ipc.md) §6.12).
 - **The port rule** (stage 11): if ufw is active, `ufw allow <p>/tcp` and `/udp` with the comment `hash-xcreen`. Otherwise, if native nftables has an input base chain that drops (policy drop, or a drop or reject rule without an interface qualifier, ignoring tables `inet hx`, `inet incus` and Docker's), the rule `meta l4proto { tcp, udp } th dport <p> accept comment "hx-agent-port"` is inserted at the top of that chain and re-applied at boot by `hx-agent-port.service` (ordered after `nftables.service`); a ruleset **reload** drops the rule, and the installer says so. Otherwise, if iptables-legacy or firewalld is blocking, the stage state is `manual`: the exact command is printed and the result carries a warning. Otherwise `none`.
 - **Re-runs.** The same command resumes; a complete install is re-verified and drift repaired, and the output says "already installed". Different options are classified by the table in §5.2: reconcilable ones are applied, and a fixed option changed after its stage is done ends with exit 12, naming each option and the command that changes it (`hx-agent desktop limits`, `hx-agent docker enable`, `hx-agent uninstall --destroy-desktop`). Concurrent runs fail with exit 11 (§5.6).
@@ -334,7 +335,7 @@ The file is root 0600, written atomically (`privd::state::write_atomic`). The in
 | `incus` | the version reported by `GetHostInfo` |
 | `setup-window`, `host` | always called (they converge), then `GetHostInfo` (`pool`, `host_firewall_loaded`, `sysctl_ok`) |
 | `desktop` | `GetDesktop` reports `ready` |
-| `pairing`, `finish` | never skipped on resume: a code or token must be fresh |
+| `pairing-token`, `pairing`, `finish` | never skipped on resume: a code or token must be fresh, so a re-run of `--pair` asks for a new token |
 
 **Credentials.** The installer generates each secret with `getrandom`, pipes it to `systemd-creds encrypt --name=<name> - <tmp>` and renames the result to 0600; `pepper.cred` and `identity.cred` are made this way, so every supported host has sealed credentials. A host that ran privd on the plaintext `/var/lib/hx/pepper.key` fallback is **migrated without invalidating its verifiers**:
 
