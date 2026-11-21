@@ -24,6 +24,12 @@ pub struct PeerCred {
 }
 
 /// `SO_PEERCRED` of a connected unix stream socket.
+///
+/// **Only for sockets whose peers share the caller's pid namespace** (the privd and admin
+/// sockets: host processes). For a peer in a child pid namespace the kernel reports pid 0, and
+/// rustix 1.1.6 reads `ucred.pid` into a non-zero integer type, which is undefined behaviour
+/// inside rustix. Never call this on the session link or on any socket a container process can
+/// connect to; the link needs no peer identity (`docs/ipc.md` section 11).
 pub fn peer_credentials<Fd: AsFd>(fd: Fd) -> io::Result<PeerCred> {
     let c = socket_peercred(fd)?;
     Ok(PeerCred {
