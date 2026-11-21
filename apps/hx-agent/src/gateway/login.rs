@@ -100,6 +100,10 @@ pub enum LoginError {
     Crypto(#[from] hx_crypto::Error),
 }
 
+/// How long a device waits after privd reported the PIN purpose locked (when privd names no
+/// time of its own).
+const LOCKED_WAIT: Duration = Duration::from_secs(60);
+
 enum Verdict {
     Right,
     Wrong {
@@ -408,6 +412,17 @@ impl Login {
                                 {
                                     Ok(b) => Some(b),
                                     Err(e) if e.is_locked() => {
+                                        // Nobody can be verified until an Admin resets the
+                                        // purpose: make every device wait, so that reconnecting
+                                        // does not keep counting attempts that are never checked
+                                        // (F1, interim: the registry refund call is pending).
+                                        let wait = match &e {
+                                            PrivdError::Remote(r) if !r.retry_after.is_zero() => {
+                                                r.retry_after
+                                            }
+                                            _ => LOCKED_WAIT,
+                                        };
+                                        this.set_not_before(&id, Some(wait));
                                         return Ok(Verdict::Locked);
                                     }
                                     Err(e) => {
@@ -422,7 +437,12 @@ impl Login {
             };
             let now_unix = this.0.clock.unix_secs();
             match right {
-                None => Ok(Verdict::Unavailable { counted }),
+                None => {
+                    // privd failed after the attempt was counted: the same wait as the retry
+                    // hint given to the client, enforced here too.
+                    this.set_not_before(&id, Some(this.0.config.privd_retry));
+                    Ok(Verdict::Unavailable { counted })
+                }
                 Some(true) => {
                     this.reg(move |r| r.record_pin_success(&id, now_unix))
                         .await?;

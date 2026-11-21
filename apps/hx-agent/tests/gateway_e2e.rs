@@ -1125,3 +1125,77 @@ async fn a_device_replaces_its_own_unresponsive_session_even_under_deny() {
     );
     assert!(back.close_info().is_none());
 }
+
+/// F1 (interim): while privd reports the PIN purpose locked, a device is made to wait. Its
+/// reconnects are answered "too soon" without being counted, so it is never driven to
+/// revocation by attempts that were never checked.
+#[tokio::test]
+async fn a_locked_pin_purpose_makes_devices_wait_and_never_revokes_them() {
+    let env = Env::start().await;
+    let phone = new_key();
+    env.pair(&phone, "phone").await;
+    env.set_pin(PIN).await;
+    let id = Env::id_of(&phone);
+    let failed = |env: &Env| {
+        env.gw
+            .authenticator()
+            .registry()
+            .get(&id)
+            .unwrap()
+            .unwrap()
+            .failed_pins
+    };
+    env.privd.with(|s| s.pin_failure_cap = 1);
+    let mut a = env.connect_unauth(&phone, "phone").await;
+    assert!(matches!(
+        within(a.submit(&hx_crypto::Pin::new("111111").unwrap()))
+            .await
+            .unwrap(),
+        PinReply::Wrong { .. }
+    ));
+    env.clock.advance(Duration::from_secs(5));
+    // The purpose is locked now: this attempt is counted, cannot be checked, and starts a wait.
+    let err = within(a.submit(&hx_crypto::Pin::new(PIN).unwrap()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CryptoError::PinNotAvailable), "{err}");
+    let counted = failed(&env);
+    // Seven reconnects with the right PIN inside the wait: all "too soon", none counted.
+    for _ in 0..7 {
+        let mut b = env.connect_unauth(&phone, "phone").await;
+        let r = within(b.submit(&hx_crypto::Pin::new(PIN).unwrap()))
+            .await
+            .unwrap();
+        assert!(matches!(r, PinReply::Backoff { .. }), "{r:?}");
+        b.abandon().await;
+    }
+    assert_eq!(failed(&env), counted, "waiting attempts are not counted");
+    assert!(
+        !env.gw
+            .authenticator()
+            .registry()
+            .get(&id)
+            .unwrap()
+            .unwrap()
+            .is_revoked()
+    );
+
+    // An Admin resets the purpose in privd and the device's lockout; one login clears it.
+    env.privd.with(|s| {
+        s.pin_locked = false;
+        s.pin_failure_cap = 0;
+    });
+    let mut adm = AdminClient::connect(&env.admin_path).await.unwrap();
+    adm.call(
+        hx_ipc::admin::pb::request::Command::ReinstateDevice(
+            hx_ipc::admin::pb::ReinstateDeviceRequest {
+                device_id: Bytes::copy_from_slice(id.as_bytes()),
+            },
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+    let _ = env.login(&phone, "phone", PIN).await;
+    assert_eq!(failed(&env), 0);
+}
