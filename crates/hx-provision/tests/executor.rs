@@ -156,7 +156,9 @@ async fn a_failing_step_reports_no_secret() {
         .unwrap_err();
     let msg = e.to_string();
     assert!(
-        msg.contains("set-password desk") && msg.contains("boom on stderr"),
+        msg.contains("set-password desk")
+            && msg.contains("withheld")
+            && !msg.contains("boom on stderr"),
         "{msg}"
     );
     assert!(!msg.contains(PASSWORD) && !format!("{e:?}").contains(PASSWORD));

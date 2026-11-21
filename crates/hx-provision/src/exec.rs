@@ -349,6 +349,9 @@ pub fn sanitize(s: &str, max: usize) -> String {
     format!("...{}", &t[start..])
 }
 
+/// Stands in for the output of a command that carries a secret.
+pub const WITHHELD: &str = "(output withheld: the command carries a secret)";
+
 fn tail(s: &str, max: usize) -> String {
     sanitize(s, max)
 }
@@ -389,14 +392,20 @@ pub async fn apply_stage<E: Executor>(
                     Ok(out) if out.exit_code == 0 => Ok(()),
                     Ok(out) => Err(StepFailure::ExitCode {
                         code: out.exit_code,
-                        tail: tail(
-                            if out.stderr.trim().is_empty() {
-                                &out.stdout
-                            } else {
-                                &out.stderr
-                            },
-                            2000,
-                        ),
+                        // A command that carries a secret on stdin must not put its output into an
+                        // error: a tool can echo what it was given.
+                        tail: if req.stdin.is_some() {
+                            WITHHELD.to_string()
+                        } else {
+                            tail(
+                                if out.stderr.trim().is_empty() {
+                                    &out.stdout
+                                } else {
+                                    &out.stderr
+                                },
+                                2000,
+                            )
+                        },
                     }),
                     Err(e) => Err(StepFailure::Exec(e)),
                 },

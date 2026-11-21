@@ -503,7 +503,11 @@ async fn failed_stdin_command_still_removes_the_secret_file() {
             ..
         }
     ));
-    assert!(e.to_string().contains("chpasswd: boom") && !e.to_string().contains(PASSWORD));
+    assert!(
+        e.to_string().contains("withheld")
+            && !e.to_string().contains("boom")
+            && !e.to_string().contains(PASSWORD)
+    );
     assert!(
         fake.with(|s| s.files.is_empty()),
         "no secret or output file left"
@@ -1768,7 +1772,10 @@ async fn step_failures_and_readiness_errors_are_sanitized() {
     .unwrap_err();
     let msg = e.to_string();
     assert!(
-        msg.contains("chpasswd: failed") && !msg.contains('\u{1b}') && !msg.contains("pwned"),
+        msg.contains("withheld")
+            && !msg.contains("chpasswd: failed")
+            && !msg.contains('\u{1b}')
+            && !msg.contains("pwned"),
         "{msg:?}"
     );
 

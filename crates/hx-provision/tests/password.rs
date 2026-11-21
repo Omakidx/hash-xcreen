@@ -246,6 +246,54 @@ async fn chpasswd_failure_is_an_error_and_still_sweeps() {
 }
 
 #[tokio::test]
+async fn a_failing_secret_command_never_puts_its_output_in_the_error() {
+    // A tool that echoes what it was given must not carry the password into an error message.
+    let fake = fake_with_running_c1().await;
+    fake.rule(PASSWORD_CHECK_HELPER, 0, "", "");
+    fake.rule("chpasswd", 1, NEW, &format!("bad line: alice:{NEW}"));
+    let err = change_user_password(&fake.client(), "c1", &user(), secrets(), true)
+        .await
+        .unwrap_err();
+    let shown = format!("{err} {err:?}");
+    assert!(
+        !shown.contains(NEW) && !shown.contains("different"),
+        "{shown}"
+    );
+    assert!(shown.contains("withheld"), "{shown}");
+
+    // The same through the post stage's runner.
+    let fake = Fake::start().await;
+    fake.rule("chpasswd", 1, NEW, &format!("bad line: alice:{NEW}"));
+    let plan = hx_provision::Catalog::embedded()
+        .resolve(
+            hx_provision::RecipeId {
+                distro: hx_provision::Distro::Debian13,
+                desktop: hx_provision::Desktop::Xfce,
+                preset: hx_provision::Preset::Basic,
+            },
+            &[],
+        )
+        .unwrap();
+    let client = fake.client();
+    let exec = hx_provision::IncusExecutor::new(&client, "c1");
+    let secrets = Secrets::none().with_user_password(NEW).unwrap();
+    let err = hx_provision::apply_stage(
+        &exec,
+        &plan,
+        hx_provision::Stage::Post,
+        &secrets,
+        &mut |_| {},
+    )
+    .await
+    .unwrap_err();
+    let shown = format!("{err} {err:?}");
+    assert!(
+        !shown.contains(NEW) && !shown.contains("different"),
+        "{shown}"
+    );
+}
+
+#[tokio::test]
 async fn standalone_check_reports_the_three_outcomes() {
     use hx_provision::password::check_user_password;
     for (code, want) in [

@@ -235,7 +235,8 @@ async fn set<T: Transport>(
         if out.exit_code != 0 {
             return Err(fail(StepFailure::ExitCode {
                 code: out.exit_code,
-                tail: crate::exec::sanitize(&out.stderr, 500),
+                // chpasswd carries the password: its output is not put into an error.
+                tail: crate::exec::WITHHELD.to_string(),
             })
             .into());
         }
