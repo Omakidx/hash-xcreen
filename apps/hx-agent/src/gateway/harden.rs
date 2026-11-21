@@ -24,18 +24,23 @@
 //! | Group | Syscalls |
 //! |---|---|
 //! | memory | `brk mmap munmap mremap mprotect madvise` |
-//! | threads, signals | `clone clone3 futex set_robust_list rseq sigaltstack rt_sigaction rt_sigprocmask rt_sigreturn prctl exit exit_group gettid tgkill sched_yield sched_getaffinity arch_prctl (x86_64)` |
+//! | threads, signals | `futex set_robust_list rseq sigaltstack rt_sigaction rt_sigprocmask rt_sigreturn exit exit_group gettid tgkill sched_yield sched_getaffinity arch_prctl (x86_64)`; `clone` **only with thread flags** (`CLONE_VM \| CLONE_SIGHAND \| CLONE_THREAD` set, no `CLONE_NEW*`); `clone3` answers `ENOSYS` (glibc falls back to `clone`); `prctl` **only** `PR_SET_NAME`, `PR_GET_NAME` and `PR_SET_DUMPABLE` with 0 |
 //! | time, randomness | `clock_gettime clock_getres gettimeofday nanosleep clock_nanosleep getrandom` |
 //! | descriptors | `read write readv writev pread64 pwrite64 close lseek dup dup3 fcntl pipe2 eventfd2 epoll_create1 epoll_ctl epoll_wait epoll_pwait poll ppoll ioctl` (**only** `FIONBIO FIONREAD FIOCLEX FIONCLEX`) |
-//! | sockets | `socket` (**only** `AF_UNIX AF_INET AF_INET6`), `socketpair` (**only** `AF_UNIX`), `connect accept4 shutdown getsockname getpeername getsockopt setsockopt sendto recvfrom sendmsg recvmsg sendmmsg recvmmsg` |
+//! | sockets | `socket` (**only** `AF_UNIX AF_INET AF_INET6` and type `SOCK_STREAM` or `SOCK_DGRAM`, with `NONBLOCK`/`CLOEXEC` only), `socketpair` (**only** `AF_UNIX`, `SOCK_STREAM`), `connect accept4 shutdown getsockname getpeername getsockopt setsockopt sendto recvfrom sendmsg recvmsg sendmmsg recvmmsg` |
 //! | files (registry, verifiers) | `openat fstat newfstatat statx fsync fdatasync fchmod unlinkat renameat renameat2 flock readlinkat access faccessat faccessat2 ftruncate fallocate getdents64` |
 //! | identity, limits | `getuid geteuid getgid getegid getpid getrlimit prlimit64 uname` |
 //!
-//! Deliberately **absent**: `execve execveat fork vfork ptrace mount umount2 setuid setgid
-//! setns unshare chroot pivot_root bpf kexec_load init_module finit_module open_by_handle_at
-//! process_vm_readv process_vm_writev perf_event_open keyctl socket families other than the
-//! three above`, and every call that creates a listening socket after start-up (`bind` and
-//! `listen`). The gateway never spawns a process.
+//! Deliberately **absent**: `execve execveat vfork ptrace mount umount2 setuid setgid setns
+//! unshare chroot pivot_root bpf kexec_load init_module finit_module open_by_handle_at
+//! process_vm_readv process_vm_writev perf_event_open keyctl`, socket families other than the
+//! three above, and every call that creates a listening socket after start-up (`bind` and
+//! `listen`). A fork-style `clone` (no `CLONE_THREAD`) and any `clone` with a `CLONE_NEW*`
+//! namespace flag match no rule and kill the process, as does `prctl(PR_SET_DUMPABLE, 1)`.
+//! The gateway never spawns a process.
+//!
+//! Two programs are installed, the ENOSYS one first (installing a filter needs `seccomp(2)`
+//! and `prctl`, which the allowlist does not permit afterwards).
 
 use seccompiler::{
     BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
@@ -103,7 +108,8 @@ fn plain() -> Vec<(i64, &'static str)> {
         SYS_mremap,
         SYS_mprotect,
         SYS_madvise,
-        SYS_clone,
+        // clone3 stays in the allowlist only so that the second filter (below) can turn it into
+        // ENOSYS: the kernel takes the strictest answer of all filters.
         SYS_clone3,
         SYS_futex,
         SYS_set_robust_list,
@@ -112,7 +118,6 @@ fn plain() -> Vec<(i64, &'static str)> {
         SYS_rt_sigaction,
         SYS_rt_sigprocmask,
         SYS_rt_sigreturn,
-        SYS_prctl,
         SYS_exit,
         SYS_exit_group,
         SYS_gettid,
@@ -200,15 +205,37 @@ fn plain() -> Vec<(i64, &'static str)> {
 /// Names of every syscall the filter allows (for the documentation and tests).
 pub fn allowed_names() -> Vec<&'static str> {
     let mut names: Vec<&'static str> = plain().into_iter().map(|(_, n)| n).collect();
-    names.extend(["SYS_ioctl", "SYS_socket", "SYS_socketpair"]);
+    names.extend([
+        "SYS_ioctl",
+        "SYS_socket",
+        "SYS_socketpair",
+        "SYS_clone",
+        "SYS_prctl",
+    ]);
     names.sort_unstable();
     names
 }
 
+fn cond(
+    arg: u8,
+    len: SeccompCmpArgLen,
+    op: SeccompCmpOp,
+    value: u64,
+) -> Result<SeccompCondition, HardenError> {
+    SeccompCondition::new(arg, len, op, value).map_err(|e| HardenError::Seccomp(e.to_string()))
+}
+
+fn rule(conditions: Vec<SeccompCondition>) -> Result<SeccompRule, HardenError> {
+    SeccompRule::new(conditions).map_err(|e| HardenError::Seccomp(e.to_string()))
+}
+
 fn eq(arg: u8, value: u64) -> Result<SeccompRule, HardenError> {
-    SeccompCondition::new(arg, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, value)
-        .and_then(|c| SeccompRule::new(vec![c]))
-        .map_err(|e| HardenError::Seccomp(e.to_string()))
+    rule(vec![cond(
+        arg,
+        SeccompCmpArgLen::Dword,
+        SeccompCmpOp::Eq,
+        value,
+    )?])
 }
 
 /// Builds the BPF program of the allowlist for `mode`.
@@ -231,17 +258,93 @@ pub fn build_filter(mode: SeccompMode) -> Result<BpfProgram, HardenError> {
             eq(1, FIONCLEX)?,
         ],
     );
-    // socket: only the three families the unit's RestrictAddressFamilies allows.
+    // socket: the three families the unit's RestrictAddressFamilies allows, and only stream
+    // or datagram types (the type argument may carry SOCK_NONBLOCK and SOCK_CLOEXEC, nothing
+    // else): no raw, packet or netlink-style sockets.
+    const SOCK_STREAM: u64 = 1;
+    const SOCK_DGRAM: u64 = 2;
+    // Everything of a 32-bit type argument except SOCK_NONBLOCK (0x800) and SOCK_CLOEXEC.
+    const SOCK_TYPE_BITS: u64 = 0xFFFF_FFFF & !(0x800 | 0x80000);
+    let mut sock = Vec::new();
+    for domain in [libc::AF_UNIX, libc::AF_INET, libc::AF_INET6] {
+        for ty in [SOCK_STREAM, SOCK_DGRAM] {
+            sock.push(rule(vec![
+                cond(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, domain as u64)?,
+                cond(
+                    1,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::MaskedEq(SOCK_TYPE_BITS),
+                    ty,
+                )?,
+            ])?);
+        }
+    }
+    rules.insert(libc::SYS_socket, sock);
+    // socketpair: tokio's signal handling and wake-ups; unix stream sockets only.
     rules.insert(
-        libc::SYS_socket,
+        libc::SYS_socketpair,
+        vec![rule(vec![
+            cond(
+                0,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                libc::AF_UNIX as u64,
+            )?,
+            cond(
+                1,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::MaskedEq(SOCK_TYPE_BITS),
+                SOCK_STREAM,
+            )?,
+        ])?],
+    );
+    // clone: a thread and nothing else. The flags must include CLONE_VM, CLONE_SIGHAND and
+    // CLONE_THREAD (so it is not a fork), and none of the namespace flags.
+    const THREAD_FLAGS: u64 = (libc::CLONE_VM | libc::CLONE_SIGHAND | libc::CLONE_THREAD) as u64;
+    const NAMESPACE_FLAGS: u64 = (libc::CLONE_NEWNS
+        | libc::CLONE_NEWCGROUP
+        | libc::CLONE_NEWUTS
+        | libc::CLONE_NEWIPC
+        | libc::CLONE_NEWUSER
+        | libc::CLONE_NEWPID
+        | libc::CLONE_NEWNET) as u64;
+    rules.insert(
+        libc::SYS_clone,
+        vec![rule(vec![
+            cond(
+                0,
+                SeccompCmpArgLen::Qword,
+                SeccompCmpOp::MaskedEq(THREAD_FLAGS),
+                THREAD_FLAGS,
+            )?,
+            cond(
+                0,
+                SeccompCmpArgLen::Qword,
+                SeccompCmpOp::MaskedEq(NAMESPACE_FLAGS),
+                0,
+            )?,
+        ])?],
+    );
+    // prctl: naming a thread, and clearing (never setting) the dumpable flag.
+    const PR_SET_DUMPABLE: u64 = 4;
+    const PR_SET_NAME: u64 = 15;
+    const PR_GET_NAME: u64 = 16;
+    rules.insert(
+        libc::SYS_prctl,
         vec![
-            eq(0, libc::AF_UNIX as u64)?,
-            eq(0, libc::AF_INET as u64)?,
-            eq(0, libc::AF_INET6 as u64)?,
+            eq(0, PR_SET_NAME)?,
+            eq(0, PR_GET_NAME)?,
+            rule(vec![
+                cond(
+                    0,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::Eq,
+                    PR_SET_DUMPABLE,
+                )?,
+                cond(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 0)?,
+            ])?,
         ],
     );
-    // socketpair: tokio's signal handling and wake-ups; unix sockets only.
-    rules.insert(libc::SYS_socketpair, vec![eq(0, libc::AF_UNIX as u64)?]);
     let arch = TargetArch::try_from(std::env::consts::ARCH)
         .map_err(|e| HardenError::Seccomp(format!("unsupported architecture: {e}")))?;
     let mismatch = match mode {
@@ -255,10 +358,34 @@ pub fn build_filter(mode: SeccompMode) -> Result<BpfProgram, HardenError> {
         .map_err(|e: seccompiler::BackendError| HardenError::Seccomp(e.to_string()))
 }
 
-/// Installs the allowlist on every thread of the process (`TSYNC`). Irreversible.
+/// The second program: `clone3` answers `ENOSYS`, everything else is left to the allowlist.
+/// `clone3` takes its flags in a struct that a filter cannot read, so it cannot be allowed
+/// with the thread-only rule of `clone`; glibc and the Rust runtime fall back to `clone`.
+pub fn build_enosys_filter() -> Result<BpfProgram, HardenError> {
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+    rules.insert(libc::SYS_clone3, vec![]);
+    let arch = TargetArch::try_from(std::env::consts::ARCH)
+        .map_err(|e| HardenError::Seccomp(format!("unsupported architecture: {e}")))?;
+    SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::ENOSYS as u32),
+        arch,
+    )
+    .map_err(|e| HardenError::Seccomp(e.to_string()))?
+    .try_into()
+    .map_err(|e: seccompiler::BackendError| HardenError::Seccomp(e.to_string()))
+}
+
+/// Installs both programs on every thread of the process (`TSYNC`). Irreversible. The ENOSYS
+/// program goes first: after the allowlist is in force, installing anything is itself forbidden.
 pub fn install_seccomp(mode: SeccompMode) -> Result<(), HardenError> {
-    let program = build_filter(mode)?;
-    seccompiler::apply_filter_all_threads(&program).map_err(|e| HardenError::Seccomp(e.to_string()))
+    let enosys = build_enosys_filter()?;
+    let allowlist = build_filter(mode)?;
+    seccompiler::apply_filter_all_threads(&enosys)
+        .map_err(|e| HardenError::Seccomp(e.to_string()))?;
+    seccompiler::apply_filter_all_threads(&allowlist)
+        .map_err(|e| HardenError::Seccomp(e.to_string()))
 }
 
 #[cfg(test)]

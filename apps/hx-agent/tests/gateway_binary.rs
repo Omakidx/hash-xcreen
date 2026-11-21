@@ -166,7 +166,7 @@ async fn the_binary_runs_a_full_session_under_its_seccomp_allowlist() {
         // The filter, no_new_privs and non-dumpability are in force.
         let status = proc_status(pid);
         assert!(status.contains("Seccomp:\t2"), "{status}");
-        assert!(status.contains("Seccomp_filters:\t1"), "{status}");
+        assert!(status.contains("Seccomp_filters:\t2"), "{status}");
         assert!(status.contains("NoNewPrivs:\t1"), "{status}");
         // A non-dumpable process's /proc entries belong to root, not to us.
         let owner = std::os::unix::fs::MetadataExt::uid(
@@ -455,25 +455,75 @@ async fn secrets_never_reach_the_binarys_log_even_at_debug_level() {
 
 // ------------------------------------------------------------------ the filter bites
 
-/// Child mode of the two tests below: install the filter, then make a forbidden call
-/// (`mkdir`). Does nothing unless the parent set the environment.
+/// Child mode of the tests below: install the filter, then make one call (`HX_SECCOMP_CALL`).
+/// Does nothing unless the parent set the environment.
 #[test]
 fn seccomp_child_process() {
     let Ok(mode) = std::env::var("HX_SECCOMP_CHILD") else {
         return;
     };
     let dir = std::env::var("HX_SECCOMP_DIR").unwrap();
+    let call = std::env::var("HX_SECCOMP_CALL").unwrap_or_else(|_| "mkdir".into());
     let mode = if mode == "log" {
         hx_agent::gateway::config::SeccompMode::Log
     } else {
         hx_agent::gateway::config::SeccompMode::Enforce
     };
     hx_agent::gateway::harden::install_seccomp(mode).expect("install");
-    std::fs::create_dir(&dir).expect("mkdir");
+    match call.as_str() {
+        "mkdir" => std::fs::create_dir(&dir).expect("mkdir"),
+        // A new user namespace through clone: no thread flags, a CLONE_NEW* flag.
+        "clone_newuser" => {
+            let r = unsafe {
+                libc::syscall(
+                    libc::SYS_clone,
+                    (libc::CLONE_NEWUSER | libc::SIGCHLD) as libc::c_long,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+            };
+            println!("clone returned {r}");
+        }
+        // A fork-style clone.
+        "fork" => {
+            let r = unsafe {
+                libc::syscall(libc::SYS_clone, libc::SIGCHLD as libc::c_long, 0, 0, 0, 0)
+            };
+            println!("fork returned {r}");
+        }
+        // clone3 must answer ENOSYS (its flags cannot be filtered).
+        "clone3" => {
+            let r =
+                unsafe { libc::syscall(libc::SYS_clone3, 0 as libc::c_long, 0 as libc::c_long) };
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            println!("clone3 {r} errno {errno:?} ENOSYS {}", libc::ENOSYS);
+        }
+        // Setting the dumpable flag back on.
+        "prctl_dumpable" => {
+            let r = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) };
+            println!("prctl returned {r}");
+        }
+        // A raw socket.
+        "socket_raw" => {
+            let r = unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW, 1) };
+            println!("socket returned {r}");
+        }
+        // Ordinary things must still work: a thread, a named thread.
+        "thread" => {
+            let t = std::thread::Builder::new()
+                .name("hx-test".into())
+                .spawn(|| 7)
+                .expect("spawn");
+            assert_eq!(t.join().expect("join"), 7);
+        }
+        other => panic!("unknown call {other}"),
+    }
     println!("SURVIVED");
 }
 
-fn run_child(mode: &str, dir: &Path) -> std::process::Output {
+fn run_child_call(mode: &str, call: &str, dir: &Path) -> std::process::Output {
     Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -482,9 +532,48 @@ fn run_child(mode: &str, dir: &Path) -> std::process::Output {
             "--test-threads=1",
         ])
         .env("HX_SECCOMP_CHILD", mode)
+        .env("HX_SECCOMP_CALL", call)
         .env("HX_SECCOMP_DIR", dir)
         .output()
         .unwrap()
+}
+
+fn run_child(mode: &str, dir: &Path) -> std::process::Output {
+    run_child_call(mode, "mkdir", dir)
+}
+
+/// F6: calls the allowlist must not give a process, each killed by SIGSYS.
+#[test]
+fn namespace_clone_fork_dumpable_and_raw_sockets_kill_the_process() {
+    let tmp = tempfile::tempdir().unwrap();
+    for call in ["clone_newuser", "fork", "prctl_dumpable", "socket_raw"] {
+        let out = run_child_call("enforce", call, tmp.path());
+        assert_eq!(out.status.signal(), Some(libc::SIGSYS), "{call}: {out:?}");
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("SURVIVED"),
+            "{call} survived"
+        );
+    }
+}
+
+/// F6: `clone3` answers ENOSYS (not a kill), so the runtime's fallback to `clone` works.
+#[test]
+fn clone3_answers_enosys_and_threads_still_work() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run_child_call("enforce", "clone3", tmp.path());
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // libtest prints its own text on the same line as the first line of output.
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("clone3 "))
+        .expect("clone3 line");
+    assert!(line.contains("-1 errno Some(38)"), "ENOSYS is 38: {line}");
+    let out = run_child_call("enforce", "thread", tmp.path());
+    assert!(
+        out.status.success(),
+        "threads and thread names work: {out:?}"
+    );
 }
 
 #[test]
