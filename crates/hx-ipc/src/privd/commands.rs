@@ -117,6 +117,59 @@ pub fn command_info(cmd: &Command) -> CommandInfo {
     }
 }
 
+/// The one place for the **`PERMISSION_DENIED` rules of the Gateway role** that depend only on the
+/// request and privd's phase. Returns the reason (a field or rule name, never a value) if a
+/// `Gateway` caller must be refused, `None` if this layer has no objection. `Admin` is never
+/// refused here; do not call it for `Admin`.
+///
+/// Rules implemented:
+/// * class `X` commands are never allowed to Gateway (section 5.1);
+/// * Admin-only arguments, by presence ([`admin_only_argument`]);
+/// * `DeleteSnapshot`: Gateway may delete `manual` snapshots only (section 6.10);
+/// * `SetUserPassword`: the `CURRENT_PASSWORD` slot (a second slot) is required unless the phase
+///   is `SETUP_OPEN` (section 6.9). Whether it is *correct* is checked by privd against the
+///   shadow hash and answers `PERMISSION_DENIED` too.
+///
+/// Rules that **stay in privd itself** because they need privd's state, other error codes or
+/// the second stage of a request:
+/// * phase gates of classes `A` and `S` (`SetupHost` and `CreateDesktop` outside `SETUP_OPEN`,
+///   routine commands while `UNINITIALIZED`) are `FAILED_PRECONDITION`, not a permission error
+///   (section 7 rule 6);
+/// * `EnableDocker` is open to Gateway only while `SETUP_OPEN` and `PERMISSION_DENIED` after
+///   (section 5.1, section 7 rule 5): decided by privd from its phase, then by the
+///   acknowledgement flag;
+/// * `StartDesktop` for Gateway while `needs_attention` holds `ISOLATION_NOT_RESTORED`
+///   (section 7 rule 11);
+/// * the `PepperEnrol` caps (5 per day after setup, 60 per hour in `SETUP_OPEN`, section 6.15),
+///   all rate limits, the connection and lock limits, and the failure caps of section 5.3;
+/// * a non-empty `CreateDesktop.settings` is `UNIMPLEMENTED` (section 6.5) and the reserved
+///   commands (`CommandInfo::reserved`) are `UNIMPLEMENTED`;
+/// * secret frames: privd must check that each kind-2 frame's `request_id` equals the pending
+///   request's and its `slot` is a declared, not yet filled slot, that it arrives within 5 s of
+///   the `Request` ([`super::BODY_TIMEOUT`]), and call [`super::check_secret_against_slot`];
+///   anything missing, extra or late rejects the request (section 5.2);
+/// * uniqueness of `request_id` on the connection, one request in flight (section 4).
+pub fn gateway_denied(req: &super::pb::Request, phase: super::pb::Phase) -> Option<&'static str> {
+    let cmd = req.command.as_ref()?;
+    if command_info(cmd).class == CommandClass::X {
+        return Some("command class X is Admin only");
+    }
+    if let Some(field) = admin_only_argument(cmd) {
+        return Some(field);
+    }
+    match cmd {
+        Command::DeleteSnapshot(r) if snapshot_kind_of(&r.name) != Some("manual") => {
+            Some("delete_snapshot.name: Gateway may delete manual snapshots only")
+        }
+        Command::SetUserPassword(_)
+            if req.secret_slots.len() < 2 && phase != super::pb::Phase::SetupOpen =>
+        {
+            Some("set_user_password: current password required outside the setup window")
+        }
+        _ => None,
+    }
+}
+
 /// The first argument of `cmd` that only `Admin` may set and that is present (proto3 `optional`
 /// presence, so a field set to its default value still counts), or `None`.
 ///

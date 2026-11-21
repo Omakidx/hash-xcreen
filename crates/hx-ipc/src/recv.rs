@@ -37,7 +37,9 @@ pub fn recv_no_cmsg<Fd: AsFd>(fd: Fd, buf: &mut [u8]) -> io::Result<usize> {
     )?;
     // MSG_TRUNC cannot happen on SOCK_STREAM; if it ever does the socket is not what this
     // module is for (datagram sockets), so it is refused as well.
-    if msg.flags.intersects(ReturnFlags::CTRUNC | ReturnFlags::TRUNC)
+    if msg
+        .flags
+        .intersects(ReturnFlags::CTRUNC | ReturnFlags::TRUNC)
         || control.drain().next().is_some()
     {
         return Err(io::Error::new(io::ErrorKind::InvalidData, AncillaryData));

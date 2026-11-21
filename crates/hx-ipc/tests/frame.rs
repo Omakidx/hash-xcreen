@@ -47,7 +47,10 @@ fn debug_output_never_contains_body_bytes() {
     let f = f.unwrap();
     let shown = format!("{f:?}");
     assert!(!shown.contains("171"), "{shown}");
-    assert!(shown.contains("body_len: 8") && shown.contains("kind: 2"), "{shown}");
+    assert!(
+        shown.contains("body_len: 8") && shown.contains("kind: 2"),
+        "{shown}"
+    );
 }
 
 #[test]

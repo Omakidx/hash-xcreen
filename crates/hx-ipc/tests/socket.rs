@@ -131,7 +131,10 @@ fn the_decoder_is_poisoned_after_a_descriptor_arrives() {
     let (carried, _w) = UnixStream::pair().unwrap();
     send_with_fd(&a, &encode_frame(1, b"x", 1_000).unwrap(), &carried);
     let mut d = Decoder::new(P);
-    assert!(matches!(d.read_from(&mut NoCmsgReader(&b)), Err(ReadError::Ancillary(_))));
+    assert!(matches!(
+        d.read_from(&mut NoCmsgReader(&b)),
+        Err(ReadError::Ancillary(_))
+    ));
     let wire = encode_frame(1, b"y", 1_000).unwrap();
     assert!(matches!(
         d.read_from(&mut &wire[..]),

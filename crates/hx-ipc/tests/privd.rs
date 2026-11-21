@@ -383,6 +383,82 @@ fn admin_only_arguments_are_detected_by_presence_even_at_default_value() {
 }
 
 #[test]
+fn gateway_denied_table_over_commands_arguments_and_phases() {
+    use pb::Phase::{Ready, SetupOpen, Uninitialized};
+    let mut rows: Vec<(pb::Request, bool, &str)> = Vec::new(); // (request, denied for every phase?, label)
+    // Base set: every command with its default valid arguments. Denied = class X, or it carries
+    // an Admin-only argument (the base FinishSetup, SetupHost and CreateDesktop do).
+    for c in every_command() {
+        let info = command_info(&c);
+        let admin_arg = privd::admin_only_argument(&c).is_some();
+        rows.push((
+            request(1, c),
+            info.class == CommandClass::X || admin_arg,
+            info.name,
+        ));
+    }
+    // Argument variants that are NOT denied.
+    rows.push((
+        request(
+            1,
+            Command::FinishSetup(pb::FinishSetupRequest { force: None }),
+        ),
+        false,
+        "FinishSetup/no force",
+    ));
+    rows.push((
+        request(1, Command::SetupHost(Default::default())),
+        false,
+        "SetupHost/restricted",
+    ));
+    let mut cd = match every_command()[6].clone() {
+        Command::CreateDesktop(r) => r,
+        _ => unreachable!(),
+    };
+    cd.image_file = None;
+    rows.push((
+        request(1, Command::CreateDesktop(cd)),
+        false,
+        "CreateDesktop/no image_file",
+    ));
+    // DeleteSnapshot: only manual for Gateway.
+    for (name, denied) in [
+        ("hx-manual-20261120T101500Z-a1b2", false),
+        ("hx-preupdate-20261120T101500Z-a1b2", true),
+        ("hx-backup-20261120T101500Z-a1b2", true),
+        ("not-a-snapshot", true),
+    ] {
+        let c = Command::DeleteSnapshot(pb::DeleteSnapshotRequest {
+            desktop_id: ID.into(),
+            name: name.into(),
+        });
+        rows.push((request(1, c), denied, "DeleteSnapshot"));
+    }
+    for (req, denied_always, label) in rows {
+        for phase in [Uninitialized, SetupOpen, Ready] {
+            let got = privd::gateway_denied(&req, phase).is_some();
+            assert_eq!(got, denied_always, "{label} in {phase:?}");
+        }
+    }
+    // SetUserPassword: the current-password slot is required unless the window is open.
+    let sup = Command::SetUserPassword(pb::SetUserPasswordRequest {
+        desktop_id: ID.into(),
+    });
+    let mut one = request(1, sup.clone());
+    one.secret_slots.truncate(1);
+    let two = request(1, sup);
+    assert_eq!(two.secret_slots.len(), 2);
+    for phase in [Uninitialized, SetupOpen, Ready] {
+        assert!(privd::gateway_denied(&two, phase).is_none(), "{phase:?}");
+    }
+    assert!(privd::gateway_denied(&one, SetupOpen).is_none());
+    assert!(privd::gateway_denied(&one, Ready).is_some());
+    assert!(privd::gateway_denied(&one, Uninitialized).is_some());
+    // No command: nothing to deny at this layer.
+    assert!(privd::gateway_denied(&pb::Request::default(), Ready).is_none());
+}
+
+#[test]
 fn every_result_variant_and_error_code_round_trips() {
     use pb::response::Result as R;
     use pb::*;
