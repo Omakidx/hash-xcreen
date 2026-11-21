@@ -567,7 +567,12 @@ fn every_result_variant_and_error_code_round_trips() {
         R::ApplyUpdate(ApplyUpdateResult { restarting: true }),
         R::RollbackUpdate(RollbackUpdateResult {}),
         R::DestroyDesktop(DestroyDesktopResult {}),
-        R::Uninstall(UninstallResult {}),
+        R::Uninstall(UninstallResult {
+            keep_desktop: true,
+            removed: vec!["session-link:main".into()],
+            kept: vec!["desktop:main".into()],
+            warnings: vec![],
+        }),
         R::ResetLockout(ResetLockoutResult {}),
         R::EnrolOwnerKey(EnrolOwnerKeyResult {}),
         R::UpgradeIncus(UpgradeIncusResult {}),
@@ -1427,4 +1432,53 @@ fn no_command_can_run_without_a_deadline() {
             info.name
         );
     }
+}
+
+#[test]
+fn the_uninstall_additions_are_known_values_and_the_result_lists_are_bounded() {
+    use pb::frame::Frame as F;
+    let f = |frame| pb::Frame { frame: Some(frame) };
+    // The new progress stage and error detail are accepted.
+    assert!(
+        privd::validate_frame(
+            &f(F::Progress(pb::Progress {
+                stage: pb::ProgressStage::Uninstall as i32,
+                step: "x".into(),
+                percent: 255,
+                ..Default::default()
+            })),
+            Side::Client
+        )
+        .is_ok()
+    );
+    let response = |result| {
+        f(F::Response(pb::Response {
+            request_id: 1,
+            result: Some(result),
+        }))
+    };
+    assert!(
+        privd::validate_frame(
+            &response(pb::response::Result::Error(pb::Error {
+                code: pb::ErrorCode::FailedPrecondition as i32,
+                detail: pb::ErrorDetail::Uninstalling as i32,
+                message: "uninstalling".into(),
+                ..Default::default()
+            })),
+            Side::Client
+        )
+        .is_ok()
+    );
+    let result = |removed: Vec<String>, text: usize| {
+        response(pb::response::Result::Uninstall(pb::UninstallResult {
+            keep_desktop: false,
+            removed,
+            kept: vec!["x".repeat(text)],
+            warnings: vec![],
+        }))
+    };
+    let many = |n: usize| (0..n).map(|i| format!("pool:{i}")).collect::<Vec<_>>();
+    assert!(privd::validate_frame(&result(many(64), 256), Side::Client).is_ok());
+    assert!(privd::validate_frame(&result(many(65), 1), Side::Client).is_err());
+    assert!(privd::validate_frame(&result(many(1), 257), Side::Client).is_err());
 }
