@@ -43,6 +43,24 @@ impl TokenBucket {
     }
 }
 
+impl TokenBucket {
+    /// Takes one token even if there is none (the bucket goes into debt) and returns how long
+    /// the caller must wait before it may act: zero while the burst lasts, then the time the
+    /// debt needs to be paid at the sustained rate. A caller that sleeps for the returned time
+    /// never exceeds the rate for longer than the burst; one whose wait grows too long is
+    /// sending faster than allowed for good.
+    pub(super) fn reserve(&mut self, now: Instant) -> Duration {
+        let dt = now.saturating_duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + dt * self.rate).min(self.burst) - 1.0;
+        if self.tokens >= 0.0 || self.rate <= 0.0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs_f64(-self.tokens / self.rate)
+        }
+    }
+}
+
 /// Bounds how often the gateway asks privd for something expensive (`RestartSession`,
 /// `InstallSession`): at least `min_gap` apart and at most `per_hour` an hour. privd rate limits
 /// as well; this keeps a hostile session from making the gateway spend privd's budget (or its own
@@ -99,6 +117,26 @@ mod tests {
         assert_eq!(n, 5);
         assert!(b.allow(t0 + Duration::from_millis(150)));
         assert!(!b.allow(t0 + Duration::from_millis(150)));
+    }
+
+    #[test]
+    fn reserve_allows_the_burst_then_paces_and_reports_the_lag() {
+        let t0 = Instant::now();
+        let mut b = TokenBucket::new(1_000, 100);
+        for _ in 0..100 {
+            assert_eq!(b.reserve(t0), Duration::ZERO, "the burst is free");
+        }
+        let w1 = b.reserve(t0);
+        let w2 = b.reserve(t0);
+        assert!(w1 > Duration::ZERO && w2 > w1, "debt grows: {w1:?} {w2:?}");
+        // 1000 more at once is a second of lag at 1000/s.
+        let mut last = Duration::ZERO;
+        for _ in 0..1_000 {
+            last = b.reserve(t0);
+        }
+        assert!(last >= Duration::from_millis(990), "{last:?}");
+        // Time pays the debt back.
+        assert_eq!(b.reserve(t0 + Duration::from_secs(5)), Duration::ZERO);
     }
 
     #[test]

@@ -8,10 +8,13 @@
 //! * **Validation and clamping.** Scancodes above `0xE7`, an unknown button and an event with
 //!   no variant are dropped; coordinates are clamped to the display of the stream in force;
 //!   scrolling is bounded; relative motion is limited to +-32 768.
-//! * **Rate.** A client may send 2 000 input events per second (ipc.md 17); more than that
-//!   closes it with `PROTOCOL_ERROR`. Motion is coalesced by the transport and again by the
-//!   link client (at most one message per millisecond), and the motion task never spins faster
-//!   than that.
+//! * **Rate.** At most 2 000 input events a second with a burst of 500 reach the session
+//!   (ipc.md 13 and 17: they must fit the session's `ctl` budget with the motion and the rest).
+//!   A burst above that is *paced* (the task waits, and flow control slows the client); a client
+//!   that is more than one second behind its allowance, that is, one that sends faster than
+//!   2 000 a second for good, is closed with `PROTOCOL_ERROR`. Motion is coalesced by the
+//!   transport and again by the link client (at most one message per millisecond), and the
+//!   motion task never spins faster than that.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
@@ -28,6 +31,11 @@ use crate::link::LinkClient;
 
 /// Input events a client may send per second.
 pub(super) const INPUT_RATE: u32 = 2_000;
+/// The burst the input allowance holds (a quarter second: it bounds what a sliding second of
+/// `ctl` can carry, see ipc.md 13).
+pub(super) const INPUT_BURST: u32 = 500;
+/// A client this far behind its allowance is sending too fast for good.
+const MAX_LAG: Duration = Duration::from_secs(1);
 /// The largest key usage the protocol allows (protocol 5.3).
 const MAX_SCANCODE: u32 = 0xE7;
 /// Scroll per event in 1/120 notch: 100 notches.
@@ -156,7 +164,7 @@ pub(super) async fn input_task(
     path: Arc<InputPath>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let mut bucket = TokenBucket::new(INPUT_RATE, INPUT_RATE);
+    let mut bucket = TokenBucket::new(INPUT_RATE, INPUT_BURST);
     loop {
         let ev = tokio::select! {
             biased;
@@ -166,10 +174,18 @@ pub(super) async fn input_task(
                 Err(_) => return,
             },
         };
-        if !bucket.allow(Instant::now()) {
+        let wait = bucket.reserve(Instant::now());
+        if wait > MAX_LAG {
             tracing::warn!("a client sent input faster than 2000 events per second; closing it");
             conn.close(CloseCode::ProtocolError, "input rate").await;
             return;
+        }
+        if !wait.is_zero() {
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => return,
+                () = tokio::time::sleep(wait) => {}
+            }
         }
         path.forward(ev);
     }

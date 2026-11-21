@@ -12,6 +12,7 @@ mod relay_common;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use hx_agent::gateway::desktop::DesktopLink as _;
 use hx_capture::clipboard::{
     Clipboard, ClipboardConfig, ClipboardEvent, MIME_TEXT, MIME_URI_LIST, RemoteProvider, Selection,
 };
@@ -946,4 +947,75 @@ async fn a_restarted_session_ends_the_stream_with_a_fixed_text_and_the_client_re
         assert!(Instant::now() < end, "no reconnect");
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// A client cannot make the link fail
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_flooding_view_configs_input_and_motion_cannot_make_the_link_fail() {
+    let Some(rig) = Rig::start(RigOptions::default()).await else {
+        return;
+    };
+    let _drawer = Drawer::start(&rig.x.display, false);
+    let dev = rig.device("laptop").await;
+    let mut c = rig.client(&dev, "laptop").await;
+    c.view(|_| {}).await;
+    c.next_frame(15).await;
+
+    // Continuous pointer motion for the whole test.
+    let conn = c.conn.clone();
+    let motion = tokio::spawn(async move {
+        let end = Instant::now() + Duration::from_secs(3);
+        let mut i = 0i32;
+        while Instant::now() < end {
+            if conn
+                .send_mouse_move(false, 10 + (i % 300), 20 + (i % 200))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            i += 1;
+            tokio::task::yield_now().await;
+        }
+    });
+    // 5000 ViewConfigs back to back (a distinct frame-rate ceiling each).
+    for i in 0..5_000u32 {
+        c.view(|v| v.max_fps = 10 + i % 50).await;
+    }
+    // An input burst of 2000 events, then about 2000 a second for 2 s.
+    let key = |pressed| InputEvent {
+        event: Some(In::Key(KeyEvent {
+            scancode: 0x04,
+            pressed,
+        })),
+    };
+    for i in 0..2_000 {
+        c.conn.send_input(&key(i % 2 == 0)).await.unwrap();
+    }
+    for tick in 0..200 {
+        for i in 0..19 {
+            c.conn.send_input(&key((tick + i) % 2 == 0)).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    motion.await.unwrap();
+    c.conn
+        .send_input(&InputEvent {
+            event: Some(In::ReleaseAll(Default::default())),
+        })
+        .await
+        .unwrap();
+
+    // The link never failed: still up, still Up in the status, no restart or install was asked
+    // for, the client was not closed and the stream goes on.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(rig.relay.keeper().is_up());
+    assert_eq!(rig.relay.state(), hx_ipc::admin::pb::LinkState::Up);
+    assert_eq!(rig.env.privd.with(|s| s.restart_session_calls), 0);
+    assert_eq!(rig.env.privd.with(|s| s.install_session_calls), 0);
+    assert!(c.conn.close_info().is_none(), "{:?}", c.conn.close_info());
+    while c.frames.try_recv().is_ok() {}
+    c.next_frame(15).await;
 }

@@ -32,6 +32,7 @@ use tokio::sync::watch;
 use super::Core;
 use super::cursor::{self, CursorSlot};
 use super::input::{self, InputPath};
+use super::reconf::Reconf;
 use super::stats::{self, StatsShared};
 use super::transfer::{self, Inbox, TransferCtx};
 use super::video::{self, VideoShared};
@@ -58,6 +59,9 @@ pub(super) struct ClientRelay {
     inbox: Arc<Inbox>,
     stats: Arc<StatsShared>,
     pub(super) input: Arc<InputPath>,
+    reconf: Arc<Reconf>,
+    /// `ClientStats` forwarded: a client sends about one a second, the session gets at most 4.
+    stats_rl: std::sync::Mutex<super::util::TokenBucket>,
     clipboard_ok: Arc<AtomicBool>,
     files_ok: Arc<AtomicBool>,
     max_file_bytes: u64,
@@ -87,6 +91,8 @@ impl ClientRelay {
                 core.epoch.clone(),
                 display,
             )),
+            reconf: Reconf::new(link.clone()),
+            stats_rl: std::sync::Mutex::new(super::util::TokenBucket::new(4, 4)),
             video: VideoShared::new(core.cfg.link.max_frame_bytes),
             cursor: Arc::new(CursorSlot::default()),
             inbox: Arc::new(Inbox::default()),
@@ -289,6 +295,7 @@ impl ClientRelay {
     }
 
     fn stop_tasks(&self) {
+        self.reconf.close();
         let _ = self.shutdown.send(true);
         self.conn.set_ack_handler(None);
         for f in self.video.queue.clear() {
@@ -309,9 +316,8 @@ impl GatewayHandle for ClientRelay {
                 .choose_codec(&self.link, &self.conn, config.codec)
                 .unwrap_or(VideoCodec::H264);
             let cfg = self.apply_view(&config, codec);
-            if let Err(e) = self.link.reconfigure(cfg) {
-                tracing::debug!(error = %e, "reconfigure was not queued");
-            }
+            // At most 10 a second reach the session; the last one always does (reconf.rs).
+            self.reconf.push(cfg);
         })
     }
 
@@ -328,7 +334,9 @@ impl GatewayHandle for ClientRelay {
 
     fn client_stats(&self, stats: hx_proto::pb::ClientStats) -> BoxFuture<'_, ()> {
         Box::pin(async move {
-            if !self.is_detached() {
+            if !self.is_detached()
+                && super::util::lock(&self.stats_rl).allow(std::time::Instant::now())
+            {
                 let _ = self.link.client_stats(stats);
             }
         })

@@ -524,8 +524,9 @@ pub(super) async fn feedback_task(
             _ = shutdown.changed() => return,
             () = video.feedback.notify.notified() => {}
         }
-        // Let a burst of acknowledgements gather into one message.
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        // Let a burst of acknowledgements gather into one message: at most 100 messages a
+        // second reach the session's ctl budget (ipc.md 13).
+        tokio::time::sleep(Duration::from_millis(10)).await;
         loop {
             let batch = video.feedback.take();
             if batch.is_empty() {

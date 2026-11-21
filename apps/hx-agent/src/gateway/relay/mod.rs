@@ -67,6 +67,7 @@
 mod client;
 mod cursor;
 mod input;
+mod reconf;
 mod stats;
 mod transfer;
 mod util;
@@ -93,6 +94,29 @@ use crate::link::{
     Advice, Attached, DesktopState, DialError, FailureClass, IDLE_KEEP, LinkClient, LinkConfig,
     LinkEvent, LinkEvents, LinkKeeper,
 };
+
+/// The most `ctl` frames toward the session that one client can cause in any sliding second.
+/// The session closes the link above `CTL_FRAMES_FROM_GATEWAY` (4 000), and that must be
+/// impossible whatever a client sends, so that a client can never make the session look faulty
+/// (ipc.md 13): input at its sustained rate plus its burst, motion at the link's 1 000 a second,
+/// feedback at most 100 messages (one per 10 ms), `reconfigure` at most 10 (one per 100 ms) plus
+/// one, `transport_stats` 4, `ClientStats` 4, `request_idr` 2, `ping` 1 and a little headroom for
+/// `start`, `stop` and `goodbye`.
+pub const MAX_CTL_FRAMES_PER_SECOND: usize = input::INPUT_RATE as usize
+    + input::INPUT_BURST as usize
+    + 1_000
+    + 100
+    + 11
+    + 4
+    + 4
+    + 2
+    + 1
+    + 10;
+
+const _: () = assert!(
+    MAX_CTL_FRAMES_PER_SECOND + 300 <= hx_ipc::link::budget::limits::CTL_FRAMES_FROM_GATEWAY,
+    "the relay's own limits must leave the session's ctl budget a margin"
+);
 
 /// Dialling the desktop (connect, preamble, `info`, the extra lanes) is bounded by the link
 /// client's own timeouts (3 + 5 + 5 s); this bounds the whole attach a little beyond that.
