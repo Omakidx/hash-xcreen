@@ -604,6 +604,13 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
         }
         let phase = self.phase();
         auth::authorize(ctx.role, req, phase)?;
+        // Sealed secrets need HPKE (Phase 2). A slot marked sealed must never be used as if it
+        // were the plain value: refuse it.
+        if req.secret_slots.iter().any(|s| s.sealed) {
+            return Err(CmdError::unimplemented(
+                "sealed secrets are not available in this release",
+            ));
+        }
         if info.reserved {
             return Err(CmdError::unimplemented(format!(
                 "{} is reserved and not available in this release",

@@ -2218,3 +2218,47 @@ async fn l3_setup_host_never_builds_the_acl_from_a_truncated_or_empty_address_li
         );
     }
 }
+
+#[tokio::test]
+async fn l4_a_sealed_user_password_is_unimplemented_not_used_as_plaintext() {
+    let h = Harness::start(GW);
+    open_window(&h).await; // inside the window Gateway needs no current password
+    add_desktop(&h);
+    let sealed = |len: u32| pb::SecretSlot {
+        slot: 0,
+        kind: pb::SecretKind::UserPassword as i32,
+        sealed: true,
+        length: len,
+        upload_nonce: vec![7; 16].into(),
+        ..Default::default()
+    };
+    let cases = [
+        Command::SetUserPassword(pb::SetUserPasswordRequest {
+            desktop_id: "main".into(),
+        }),
+        Command::CreateDesktop(pb::CreateDesktopRequest {
+            desktop_id: "main".into(),
+            distro: 1,
+            desktop: 1,
+            preset: 1,
+            username: "alice".into(),
+            ..Default::default()
+        }),
+    ];
+    for c in cases {
+        for role in [Role::Admin, Role::Gateway] {
+            let mut r = request(1, c.clone());
+            r.secret_slots = vec![sealed(24)];
+            let resp = h
+                .daemon
+                .handle(r, ctx(role, &[b"not-a-real-plain-password"]))
+                .await;
+            assert_eq!(code(&resp), ErrorCode::Unimplemented, "{role:?}");
+        }
+    }
+    // Nothing reached the container.
+    assert!(
+        h.incus
+            .with(|s| !s.execs.iter().any(|e| e.contains("chpasswd")))
+    );
+}
