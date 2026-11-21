@@ -21,9 +21,9 @@ incus_config security.syscalls.intercept.setxattr=true
 08 write-file /etc/hx/xorg-dummy.conf mode=0644 owner=root:root sha256=2c4b8728bcb56ee0e5912d9b5abdfa1adad51a881454ac38436890fb918ff6ae
 09 write-file /etc/systemd/system/hx-xorg.service mode=0644 owner=root:root sha256=0caac8be5bb8177bafdf5cdd717441d5b2ea264fc46416ff801f27dc5aebfd39
 10 write-file /etc/systemd/user/hx-xsession.service mode=0644 owner=root:root sha256=135b8be531e2a9aad302ce1c783ac5280866dec13c5239964ed229c5f5e0be01
-11 write-file /etc/tmpfiles.d/hx-session.conf mode=0644 owner=root:root sha256=0293eb4a9dadfe338a6eb91b802be6919cf0d0c8b081f3e39b912923d02fcdbc
+11 write-file /etc/tmpfiles.d/hx-session.conf mode=0644 owner=root:root sha256=273346d3df42555169e3f8b957c3d1b6bc2f6afdace809c6401614d979fad93a
 12 write-file /etc/systemd/system/hx-session.socket mode=0644 owner=root:root sha256=203c766b12a31049417884b6af57d2aee07952d69cf04e1a25608b1fd30a6ab9
-13 write-file /etc/systemd/system/hx-session.service mode=0644 owner=root:root sha256=ca3ddac5d4f56929aef87b4187f0c480af38b5a7445e28d115c4fde23a4fe97c
+13 write-file /etc/systemd/system/hx-session.service mode=0644 owner=root:root sha256=ecf09de6a37de526457d36226cb6853b6f2c2890e89cd466488d51b95299c8d5
 14 write-file /etc/systemd/system/hx-session.service.d/zzzz-hx-hardening.conf mode=0644 owner=root:root sha256=b0d55083c0e6f97514a6d811e8324d31258a821c774095ba3c7f1df881a4bc6a
 15 write-file /etc/pipewire/pipewire.conf.d/10-hx-null-sink.conf mode=0644 owner=root:root sha256=52ad58b48e93d328a25ee4c93b8da6e31d2b21d61adf7f83f806d94d3607c93f
 16 enable-services system=[hx-xorg.service,hx-session.socket,docker.service,containerd.service] user-global=[hx-xsession.service,pipewire.socket,pipewire-pulse.socket,wireplumber.service] linger=desk
