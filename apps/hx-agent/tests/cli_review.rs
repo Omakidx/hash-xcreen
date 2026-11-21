@@ -505,3 +505,70 @@ async fn l7_opening_the_setup_window_lists_the_powers_and_needs_a_confirmation()
     assert!(r.asked.is_empty());
     assert_eq!(s.p.commands(), ["BeginSetup", "BeginSetup"]);
 }
+
+// ----------------------------------------------------------------------------------------- N1
+
+#[tokio::test]
+async fn n1_a_socket_that_is_not_the_daemons_gets_nothing() {
+    use std::sync::atomic::Ordering;
+    let s = stack(None, false).await;
+    // 1. The process behind the socket runs as another uid than the one expected.
+    let mut cfg = s.cfg.clone();
+    cfg.expected_peer_uid = my_uid() + 1;
+    let r = cli(&cfg, &["devices", "list"], &[], &[]).await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(
+        r.stderr.contains("refusing to talk to hx-gatewayd"),
+        "{}",
+        r.stderr
+    );
+    let r = cli(&cfg, &["pairing", "token", "--generate"], &[], &[]).await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert_eq!(
+        s.a.hellos.load(Ordering::SeqCst),
+        0,
+        "not even a Hello was sent"
+    );
+    assert_eq!(s.p.hellos.load(Ordering::SeqCst), 0);
+    let r = cli(&cfg, &["desktop", "password"], &[PW, PW], &[]).await;
+    assert_ne!(r.code, 0);
+    assert!(
+        s.p.secrets.lock().unwrap().is_empty(),
+        "no secret reached the socket"
+    );
+    // 2. The directory is writable by others: anyone could have put the socket there.
+    let dir = private_tempdir();
+    let p = ScriptedAdmin::start(dir.path(), "a.sock", "0.1.0", admin_handler(false)).await;
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o770),
+    )
+    .unwrap();
+    let mut cfg = unreachable_config(dir.path());
+    cfg.admin_socket = p.path.clone();
+    let r = cli(&cfg, &["devices", "list"], &[], &[]).await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(r.stderr.contains("writable by others"), "{}", r.stderr);
+    assert_eq!(p.hellos.load(Ordering::SeqCst), 0);
+    // 3. A symlink to a real daemon's socket is refused as well.
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    let link = dir.path().join("link.sock");
+    std::os::unix::fs::symlink(&p.path, &link).unwrap();
+    cfg.admin_socket = link;
+    let r = cli(&cfg, &["devices", "list"], &[], &[]).await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(r.stderr.contains("symlink"), "{}", r.stderr);
+    assert_eq!(p.hellos.load(Ordering::SeqCst), 0);
+    // 4. A regular file is not a socket.
+    let file = dir.path().join("plain");
+    std::fs::write(&file, "x").unwrap();
+    cfg.admin_socket = file;
+    assert_eq!(cli(&cfg, &["devices", "list"], &[], &[]).await.code, 1);
+    // The healthy case still works.
+    cfg.admin_socket = p.path.clone();
+    assert_eq!(cli(&cfg, &["devices", "list"], &[], &[]).await.code, 0);
+}

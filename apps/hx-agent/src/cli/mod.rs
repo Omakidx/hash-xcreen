@@ -67,6 +67,10 @@ pub struct Config {
     pub audit_owner_uid: u32,
     /// `/usr/bin/journalctl`.
     pub journalctl: PathBuf,
+    /// The uid the daemons run their sockets as, and that must own the socket files and their
+    /// directory: 0 in production (a test points it at its own uid). The CLI sends a secret only
+    /// to a socket that passes this check.
+    pub expected_peer_uid: u32,
     /// Argon2id cost of the verifiers `pin set` and `desktop password` create.
     pub verifier_params: PinParams,
 }
@@ -80,6 +84,7 @@ impl Config {
             audit_log: crate::privd::config::AUDIT_LOG.into(),
             audit_owner_uid: 0,
             journalctl: "/usr/bin/journalctl".into(),
+            expected_peer_uid: 0,
             verifier_params: PinParams::DEFAULT,
         }
     }

@@ -150,6 +150,7 @@ pub fn unreachable_config(dir: &Path) -> Config {
         audit_log: dir.join("audit.log"),
         audit_owner_uid: my_uid(),
         journalctl: dir.join("no-journalctl"),
+        expected_peer_uid: my_uid(),
         verifier_params: CHEAP,
     }
 }
@@ -228,6 +229,8 @@ pub struct ScriptedPrivd {
     pub requests: Arc<Mutex<Vec<pb::Request>>>,
     /// Every raw request body (protobuf bytes), to prove that no secret is inside.
     pub encoded: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// `Hello` frames received.
+    pub hellos: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 pub struct PrivdOptions {
@@ -254,6 +257,8 @@ impl ScriptedPrivd {
         let secrets: SecretLog = Arc::default();
         let requests: Arc<Mutex<Vec<pb::Request>>> = Arc::default();
         let encoded: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let hellos: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
+        let h2 = hellos.clone();
         let (s2, r2, e2) = (secrets.clone(), requests.clone(), encoded.clone());
         let opts = Arc::new(opts);
         tokio::spawn(async move {
@@ -262,6 +267,7 @@ impl ScriptedPrivd {
                     return;
                 };
                 let (handler, opts) = (handler.clone(), opts.clone());
+                let hellos = h2.clone();
                 let (secrets, requests, encoded) = (s2.clone(), r2.clone(), e2.clone());
                 tokio::spawn(async move {
                     let mut src = FrameSource::new(stream);
@@ -273,6 +279,7 @@ impl ScriptedPrivd {
                     else {
                         return;
                     };
+                    hellos.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let ack = pb::Frame {
                         frame: Some(pb::frame::Frame::HelloAck(pb::HelloAck {
                             major: 1,
@@ -357,6 +364,7 @@ impl ScriptedPrivd {
             secrets,
             requests,
             encoded,
+            hellos,
         }
     }
 
@@ -404,6 +412,8 @@ pub struct ScriptedAdmin {
     pub secrets: SecretLog,
     pub requests: Arc<Mutex<Vec<apb::Request>>>,
     pub encoded: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// `Hello` frames received.
+    pub hellos: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ScriptedAdmin {
@@ -414,6 +424,8 @@ impl ScriptedAdmin {
         let secrets: SecretLog = Arc::default();
         let requests: Arc<Mutex<Vec<apb::Request>>> = Arc::default();
         let encoded: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let hellos: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
+        let h2 = hellos.clone();
         let (s2, r2, e2) = (secrets.clone(), requests.clone(), encoded.clone());
         let version = version.to_owned();
         tokio::spawn(async move {
@@ -422,6 +434,7 @@ impl ScriptedAdmin {
                     return;
                 };
                 let (handler, version) = (handler.clone(), version.clone());
+                let hellos = h2.clone();
                 let (secrets, requests, encoded) = (s2.clone(), r2.clone(), e2.clone());
                 tokio::spawn(async move {
                     let mut src = FrameSource::new(stream);
@@ -432,6 +445,7 @@ impl ScriptedAdmin {
                     else {
                         return;
                     };
+                    hellos.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let ack = apb::Frame {
                         frame: Some(apb::frame::Frame::HelloAck(apb::HelloAck {
                             major: 1,
@@ -487,6 +501,7 @@ impl ScriptedAdmin {
             secrets,
             requests,
             encoded,
+            hellos,
         }
     }
 
@@ -544,6 +559,12 @@ pub struct World {
 impl World {
     pub async fn start() -> Self {
         let gw = gateway_common::Env::start().await;
+        // The admin socket's directory must be closed to others, as /run/hx is (the CLI checks).
+        std::fs::set_permissions(
+            gw.dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let privd = Harness::start(GW_UID);
         let dir = private_tempdir();
         let privd_admin = ScriptedPrivd::start(
@@ -561,6 +582,7 @@ impl World {
             audit_log: audit,
             audit_owner_uid: my_uid(),
             journalctl,
+            expected_peer_uid: my_uid(),
             verifier_params: CHEAP,
         };
         Self {

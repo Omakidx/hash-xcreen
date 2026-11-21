@@ -29,8 +29,8 @@ pub struct AdminConn {
 
 impl AdminConn {
     /// Connects and says `Hello`.
-    pub fn connect(path: &Path) -> Result<Self, CliError> {
-        let mut wire = Wire::connect(path, "hx-gatewayd")?;
+    pub fn connect(path: &Path, expected_uid: u32) -> Result<Self, CliError> {
+        let mut wire = Wire::connect(path, "hx-gatewayd", expected_uid)?;
         let hello = pb::Frame {
             frame: Some(pb::frame::Frame::Hello(privd::pb::Hello {
                 major: privd::VERSION_MAJOR,

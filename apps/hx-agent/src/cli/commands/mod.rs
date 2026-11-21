@@ -34,12 +34,12 @@ pub(crate) use enum_name;
 
 /// Connects to privd as `Admin`.
 pub(crate) fn privd(env: &Env<'_>) -> Result<PrivdConn, CliError> {
-    PrivdConn::connect(&env.config.privd_socket)
+    PrivdConn::connect(&env.config.privd_socket, env.config.expected_peer_uid)
 }
 
 /// Connects to the gatewayd admin socket.
 pub(crate) fn admin(env: &Env<'_>) -> Result<AdminConn, CliError> {
-    AdminConn::connect(&env.config.admin_socket)
+    AdminConn::connect(&env.config.admin_socket, env.config.expected_peer_uid)
 }
 
 /// Asks the operator to type `word` before something wide-reaching happens. `yes` (the

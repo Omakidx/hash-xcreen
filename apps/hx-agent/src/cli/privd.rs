@@ -61,8 +61,8 @@ impl PrivdConn {
     /// Connects, says `Hello` and checks that privd serves this connection as `Admin`: a CLI
     /// that was served as `Gateway` is not root, and every X-class command would fail in a
     /// confusing way.
-    pub fn connect(path: &Path) -> Result<Self, CliError> {
-        let mut wire = Wire::connect(path, "hx-privd")?;
+    pub fn connect(path: &Path, expected_uid: u32) -> Result<Self, CliError> {
+        let mut wire = Wire::connect(path, "hx-privd", expected_uid)?;
         let hello = pb::Frame {
             frame: Some(pb::frame::Frame::Hello(pb::Hello {
                 major: privd::VERSION_MAJOR,
