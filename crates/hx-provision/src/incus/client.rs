@@ -14,6 +14,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::error::IncusError;
+use super::limits::{LimitsApplied, LimitsUpdate};
 use super::link::{LinkOutcome, SESSION_LINK_DEVICE, SessionLink};
 use super::operation::{OperationEnd, OperationId};
 use super::transport::{Request, Response, Transport, UnixTransport};
@@ -673,6 +674,72 @@ impl<T: Transport> Client<T> {
         )
         .await
         .map(drop)
+    }
+
+    /// Change CPU, memory and root-disk limits of an instance, running or not (ipc.md 6.8).
+    ///
+    /// Only `limits.cpu`, `limits.memory` and the `size` of the instance's root disk are written.
+    /// The root device is taken from the instance's effective devices and written back with the
+    /// new `size` as an instance-level override, so the pool, path and any other option stay as
+    /// they are; an instance without a root disk device is refused. Idempotent (same values, same
+    /// result). Host-dependent bounds are the caller's job, see [`LimitsUpdate`].
+    pub async fn set_limits(
+        &self,
+        instance: &str,
+        update: &LimitsUpdate,
+    ) -> Result<LimitsApplied, IncusError> {
+        let name = checked("instance", instance)?;
+        update.validate()?;
+        let mut applied = LimitsApplied::default();
+        let mut config = std::collections::BTreeMap::new();
+        if let Some(c) = update.cpu {
+            config.insert("limits.cpu".to_string(), c.to_string());
+            applied.changed.push("limits.cpu");
+        }
+        if let Some(m) = update.memory_mib {
+            config.insert("limits.memory".to_string(), format!("{m}MiB"));
+            applied.changed.push("limits.memory");
+        }
+        let mut body = json!({});
+        if !config.is_empty() {
+            body["config"] = json!(config);
+        }
+        if let Some(d) = update.disk_gib {
+            let inst = self
+                .get_instance(name)
+                .await?
+                .ok_or_else(|| IncusError::Api {
+                    code: 404,
+                    message: format!("instance `{name}` not found"),
+                })?;
+            let mut root = inst
+                .devices
+                .get("root")
+                .or_else(|| inst.expanded_devices.get("root"))
+                .cloned()
+                .ok_or_else(|| {
+                    IncusError::InvalidArgument("the instance has no root disk device".into())
+                })?;
+            if root.get("type").map(String::as_str) != Some("disk")
+                || root.get("path").map(String::as_str) != Some("/")
+            {
+                return Err(IncusError::InvalidArgument(
+                    "the `root` device is not the root disk".into(),
+                ));
+            }
+            root.insert("size".into(), format!("{d}GiB"));
+            body["devices"] = json!({"root": root});
+            applied.changed.push("devices.root.size");
+        }
+        self.run(
+            Method::PATCH,
+            format!("/1.0/instances/{name}"),
+            Some(&body),
+            Duration::from_secs(120),
+            "applying limits",
+        )
+        .await?;
+        Ok(applied)
     }
 
     /// Add the session-link proxy device ([`SessionLink`], ipc.md 6.11) to an instance.

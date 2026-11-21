@@ -7,6 +7,7 @@
 
 mod client;
 mod error;
+mod limits;
 mod link;
 mod operation;
 mod transport;
@@ -15,6 +16,7 @@ mod version;
 
 pub use client::Client;
 pub use error::IncusError;
+pub use limits::{LimitsApplied, LimitsUpdate, MAX_CPU, MAX_DISK_GIB, MAX_MEMORY_MIB};
 pub use link::{
     LinkOutcome, SESSION_LINK_CONNECT, SESSION_LINK_DEVICE, SESSION_LINK_HOST_DIR,
     SESSION_LINK_MODE, SessionLink,
