@@ -225,7 +225,7 @@ async fn devices_list_revoke_and_reinstate_by_prefix() {
         &w.cfg,
         &["devices", "reinstate", &ha.to_uppercase()],
         &[],
-        &[],
+        &["yes"],
     )
     .await;
     assert_eq!(r.code, 0, "{r:?}");

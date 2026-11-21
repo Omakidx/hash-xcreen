@@ -39,7 +39,7 @@ pub enum Cmd {
     /// `devices revoke <id-prefix>`.
     DevicesRevoke { prefix: String },
     /// `devices reinstate <id-prefix>`.
-    DevicesReinstate { prefix: String },
+    DevicesReinstate { prefix: String, yes: bool },
     /// `pairing code`.
     PairingCode { ttl_s: u32 },
     /// `pairing token`.
@@ -324,7 +324,10 @@ fn parse_cmd(args: &[String], help: bool) -> Result<Cmd, CliError> {
         }
         "devices" => {
             let (sub, r) = group(&["list", "revoke", "reinstate"])?;
-            let o = opts(&r, &[], &[])?;
+            let o = opts(&r, &["--yes"], &[])?;
+            if o.flag("--yes") && sub != "reinstate" {
+                return Err(usage("--yes applies to devices reinstate only"));
+            }
             match sub.as_str() {
                 "list" => {
                     o.positionals(0, "")?;
@@ -337,6 +340,7 @@ fn parse_cmd(args: &[String], help: bool) -> Result<Cmd, CliError> {
                 _ => Ok(Cmd::DevicesReinstate {
                     prefix: o.positionals(1, "the device id (or an unambiguous prefix)")?[0]
                         .clone(),
+                    yes: o.flag("--yes"),
                 }),
             }
         }

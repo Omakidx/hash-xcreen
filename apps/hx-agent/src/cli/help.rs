@@ -20,7 +20,8 @@ const BLOCKS: &[(&str, &str)] = &[
         "\
   devices list                    The paired devices.
   devices revoke <id-prefix>      Revoke a device and close its live sessions.
-  devices reinstate <id-prefix>   Lift a revocation or a PIN lockout of one device.
+  devices reinstate <id-prefix> [--yes]
+                                  Lift a revocation (asks first) or a PIN lockout of one device.
 ",
     ),
     (

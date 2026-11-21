@@ -19,7 +19,7 @@ environment variable at all**.
 hx-agent [--json] <command> [options]
 
 status
-devices list | revoke <id-prefix> | reinstate <id-prefix>
+devices list | revoke <id-prefix> | reinstate <id-prefix> [--yes]
 pairing code [--ttl 15m]
 pairing token [--ttl 15m] [--generate | --token <t>]
 pin set [--device <id-prefix>]
@@ -52,7 +52,7 @@ message first. Run it with `sudo hx-agent ...`.
 | `status` | privd `GetHostInfo`, `ListDesktops`; gatewayd `Status`, `ListDevices`. Reports versions, setup phase and window, desktop state, `needs_attention` flags, lockouts and device counts. Each daemon is reported on its own; exit 3 if either is unreachable. |
 | `devices list` | gatewayd `ListDevices` |
 | `devices revoke <id>` | gatewayd `ListDevices` (to resolve the prefix), `RevokeDevice` (closes the device's live sessions) |
-| `devices reinstate <id>` | gatewayd `ListDevices`, `ReinstateDevice` (lifts a revocation or a PIN lockout of that device and resets its failure counter) |
+| `devices reinstate <id>` | gatewayd `ListDevices`, `ReinstateDevice` (lifts a revocation or a PIN lockout of that device and resets its failure counter; a revoked device is shown in full and a typed `yes` (or `--yes`) is required) |
 | `pairing code` | gatewayd `CreatePairingCode`. Prints the short code once. |
 | `pairing token` | gatewayd `CreatePairingToken` (the token as a secret frame). See "Secrets". |
 | `pin set` | hidden prompt (twice); Argon2id in the CLI; privd `PepperEnrol` (purpose `PIN`); gatewayd `ListDevices` (with `--device`), `SetPinVerifier` |
@@ -129,7 +129,7 @@ terminal escape sequence, bidi control or forged line can reach the operator's t
 
 ## Confirmations
 
-`pin reset-lockout`, `docker enable`, `update apply`, `update rollback` and `uninstall` ask the
+`devices reinstate` (of a revoked device), `pin reset-lockout`, `docker enable`, `update apply`, `update rollback` and `uninstall` ask the
 operator to type a word (`yes`, `uninstall`, `destroy`) on the terminal, after printing what the
 action does. `--yes` answers for scripts; there is no other way around the question (no terminal and
 no `--yes` is exit 8). `pin reset-lockout` clears the **whole** failure history of the purpose, not

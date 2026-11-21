@@ -143,3 +143,48 @@ async fn l1_a_lost_connection_after_the_request_says_the_password_may_have_chang
         "no verifier is set on an unknown outcome"
     );
 }
+
+// ----------------------------------------------------------------------------------------- L2
+
+#[tokio::test]
+async fn l2_reinstating_a_revoked_device_needs_a_confirmation() {
+    let s = stack(None, false).await;
+    let full = "a".repeat(32);
+    // No terminal and no --yes: declined, and nothing is sent.
+    let r = cli(&s.cfg, &["devices", "reinstate", "aaaa"], &[], &[]).await;
+    assert_eq!(r.code, 8, "{r:?}");
+    assert!(
+        !s.a.commands().contains(&"ReinstateDevice"),
+        "{:?}",
+        s.a.commands()
+    );
+    // A wrong answer is a no too; the warning shows the full id and the name.
+    let r = cli(&s.cfg, &["devices", "reinstate", "aaaa"], &[], &["y"]).await;
+    assert_eq!(r.code, 8, "{r:?}");
+    assert!(
+        r.stderr.contains(&full) && r.stderr.contains("laptop"),
+        "{}",
+        r.stderr
+    );
+    assert!(!s.a.commands().contains(&"ReinstateDevice"));
+    // Typed yes, and --yes, both go through.
+    let r = cli(&s.cfg, &["devices", "reinstate", "aaaa"], &[], &["yes"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let r = cli(&s.cfg, &["devices", "reinstate", "aaaa", "--yes"], &[], &[]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.asked.is_empty());
+    assert_eq!(
+        s.a.commands()
+            .iter()
+            .filter(|c| **c == "ReinstateDevice")
+            .count(),
+        2
+    );
+    // --yes belongs to reinstate only.
+    assert_eq!(
+        cli(&s.cfg, &["devices", "revoke", "aaaa", "--yes"], &[], &[])
+            .await
+            .code,
+        2
+    );
+}

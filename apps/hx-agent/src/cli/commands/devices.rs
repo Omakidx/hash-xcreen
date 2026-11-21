@@ -9,7 +9,7 @@
 use hx_ipc::admin::pb::{self, request::Command, response::Result as R};
 use serde_json::{Value, json};
 
-use super::{admin, enum_name};
+use super::{admin, confirm, enum_name};
 use crate::cli::error::CliError;
 use crate::cli::gatewayd::{AdminConn, unexpected};
 use crate::cli::text::{hex, peer, time};
@@ -141,9 +141,22 @@ pub(super) fn revoke(env: &mut Env<'_>, prefix: &str) -> Result<Outcome, CliErro
     ))
 }
 
-pub(super) fn reinstate(env: &mut Env<'_>, prefix: &str) -> Result<Outcome, CliError> {
+pub(super) fn reinstate(env: &mut Env<'_>, prefix: &str, yes: bool) -> Result<Outcome, CliError> {
     let mut c = admin(env)?;
     let d = resolve(&mut c, prefix)?;
+    // A revocation is a security decision (a stolen or lost device): lifting it is confirmed
+    // against the full id and the name, not a prefix.
+    if d.state == "REVOKED" {
+        confirm(
+            env,
+            &format!(
+                "Device {} ({}) was REVOKED. Reinstating it lets that device connect again (with its PIN).",
+                d.hex, d.name
+            ),
+            "yes",
+            yes,
+        )?;
+    }
     match c.call(
         Command::ReinstateDevice(pb::ReinstateDeviceRequest {
             device_id: d.id.to_vec().into(),

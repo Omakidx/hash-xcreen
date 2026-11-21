@@ -96,7 +96,7 @@ pub(crate) fn dispatch(env: &mut Env<'_>, cmd: Cmd) -> Result<Option<Outcome>, C
         Cmd::Status => some(status::run(env)),
         Cmd::DevicesList => some(devices::list(env)),
         Cmd::DevicesRevoke { prefix } => some(devices::revoke(env, &prefix)),
-        Cmd::DevicesReinstate { prefix } => some(devices::reinstate(env, &prefix)),
+        Cmd::DevicesReinstate { prefix, yes } => some(devices::reinstate(env, &prefix, yes)),
         Cmd::PairingCode { ttl_s } => some(pairing::code(env, ttl_s)),
         Cmd::PairingToken { source, ttl_s } => some(pairing::token(env, source, ttl_s)),
         Cmd::PinSet { device } => some(pin::set(env, device.as_deref())),
