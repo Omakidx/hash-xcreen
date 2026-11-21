@@ -19,10 +19,9 @@ use crate::privd::error::CmdError;
 use crate::privd::limiter::{Purpose, Refused};
 use crate::privd::state::PhaseKind;
 
-fn utf8(secret: &hx_ipc::secret::Secret, what: &'static str) -> Result<String, CmdError> {
-    std::str::from_utf8(secret.expose())
-        .map(str::to_string)
-        .map_err(|_| CmdError::invalid(what))
+/// The secret as `&str`, **borrowed**: no `String` copy that nothing would zeroize.
+fn utf8<'a>(secret: &'a hx_ipc::secret::Secret, what: &'static str) -> Result<&'a str, CmdError> {
+    std::str::from_utf8(secret.expose()).map_err(|_| CmdError::invalid(what))
 }
 
 /// `SetUserPassword` (class A). Slot 0 is the new password; slot 1 the current one, required
@@ -62,7 +61,7 @@ pub async fn set_user_password<T: Transport + Clone + 'static>(
         .map_err(|_| CmdError::internal("the desktop has no valid username recorded"))?;
 
     let mut secrets = Secrets::none()
-        .with_user_password(&utf8(&new, "set_user_password: slot 0")?)
+        .with_user_password(utf8(&new, "set_user_password: slot 0")?)
         .map_err(|_| CmdError::invalid("set_user_password: slot 0"))?;
     if let Some(c) = &current {
         // A locked PASSWORD purpose refuses the check; the check also has its own daily cap.
@@ -81,7 +80,7 @@ pub async fn set_user_password<T: Transport + Clone + 'static>(
             })?;
         }
         secrets = secrets
-            .with_current_password(&utf8(c, "set_user_password: slot 1")?)
+            .with_current_password(utf8(c, "set_user_password: slot 1")?)
             .map_err(|_| CmdError::invalid("set_user_password: slot 1"))?;
     }
     drop((new, current));
