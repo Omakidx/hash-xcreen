@@ -58,11 +58,9 @@ pub(crate) fn cursor_shape_to_wire(s: &CursorShape) -> Option<hx::CursorShape> {
         for &p in row {
             let a = p >> 24;
             let un = |c: u32| -> u8 {
-                if a == 0 {
-                    0
-                } else {
-                    ((c * 255 + a / 2) / a).min(255) as u8
-                }
+                (c * 255 + a / 2)
+                    .checked_div(a)
+                    .map_or(0, |v| v.min(255) as u8)
             };
             rgba.extend_from_slice(&[
                 un((p >> 16) & 0xff),

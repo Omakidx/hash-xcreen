@@ -12,11 +12,19 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+bytes.workspace = true
 hx-crypto.workspace = true
 hx-ipc = { workspace = true, features = ["privd", "link"] }
 hx-proto.workspace = true
 hx-provision.workspace = true
 hx-transport.workspace = true
+rustix = { workspace = true, features = ["rand"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "signal"] }
 tracing.workspace = true
+
+[dev-dependencies]
+crossbeam-channel.workspace = true
+hx-capture.workspace = true
+hx-session.workspace = true
+x11rb = { workspace = true, features = ["xtest"] }

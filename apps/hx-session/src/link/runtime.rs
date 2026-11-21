@@ -28,7 +28,7 @@ use crate::congestion::{
 use crate::input::InputGate;
 use crate::pipeline::{Control, Pipeline};
 use crate::stats::StatsSnapshot;
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, bounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
 use hx_capture::clipboard::Selection;
 use hx_capture::{CursorEvent, Size, X11Input, mono_ns};
 use hx_codec::EncodedFrame;
@@ -581,11 +581,8 @@ fn engine_loop(ctx: &Arc<LinkCtx>, rx: &Receiver<Cmd>, mut media_probe: LaneRead
             Err(RecvTimeoutError::Disconnected) => break,
         }
         // Drain what queued behind it without waiting again.
-        loop {
-            match rx.try_recv() {
-                Ok(cmd) => e.handle(ctx, cmd),
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-            }
+        while let Ok(cmd) = rx.try_recv() {
+            e.handle(ctx, cmd);
         }
         e.tick(ctx);
         // The gateway to session direction of `media` is silent: anything there is a violation,
