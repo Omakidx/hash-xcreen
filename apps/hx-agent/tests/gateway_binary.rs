@@ -262,19 +262,33 @@ async fn the_binary_runs_a_full_session_under_its_seccomp_allowlist() {
     ))
     .await
     .unwrap();
-    assert!(matches!(
-        within(a.submit(&hx_crypto::Pin::new("111111").unwrap()))
+    let wait = match within(a.submit(&hx_crypto::Pin::new("111111").unwrap()))
+        .await
+        .unwrap()
+    {
+        hx_crypto::PinReply::Wrong { retry_after, .. } => retry_after,
+        other => panic!("expected a wrong-PIN reply, got {other:?}"),
+    };
+    // Wait out the server's backoff. Under load the server may start its clock slightly after
+    // the reply was sent, so a `Backoff` answer is retried after the wait it names.
+    tokio::time::sleep(wait + Duration::from_millis(100)).await;
+    let mut accepted = false;
+    for _ in 0..5 {
+        match within(a.submit(&hx_crypto::Pin::new(PIN).unwrap()))
             .await
-            .unwrap(),
-        hx_crypto::PinReply::Wrong { .. }
-    ));
-    tokio::time::sleep(Duration::from_millis(1100)).await;
-    assert_eq!(
-        within(a.submit(&hx_crypto::Pin::new(PIN).unwrap()))
-            .await
-            .unwrap(),
-        hx_crypto::PinReply::Accepted
-    );
+            .unwrap()
+        {
+            hx_crypto::PinReply::Accepted => {
+                accepted = true;
+                break;
+            }
+            hx_crypto::PinReply::Backoff { retry_after, .. } => {
+                tokio::time::sleep(retry_after + Duration::from_millis(100)).await;
+            }
+            other => panic!("expected the right PIN to be accepted, got {other:?}"),
+        }
+    }
+    assert!(accepted, "the right PIN was never accepted");
     let conn = a.into_connection().unwrap();
     // Device management over the new messages.
     conn.send_control(&ctl(Ctl::DeviceMgmt(hx_proto::pb::DeviceMgmt {
