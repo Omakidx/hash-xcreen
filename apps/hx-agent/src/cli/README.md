@@ -33,6 +33,8 @@ snapshots list|create [--desktop main] | delete <name> [--desktop main]
 logs [-f|--follow] [-n <lines>] [--journal] [--audit]
 update check | apply [<version>] [--yes] | rollback [--yes]
 uninstall [--keep-desktop | --destroy-desktop] [--yes]
+install --interactive | --pair | --ssh | --token <t>  [options]      (see "install" below)
+port-rule apply
 help [command]    --help    --version
 ```
 
@@ -72,7 +74,9 @@ placed in a writable directory never receives a token, a verifier or a command.
 | `snapshots list` / `create` / `delete` | privd `ListSnapshots` / `CreateSnapshot` / `DeleteSnapshot` |
 | `logs` | `journalctl` and the audit file, see below |
 | `update check` / `apply` / `rollback` | privd `CheckUpdate` / `ApplyUpdate` / `RollbackUpdate`. The CLI does no update logic. `UNIMPLEMENTED` is reported as exit 6. `apply` without a version applies what `check` found; both ask for a typed `yes` unless `--yes`. |
-| `uninstall` | privd `Uninstall`. A guided flow, see below. |
+| `uninstall` | privd `Uninstall` plus the CLI's own steps U1 to U8. A guided flow, see below. |
+| `install` | The installer engine (`hx_agent::install`), see below. |
+| `port-rule apply` | Re-applies the nftables accept rule for the public port. Run by `hx-agent-port.service`. |
 
 ### Device ids
 
@@ -105,9 +109,57 @@ text, shown for convenience, and never select a device. `devices list` shows 12 
 
 Asks whether to keep the desktop (deleting it is never the default; with `--yes` you must say
 `--keep-desktop` or `--destroy-desktop`), asks for a typed confirmation (`uninstall` or `destroy`),
-then calls privd `Uninstall`. **In this release privd's `Uninstall` answers `UNIMPLEMENTED`**; the
-CLI then prints the manual steps for the chosen mode, changes nothing, and exits 6. It never runs
-those steps itself. Where `Uninstall` works, it is idempotent and resumable (ipc.md 6.13).
+then runs, under the lock `/run/hx-install.lock` (exit 11 if an install or uninstall is running):
+
+| Step | What |
+|---|---|
+| U1 | `systemctl disable --now` the gateway units (the public and admin sockets and the service), so no gateway traffic arrives during the uninstall |
+| U2 | privd `Uninstall` (what privd created: the desktop and Incus objects in destroy mode, the firewall table, the link devices) |
+| U3 | stop and disable privd's units, the fetcher and the updates mount (destroy mode: the firewall units too) |
+| U4 | remove the port rule (ufw, nft by comment) and its unit |
+| U5 | remove the files and directories; gatewayd's state is emptied by a child that runs as the `hx-gatewayd` uid and gid (`ipc.md` 7 rule 15), never walked by root |
+| U6 | `userdel hx-gatewayd` |
+| U7 | `daemon-reload`, `reset-failed` |
+| U8 | drop the resume file `/var/lib/hx-uninstall.json` |
+
+Every step is idempotent and recorded, so a run that stops resumes after the last finished step.
+Keep mode leaves `/etc/hx/host-firewall.nft` and both firewall units. From keep to destroy is
+allowed only until privd's part is done; from destroy to keep never (exit 12). Incus and the Zabbly
+repository stay installed, and the result says how to remove the repository. If privd answers
+`UNIMPLEMENTED` (an old privd), or cannot be reached and cannot be started, the CLI puts the gateway
+units back, prints the manual steps for the chosen mode, changes nothing and exits 6. It never runs
+those steps itself.
+
+### install
+
+`hx-agent install` is run by `install.sh` (`--bootstrap-dir <dir> --lock-fd 9`), or by hand. It
+checks the host (Ubuntu 24.04 or 26.04, Debian 12 or 13, x86_64, systemd 250 or newer, not a
+container, 3584 MiB, 2 CPUs, 30 GiB), then runs 19 stages: preflight, packages, incus, release,
+system-files, credentials, config, units, setup-window, host, firewall-port, pairing-token, desktop,
+verifiers, owner-key, backup (deferred: Phase 2), pairing, finish, done. State is
+`/var/lib/hx/install-state.json`; the log is `/var/log/hx-install.log`. Nothing secret is ever in
+an argument, an environment, a log or the state.
+
+| Mode | Behaviour |
+|---|---|
+| `--interactive` | asks every question on `/dev/tty` before any change; ends with a pairing code |
+| `--pair` | the one-liner: the token is typed at a hidden prompt; the stages run through `pairing-token` and stop, the setup window stays open for the app |
+| `--token <t>` | like `--pair` with the token on the command line (weaker: a warning is printed) |
+| `--ssh` | the secrets arrive on stdin (framed: `HXI1`, then records of kind, length and bytes: password, PIN, optional token and owner key; at most 8192 bytes in 30 s); `--json` is implied; the token, if any, is installed last |
+| none | resume or re-verify the recorded install; a fresh host refuses (exit 2) |
+
+A run again resumes and converges: a stage is skipped only when it is recorded as done and its
+check still passes. `pairing-token`, `pairing` and `finish` are never skipped (a token or code must
+be fresh). A changed option that cannot change after its stage is done (`--user`, `--distro`,
+`--docker`, `--storage-device`, ...) is exit 12 with the command that changes it. `--image prebuilt`
+and `--image-file` are exit 6.
+
+With `--json` standard output is only JSON Lines (`stage`, `step`, `warn`, `result`; `docs/ipc.md`
+and the installer design C3) and human text goes to standard error.
+
+Install exit codes besides 0 to 8: 9 preflight failed (nothing changed), 10 verification failed
+(signature, digest, version), 11 another install or uninstall is running, 12 the options conflict
+with the existing install.
 
 ## Secrets
 
@@ -199,6 +251,10 @@ Times are Unix seconds with the suffix `_unix_s`.
 | 6 | Not implemented in this release (`UNIMPLEMENTED`), for example `update` on a privd without self-update and `uninstall` (manual steps printed) |
 | 7 | Not root |
 | 8 | Declined: the operator did not confirm, or there was no terminal to ask on |
+| 9 | `install`: preflight failed, nothing was changed |
+| 10 | `install`: a signature, digest or version check failed |
+| 11 | `install`, `uninstall`: another install or uninstall is running |
+| 12 | `install`, `uninstall`: the options conflict with the existing install |
 
 ## Not implemented here
 
