@@ -3,10 +3,12 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    pin::Pin,
     sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -30,7 +32,7 @@ use hx_proto::{
 };
 use rustls::pki_types::CertificateDer;
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
     sync::{
         mpsc::{self, error::TrySendError},
@@ -68,7 +70,84 @@ use crate::{
 pub(crate) trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 type BoxIo = Box<dyn Io>;
-type Ws = WebSocketStream<BoxIo>;
+type Ws = WebSocketStream<GuardedIo>;
+
+/// The socket under a WebSocket connection. The first failed write raises `failed`; from then
+/// on writes stay pending instead of failing again. Tungstenite flushes its automatic replies
+/// (a Pong) at the start of every read and abandons the read if that flush fails, which would
+/// lose a close frame the peer sent before the socket went away; a pending write lets it read
+/// on. The writer task learns of the failure from `failed`. Only armed once the connection's
+/// tasks run: during the handshake a failed write is an ordinary error.
+pub(crate) struct GuardedIo {
+    io: BoxIo,
+    armed: bool,
+    failed: Arc<watch::Sender<bool>>,
+}
+
+impl GuardedIo {
+    fn new(io: BoxIo) -> Self {
+        Self {
+            io,
+            armed: false,
+            failed: Arc::new(watch::Sender::new(false)),
+        }
+    }
+
+    /// Armed, and a write has failed.
+    fn dead(&self) -> bool {
+        self.armed && *self.failed.borrow()
+    }
+
+    fn guard<T>(&self, r: Poll<std::io::Result<T>>) -> Poll<std::io::Result<T>> {
+        match r {
+            Poll::Ready(Err(e)) if self.armed && e.kind() != std::io::ErrorKind::WouldBlock => {
+                tracing::debug!(error = %e, "websocket write failed");
+                self.failed.send_replace(true);
+                Poll::Pending
+            }
+            r => r,
+        }
+    }
+}
+
+impl AsyncRead for GuardedIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for GuardedIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.dead() {
+            return Poll::Pending;
+        }
+        let r = Pin::new(&mut self.io).poll_write(cx, buf);
+        self.guard(r)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if self.dead() {
+            return Poll::Pending;
+        }
+        let r = Pin::new(&mut self.io).poll_flush(cx);
+        self.guard(r)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if self.dead() {
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+}
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const KEEPALIVE: Duration = Duration::from_secs(5);
@@ -139,6 +218,10 @@ pub(crate) struct WsBackend {
     outgoing: Arc<StdMutex<HashMap<u32, Arc<AtomicBool>>>>,
     next_transfer_id: AtomicU32,
     done: watch::Receiver<bool>,
+    /// Raised when a write fails (by [`GuardedIo`] or the writer): the writer stops, and the
+    /// reader stops waiting on the application and reads on to a close frame the peer may have
+    /// sent before the socket went away.
+    write_failed: Arc<watch::Sender<bool>>,
 }
 
 fn frame(ch: ChannelId, parts: &[&[u8]]) -> Bytes {
@@ -336,7 +419,9 @@ impl WsTransferSender {
 // ---------------------------------------------------------------- tasks
 
 /// Split the socket and start the writer and reader.
-fn start(ws: Ws, parts: Parts) -> Connection {
+fn start(mut ws: Ws, parts: Parts) -> Connection {
+    ws.get_mut().armed = true;
+    let write_failed = ws.get_ref().failed.clone();
     let (sink, stream) = ws.split();
     let (hi_tx, hi_rx) = mpsc::channel(256);
     let (lo_tx, lo_rx) = mpsc::channel(8);
@@ -351,6 +436,7 @@ fn start(ws: Ws, parts: Parts) -> Connection {
         outgoing: Arc::new(StdMutex::new(HashMap::new())),
         next_transfer_id: AtomicU32::new(first_id),
         done: done_rx,
+        write_failed,
     });
     let inner = Inner::new(parts, backend);
     tokio::spawn(writer(inner.clone(), sink, hi_rx, lo_rx, done_tx));
@@ -381,6 +467,7 @@ async fn writer(
 ) {
     let mut keepalive = tokio::time::interval(KEEPALIVE);
     let mut closed = inner.subscribe_closed();
+    let mut failed = backend(&inner).map(|w| w.write_failed.subscribe());
     let mut peer_gone = false;
     loop {
         let out = tokio::select! {
@@ -388,7 +475,7 @@ async fn writer(
             Some(o) = hi.recv() => o,
             Some(o) = lo.recv() => o,
             _ = keepalive.tick() => {
-                if sink.send(Message::Ping(Bytes::new())).await.is_err() {
+                if !put(&mut sink, Message::Ping(Bytes::new()), &mut failed).await {
                     peer_gone = true;
                     break;
                 }
@@ -396,8 +483,8 @@ async fn writer(
             }
             _ = wait_closed(&mut closed) => break,
         };
-        let result = match out {
-            Out::Binary(b) => sink.send(Message::Binary(b)).await,
+        let sent = match out {
+            Out::Binary(b) => put(&mut sink, Message::Binary(b), &mut failed).await,
             Out::Video {
                 msg,
                 frame_number,
@@ -409,19 +496,28 @@ async fn writer(
                     }
                     continue;
                 }
-                sink.send(Message::Binary(msg)).await
+                put(&mut sink, Message::Binary(msg), &mut failed).await
             }
             Out::Close(code, reason) => {
-                let _ = sink.send(close_frame(code, &reason)).await;
+                put(&mut sink, close_frame(code, &reason), &mut failed).await;
                 break;
             }
         };
-        if result.is_err() {
+        if !sent {
             peer_gone = true;
             break;
         }
     }
     if peer_gone {
+        // The write may have failed because the peer closed: its close frame can be read, or
+        // still be queued behind messages the reader has not processed yet. That close frame
+        // is the reason the connection ended; let the reader find it before recording a loss.
+        if let Some(w) = backend(&inner) {
+            w.write_failed.send_replace(true);
+        }
+        hi.close();
+        lo.close();
+        let _ = tokio::time::timeout(CLOSE_GRACE, wait_closed(&mut closed)).await;
         inner.record_close(CloseInfo {
             code: CloseCode::InternalError,
             reason: "connection lost".into(),
@@ -434,10 +530,38 @@ async fn writer(
     let _ = done.send(true);
 }
 
+/// Send one message; false if the socket can no longer be written (a [`GuardedIo`] write
+/// failure leaves the send pending, so it is raced against the flag).
+async fn put(
+    sink: &mut SplitSink<Ws, Message>,
+    msg: Message,
+    failed: &mut Option<watch::Receiver<bool>>,
+) -> bool {
+    tokio::select! {
+        biased;
+        r = sink.send(msg) => r.is_ok(),
+        _ = write_failed(failed) => false,
+    }
+}
+
+/// Resolves once a write has failed (never if there is no WebSocket backend).
+async fn write_failed(rx: &mut Option<watch::Receiver<bool>>) {
+    match rx {
+        Some(rx) => {
+            if rx.wait_for(|f| *f).await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+        None => std::future::pending().await,
+    }
+}
+
 async fn reader(inner: Arc<Inner>, mut stream: SplitStream<Ws>) {
     let mut closed = inner.subscribe_closed();
-    // Once the connection is closed, the peer gets one grace period in total to answer with
-    // its own close frame: a peer that keeps sending must not keep the socket open.
+    let mut write_dead = backend(&inner).map(|w| w.write_failed.subscribe());
+    // Once the connection is closed (or can no longer be written), the peer gets one grace
+    // period in total to deliver its close frame: a peer that keeps sending must not keep the
+    // socket open.
     let mut grace_until: Option<Instant> = None;
     loop {
         let limit = grace_until.unwrap_or_else(|| Instant::now() + IDLE_TIMEOUT);
@@ -448,6 +572,10 @@ async fn reader(inner: Arc<Inner>, mut stream: SplitStream<Ws>) {
                 grace_until = Some(Instant::now() + CLOSE_GRACE);
                 continue;
             }
+            _ = write_failed(&mut write_dead), if grace_until.is_none() => {
+                grace_until = Some(Instant::now() + CLOSE_GRACE);
+                continue;
+            }
             _ = tokio::time::sleep_until(limit) => None,
         };
         let next = match next {
@@ -455,7 +583,12 @@ async fn reader(inner: Arc<Inner>, mut stream: SplitStream<Ws>) {
             None => {
                 inner.record_close(CloseInfo {
                     code: CloseCode::InternalError,
-                    reason: "idle timeout".into(),
+                    reason: if grace_until.is_some() {
+                        "connection lost"
+                    } else {
+                        "idle timeout"
+                    }
+                    .into(),
                     by_peer: true,
                 });
                 break;
@@ -487,7 +620,14 @@ async fn reader(inner: Arc<Inner>, mut stream: SplitStream<Ws>) {
                 break;
             }
             Some(Ok(Message::Binary(b))) => {
-                if let Err(e) = handle_binary(&inner, b).await {
+                // Once the writer has failed the connection is gone: deliver what the
+                // application has room for, drop what would wait, and read on to the close.
+                let handled = tokio::select! {
+                    biased;
+                    r = handle_binary(&inner, b) => r,
+                    _ = write_failed(&mut write_dead) => continue,
+                };
+                if let Err(e) = handled {
                     match e {
                         Error::Protocol(_) | Error::Violation(_) => inner.fail(&e.to_string()),
                         other => tracing::debug!(error = %other, "websocket reader ended"),
@@ -807,7 +947,7 @@ async fn incoming(
         .map_err(tls_error)?;
     require_tls13(tls.get_ref().1.protocol_version())?;
     let certs = owned_certs(tls.get_ref().1.peer_certificates());
-    let io: BoxIo = Box::new(tls);
+    let io = GuardedIo::new(Box::new(tls));
     let mut ws = tokio::time::timeout_at(
         tls_deadline,
         accept_hdr_async_with_config(io, PathCheck, Some(ws_config(Role::Server))),
@@ -947,7 +1087,7 @@ pub(crate) async fn connect(
     .map_err(tls_error)?;
     require_tls13(tls_stream.get_ref().1.protocol_version())?;
     let certs = owned_certs(tls_stream.get_ref().1.peer_certificates());
-    let io: BoxIo = Box::new(tls_stream);
+    let io = GuardedIo::new(Box::new(tls_stream));
 
     let host = target.server_name.to_str();
     let host = if host.contains(':') {
