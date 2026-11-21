@@ -14,7 +14,9 @@ use hx_agent::privd::state::Flag;
 use hx_agent::privd::testing::request;
 use hx_agent::privd::update::Unit;
 use hx_agent::privd::update::state::UpdateState;
-use hx_ipc::privd::pb::{self, ErrorCode, ProgressStage, Role, request::Command, response::Result as R};
+use hx_ipc::privd::pb::{
+    self, ErrorCode, ProgressStage, Role, request::Command, response::Result as R,
+};
 use privd_update_common::*;
 
 const T0: u64 = NOW - 100_000;
@@ -72,8 +74,14 @@ async fn a_build_without_keys_refuses_every_update() {
     let (code, msg) = err(&env.check().await);
     assert_eq!(code, ErrorCode::FailedPrecondition);
     assert!(msg.contains("no release signing key"), "{msg}");
-    assert_eq!(err(&env.apply("1.1.0").await).0, ErrorCode::FailedPrecondition);
-    assert!(env.server.lock().unwrap().jobs.is_empty(), "nothing was fetched");
+    assert_eq!(
+        err(&env.apply("1.1.0").await).0,
+        ErrorCode::FailedPrecondition
+    );
+    assert!(
+        env.server.lock().unwrap().jobs.is_empty(),
+        "nothing was fetched"
+    );
 }
 
 #[tokio::test]
@@ -97,16 +105,35 @@ async fn an_unsigned_or_mis_signed_manifest_is_refused() {
     assert_eq!(err(&env.check().await).0, ErrorCode::FailedPrecondition);
 
     // Not a signature file at all, and an empty one.
-    for junk in ["", "not a signature", "untrusted comment: x\nAAAA\ntrusted comment: y\nBBBB\n"] {
+    for junk in [
+        "",
+        "not a signature",
+        "untrusted comment: x\nAAAA\ntrusted comment: y\nBBBB\n",
+    ] {
         env.server.lock().unwrap().manifest = Some((good.manifest.clone(), junk.into()));
-        assert_eq!(err(&env.check().await).0, ErrorCode::FailedPrecondition, "{junk:?}");
+        assert_eq!(
+            err(&env.check().await).0,
+            ErrorCode::FailedPrecondition,
+            "{junk:?}"
+        );
     }
     assert_eq!(state(&env).highest_manifest_ts, 0, "nothing was accepted");
-    assert!(!env.h.daemon.cfg.update.staging_dir.join("manifest.json").exists());
+    assert!(
+        !env.h
+            .daemon
+            .cfg
+            .update
+            .staging_dir
+            .join("manifest.json")
+            .exists()
+    );
 
     // The honest release still works.
     env.serve(&good);
-    assert_eq!(check_result(env.check().await).available.as_deref(), Some("1.1.0"));
+    assert_eq!(
+        check_result(env.check().await).available.as_deref(),
+        Some("1.1.0")
+    );
 }
 
 #[tokio::test]
@@ -119,10 +146,19 @@ async fn the_next_key_is_accepted_and_a_rotation_needs_no_flag_day() {
         .set_update_deps(env.deps(&[&env.signer.public(), &next.public()]));
     let p = env.sign_release("1.1.0", T0, archive(&good_files("1.1.0")), None, &next);
     env.serve(&p);
-    assert_eq!(check_result(env.check().await).available.as_deref(), Some("1.1.0"));
+    assert_eq!(
+        check_result(env.check().await).available.as_deref(),
+        Some("1.1.0")
+    );
     // After the rotation the old key is gone: a release it signs is refused.
     env.h.daemon.set_update_deps(env.deps(&[&next.public()]));
-    let p = env.sign_release("1.2.0", T0 + 1, archive(&good_files("1.2.0")), None, &env.signer);
+    let p = env.sign_release(
+        "1.2.0",
+        T0 + 1,
+        archive(&good_files("1.2.0")),
+        None,
+        &env.signer,
+    );
     env.serve(&p);
     assert_eq!(err(&env.check().await).0, ErrorCode::FailedPrecondition);
 }
@@ -132,9 +168,11 @@ async fn a_manifest_with_bad_fields_is_refused_even_when_signed() {
     let env = Env::new();
     let art = archive(&good_files("1.1.0"));
     // Wrong channel.
-    let mut m: hx_agent::privd::update::manifest::Manifest =
-        serde_json::from_slice(&env.sign_release("1.1.0", T0, art.clone(), None, &env.signer).manifest)
-            .unwrap();
+    let mut m: hx_agent::privd::update::manifest::Manifest = serde_json::from_slice(
+        &env.sign_release("1.1.0", T0, art.clone(), None, &env.signer)
+            .manifest,
+    )
+    .unwrap();
     m.channel = "beta".into();
     let bytes = serde_json::to_vec(&m).unwrap();
     let sig = env.signer.sign(&bytes);
@@ -149,7 +187,8 @@ async fn a_manifest_with_bad_fields_is_refused_even_when_signed() {
         |m: &mut hx_agent::privd::update::manifest::Manifest| m.size = u64::MAX,
     ] {
         let mut m: hx_agent::privd::update::manifest::Manifest = serde_json::from_slice(
-            &env.sign_release("1.1.0", T0, art.clone(), None, &env.signer).manifest,
+            &env.sign_release("1.1.0", T0, art.clone(), None, &env.signer)
+                .manifest,
         )
         .unwrap();
         edit(&mut m);
@@ -164,9 +203,15 @@ async fn a_manifest_with_bad_fields_is_refused_even_when_signed() {
 async fn a_replayed_older_manifest_is_refused_and_the_counter_never_goes_back() {
     let env = Env::new();
     let old = env.publish("1.1.0", T0);
-    assert_eq!(check_result(env.check().await).available.as_deref(), Some("1.1.0"));
+    assert_eq!(
+        check_result(env.check().await).available.as_deref(),
+        Some("1.1.0")
+    );
     env.publish("1.2.0", T0 + 500);
-    assert_eq!(check_result(env.check().await).available.as_deref(), Some("1.2.0"));
+    assert_eq!(
+        check_result(env.check().await).available.as_deref(),
+        Some("1.2.0")
+    );
     assert_eq!(state(&env).highest_manifest_ts, T0 + 500);
     // The old, validly signed release is served again (a replay of a vulnerable release).
     env.serve(&old);
@@ -180,7 +225,9 @@ async fn a_replayed_older_manifest_is_refused_and_the_counter_never_goes_back() 
     // The counter survives a restart of privd.
     let again = env.new_process("1.0.0");
     assert_eq!(
-        UpdateState::load(&store(&again.cfg.state_dir)).unwrap().highest_manifest_ts,
+        UpdateState::load(&store(&again.cfg.state_dir))
+            .unwrap()
+            .highest_manifest_ts,
         T0 + 500
     );
 }
@@ -271,7 +318,10 @@ async fn hostile_fetch_directories_are_refused_without_following_anything() {
     assert_eq!(state(&env).highest_manifest_ts, 0);
     env.server.lock().unwrap().hook = None;
     env.serve(&p);
-    assert_eq!(check_result(env.check().await).available.as_deref(), Some("1.1.0"));
+    assert_eq!(
+        check_result(env.check().await).available.as_deref(),
+        Some("1.1.0")
+    );
 }
 
 #[tokio::test]
@@ -304,7 +354,11 @@ async fn apply_refuses_what_check_did_not_verify() {
     let (code, msg) = err(&env.apply("1.2.0").await);
     assert_eq!(code, ErrorCode::FailedPrecondition);
     assert!(msg.contains("verified"), "{msg}");
-    assert_eq!(env.server.lock().unwrap().jobs, ["manifest-stable"], "no artifact was fetched");
+    assert_eq!(
+        env.server.lock().unwrap().jobs,
+        ["manifest-stable"],
+        "no artifact was fetched"
+    );
 }
 
 #[tokio::test]
@@ -320,7 +374,10 @@ async fn downgrade_and_reinstall_by_request_are_refused() {
     // Even a signed, fresh manifest for an older version cannot be applied.
     env.publish("0.9.0", T0 + 5);
     check_result(env.check().await);
-    assert_eq!(err(&env.apply_fresh("0.9.0").await).0, ErrorCode::FailedPrecondition);
+    assert_eq!(
+        err(&env.apply_fresh("0.9.0").await).0,
+        ErrorCode::FailedPrecondition
+    );
     assert_eq!(env.layout().current().unwrap().as_deref(), Some("1.0.0"));
 }
 
@@ -344,7 +401,11 @@ async fn an_artifact_that_does_not_match_the_signed_manifest_is_refused() {
     let mut bad = p.artifact.clone();
     let last = bad.len() - 1;
     bad[last] ^= 1;
-    env.server.lock().unwrap().artifacts.insert("1.1.0".into(), bad);
+    env.server
+        .lock()
+        .unwrap()
+        .artifacts
+        .insert("1.1.0".into(), bad);
     let (code, msg) = err(&env.apply_fresh("1.1.0").await);
     assert_eq!(code, ErrorCode::FailedPrecondition);
     assert!(msg.contains("SHA-256"), "{msg}");
@@ -352,11 +413,25 @@ async fn an_artifact_that_does_not_match_the_signed_manifest_is_refused() {
     // Longer and shorter than announced.
     let mut longer = p.artifact.clone();
     longer.push(0);
-    env.server.lock().unwrap().artifacts.insert("1.1.0".into(), longer);
-    assert_eq!(err(&env.apply_fresh("1.1.0").await).0, ErrorCode::FailedPrecondition);
+    env.server
+        .lock()
+        .unwrap()
+        .artifacts
+        .insert("1.1.0".into(), longer);
+    assert_eq!(
+        err(&env.apply_fresh("1.1.0").await).0,
+        ErrorCode::FailedPrecondition
+    );
     let shorter = p.artifact[..p.artifact.len() - 1].to_vec();
-    env.server.lock().unwrap().artifacts.insert("1.1.0".into(), shorter);
-    assert_eq!(err(&env.apply_fresh("1.1.0").await).0, ErrorCode::FailedPrecondition);
+    env.server
+        .lock()
+        .unwrap()
+        .artifacts
+        .insert("1.1.0".into(), shorter);
+    assert_eq!(
+        err(&env.apply_fresh("1.1.0").await).0,
+        ErrorCode::FailedPrecondition
+    );
 
     // A symlink in place of the artifact.
     env.server.lock().unwrap().hook = Some(Box::new(|j, dir| {
@@ -365,7 +440,10 @@ async fn an_artifact_that_does_not_match_the_signed_manifest_is_refused() {
             Ok(())
         })
     }));
-    assert_eq!(err(&env.apply_fresh("1.1.0").await).0, ErrorCode::FailedPrecondition);
+    assert_eq!(
+        err(&env.apply_fresh("1.1.0").await).0,
+        ErrorCode::FailedPrecondition
+    );
 
     // Nothing was installed or switched, and no pending record exists.
     assert_eq!(env.layout().current().unwrap().as_deref(), Some("1.0.0"));
@@ -391,7 +469,12 @@ async fn a_verified_artifact_with_a_hostile_member_is_not_installed() {
         .filter_map(Result::ok)
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
-    assert!(!left.iter().any(|n| n.starts_with(".incoming") || n == "1.1.0"), "{left:?}");
+    assert!(
+        !left
+            .iter()
+            .any(|n| n.starts_with(".incoming") || n == "1.1.0"),
+        "{left:?}"
+    );
     assert!(!u.versions_dir.parent().unwrap().join("escape").exists());
 
     // An incomplete release (no gatewayd) is refused after unpacking, before the switch.
@@ -401,7 +484,10 @@ async fn a_verified_artifact_with_a_hostile_member_is_not_installed() {
         .collect();
     env.publish_with("1.2.0", T0 + 1, &files, None);
     check_result(env.check().await);
-    assert_eq!(err(&env.apply("1.2.0").await).0, ErrorCode::FailedPrecondition);
+    assert_eq!(
+        err(&env.apply("1.2.0").await).0,
+        ErrorCode::FailedPrecondition
+    );
     assert_eq!(env.layout().current().unwrap().as_deref(), Some("1.0.0"));
 }
 
@@ -409,7 +495,9 @@ async fn a_verified_artifact_with_a_hostile_member_is_not_installed() {
 async fn apply_installs_switches_snapshots_and_restarts() {
     let env = Env::new();
     // A ready desktop, registered with privd.
-    env.h.incus.add_desktop("hx-main", "ubuntu-24.04-xfce-basic", "alice", true);
+    env.h
+        .incus
+        .add_desktop("hx-main", "ubuntu-24.04-xfce-basic", "alice", true);
     env.h.daemon.register_desktop("main").unwrap();
     env.publish("1.1.0", T0);
     check_result(env.check().await);
@@ -440,7 +528,10 @@ async fn apply_installs_switches_snapshots_and_restarts() {
     while let Some(p) = queue.pop() {
         stages.push(p.stage());
     }
-    assert!(!stages.is_empty() && stages.iter().all(|s| *s == ProgressStage::Update), "{stages:?}");
+    assert!(
+        !stages.is_empty() && stages.iter().all(|s| *s == ProgressStage::Update),
+        "{stages:?}"
+    );
 
     // The release is unpacked, owned and moded sanely, and current/previous moved.
     let lay = env.layout();
@@ -449,27 +540,51 @@ async fn apply_installs_switches_snapshots_and_restarts() {
     let u = &env.h.daemon.cfg.update;
     let v = u.versions_dir.join("1.1.0");
     use std::os::unix::fs::PermissionsExt;
-    assert_eq!(std::fs::metadata(v.join("hx-privd")).unwrap().permissions().mode() & 0o7777, 0o755);
-    assert_eq!(std::fs::metadata(v.join("VERSION")).unwrap().permissions().mode() & 0o7777, 0o644);
-    assert_eq!(std::fs::metadata(v.join("session")).unwrap().permissions().mode() & 0o7777, 0o755);
+    assert_eq!(
+        std::fs::metadata(v.join("hx-privd"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o755
+    );
+    assert_eq!(
+        std::fs::metadata(v.join("VERSION"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o644
+    );
+    assert_eq!(
+        std::fs::metadata(v.join("session"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o755
+    );
     assert!(v.join("session/ubuntu-24.04/hx-session.deb").is_file());
 
     // The pending record is on disk for the next process.
     let st = state(&env);
     let p = st.pending.expect("pending");
-    assert_eq!((p.version.as_str(), p.previous.as_deref()), ("1.1.0", Some("1.0.0")));
+    assert_eq!(
+        (p.version.as_str(), p.previous.as_deref()),
+        ("1.1.0", Some("1.0.0"))
+    );
 
     // A preupdate snapshot of the desktop exists, with a name privd may delete.
-    let snaps: Vec<String> = env.h.incus.with(|s| {
-        s.instances["hx-main"]
-            .snapshots
-            .iter()
-            .cloned()
-            .collect()
-    });
+    let snaps: Vec<String> = env
+        .h
+        .incus
+        .with(|s| s.instances["hx-main"].snapshots.to_vec());
     assert_eq!(snaps.len(), 1, "{snaps:?}");
     assert!(hx_ipc::privd::is_valid_snapshot_name(&snaps[0]));
-    assert_eq!(hx_ipc::privd::snapshot_kind_of(&snaps[0]), Some("preupdate"));
+    assert_eq!(
+        hx_ipc::privd::snapshot_kind_of(&snaps[0]),
+        Some("preupdate")
+    );
 
     // After the answer: gatewayd is restarted first, then privd re-execs.
     env.wait_restarts(2).await;
@@ -477,20 +592,29 @@ async fn apply_installs_switches_snapshots_and_restarts() {
     let jobs = env.server.lock().unwrap().jobs.clone();
     assert_eq!(jobs, ["manifest-stable", "artifact-1.1.0"]);
     assert!(
-        env.h.audit.lines().iter().any(|l| l.contains("update 1.1.0 switched in")),
+        env.h
+            .audit
+            .lines()
+            .iter()
+            .any(|l| l.contains("update 1.1.0 switched in")),
         "audited"
     );
 
     // While the update is pending, no other update command runs.
     assert_eq!(err(&env.check().await).0, ErrorCode::FailedPrecondition);
-    assert_eq!(err(&env.apply("1.1.0").await).0, ErrorCode::FailedPrecondition);
+    assert_eq!(
+        err(&env.apply("1.1.0").await).0,
+        ErrorCode::FailedPrecondition
+    );
     let _ = CancelToken::new();
 }
 
 #[tokio::test]
 async fn only_two_preupdate_snapshots_are_kept() {
     let env = Env::new();
-    env.h.incus.add_desktop("hx-main", "ubuntu-24.04-xfce-basic", "alice", true);
+    env.h
+        .incus
+        .add_desktop("hx-main", "ubuntu-24.04-xfce-basic", "alice", true);
     env.h.daemon.register_desktop("main").unwrap();
     for (i, v) in ["1.1.0", "1.2.0", "1.3.0"].into_iter().enumerate() {
         env.publish(v, T0 + i as u64);
@@ -526,25 +650,50 @@ async fn applied_env() -> Env {
 async fn a_healthy_update_is_confirmed_and_old_versions_are_pruned() {
     let env = applied_env().await;
     install_release(&env.h.daemon.cfg.update.versions_dir, "0.8.0");
-    std::fs::create_dir(env.h.daemon.cfg.update.versions_dir.join(".incoming-1.9.0-aa")).unwrap();
+    std::fs::create_dir(
+        env.h
+            .daemon
+            .cfg
+            .update
+            .versions_dir
+            .join(".incoming-1.9.0-aa"),
+    )
+    .unwrap();
     let d = env.new_process("1.1.0");
     d.resume_update().await;
     let st = UpdateState::load(&store(&d.cfg.state_dir)).unwrap();
     assert!(st.pending.is_none() && st.rolled_back.is_none());
-    assert!(env.health.status_calls.load(Ordering::SeqCst) >= 1, "Status was asked");
+    assert!(
+        env.health.status_calls.load(Ordering::SeqCst) >= 1,
+        "Status was asked"
+    );
     assert_eq!(env.layout().current().unwrap().as_deref(), Some("1.1.0"));
     assert!(!d.flags_for("main").contains(&Flag::UpdateRolledBack));
     // Two versions are kept: current and previous. The rest is gone.
     let vd = &env.h.daemon.cfg.update.versions_dir;
     assert!(vd.join("1.1.0").is_dir() && vd.join("1.0.0").is_dir());
     assert!(!vd.join("0.8.0").exists() && !vd.join(".incoming-1.9.0-aa").exists());
-    assert!(env.h.audit.lines().iter().any(|l| l.contains("update 1.1.0 is healthy")));
+    assert!(
+        env.h
+            .audit
+            .lines()
+            .iter()
+            .any(|l| l.contains("update 1.1.0 is healthy"))
+    );
     // Nothing happens at the next start.
     d.resume_update().await;
 }
 
-async fn assert_rolled_back(env: &Env, d: &std::sync::Arc<hx_agent::privd::daemon::Daemon<hx_agent::privd::testing::FakeIncus>>, why: &str) {
-    assert_eq!(env.layout().current().unwrap().as_deref(), Some("1.0.0"), "flipped back");
+async fn assert_rolled_back(
+    env: &Env,
+    d: &std::sync::Arc<hx_agent::privd::daemon::Daemon<hx_agent::privd::testing::FakeIncus>>,
+    why: &str,
+) {
+    assert_eq!(
+        env.layout().current().unwrap().as_deref(),
+        Some("1.0.0"),
+        "flipped back"
+    );
     assert_eq!(env.layout().previous().unwrap().as_deref(), Some("1.1.0"));
     let st = UpdateState::load(&store(&d.cfg.state_dir)).unwrap();
     assert!(st.pending.is_none());
@@ -555,7 +704,11 @@ async fn assert_rolled_back(env: &Env, d: &std::sync::Arc<hx_agent::privd::daemo
     // Both units were restarted again (the second pair of restarts).
     assert!(env.systemd.restarted().len() >= 4);
     assert!(
-        env.h.audit.lines().iter().any(|l| l.contains("needs_attention=UPDATE_ROLLED_BACK")),
+        env.h
+            .audit
+            .lines()
+            .iter()
+            .any(|l| l.contains("needs_attention=UPDATE_ROLLED_BACK")),
         "audited"
     );
 }
@@ -576,7 +729,11 @@ async fn a_gatewayd_that_is_not_running_rolls_back() {
     let d = env.new_process("1.1.0");
     d.resume_update().await;
     assert_rolled_back(&env, &d, "stable MainPID").await;
-    assert_eq!(env.health.status_calls.load(Ordering::SeqCst), 0, "Status is only asked of a stable gatewayd");
+    assert_eq!(
+        env.health.status_calls.load(Ordering::SeqCst),
+        0,
+        "Status is only asked of a stable gatewayd"
+    );
 }
 
 #[tokio::test]
@@ -676,7 +833,10 @@ async fn gateway_cannot_call_rollback_update() {
     d.resume_update().await;
     env.systemd.restarts.lock().unwrap().clear();
     let r = env
-        .call(Role::Gateway, Command::RollbackUpdate(pb::RollbackUpdateRequest {}))
+        .call(
+            Role::Gateway,
+            Command::RollbackUpdate(pb::RollbackUpdateRequest {}),
+        )
         .await;
     assert_eq!(err(&r).0, ErrorCode::PermissionDenied);
     assert_eq!(env.layout().current().unwrap().as_deref(), Some("1.1.0"));
@@ -691,7 +851,10 @@ async fn admin_rollback_flips_back_and_restarts() {
     d.resume_update().await;
     env.systemd.restarts.lock().unwrap().clear();
     let r = env
-        .call(Role::Admin, Command::RollbackUpdate(pb::RollbackUpdateRequest {}))
+        .call(
+            Role::Admin,
+            Command::RollbackUpdate(pb::RollbackUpdateRequest {}),
+        )
         .await;
     assert!(matches!(ok(r), R::RollbackUpdate(_)));
     assert_eq!(env.layout().current().unwrap().as_deref(), Some("1.0.0"));
@@ -704,15 +867,33 @@ async fn admin_rollback_flips_back_and_restarts() {
 async fn rollback_without_a_previous_version_is_refused() {
     let env = Env::new();
     let r = env
-        .call(Role::Admin, Command::RollbackUpdate(pb::RollbackUpdateRequest {}))
+        .call(
+            Role::Admin,
+            Command::RollbackUpdate(pb::RollbackUpdateRequest {}),
+        )
         .await;
     assert_eq!(err(&r).0, ErrorCode::FailedPrecondition);
     // A previous version that is not intact is not switched to.
     install_release(&env.h.daemon.cfg.update.versions_dir, "0.9.0");
-    std::os::unix::fs::symlink("0.9.0", env.h.daemon.cfg.update.versions_dir.join("previous")).unwrap();
-    std::fs::remove_file(env.h.daemon.cfg.update.versions_dir.join("0.9.0/hx-gatewayd")).unwrap();
+    std::os::unix::fs::symlink(
+        "0.9.0",
+        env.h.daemon.cfg.update.versions_dir.join("previous"),
+    )
+    .unwrap();
+    std::fs::remove_file(
+        env.h
+            .daemon
+            .cfg
+            .update
+            .versions_dir
+            .join("0.9.0/hx-gatewayd"),
+    )
+    .unwrap();
     let r = env
-        .call(Role::Admin, Command::RollbackUpdate(pb::RollbackUpdateRequest {}))
+        .call(
+            Role::Admin,
+            Command::RollbackUpdate(pb::RollbackUpdateRequest {}),
+        )
         .await;
     assert_eq!(err(&r).0, ErrorCode::FailedPrecondition);
     assert_eq!(env.layout().current().unwrap().as_deref(), Some("1.0.0"));
@@ -722,7 +903,10 @@ async fn rollback_without_a_previous_version_is_refused() {
 async fn rollback_is_refused_while_an_update_is_pending() {
     let env = applied_env().await;
     let r = env
-        .call(Role::Admin, Command::RollbackUpdate(pb::RollbackUpdateRequest {}))
+        .call(
+            Role::Admin,
+            Command::RollbackUpdate(pb::RollbackUpdateRequest {}),
+        )
         .await;
     assert_eq!(err(&r).0, ErrorCode::FailedPrecondition);
 }
@@ -734,7 +918,10 @@ async fn check_and_apply_are_open_to_gateway_once_set_up() {
     let env = Env::new();
     // Phase gates apply as for every class A command: refused until the host is set up.
     let r = env
-        .call(Role::Gateway, Command::CheckUpdate(pb::CheckUpdateRequest {}))
+        .call(
+            Role::Gateway,
+            Command::CheckUpdate(pb::CheckUpdateRequest {}),
+        )
         .await;
     assert_eq!(err(&r).0, ErrorCode::FailedPrecondition);
     env.h
@@ -743,7 +930,10 @@ async fn check_and_apply_are_open_to_gateway_once_set_up() {
         .unwrap();
     env.publish("1.1.0", T0);
     let r = env
-        .call(Role::Gateway, Command::CheckUpdate(pb::CheckUpdateRequest {}))
+        .call(
+            Role::Gateway,
+            Command::CheckUpdate(pb::CheckUpdateRequest {}),
+        )
         .await;
     assert_eq!(check_result(r).available.as_deref(), Some("1.1.0"));
 }
@@ -767,11 +957,23 @@ async fn check_update_is_limited_to_six_an_hour() {
 async fn apply_update_is_limited_to_two_a_day() {
     let env = Env::new();
     // Admitted requests count even when they fail: two refusals use the allowance.
-    assert_eq!(err(&env.apply("1.1.0").await).0, ErrorCode::FailedPrecondition);
-    assert_eq!(err(&env.apply("1.1.0").await).0, ErrorCode::FailedPrecondition);
-    assert_eq!(err(&env.apply("1.1.0").await).0, ErrorCode::ResourceExhausted);
+    assert_eq!(
+        err(&env.apply("1.1.0").await).0,
+        ErrorCode::FailedPrecondition
+    );
+    assert_eq!(
+        err(&env.apply("1.1.0").await).0,
+        ErrorCode::FailedPrecondition
+    );
+    assert_eq!(
+        err(&env.apply("1.1.0").await).0,
+        ErrorCode::ResourceExhausted
+    );
     env.h.clock.advance_secs(86_401);
-    assert_eq!(err(&env.apply("1.1.0").await).0, ErrorCode::FailedPrecondition);
+    assert_eq!(
+        err(&env.apply("1.1.0").await).0,
+        ErrorCode::FailedPrecondition
+    );
 }
 
 #[tokio::test]

@@ -137,7 +137,7 @@ fn header(path: &[u8], kind: u8, mode: u32, size: u64, link: &[u8]) -> [u8; 512]
 }
 
 fn pad(out: &mut Vec<u8>) {
-    while out.len() % 512 != 0 {
+    while !out.len().is_multiple_of(512) {
         out.push(0);
     }
 }
@@ -160,7 +160,11 @@ pub fn tar_bytes(entries: &[TarEntry]) -> Vec<u8> {
             out.extend_from_slice(&rec);
             pad(&mut out);
         }
-        let size = if e.kind == b'0' { e.data.len() as u64 } else { 0 };
+        let size = if e.kind == b'0' {
+            e.data.len() as u64
+        } else {
+            0
+        };
         out.extend_from_slice(&header(&e.path, e.kind, e.mode, size, &e.link));
         if e.kind == b'0' {
             out.extend_from_slice(&e.data);
@@ -190,7 +194,11 @@ pub fn good_files(version: &str) -> Vec<TarEntry> {
         v.push(TarEntry::file(b, b"#!/bin/true\n", 0o755));
     }
     v.push(TarEntry::file("hx-backup-worker", b"#!/bin/true\n", 0o755));
-    v.push(TarEntry::file(VERSION_FILE, format!("{version}\n").as_bytes(), 0o644));
+    v.push(TarEntry::file(
+        VERSION_FILE,
+        format!("{version}\n").as_bytes(),
+        0o644,
+    ));
     v.push(TarEntry::dir("session"));
     v.push(TarEntry::dir("session/ubuntu-24.04"));
     v.push(TarEntry::file(
@@ -383,7 +391,9 @@ impl Env {
             systemd,
             health,
         };
-        env.h.daemon.set_update_deps(env.deps(&[&env.signer.public()]));
+        env.h
+            .daemon
+            .set_update_deps(env.deps(&[&env.signer.public()]));
         env
     }
 
