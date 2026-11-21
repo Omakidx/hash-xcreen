@@ -119,7 +119,16 @@ pub struct Server {
     endpoint: Option<quinn::Endpoint>,
     pending: Mutex<mpsc::Receiver<PendingSession>>,
     ctx: Arc<ServerCtx>,
-    tasks: Vec<JoinHandle<()>>,
+    /// The accept loops, once started.
+    tasks: StdMutex<Vec<JoinHandle<()>>>,
+    /// Sockets bound by [`Server::bind_paused`] that no loop reads yet.
+    unstarted: StdMutex<Option<Unstarted>>,
+}
+
+/// What [`Server::start`] spawns the accept loops on.
+struct Unstarted {
+    endpoint: Option<quinn::Endpoint>,
+    listener: Option<tokio::net::TcpListener>,
 }
 
 /// A ticket producer that never produces tickets, so stateless resumption stays off even if
@@ -173,7 +182,25 @@ impl Server {
     /// `tls` is injected by the caller (identity, client-certificate verification); it must
     /// allow TLS 1.3 and should allow nothing else (TLS 1.2 handshakes are dropped). ALPN
     /// values are set by this crate, and session resumption and early data are forced off.
+    ///
+    /// This is [`bind_paused`](Self::bind_paused) followed by [`start`](Self::start).
     pub async fn bind(
+        addr: SocketAddr,
+        tls: Arc<rustls::ServerConfig>,
+        opts: ServerOptions,
+    ) -> Result<Self> {
+        let server = Self::bind_paused(addr, tls, opts).await?;
+        server.start();
+        Ok(server)
+    }
+
+    /// Binds the sockets like [`bind`](Self::bind) but **does not read them**: no TLS or QUIC
+    /// handshake runs and no `Hello` is decoded until [`start`](Self::start). Connection
+    /// attempts queue in the kernel (TCP backlog) and in the QUIC endpoint (initial packets)
+    /// and are served after `start`. A process that must apply hardening (seccomp,
+    /// `mlockall`, `PR_SET_DUMPABLE`) before it parses anything from the network calls this,
+    /// hardens, then starts.
+    pub async fn bind_paused(
         addr: SocketAddr,
         tls: Arc<rustls::ServerConfig>,
         opts: ServerOptions,
@@ -226,21 +253,35 @@ impl Server {
                 .map(tokio::net::TcpListener::local_addr)
                 .transpose()?;
 
-            let mut tasks = Vec::new();
-            if let Some(ep) = endpoint.clone() {
-                tasks.push(tokio::spawn(quic_accept_loop(ep, ctx.clone())));
-            }
-            if let Some(l) = listener {
-                tasks.push(tokio::spawn(ws::accept_loop(l, ctx.clone())));
-            }
             return Ok(Self {
                 quic_addr,
                 tcp_addr,
-                endpoint,
+                endpoint: endpoint.clone(),
                 pending: Mutex::new(rx),
                 ctx,
-                tasks,
+                tasks: StdMutex::new(Vec::new()),
+                unstarted: StdMutex::new(Some(Unstarted { endpoint, listener })),
             });
+        }
+    }
+
+    /// Starts the accept loops of a server made with [`bind_paused`](Self::bind_paused). Does
+    /// nothing if they already run (or after [`close`](Self::close)).
+    pub fn start(&self) {
+        let Some(u) = self
+            .unstarted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        else {
+            return;
+        };
+        let mut tasks = self.tasks.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(ep) = u.endpoint {
+            tasks.push(tokio::spawn(quic_accept_loop(ep, self.ctx.clone())));
+        }
+        if let Some(l) = u.listener {
+            tasks.push(tokio::spawn(ws::accept_loop(l, self.ctx.clone())));
         }
     }
 
@@ -283,7 +324,12 @@ impl Server {
         if let Some(ep) = &self.endpoint {
             ep.close(quic_code(CloseCode::Shutdown), b"server shutdown");
         }
-        for t in &self.tasks {
+        // A server that was never started drops its sockets here.
+        self.unstarted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        for t in self.tasks.lock().unwrap_or_else(|p| p.into_inner()).iter() {
             t.abort();
         }
     }

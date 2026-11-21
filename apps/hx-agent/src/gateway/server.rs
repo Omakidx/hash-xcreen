@@ -202,7 +202,7 @@ impl Gateway {
             clock,
         );
         let server = Arc::new(
-            Server::bind(
+            Server::bind_paused(
                 config.listen,
                 tls::server_config(&identity)?,
                 server_options,
@@ -248,6 +248,9 @@ impl Gateway {
         if std::mem::replace(&mut self.begun, true) {
             return;
         }
+        // Only now does the transport read its sockets: the binary hardened itself between
+        // `bind` and `begin`.
+        self.server.start();
         // The public accept loop: every pending session gets its own task, so a slow peer
         // never blocks the loop.
         let (srv, sh) = (self.server.clone(), self.shared.clone());
