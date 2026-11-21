@@ -1,0 +1,814 @@
+// hx-privd command set (docs/ipc.md Part 1, sections 4 to 6).
+//
+// Conventions (ipc.md section 4): fields only Admin may set are proto3 `optional` so that
+// privd sees whether the caller set them; unknown fields are ignored; field numbers are never
+// reused. Secrets never appear in this schema: they travel in kind-2 secret frames, and the
+// Request only declares them in `secret_slots`.
+syntax = "proto3";
+
+package hx.privd.v1;
+
+// ----- identities, phases -----
+
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_GATEWAY = 1;
+  ROLE_ADMIN = 2;
+}
+
+// Section 5.1.
+enum Phase {
+  PHASE_UNSPECIFIED = 0;
+  PHASE_UNINITIALIZED = 1;
+  PHASE_SETUP_OPEN = 2;
+  PHASE_READY = 3;
+}
+
+// ----- errors (section 4) -----
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_INVALID_ARGUMENT = 1;
+  ERROR_CODE_PERMISSION_DENIED = 2;
+  ERROR_CODE_FAILED_PRECONDITION = 3;
+  ERROR_CODE_NOT_FOUND = 4;
+  ERROR_CODE_RESOURCE_EXHAUSTED = 5;
+  ERROR_CODE_DEADLINE_EXCEEDED = 6;
+  ERROR_CODE_CANCELLED = 7;
+  ERROR_CODE_UNAVAILABLE = 8;
+  ERROR_CODE_UNIMPLEMENTED = 9;
+  ERROR_CODE_INTERNAL = 10;
+}
+
+// Command-specific refinement of an Error code (sections 4, 5.3, 6.4, 6.7, 6.9).
+enum ErrorDetail {
+  ERROR_DETAIL_UNSPECIFIED = 0;
+  ERROR_DETAIL_SETUP_WINDOW_CLOSED = 1;
+  ERROR_DETAIL_DESKTOP_NOT_READY = 2;
+  ERROR_DETAIL_NEEDS_ATTENTION = 3;
+  ERROR_DETAIL_ISOLATION_NOT_RESTORED = 4;
+  ERROR_DETAIL_LOCKED = 5;
+  ERROR_DETAIL_POOL = 6;
+  ERROR_DETAIL_NETWORK = 7;
+  ERROR_DETAIL_NFT = 8;
+  ERROR_DETAIL_SYSCTL = 9;
+  ERROR_DETAIL_DOCKER_USER = 10;
+  ERROR_DETAIL_DESKTOP_EXISTS = 11;
+  ERROR_DETAIL_OWNER_KEY_NOT_ENROLLED = 12;
+}
+
+message Error {
+  ErrorCode code = 1;
+  ErrorDetail detail = 2;
+  // At most 256 bytes, sanitized, never contains secrets or unsanitized container output.
+  string message = 3;
+  bool retryable = 4;
+  uint32 retry_after_ms = 5;
+  // The failing stage, set by CreateDesktop and other long commands.
+  optional ProgressStage stage = 6;
+}
+
+// ----- connection-level frames (section 4) -----
+
+message Hello {
+  uint32 major = 1;
+  uint32 minor = 2;
+  // At most 64 bytes.
+  string software = 3;
+}
+
+message HelloAck {
+  uint32 major = 1;
+  uint32 minor = 2;
+  string privd_version = 3;
+  Phase phase = 4;
+  // The role privd derived from SO_PEERCRED, echoed for diagnostics.
+  Role role = 5;
+}
+
+enum SecretKind {
+  SECRET_KIND_UNSPECIFIED = 0;
+  SECRET_KIND_USER_PASSWORD = 1;
+  SECRET_KIND_CURRENT_PASSWORD = 2;
+  SECRET_KIND_MAC_INPUT = 3;
+  // Phase 2: sealed only.
+  SECRET_KIND_DRIVE_TOKEN = 4;
+  SECRET_KIND_BACKUP_KEY = 5;
+}
+
+// Declares one kind-2 secret frame that follows the Request (section 5.2).
+message SecretSlot {
+  // 0 to 255.
+  uint32 slot = 1;
+  SecretKind kind = 2;
+  bool sealed = 3;
+  uint32 length = 4;
+  // Reserved for the Phase 2 sealed form: 16 bytes issued by BeginSecretUpload.
+  bytes upload_nonce = 5;
+  // Reserved for the Phase 2 sealed form.
+  uint32 signer_key_id = 6;
+}
+
+message Cancel {
+  uint64 request_id = 1;
+}
+
+message Ping {
+  uint64 nonce = 1;
+}
+
+message Pong {
+  uint64 nonce = 1;
+}
+
+enum ProgressStage {
+  PROGRESS_STAGE_UNSPECIFIED = 0;
+  PROGRESS_STAGE_PREFLIGHT = 1;
+  PROGRESS_STAGE_HOST = 2;
+  PROGRESS_STAGE_IMAGE_FETCH = 3;
+  PROGRESS_STAGE_IMAGE_IMPORT = 4;
+  PROGRESS_STAGE_BUILD = 5;
+  PROGRESS_STAGE_LAUNCH = 6;
+  PROGRESS_STAGE_POST = 7;
+  PROGRESS_STAGE_DOCKER = 8;
+  PROGRESS_STAGE_SESSION = 9;
+  PROGRESS_STAGE_UPDATE = 10;
+  PROGRESS_STAGE_BACKUP = 11;
+  PROGRESS_STAGE_RESTORE = 12;
+  PROGRESS_STAGE_DONE = 13;
+}
+
+message Progress {
+  uint64 request_id = 1;
+  ProgressStage stage = 2;
+  uint32 index = 3;
+  uint32 total = 4;
+  // At most 128 bytes, sanitized.
+  string step = 5;
+  // 0 to 100, or 255 for unknown.
+  uint32 percent = 6;
+  bool ok = 7;
+}
+
+// ----- shared types (section 6) -----
+
+enum Distro {
+  DISTRO_UNSPECIFIED = 0;
+  DISTRO_UBUNTU_24_04 = 1;
+  DISTRO_UBUNTU_26_04 = 2;
+  DISTRO_DEBIAN_12 = 3;
+  DISTRO_DEBIAN_13 = 4;
+}
+
+enum DesktopKind {
+  DESKTOP_KIND_UNSPECIFIED = 0;
+  DESKTOP_KIND_XFCE = 1;
+}
+
+enum Preset {
+  PRESET_UNSPECIFIED = 0;
+  PRESET_BASIC = 1;
+  PRESET_DEVELOPER = 2;
+}
+
+// 0 in any field means "not given" where a command allows omission.
+message Limits {
+  uint32 cpu = 1;
+  uint64 memory_mib = 2;
+  uint64 disk_gib = 3;
+}
+
+enum NeedsAttention {
+  NEEDS_ATTENTION_UNSPECIFIED = 0;
+  NEEDS_ATTENTION_HOST_ACCOUNT_POLICY = 1;
+  NEEDS_ATTENTION_STUCK_OPERATION = 2;
+  NEEDS_ATTENTION_ISOLATION_NOT_RESTORED = 3;
+  NEEDS_ATTENTION_PIN_LOCKED = 4;
+  NEEDS_ATTENTION_PASSWORD_LOCKED = 5;
+  NEEDS_ATTENTION_UPDATE_ROLLED_BACK = 6;
+  NEEDS_ATTENTION_HOST_DOCKER_FORWARDING = 7;
+}
+
+enum DesktopState {
+  DESKTOP_STATE_UNSPECIFIED = 0;
+  DESKTOP_STATE_CREATING = 1;
+  DESKTOP_STATE_READY = 2;
+  DESKTOP_STATE_FAILED = 3;
+  DESKTOP_STATE_STOPPED = 4;
+  DESKTOP_STATE_RUNNING = 5;
+  DESKTOP_STATE_STARTING = 6;
+}
+
+enum DockerState {
+  DOCKER_STATE_UNSPECIFIED = 0;
+  DOCKER_STATE_OFF = 1;
+  DOCKER_STATE_ON = 2;
+  DOCKER_STATE_DEGRADED = 3;
+}
+
+enum LockoutPurpose {
+  LOCKOUT_PURPOSE_UNSPECIFIED = 0;
+  LOCKOUT_PURPOSE_PIN = 1;
+  LOCKOUT_PURPOSE_PASSWORD = 2;
+}
+
+// ----- commands (section 6) -----
+
+message GetHostInfoRequest {}
+
+message GetRecipientKeyRequest {}
+
+message BeginSetupRequest {
+  // 60 to 86 400; 0 = the default of 7 200.
+  uint32 expires_in_s = 1;
+}
+
+message ExtendSetupRequest {
+  uint32 extend_by_s = 1;
+}
+
+message FinishSetupRequest {
+  // Admin only.
+  optional bool force = 1;
+}
+
+message ExtraHostAddresses {
+  // Up to 16 IP addresses in text form.
+  repeated string addresses = 1;
+}
+
+message SetupHostRequest {
+  // 12 to 200; 0 = privd's default.
+  uint32 pool_size_gib = 1;
+  // Admin only: a block device path under /dev/.
+  optional string pool_device = 2;
+  // Admin only.
+  optional bool allow_private_networks = 3;
+  // Admin only.
+  optional ExtraHostAddresses extra_host_addresses = 4;
+  // Admin only: "auto" or a.b.c.d/nn.
+  optional string ipv4 = 5;
+}
+
+enum ImageMode {
+  IMAGE_MODE_UNSPECIFIED = 0; // = AUTO
+  IMAGE_MODE_AUTO = 1;
+  IMAGE_MODE_PREBUILT = 2;
+  IMAGE_MODE_BUILD = 3;
+}
+
+// Reserved (section 6.5): a non-empty settings message is UNIMPLEMENTED until hx-provision
+// has the recipe variables.
+message DesktopSettings {
+  string hostname = 1;
+  string timezone = 2;
+  string locale = 3;
+  string keyboard = 4;
+}
+
+// The password travels as secret slot 0 (USER_PASSWORD), not here.
+message CreateDesktopRequest {
+  string desktop_id = 1;
+  Distro distro = 2;
+  DesktopKind desktop = 3;
+  Preset preset = 4;
+  string username = 5;
+  ImageMode image_mode = 6;
+  Limits limits = 7;
+  bool docker = 8;
+  bool docker_isolation_acknowledged = 9;
+  DesktopSettings settings = 10;
+  // Admin only: a path of an offline image under /var/lib/hx/import/.
+  optional string image_file = 11;
+}
+
+message GetDesktopRequest {
+  string desktop_id = 1;
+}
+
+message ListDesktopsRequest {}
+
+message StartDesktopRequest {
+  string desktop_id = 1;
+}
+
+message StopDesktopRequest {
+  string desktop_id = 1;
+  bool force = 2;
+}
+
+message RestartDesktopRequest {
+  string desktop_id = 1;
+  bool force = 2;
+}
+
+message SetLimitsRequest {
+  string desktop_id = 1;
+  Limits limits = 2;
+}
+
+// Secret slot 0 USER_PASSWORD; slot 1 CURRENT_PASSWORD unless the setup window is open.
+message SetUserPasswordRequest {
+  string desktop_id = 1;
+}
+
+enum DockerMode {
+  DOCKER_MODE_UNSPECIFIED = 0; // = STANDARD
+  DOCKER_MODE_STANDARD = 1;
+  // Reserved: UNIMPLEMENTED until hx-provision supports it.
+  DOCKER_MODE_HOST_NETWORK_ONLY = 2;
+}
+
+message EnableDockerRequest {
+  string desktop_id = 1;
+  // MUST be true.
+  bool acknowledged_isolation_warning = 2;
+  DockerMode mode = 3;
+}
+
+message DisableDockerRequest {
+  string desktop_id = 1;
+}
+
+message CreateSnapshotRequest {
+  string desktop_id = 1;
+}
+
+message ListSnapshotsRequest {
+  string desktop_id = 1;
+}
+
+message DeleteSnapshotRequest {
+  string desktop_id = 1;
+  // ^hx-(manual|preupdate|backup)-[0-9TZ-]+-[0-9a-f]{4}$
+  string name = 2;
+}
+
+message ProvisionSessionLinkRequest {
+  string desktop_id = 1;
+}
+
+message InstallSessionRequest {
+  string desktop_id = 1;
+}
+
+message RestartSessionRequest {
+  string desktop_id = 1;
+}
+
+message CheckUpdateRequest {}
+
+message ApplyUpdateRequest {
+  // ^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}(-(alpha|beta|rc)\.[0-9]{1,4})?$
+  string version = 1;
+}
+
+message RollbackUpdateRequest {}
+
+message DestroyDesktopRequest {
+  string desktop_id = 1;
+  bool confirm_destroy = 2;
+}
+
+message UninstallRequest {
+  bool keep_desktop = 1;
+  // Required true when keep_desktop is false.
+  bool confirm_destroy = 2;
+}
+
+message ResetLockoutRequest {
+  LockoutPurpose purpose = 1;
+}
+
+message EnrolOwnerKeyRequest {
+  // 32 bytes.
+  bytes public_key = 1;
+  bool replace = 2;
+}
+
+// Reserved in Phase 1: UNIMPLEMENTED.
+message UpgradeIncusRequest {}
+
+// Secret slot 0 MAC_INPUT (32 bytes).
+message PepperVerifyRequest {
+  LockoutPurpose purpose = 1;
+  // 32 bytes.
+  bytes expected_verifier = 2;
+}
+
+// Secret slot 0 MAC_INPUT (32 bytes).
+message PepperEnrolRequest {
+  LockoutPurpose purpose = 1;
+}
+
+enum AuditEvent {
+  AUDIT_EVENT_UNSPECIFIED = 0;
+  AUDIT_EVENT_DEVICE_ADDED = 1;
+  AUDIT_EVENT_DEVICE_REVOKED = 2;
+  AUDIT_EVENT_DEVICE_REINSTATED = 3;
+  AUDIT_EVENT_PIN_CHANGED = 4;
+  AUDIT_EVENT_PASSWORD_VERIFIER_CHANGED = 5;
+  AUDIT_EVENT_PAIRING_OPENED = 6;
+  AUDIT_EVENT_TAKEOVER = 7;
+}
+
+message RecordEventRequest {
+  AuditEvent event = 1;
+  // 16 bytes when present.
+  optional bytes device_id = 2;
+  // At most 64 bytes; sanitized and logged only.
+  string label = 3;
+}
+
+// Reserved for Phase 2: UNIMPLEMENTED until the first sealed secret exists.
+message BeginSecretUploadRequest {
+  SecretKind kind = 1;
+  string desktop_id = 2;
+}
+
+// Phase 2 reserved commands (section 6.14). Named now so that adding fields later is not a
+// breaking change; every one answers UNIMPLEMENTED in Phase 1.
+message BackupRunRequest {}
+message BackupCancelRequest {}
+message BackupStatusRequest {}
+message ListBackupsRequest {}
+message SetBackupScheduleRequest {}
+message SetBackupCredentialsRequest {}
+message VerifyBackupRequest {}
+message PruneBackupsRequest {}
+message RestoreStartRequest {}
+message RestoreStatusRequest {}
+message RestoreConfirmRequest {}
+message GenerateRecoveryKeyRequest {}
+
+// request_id is chosen by the caller: non-zero and unique on the connection. deadline_ms may
+// only shorten the command's maximum deadline; 0 means the maximum.
+message Request {
+  uint64 request_id = 1;
+  uint32 deadline_ms = 2;
+  repeated SecretSlot secret_slots = 3;
+  oneof command {
+    GetHostInfoRequest get_host_info = 10;
+    GetRecipientKeyRequest get_recipient_key = 11;
+    BeginSetupRequest begin_setup = 12;
+    ExtendSetupRequest extend_setup = 13;
+    FinishSetupRequest finish_setup = 14;
+    SetupHostRequest setup_host = 15;
+    CreateDesktopRequest create_desktop = 16;
+    GetDesktopRequest get_desktop = 17;
+    ListDesktopsRequest list_desktops = 18;
+    StartDesktopRequest start_desktop = 19;
+    StopDesktopRequest stop_desktop = 20;
+    RestartDesktopRequest restart_desktop = 21;
+    SetLimitsRequest set_limits = 22;
+    SetUserPasswordRequest set_user_password = 23;
+    EnableDockerRequest enable_docker = 24;
+    DisableDockerRequest disable_docker = 25;
+    CreateSnapshotRequest create_snapshot = 26;
+    ListSnapshotsRequest list_snapshots = 27;
+    DeleteSnapshotRequest delete_snapshot = 28;
+    ProvisionSessionLinkRequest provision_session_link = 29;
+    InstallSessionRequest install_session = 30;
+    RestartSessionRequest restart_session = 31;
+    CheckUpdateRequest check_update = 32;
+    ApplyUpdateRequest apply_update = 33;
+    RollbackUpdateRequest rollback_update = 34;
+    DestroyDesktopRequest destroy_desktop = 35;
+    UninstallRequest uninstall = 36;
+    ResetLockoutRequest reset_lockout = 37;
+    EnrolOwnerKeyRequest enrol_owner_key = 38;
+    UpgradeIncusRequest upgrade_incus = 39;
+    PepperVerifyRequest pepper_verify = 40;
+    PepperEnrolRequest pepper_enrol = 41;
+    RecordEventRequest record_event = 42;
+    BeginSecretUploadRequest begin_secret_upload = 43;
+    BackupRunRequest backup_run = 60;
+    BackupCancelRequest backup_cancel = 61;
+    BackupStatusRequest backup_status = 62;
+    ListBackupsRequest list_backups = 63;
+    SetBackupScheduleRequest set_backup_schedule = 64;
+    SetBackupCredentialsRequest set_backup_credentials = 65;
+    VerifyBackupRequest verify_backup = 66;
+    PruneBackupsRequest prune_backups = 67;
+    RestoreStartRequest restore_start = 68;
+    RestoreStatusRequest restore_status = 69;
+    RestoreConfirmRequest restore_confirm = 70;
+    GenerateRecoveryKeyRequest generate_recovery_key = 71;
+  }
+}
+
+// ----- results -----
+
+message PoolInfo {
+  bool exists = 1;
+  string driver = 2;
+  uint64 total_gib = 3;
+  uint64 free_gib = 4;
+}
+
+message GetHostInfoResult {
+  string privd_version = 1;
+  Phase phase = 2;
+  string os_id = 3;
+  string os_version = 4;
+  string arch = 5;
+  uint32 cpu_count = 6;
+  uint64 memory_total_mib = 7;
+  uint64 memory_available_mib = 8;
+  PoolInfo pool = 9;
+  // Absent when Incus cannot be reached (the other fields are still returned).
+  optional string incus_version = 10;
+  bool docker_on_host = 11;
+  bool host_firewall_loaded = 12;
+  bool sysctl_ok = 13;
+  repeated NeedsAttention needs_attention = 14;
+  bool desktop_exists = 15;
+}
+
+message GetRecipientKeyResult {
+  uint32 key_id = 1;
+  // 32 bytes, X25519.
+  bytes public_key = 2;
+  bool owner_key_enrolled = 3;
+}
+
+message BeginSetupResult {
+  uint64 expires_at_unix_s = 1;
+}
+
+message ExtendSetupResult {
+  uint64 expires_at_unix_s = 1;
+}
+
+message FinishSetupResult {}
+
+enum Ensured {
+  ENSURED_UNSPECIFIED = 0;
+  ENSURED_CREATED = 1;
+  ENSURED_EXISTED = 2;
+  ENSURED_UPDATED = 3;
+}
+
+enum DockerUserRules {
+  DOCKER_USER_RULES_UNSPECIFIED = 0;
+  DOCKER_USER_RULES_NOT_PRESENT = 1;
+  DOCKER_USER_RULES_APPLIED = 2;
+  DOCKER_USER_RULES_FAILED = 3;
+}
+
+message SetupHostResult {
+  Ensured pool = 1;
+  Ensured network = 2;
+  Ensured acl = 3;
+  Ensured desktop_profile = 4;
+  Ensured compat_profile = 5;
+  string gateway_ip = 6;
+  bool firewall_loaded = 7;
+  bool sysctl_applied = 8;
+  DockerUserRules docker_user_rules = 9;
+}
+
+enum PathTaken {
+  PATH_TAKEN_UNSPECIFIED = 0;
+  PATH_TAKEN_PREBUILT = 1;
+  PATH_TAKEN_BUILD = 2;
+}
+
+message StageTiming {
+  ProgressStage stage = 1;
+  uint32 elapsed_ms = 2;
+}
+
+enum DockerFallback {
+  DOCKER_FALLBACK_UNSPECIFIED = 0;
+  DOCKER_FALLBACK_ZABBLY_INCUS = 1;
+  DOCKER_FALLBACK_HOST_NETWORK_ONLY = 2;
+}
+
+// The DockerOutcome of hx-provision, returned as a normal response (section 6.9).
+message DockerOutcome {
+  oneof outcome {
+    DockerEnabled enabled = 1;
+    DockerUnsupportedIncus unsupported_incus = 2;
+    DockerSelfTestFailed self_test_failed = 3;
+  }
+}
+
+message DockerEnabled {
+  string docker_version = 1;
+}
+
+message DockerUnsupportedIncus {
+  string found = 1;
+  string required = 2;
+  repeated DockerFallback fallbacks = 3;
+}
+
+message DockerSelfTestFailed {
+  bool isolation_restored = 1;
+  string hint = 2;
+  // Sanitized, at most 2 KiB.
+  string output_tail = 3;
+  repeated DockerFallback fallbacks = 4;
+}
+
+message CreateDesktopResult {
+  string desktop_id = 1;
+  PathTaken path_taken = 2;
+  string reason = 3;
+  repeated StageTiming timings = 4;
+  // At most 16, each at most 256 bytes, sanitized.
+  repeated string warnings = 5;
+  // Present when Docker was requested.
+  optional DockerOutcome docker = 6;
+}
+
+message SessionInfo {
+  string installed_version = 1;
+  bool link_provisioned = 2;
+}
+
+message Desktop {
+  string desktop_id = 1;
+  DesktopState state = 2;
+  string username = 3;
+  Distro distro = 4;
+  Preset preset = 5;
+  string ip = 6;
+  Limits limits = 7;
+  DockerState docker = 8;
+  repeated NeedsAttention needs_attention = 9;
+  SessionInfo session = 10;
+  uint32 snapshot_count = 11;
+  uint64 created_unix_s = 12;
+}
+
+message GetDesktopResult {
+  Desktop desktop = 1;
+}
+
+message ListDesktopsResult {
+  // At most 8.
+  repeated Desktop desktops = 1;
+}
+
+// Shared by start, stop and restart.
+message PowerResult {
+  bool running = 1;
+  bool degraded = 2;
+}
+
+message SetLimitsResult {
+  bool restart_required = 1;
+}
+
+message SetUserPasswordResult {}
+
+message EnableDockerResult {
+  DockerOutcome outcome = 1;
+}
+
+message DisableDockerResult {
+  bool restarted = 1;
+}
+
+enum SnapshotKind {
+  SNAPSHOT_KIND_UNSPECIFIED = 0;
+  SNAPSHOT_KIND_MANUAL = 1;
+  SNAPSHOT_KIND_PREUPDATE = 2;
+  SNAPSHOT_KIND_BACKUP = 3;
+}
+
+message Snapshot {
+  string name = 1;
+  SnapshotKind kind = 2;
+  uint64 created_unix_s = 3;
+  uint64 size_bytes = 4;
+}
+
+message CreateSnapshotResult {
+  Snapshot snapshot = 1;
+}
+
+message ListSnapshotsResult {
+  // At most 64.
+  repeated Snapshot snapshots = 1;
+}
+
+message DeleteSnapshotResult {}
+
+message ProvisionSessionLinkResult {
+  string socket_path = 1;
+}
+
+message InstallSessionResult {
+  string installed_version = 1;
+  bool restarted = 2;
+}
+
+message RestartSessionResult {}
+
+enum UpdateChannel {
+  UPDATE_CHANNEL_UNSPECIFIED = 0;
+  UPDATE_CHANNEL_STABLE = 1;
+  UPDATE_CHANNEL_BETA = 2;
+}
+
+message RolledBack {
+  string version = 1;
+  string reason = 2;
+}
+
+message CheckUpdateResult {
+  string current = 1;
+  optional string available = 2;
+  UpdateChannel channel = 3;
+  bool verified = 4;
+  optional RolledBack rolled_back = 5;
+}
+
+message ApplyUpdateResult {
+  // privd answers first, then re-execs.
+  bool restarting = 1;
+}
+
+message RollbackUpdateResult {}
+message DestroyDesktopResult {}
+message UninstallResult {}
+message ResetLockoutResult {}
+message EnrolOwnerKeyResult {}
+message UpgradeIncusResult {}
+
+// The only result that answers a MAC question: yes or no, never the MAC (section 6.15).
+message PepperVerifyResult {
+  bool ok = 1;
+}
+
+// The only result that ever carries a MAC (section 5.3 test 4).
+message PepperEnrolResult {
+  // 32 bytes.
+  bytes mac = 1;
+  uint32 version = 2;
+}
+
+message RecordEventResult {}
+
+message BeginSecretUploadResult {
+  // 16 random bytes.
+  bytes upload_nonce = 1;
+}
+
+message Response {
+  uint64 request_id = 1;
+  oneof result {
+    Error error = 2;
+    GetHostInfoResult get_host_info = 10;
+    GetRecipientKeyResult get_recipient_key = 11;
+    BeginSetupResult begin_setup = 12;
+    ExtendSetupResult extend_setup = 13;
+    FinishSetupResult finish_setup = 14;
+    SetupHostResult setup_host = 15;
+    CreateDesktopResult create_desktop = 16;
+    GetDesktopResult get_desktop = 17;
+    ListDesktopsResult list_desktops = 18;
+    PowerResult start_desktop = 19;
+    PowerResult stop_desktop = 20;
+    PowerResult restart_desktop = 21;
+    SetLimitsResult set_limits = 22;
+    SetUserPasswordResult set_user_password = 23;
+    EnableDockerResult enable_docker = 24;
+    DisableDockerResult disable_docker = 25;
+    CreateSnapshotResult create_snapshot = 26;
+    ListSnapshotsResult list_snapshots = 27;
+    DeleteSnapshotResult delete_snapshot = 28;
+    ProvisionSessionLinkResult provision_session_link = 29;
+    InstallSessionResult install_session = 30;
+    RestartSessionResult restart_session = 31;
+    CheckUpdateResult check_update = 32;
+    ApplyUpdateResult apply_update = 33;
+    RollbackUpdateResult rollback_update = 34;
+    DestroyDesktopResult destroy_desktop = 35;
+    UninstallResult uninstall = 36;
+    ResetLockoutResult reset_lockout = 37;
+    EnrolOwnerKeyResult enrol_owner_key = 38;
+    UpgradeIncusResult upgrade_incus = 39;
+    PepperVerifyResult pepper_verify = 40;
+    PepperEnrolResult pepper_enrol = 41;
+    RecordEventResult record_event = 42;
+    BeginSecretUploadResult begin_secret_upload = 43;
+  }
+}
+
+// Kind-1 body of the privd socket (section 4): exactly one variant, else invalid.
+message Frame {
+  oneof frame {
+    Hello hello = 1;
+    HelloAck hello_ack = 2;
+    Request request = 3;
+    Cancel cancel = 4;
+    Ping ping = 5;
+    Pong pong = 6;
+    Progress progress = 7;
+    Response response = 8;
+  }
+}

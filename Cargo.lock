@@ -789,6 +789,21 @@ name = "hx-desktop"
 version = "0.1.0"
 
 [[package]]
+name = "hx-ipc"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "hx-proto",
+ "proptest",
+ "prost",
+ "prost-build",
+ "protox",
+ "rustix",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
 name = "hx-proto"
 version = "0.1.0"
 dependencies = [

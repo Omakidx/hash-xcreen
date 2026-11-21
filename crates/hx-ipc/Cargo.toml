@@ -1,0 +1,37 @@
+[package]
+name = "hx-ipc"
+description = "Internal IPC: framing and message schemas for hx-privd, the hx-gatewayd admin socket and the session link."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = ["privd", "link"]
+# The hx-privd command set and the hx-gatewayd admin socket (docs/ipc.md Part 1 and section 9):
+# schemas, framing, secret frames, SO_PEERCRED. Not needed by hx-session.
+privd = ["dep:prost"]
+# The session link (docs/ipc.md Part 2): schemas, preamble, lanes, budgets. Needs the shared
+# hx.v1 types, hence hx-proto.
+link = ["dep:hx-proto", "dep:prost"]
+
+[dependencies]
+bytes.workspace = true
+hx-proto = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+rustix = { workspace = true, features = ["net"] }
+thiserror.workspace = true
+zeroize.workspace = true
+
+[build-dependencies]
+# Pure-Rust protobuf compiler, as in hx-proto: no `protoc` binary needed.
+prost-build = "0.14"
+protox = "0.9"
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true
