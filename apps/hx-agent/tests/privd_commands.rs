@@ -1378,10 +1378,17 @@ async fn setup_host_loads_and_persists_the_generated_ruleset_through_the_runner(
         assert!(c.stdin.is_none());
         assert!(c.args.iter().all(|a| !a.contains("198.51.100.7")), "{c:?}");
     }
+    assert!(calls.iter().any(|c| c.tool == Tool::Sysctl
+        && c.args
+            == [
+                "-p",
+                &h.daemon.cfg.sysctl_file.to_string_lossy().into_owned()
+            ]));
+    // L7: never `--system`, which would apply every other sysctl file of the host.
     assert!(
         calls
             .iter()
-            .any(|c| c.tool == Tool::Sysctl && c.args == ["--system"])
+            .all(|c| c.tool != Tool::Sysctl || !c.args.iter().any(|a| a == "--system"))
     );
     // The docker rules: probe the chain, check, insert.
     let ipt: Vec<String> = calls

@@ -152,7 +152,7 @@ waiters and a 10 s wait). `Ping` is answered at once, at most 10 times a second.
   `RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6` (iptables-legacy needs inet),
   `SystemCallFilter=@system-service`, `ProtectHome`, `PrivateTmp`, `ProtectKernelModules`,
   `ProtectKernelLogs`, `ProtectControlGroups`, `ProtectClock`, `ProtectHostname`, `ProtectProc=invisible`.
-* **Not set, deliberately:** `ProtectKernelTunables` (`sysctl --system` writes `/proc/sys`),
+* **Not set, deliberately:** `ProtectKernelTunables` (`sysctl -p` writes `/proc/sys`),
   `PrivateDevices` (blkid reads host block devices), `ProcSubset=pid` (the daemon reads
   `/proc/meminfo` and `/proc/self/mountinfo`), `PrivateNetwork` (nft and iptables act on the host
   network), `RuntimeDirectory` (it would delete `/run/hx` and the socket at stop).

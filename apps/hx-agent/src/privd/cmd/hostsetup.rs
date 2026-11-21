@@ -274,13 +274,16 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
         let err = |m: &str| CmdError::internal(m.to_string()).with_detail(ErrorDetail::Sysctl);
         write_atomic(&self.cfg.sysctl_file, sysctl_text().as_bytes(), 0o644)
             .map_err(CmdError::from)?;
+        // Only the file privd just wrote: `sysctl --system` would also apply every other file
+        // under /etc/sysctl.d, /run/sysctl.d and /usr/lib/sysctl.d.
+        let file = self.cfg.sysctl_file.to_string_lossy().into_owned();
         let out = self
             .runner
-            .run(Program::new(Tool::Sysctl, &["--system"]).with_timeout(Duration::from_secs(30)))
+            .run(Program::new(Tool::Sysctl, &["-p", &file]).with_timeout(Duration::from_secs(30)))
             .await
             .map_err(CmdError::from)?;
         if !out.success() {
-            return Err(err("`sysctl --system` failed"));
+            return Err(err("`sysctl -p` of the drop-in failed"));
         }
         if !self.probe.sysctl_ok() {
             return Err(err("the sysctl values did not take effect"));
