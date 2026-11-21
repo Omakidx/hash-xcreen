@@ -134,6 +134,25 @@ async fn an_operation_the_daemon_forgot_counts_as_ended() {
 }
 
 #[tokio::test]
+async fn an_operation_purged_before_the_wait_is_treated_as_finished() {
+    // Seen on a real daemon: the restart op was already gone when the client asked.
+    let fake = Fake::start().await;
+    fake.with(|s| {
+        s.forgotten_ops.insert(common::OP_ID.to_string());
+    });
+    let c = fake.client();
+    c.set_state(
+        "hx-main",
+        StateAction::Restart,
+        false,
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert!(c.in_flight_operations().is_empty());
+}
+
+#[tokio::test]
 async fn scoped_clients_do_not_see_each_others_operations() {
     let fake = Fake::start().await;
     fake.with(|s| s.stuck_ops = true);

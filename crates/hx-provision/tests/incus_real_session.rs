@@ -327,12 +327,23 @@ async fn real_session_units_in_an_unprivileged_container() {
         .map(|s| s.trim().to_string())
         .collect();
     let c2 = c.clone();
+    // Every recipe runs in its own task: one failing recipe does not hide the others.
     let result = tokio::spawn(async move {
+        let mut failed = Vec::new();
         for (i, r) in recipes.iter().enumerate() {
-            run_one(&c2, r, i == 0).await;
+            let (c3, r3) = (c2.clone(), r.clone());
+            let outcome = tokio::spawn(async move { run_one(&c3, &r3, i == 0).await }).await;
+            eprintln!(
+                "RESULT {r}: {}",
+                if outcome.is_ok() { "PASS" } else { "FAIL" }
+            );
+            if outcome.is_err() {
+                failed.push(r.clone());
+            }
             // Next recipe starts from a fresh container (host objects stay).
-            destroy_desktop(&c2, INSTANCE).await.unwrap();
+            let _ = destroy_desktop(&c2, INSTANCE).await;
         }
+        assert!(failed.is_empty(), "recipes that failed: {failed:?}");
     })
     .await;
     if std::env::var("HX3B_KEEP").as_deref() == Ok("1") {

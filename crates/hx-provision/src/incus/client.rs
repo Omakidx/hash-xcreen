@@ -457,13 +457,21 @@ impl<T: Transport> Client<T> {
             let env = match env {
                 Ok(e) => e,
                 Err(e) if is_wait_timeout(&e) => continue,
-                Err(e) => {
-                    // An operation the daemon no longer knows has ended; keep other errors tracked.
-                    if e.is_not_found() {
-                        self.untrack(tracked);
-                    }
-                    return Err(e);
+                Err(e) if e.is_not_found() => {
+                    // The daemon no longer knows the operation: it finished and was purged before
+                    // we asked (seen on a real daemon for an instance restart). Its result is
+                    // gone; callers that care verify the outcome (readiness, instance state), and
+                    // a command whose exit status is missing fails in `exec`.
+                    self.untrack(tracked);
+                    return Ok(Operation {
+                        id: tracked.to_string(),
+                        status: "Success".into(),
+                        status_code: 200,
+                        ..Operation::default()
+                    });
                 }
+                // Other errors keep the operation tracked.
+                Err(e) => return Err(e),
             };
             let op = Operation::from_value(&env.metadata)?;
             if op.is_terminal() {
