@@ -1659,3 +1659,46 @@ async fn a_refusal_during_an_upload_does_not_end_the_link_and_the_abort_arrives(
     );
     assert!(!link.is_closed());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_errors_say_whether_the_session_closed_right_after_the_preamble() {
+    // Review L2: an honest older session closes without answering; that must be told apart from
+    // a refusal, a missing socket and silence, so the policy can guess "outdated".
+    let dir = std::env::temp_dir().join(format!("hx-link-hostile-l2-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = LinkConfig {
+        handshake_timeout: Duration::from_secs(1),
+        ..LinkConfig::default()
+    };
+    // Accepts, reads the preamble, closes (what hx-session does for another major).
+    let sock = dir.join("closes.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let t = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let mut b = [0u8; CLIENT_PREAMBLE_LEN];
+        s.read_exact(&mut b).unwrap();
+    });
+    let err = LinkClient::connect(&sock, cfg.clone()).await.err().unwrap();
+    t.join().unwrap();
+    assert_eq!(err.class, FailureClass::Unavailable);
+    assert!(err.closed_after_preamble, "{err:?}");
+    // Not there, refused, and silent are not that.
+    let err = LinkClient::connect(dir.join("missing.sock"), cfg.clone())
+        .await
+        .err()
+        .unwrap();
+    assert!(!err.closed_after_preamble);
+    let stale = dir.join("stale.sock");
+    drop(UnixListener::bind(&stale).unwrap());
+    let err = LinkClient::connect(&stale, cfg.clone())
+        .await
+        .err()
+        .unwrap();
+    assert!(!err.closed_after_preamble);
+    let silent = dir.join("silent.sock");
+    let _keep = UnixListener::bind(&silent).unwrap();
+    let err = LinkClient::connect(&silent, cfg).await.err().unwrap();
+    assert_eq!(err.class, FailureClass::Unavailable);
+    assert!(!err.closed_after_preamble);
+    let _ = std::fs::remove_dir_all(&dir);
+}

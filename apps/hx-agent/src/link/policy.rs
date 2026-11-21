@@ -18,6 +18,13 @@ use std::time::{Duration, Instant};
 pub const BACKOFF_MIN: Duration = Duration::from_secs(1);
 /// Longest redial delay.
 pub const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// `InstallSession` requests within [`RESTART_WINDOW`] after which the desktop is reported
+/// unavailable, like restarts (review L2: a hostile session answering with another major could
+/// otherwise have the gateway ask for an install for ever).
+pub const INSTALLS_BEFORE_UNAVAILABLE: usize = 3;
+/// Consecutive "the session closed right after the preamble" failures, on a desktop whose
+/// session has worked before, that are taken for an outdated in-container binary.
+pub const OUTDATED_GUESS_AFTER: u32 = 3;
 /// Faults within [`FAULT_WINDOW`] that trigger a `RestartSession`.
 pub const FAULTS_BEFORE_RESTART: usize = 5;
 /// The window the faults are counted in.
@@ -69,6 +76,10 @@ pub struct ReconnectPolicy {
     backoff: Duration,
     faults: VecDeque<Instant>,
     restarts: VecDeque<Instant>,
+    installs: VecDeque<Instant>,
+    /// A handshake has succeeded at least once (the session worked before).
+    connected_before: bool,
+    closed_after_preamble: u32,
     state: DesktopState,
     next_dial: Option<Instant>,
 }
@@ -86,6 +97,9 @@ impl ReconnectPolicy {
             backoff: BACKOFF_MIN,
             faults: VecDeque::new(),
             restarts: VecDeque::new(),
+            installs: VecDeque::new(),
+            connected_before: false,
+            closed_after_preamble: 0,
             state: DesktopState::Available,
             next_dial: None,
         }
@@ -105,6 +119,8 @@ impl ReconnectPolicy {
 
     /// A clean handshake: the backoff and the unavailable state are cleared.
     pub fn on_connected(&mut self) {
+        self.connected_before = true;
+        self.closed_after_preamble = 0;
         self.backoff = BACKOFF_MIN;
         self.state = DesktopState::Available;
         self.next_dial = None;
@@ -120,6 +136,33 @@ impl ReconnectPolicy {
 
     /// A link ended or a dial failed with `class` at `now`.
     pub fn on_failure(&mut self, now: Instant, class: FailureClass) -> Advice {
+        self.on_failure_detail(now, class, false)
+    }
+
+    /// As [`on_failure`](Self::on_failure), for a dial failure that says whether the session
+    /// closed the connection right after the preamble
+    /// ([`ConnectError::closed_after_preamble`]).
+    ///
+    /// An honest session of another major version closes without answering (ipc.md 12.2), which
+    /// looks exactly like `Unavailable`. When the session has worked before and
+    /// [`OUTDATED_GUESS_AFTER`] dials in a row end that way, it is taken for `Outdated`: the
+    /// install is requested (rate limited like restarts).
+    pub fn on_failure_detail(
+        &mut self,
+        now: Instant,
+        class: FailureClass,
+        closed_after_preamble: bool,
+    ) -> Advice {
+        let mut class = class;
+        if class == FailureClass::Unavailable && closed_after_preamble && self.connected_before {
+            self.closed_after_preamble += 1;
+            if self.closed_after_preamble >= OUTDATED_GUESS_AFTER {
+                self.closed_after_preamble = 0;
+                class = FailureClass::Outdated;
+            }
+        } else if class != FailureClass::Closed {
+            self.closed_after_preamble = 0;
+        }
         if class == FailureClass::Closed {
             return Advice {
                 redial_after: Duration::ZERO,
@@ -145,6 +188,18 @@ impl ReconnectPolicy {
                 }
             }
         }
+        // Installs are rate limited like restarts: repetition ends in session_unavailable.
+        let mut ask_install = false;
+        if matches!(class, FailureClass::Outdated | FailureClass::Incompatible) {
+            self.installs
+                .retain(|t| now.saturating_duration_since(*t) < RESTART_WINDOW);
+            if self.installs.len() >= INSTALLS_BEFORE_UNAVAILABLE {
+                self.state = DesktopState::SessionUnavailable;
+            } else {
+                self.installs.push_back(now);
+                ask_install = true;
+            }
+        }
         let redial_after = if self.state == DesktopState::SessionUnavailable {
             UNAVAILABLE_RETRY
         } else {
@@ -156,7 +211,7 @@ impl ReconnectPolicy {
         Advice {
             redial_after,
             ask_restart,
-            ask_install: matches!(class, FailureClass::Outdated | FailureClass::Incompatible),
+            ask_install,
             state: self.state,
         }
     }
@@ -287,9 +342,11 @@ impl DesktopLink {
                 })
             }
             Err(error) => {
-                let advice = lock(&self.inner)
-                    .policy
-                    .on_failure(Instant::now(), error.class);
+                let advice = lock(&self.inner).policy.on_failure_detail(
+                    Instant::now(),
+                    error.class,
+                    error.closed_after_preamble,
+                );
                 Err(DialError::Failed { error, advice })
             }
         }
@@ -450,6 +507,72 @@ mod tests {
         assert_eq!(last.unwrap().state, DesktopState::SessionUnavailable);
         assert!(FailureClass::SessionGoodbye.is_fault());
         assert!(!FailureClass::Closed.is_fault());
+    }
+
+    #[test]
+    fn an_honest_older_session_is_guessed_outdated_after_repeated_silent_closes() {
+        // Review L2, case 1: an older session closes without answering, which looks like
+        // `Unavailable`. Only on a desktop whose session worked before, and only when the close
+        // came right after the preamble (not a refusal or a timeout).
+        let t0 = Instant::now();
+        let mut p = ReconnectPolicy::new();
+        for i in 0..6 {
+            // Never connected: the proxy may simply be down. No install, whatever the shape.
+            let a = p.on_failure_detail(secs(t0, i), FailureClass::Unavailable, true);
+            assert!(!a.ask_install);
+        }
+        p.on_connected();
+        for i in 0..5 {
+            // Refusals and timeouts reset the count: still no install.
+            assert!(
+                !p.on_failure_detail(secs(t0, 10 + i), FailureClass::Unavailable, false)
+                    .ask_install
+            );
+        }
+        let asks: Vec<_> = (0..3)
+            .map(|i| {
+                p.on_failure_detail(secs(t0, 20 + i), FailureClass::Unavailable, true)
+                    .ask_install
+            })
+            .collect();
+        assert_eq!(asks, [false, false, true]);
+        // An interleaved refusal starts the count again.
+        p.on_failure_detail(secs(t0, 30), FailureClass::Unavailable, true);
+        p.on_failure_detail(secs(t0, 31), FailureClass::Unavailable, false);
+        assert!(
+            !p.on_failure_detail(secs(t0, 32), FailureClass::Unavailable, true)
+                .ask_install
+        );
+    }
+
+    #[test]
+    fn install_requests_are_rate_limited_and_end_in_unavailable() {
+        // Review L2, case 2: a hostile session that answers with another major used to get
+        // `ask_install` for ever.
+        let t0 = Instant::now();
+        let mut p = ReconnectPolicy::new();
+        let mut asked = 0;
+        for i in 0..3 {
+            let a = p.on_failure(secs(t0, i * 60), FailureClass::Outdated);
+            assert!(a.ask_install, "{i}");
+            asked += 1;
+        }
+        assert_eq!(asked, INSTALLS_BEFORE_UNAVAILABLE);
+        let a = p.on_failure(secs(t0, 200), FailureClass::Outdated);
+        assert!(!a.ask_install);
+        assert_eq!(a.state, DesktopState::SessionUnavailable);
+        assert_eq!(a.redial_after, UNAVAILABLE_RETRY);
+        // Incompatible shares the same budget; an hour later it may ask again.
+        assert!(
+            !p.on_failure(secs(t0, 300), FailureClass::Incompatible)
+                .ask_install
+        );
+        p.on_session_restarted();
+        assert!(
+            p.on_failure(secs(t0, 3_800), FailureClass::Incompatible)
+                .ask_install,
+            "the window has passed"
+        );
     }
 
     #[test]

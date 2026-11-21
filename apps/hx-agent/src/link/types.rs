@@ -273,6 +273,11 @@ pub struct ConnectError {
     pub class: FailureClass,
     /// Sanitised reason for the log.
     pub detail: String,
+    /// The session accepted the connection and closed it (or reset it) right after the
+    /// preamble, as opposed to refusing it, not being there or staying silent. An honest session
+    /// of another link major version does this (ipc.md 12.2); so does a proxy that cannot reach
+    /// the container. [`ReconnectPolicy`](super::ReconnectPolicy) uses it to guess `Outdated`.
+    pub closed_after_preamble: bool,
 }
 
 impl ConnectError {
@@ -280,7 +285,13 @@ impl ConnectError {
         Self {
             class,
             detail: hx_ipc::text::sanitize_text(&detail.into(), 200),
+            closed_after_preamble: false,
         }
+    }
+
+    pub(crate) fn after_preamble(mut self) -> Self {
+        self.closed_after_preamble = true;
+        self
     }
 }
 

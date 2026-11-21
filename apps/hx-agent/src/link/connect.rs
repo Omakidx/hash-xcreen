@@ -67,12 +67,19 @@ async fn dial_lane(
         remaining.max(std::time::Duration::from_millis(1)),
     )
     .await
-    .map_err(|_| unavailable(format!("{name}: the session did not take the preamble")))?;
+    .map_err(|_| {
+        unavailable(format!("{name}: the session did not take the preamble")).after_preamble()
+    })?;
     let mut answer = [0u8; PREAMBLE_LEN];
     timeout_at(deadline, read_exact(&stream, &mut answer))
         .await
         .map_err(|_| unavailable(format!("{name}: no preamble answer in time")))?
-        .map_err(|f| from_lane(name, f))?;
+        .map_err(|f| {
+            let ended = matches!(f, LaneFail::Eof | LaneFail::Io(_));
+            let e = from_lane(name, f);
+            // The connection ended right after the preamble was sent (not a timeout).
+            if ended { e.after_preamble() } else { e }
+        })?;
     let answer = Preamble::decode(&answer)
         .map_err(|e| ConnectError::new(FailureClass::Violation, format!("{name}: {e}")))?;
     match offer.check_answer(&answer) {
