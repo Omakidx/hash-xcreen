@@ -277,3 +277,122 @@ async fn l4_a_symlinked_audit_directory_is_refused() {
     );
     assert!(!r.stdout.contains("forged-line"));
 }
+
+// ----------------------------------------------------------------------------------------- L5
+
+/// A writer whose reader has gone away.
+struct ClosedPipe;
+impl std::io::Write for ClosedPipe {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Runs the CLI with a closed stdout and returns how long it took, or None if it hung.
+async fn run_with_closed_stdout(cfg: Config, args: &[&str]) -> Option<(u8, std::time::Duration)> {
+    let args: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+    let job = tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        let mut out = ClosedPipe;
+        let mut err = Vec::new();
+        let mut prompt = Scripted::new(&[], &[]);
+        let mut env = hx_agent::cli::Env {
+            config: cfg,
+            euid: 0,
+            out: &mut out,
+            err: &mut err,
+            prompt: &mut prompt,
+            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            now: hx_agent::cli::system_now,
+            json: false,
+        };
+        let code = hx_agent::cli::run(&args, &mut env);
+        (code, started.elapsed())
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), job)
+        .await
+        .ok()
+        .map(|j| j.unwrap())
+}
+
+#[tokio::test]
+async fn l5_following_stops_on_a_closed_pipe_and_ends_journalctl() {
+    let dir = private_tempdir();
+    let mut cfg = unreachable_config(dir.path());
+    let pidfile = dir.path().join("pid");
+    let entry = journal_entry("hx-privd.service", 1, "x", "spam");
+    // An endless journal: it only stops when it is killed.
+    cfg.journalctl = write_script(
+        dir.path(),
+        "journalctl",
+        &format!(
+            "echo $$ > '{}'\nwhile true; do echo '{}'; done\n",
+            pidfile.display(),
+            entry
+        ),
+    );
+    let (code, took) = run_with_closed_stdout(cfg, &["logs", "--follow", "--journal"])
+        .await
+        .expect("the CLI must return when its output is closed");
+    assert_eq!(code, 0);
+    assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+    // journalctl was killed, not left running.
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::path::Path::new(&format!("/proc/{pid}")).exists()
+        && !std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map(|s| s.contains(") Z"))
+            .unwrap_or(true)
+    {
+        assert!(
+            std::time::Instant::now() < end,
+            "journalctl (pid {pid}) is still running"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[tokio::test]
+async fn l5_plain_output_is_streamed_and_stops_on_a_closed_pipe() {
+    let dir = private_tempdir();
+    let mut cfg = unreachable_config(dir.path());
+    let entry = journal_entry("hx-privd.service", 1, "x", "spam");
+    cfg.journalctl = write_script(
+        dir.path(),
+        "journalctl",
+        &format!("while true; do echo '{entry}'; done\n"),
+    );
+    let (code, took) = run_with_closed_stdout(cfg, &["logs", "--journal", "-n", "10000"])
+        .await
+        .expect("the CLI must return when its output is closed");
+    assert_eq!(code, 0);
+    assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+}
+
+#[tokio::test]
+async fn l5_json_output_is_bounded_by_lines() {
+    let dir = private_tempdir();
+    let mut cfg = unreachable_config(dir.path());
+    let entry = journal_entry("hx-privd.service", 1, "x", "line");
+    cfg.journalctl = write_script(
+        dir.path(),
+        "journalctl",
+        &format!("while true; do echo '{entry}'; done\n"),
+    );
+    let r = cli(
+        &cfg,
+        &["logs", "--journal", "--json", "-n", "10000"],
+        &[],
+        &[],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.json()["data"]["journal"].as_array().unwrap().len() <= 20_000);
+}

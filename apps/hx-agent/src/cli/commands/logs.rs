@@ -39,6 +39,10 @@ const MAX_LINE: usize = 4096;
 const MAX_ENTRY: usize = 65_536;
 /// Most journal lines read in one non-follow call.
 const MAX_JOURNAL_LINES: usize = 20_000;
+/// Most journal text collected into one `--json` object.
+const MAX_JSON_BYTES: usize = 16 << 20;
+/// Entries queued between the journalctl reader thread and the printer while following.
+const QUEUE: usize = 1024;
 /// How much of the end of the audit file is looked at for a tail.
 const TAIL_WINDOW: u64 = 1 << 20;
 /// Poll interval for the audit file while following.
@@ -184,25 +188,36 @@ fn spawn_journal(cfg: &Config, lines: u32, follow: bool) -> Result<Child, CliErr
         })
 }
 
-fn read_journal(cfg: &Config, lines: u32) -> Result<Vec<String>, CliError> {
+/// Reads the journal entries and hands each rendered line to `sink`, one at a time, so nothing
+/// accumulates here. `sink` returns false to stop (the reader of our output went away).
+fn each_journal(
+    cfg: &Config,
+    lines: u32,
+    sink: &mut dyn FnMut(String) -> bool,
+) -> Result<(), CliError> {
     let mut child = spawn_journal(cfg, lines, false)?;
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| CliError::failed("journalctl has no output"))?;
     let mut rd = Lines::new(stdout, MAX_ENTRY);
-    let mut out = Vec::new();
-    while out.len() < MAX_JOURNAL_LINES {
+    let mut count = 0usize;
+    let mut failed = None;
+    while count < MAX_JOURNAL_LINES {
         match rd.next_line() {
-            Ok(Some(l)) => out.push(render_entry(&l)),
+            Ok(Some(l)) => {
+                count += 1;
+                if !sink(render_entry(&l)) {
+                    break;
+                }
+            }
             Ok(None) => break,
             Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(CliError::Unavailable(format!(
+                failed = Some(CliError::Unavailable(format!(
                     "reading journalctl: {}",
                     e.kind()
                 )));
+                break;
             }
         }
     }
@@ -210,14 +225,17 @@ fn read_journal(cfg: &Config, lines: u32) -> Result<Vec<String>, CliError> {
     let status = child
         .wait()
         .map_err(|e| CliError::Unavailable(format!("journalctl: {}", e.kind())))?;
+    if let Some(e) = failed {
+        return Err(e);
+    }
     // A kill after a complete read is our own; an exit with an error before any line is not.
-    if out.is_empty() && !status.success() && status.code().is_some() {
+    if count == 0 && !status.success() && status.code().is_some() {
         return Err(CliError::Unavailable(format!(
             "journalctl failed (exit {})",
             status.code().unwrap_or(-1)
         )));
     }
-    Ok(out)
+    Ok(())
 }
 
 /// The audit log's directory, held open. The file is only ever opened **relative to this
@@ -349,8 +367,42 @@ pub(super) fn run(
         follow_logs(env, lines, journal, audit)?;
         return Ok(None);
     }
+    if !env.json {
+        // Streamed: every line is written as it is read, nothing is built in memory.
+        if journal {
+            put(env.out, "== journal (hx-privd, hx-gatewayd) ==\n");
+            let out = &mut *env.out;
+            each_journal(&env.config, lines, &mut |l| {
+                put(out, &scrub_output(&format!("{l}\n")))
+            })?;
+        }
+        if audit {
+            put(env.out, "== audit log ==\n");
+            let tail = match open_audit(&env.config.audit_log, env.config.audit_owner_uid)? {
+                Some(mut f) => audit_tail(&mut f, lines as usize)?,
+                None => Vec::new(),
+            };
+            if tail.is_empty() {
+                put(env.out, "(no entries)\n");
+            }
+            for l in tail {
+                if !put(env.out, &scrub_output(&format!("{l}\n"))) {
+                    break;
+                }
+            }
+        }
+        return Ok(None);
+    }
+    // JSON: one object holds everything, so it is bounded by bytes as well as by lines.
     let j = if journal {
-        Some(read_journal(&env.config, lines)?)
+        let mut v = Vec::new();
+        let mut bytes = 0usize;
+        each_journal(&env.config, lines, &mut |l| {
+            bytes += l.len();
+            v.push(l);
+            bytes < MAX_JSON_BYTES
+        })?;
+        Some(v)
     } else {
         None
     };
@@ -362,28 +414,19 @@ pub(super) fn run(
     } else {
         None
     };
-    let mut text = String::new();
-    if let Some(j) = &j {
-        text.push_str("== journal (hx-privd, hx-gatewayd) ==\n");
-        for l in j {
-            text.push_str(l);
-            text.push('\n');
-        }
-    }
-    if let Some(a) = &a {
-        text.push_str("== audit log ==\n");
-        if a.is_empty() {
-            text.push_str("(no entries)\n");
-        }
-        for l in a {
-            text.push_str(l);
-            text.push('\n');
-        }
-    }
-    Ok(Some(Outcome::ok(text, json!({"journal": j, "audit": a}))))
+    Ok(Some(Outcome::ok(
+        String::new(),
+        json!({"journal": j, "audit": a}),
+    )))
 }
 
-fn emit(env: &mut Env<'_>, source: &str, line: &str) {
+/// Writes text; false when the reader of our output is gone (a closed pipe).
+fn put(w: &mut dyn std::io::Write, s: &str) -> bool {
+    w.write_all(s.as_bytes()).and_then(|()| w.flush()).is_ok()
+}
+
+/// Writes one followed line; false when the reader of our output is gone.
+fn emit(env: &mut Env<'_>, source: &str, line: &str) -> bool {
     let s = if env.json {
         let mut v = json!({"source": source, "line": line});
         scrub_json(&mut v);
@@ -393,12 +436,11 @@ fn emit(env: &mut Env<'_>, source: &str, line: &str) {
     } else {
         scrub_output(&format!("{source:<7}| {line}\n"))
     };
-    let _ = env.out.write_all(s.as_bytes());
-    let _ = env.out.flush();
+    put(env.out, &s)
 }
 
 fn follow_logs(env: &mut Env<'_>, lines: u32, journal: bool, audit: bool) -> Result<(), CliError> {
-    let (tx, rx) = mpsc::channel::<String>();
+    let (tx, rx) = mpsc::sync_channel::<String>(QUEUE);
     let mut child: Option<Child> = None;
     if journal {
         let mut c = spawn_journal(&env.config, lines, true)?;
@@ -418,6 +460,25 @@ fn follow_logs(env: &mut Env<'_>, lines: u32, journal: bool, audit: bool) -> Res
     } else {
         drop(tx);
     }
+    let result = follow_loop(env, lines, journal, audit, &rx);
+    // However the loop ended (stop flag, journalctl gone, a closed pipe, an error), journalctl
+    // is ended too; dropping `rx` ends the reader thread.
+    drop(rx);
+    if let Some(mut c) = child {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    result
+}
+
+/// The printing loop of `--follow`. Ends on the first failed write (including a closed pipe).
+fn follow_loop(
+    env: &mut Env<'_>,
+    lines: u32,
+    journal: bool,
+    audit: bool,
+    rx: &mpsc::Receiver<String>,
+) -> Result<(), CliError> {
     // The audit log: the last lines first, then whatever is appended.
     let mut follow = AuditFollow::default();
     if audit {
@@ -426,7 +487,9 @@ fn follow_logs(env: &mut Env<'_>, lines: u32, journal: bool, audit: bool) -> Res
             && let Some(mut f) = d.open()?
         {
             for l in audit_tail(&mut f, lines as usize)? {
-                emit(env, "audit", &l);
+                if !emit(env, "audit", &l) {
+                    return Ok(());
+                }
             }
             let m = f
                 .metadata()
@@ -438,28 +501,27 @@ fn follow_logs(env: &mut Env<'_>, lines: u32, journal: bool, audit: bool) -> Res
     }
     loop {
         if env.stop.load(Ordering::Relaxed) {
-            break;
+            return Ok(());
         }
         match rx.recv_timeout(POLL) {
-            Ok(l) => emit(env, "journal", &l),
+            Ok(l) => {
+                if !emit(env, "journal", &l) {
+                    return Ok(());
+                }
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 if journal {
                     // journalctl ended: nothing more to follow.
-                    break;
+                    return Ok(());
                 }
                 std::thread::sleep(POLL);
             }
         }
-        if audit {
-            poll_audit(env, &mut follow)?;
+        if audit && !poll_audit(env, &mut follow)? {
+            return Ok(());
         }
     }
-    if let Some(mut c) = child {
-        let _ = c.kill();
-        let _ = c.wait();
-    }
-    Ok(())
 }
 
 /// What `--follow` remembers of the audit log.
@@ -474,13 +536,13 @@ struct AuditFollow {
 
 /// Emits lines appended to the audit log since the last poll, following a rotation. The file is
 /// always (re)opened relative to the directory descriptor held since the start.
-fn poll_audit(env: &mut Env<'_>, st: &mut AuditFollow) -> Result<(), CliError> {
+fn poll_audit(env: &mut Env<'_>, st: &mut AuditFollow) -> Result<bool, CliError> {
     if st.dir.is_none() {
         // The directory did not exist when following began.
         st.dir = audit_dir(&env.config.audit_log, env.config.audit_owner_uid)?;
     }
     let Some(dir) = st.dir.as_ref() else {
-        return Ok(());
+        return Ok(true);
     };
     // Look at the name (not the open file): a rotation replaces the file under the same name.
     if dir.ident() != st.ident {
@@ -494,7 +556,7 @@ fn poll_audit(env: &mut Env<'_>, st: &mut AuditFollow) -> Result<(), CliError> {
             .map(|m| (m.dev(), m.ino()));
     }
     let Some(f) = st.file.as_mut() else {
-        return Ok(());
+        return Ok(true);
     };
     let len = f
         .metadata()
@@ -506,7 +568,7 @@ fn poll_audit(env: &mut Env<'_>, st: &mut AuditFollow) -> Result<(), CliError> {
         st.partial.clear();
     }
     if len == st.offset {
-        return Ok(());
+        return Ok(true);
     }
     let io = |e: std::io::Error| CliError::Failed(format!("audit log: {}", e.kind()));
     f.seek(SeekFrom::Start(st.offset)).map_err(io)?;
@@ -518,11 +580,13 @@ fn poll_audit(env: &mut Env<'_>, st: &mut AuditFollow) -> Result<(), CliError> {
         let rest = st.partial.split_off(i + 1);
         let line = std::mem::replace(&mut st.partial, rest);
         let text = peer(&String::from_utf8_lossy(&line[..line.len() - 1]), MAX_LINE);
-        emit(env, "audit", &text);
+        if !emit(env, "audit", &text) {
+            return Ok(false);
+        }
     }
     // A partial line that grows without a newline is cut, not accumulated.
     st.partial.truncate(MAX_LINE);
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
