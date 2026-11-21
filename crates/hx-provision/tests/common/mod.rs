@@ -97,6 +97,8 @@ pub struct State {
     pub forgotten_ops: std::collections::HashSet<String>,
     /// Accept `DELETE /operations/<id>` but never end the operation.
     pub refuse_cancel: bool,
+    /// Answer this many `/wait` calls with Incus 6.0.0's `500 context deadline exceeded`.
+    pub wait_timeouts: u32,
 }
 
 impl State {
@@ -130,6 +132,7 @@ impl State {
             cancelled_ops: Default::default(),
             forgotten_ops: Default::default(),
             refuse_cancel: false,
+            wait_timeouts: 0,
         }
     }
 }
@@ -391,6 +394,14 @@ impl State {
                 sync(Value::Array(items))
             }
             ("GET", ["1.0", "operations", id, "wait"]) => {
+                if self.wait_timeouts > 0 {
+                    self.wait_timeouts -= 1;
+                    return (
+                        500,
+                        json!({"type":"error","error_code":500,"error":"context deadline exceeded"})
+                            .to_string(),
+                    );
+                }
                 if self.forgotten_ops.contains(*id) {
                     return not_found("operation");
                 }

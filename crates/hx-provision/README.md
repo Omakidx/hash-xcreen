@@ -41,6 +41,17 @@ sg incus-admin -c 'cargo test -p hx-provision --test incus_real -- --ignored --n
   inside the container: a host that runs Docker needs the `DOCKER-USER` accept rules for the test
   bridge (architecture 4.2), otherwise the container has no IPv4 egress and the test stops early.
 
+`tests/incus_real_session.rs` (`HX3B_REAL=1`, objects named `hx3b-*`) builds a real recipe into an
+unprivileged isolated-idmap container and checks the `hx-session` socket and service units and
+the follow-up APIs against the daemon:
+
+```text
+HX3B_REAL=1 sg incus-admin -c 'cargo nextest run -p hx-provision --run-ignored only --test incus_real_session --no-capture'
+```
+
+It needs a way for the container to reach package mirrors; on a host that runs Docker it starts a
+proxy bound to the test bridge's gateway only (see the module docs). `HX3B_RECIPES` selects recipes.
+
 ## Caller obligations for `hx-privd`
 
 `hx-provision` trusts its caller. These are the rules `hx-privd` (1C) and the installer (1E) must
@@ -70,6 +81,43 @@ follow; `hx-gatewayd` and everything else unprivileged is never allowed to influ
   after) rather than `apply_stage` directly with a password.
 - **Docker.** Check `DockerOutcome::SelfTestFailed::isolation_restored`; when `false`, retry the
   rollback or warn the user that `security.nesting` is still on.
+- **Secrets are moved, never copied.** `Secret`, `Secrets`, `ExecRequest` and `Action` are not
+  `Clone` and `Secret` zeroizes on drop. Build `Secrets` from the secret frames
+  (`with_user_password`, `with_current_password`), hand them over by value.
+- **Set a password: `password::change_user_password(&client, instance, &username, secrets,
+  require_current)`.** Outside the setup window always `require_current = true`. The whole
+  sequence (sweep, check, `chpasswd`, sweep) runs as one detached task, so dropping the future
+  (cancel, deadline) cannot leave the 0600 file behind; answer `CANCELLED` afterwards. The check
+  runs `session::PASSWORD_CHECK_HELPER <login>` with the candidate on stdin and trusts only its
+  exit status (0 match, 1 wrong, anything else `CheckUnavailable`, fail closed). Contract of the
+  helper: `hx_provision::session`. Map `PasswordChange::CurrentPasswordWrong` to
+  `PERMISSION_DENIED` and charge the failure budget; `CheckUnavailable` is `INTERNAL`;
+  `ProvisionError::NotRunning` is `FAILED_PRECONDITION`.
+- **Cancel an Incus operation.** Use one `client.scoped()` per request. After dropping the
+  request's futures call `client.cancel_in_flight(Duration::from_secs(30))`: `Ok(n)` cancelled
+  and ended, `Err(ids)` means set `STUCK_OPERATION`. (`in_flight_operations`, `cancel_operation`
+  and `wait_operation_end` are the pieces.) An operation the daemon created while a request was
+  still on the wire is not known yet: check the instance during cleanup.
+- **Session link.** `incus::SessionLink::new(desktop_id, (gateway_uid, gateway_gid), (1000, 1000))`
+  then `client.add_session_link(instance, &link)`; nothing else can be added as a device.
+  privd creates `/run/hx/link` (root:`hx-gatewayd` 0750) itself. `remove_session_link` for
+  teardown.
+- **Limits.** `client.set_limits(instance, &LimitsUpdate{..})` writes `limits.cpu`,
+  `limits.memory` and the root disk `size` (live). Only "not zero" and absurd maxima are checked
+  here; every host-dependent bound of ipc.md 6.8 is yours.
+- **Settings.** Build `Settings` (`with_hostname`, `with_timezone_in(.., "/usr/share/zoneinfo")`,
+  `with_locale`, `with_keyboard`) and resolve with `Catalog::resolve_with`.
+- **Docker.** `docker::disable_docker(&client, instance)`; `DockerOptions { mode:
+  DockerMode::HostNetworkOnly, .. }` makes `enable_docker` return `ProvisionError::Unimplemented`
+  (map to `UNIMPLEMENTED`) before anything changes.
+- **Teardown.** `teardown::destroy_desktop` (instance must carry `user.hx.*`, else
+  `ProvisionError::NotOurs`) and `teardown::teardown_host(&client, &Naming::production())`
+  (skips, and reports, any object without the hash-xcreen description). `DesktopSpec::to_create`
+  sets `user.hx.state=creating`; privd moves it on. Pools and networks created by older builds have
+  no description and are therefore never torn down by these helpers.
+- **In-container paths.** `hx-session` installs at `session::SESSION_BINARY`
+  (`/usr/lib/hx-session/hx-session`), the password helper at `session::PASSWORD_CHECK_HELPER`; the
+  recipes' units use exactly these.
 - **Messages.** Text that came out of a container is sanitized (control and ANSI characters
   removed, truncated) before it appears in an error or outcome, but it is still untrusted: do not
   interpret it, and escape it for any UI.

@@ -153,6 +153,41 @@ async fn scoped_clients_do_not_see_each_others_operations() {
     let _ = task.await;
 }
 
+#[tokio::test]
+async fn a_wait_that_times_out_with_a_500_is_not_a_failure() {
+    // Incus 6.0.0 answers a `/wait` that ran out with `500 context deadline exceeded`.
+    let fake = Fake::start().await;
+    fake.with(|s| s.wait_timeouts = 3);
+    let c = fake.client();
+    c.create_instance(&spec(), Duration::from_secs(30))
+        .await
+        .unwrap();
+    // The same for waiting on an operation by id.
+    fake.with(|s| s.wait_timeouts = 2);
+    let id = OperationId::new("6b2d0c1e-0a5e-4f0e-9a52-0f0b7d3e3b11").unwrap();
+    assert_eq!(
+        c.wait_operation_end(&id, Duration::from_secs(30))
+            .await
+            .unwrap(),
+        OperationEnd::Success
+    );
+    // Other 500s still fail.
+    fake.with(|s| {
+        s.overrides.insert(
+            "POST /1.0/instances".into(),
+            (
+                500,
+                r#"{"type":"error","error_code":500,"error":"boom"}"#.into(),
+            ),
+        );
+    });
+    assert!(
+        c.create_instance(&spec(), Duration::from_secs(5))
+            .await
+            .is_err()
+    );
+}
+
 #[test]
 fn operation_ids_are_validated() {
     for bad in ["", "../x", "a b", "a/b", "x\n", &"a".repeat(65)] {

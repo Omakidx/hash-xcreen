@@ -210,16 +210,16 @@ async fn pool_network_acl_profile_request_bodies() {
         ]
     );
     assert!(egress.iter().all(|r| r["state"] == "enabled"));
-    assert_eq!(log[3].method, "PATCH");
+    assert_eq!(log[4].method, "PATCH");
     assert_eq!(
-        log[3].json()["config"]["security.acls"],
+        log[4].json()["config"]["security.acls"],
         "hx1d-test-isolate"
     );
     assert_eq!(
-        log[3].json()["config"]["security.acls.default.egress.action"],
+        log[4].json()["config"]["security.acls.default.egress.action"],
         "allow"
     );
-    assert_eq!(log[4].json()["config"]["raw.apparmor"], "signal,");
+    assert_eq!(log[5].json()["config"]["raw.apparmor"], "signal,");
     let _ = AclAction::Allow;
 }
 

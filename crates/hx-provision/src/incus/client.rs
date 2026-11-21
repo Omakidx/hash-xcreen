@@ -50,6 +50,13 @@ fn checked<'a>(what: &'static str, name: &'a str) -> Result<&'a str, IncusError>
     }
 }
 
+/// Incus 6.0.0 answers a `/wait?timeout=N` that runs out with `500 context deadline exceeded`
+/// instead of the still-running operation (found with the real-container test, which is the first
+/// to wait longer than one slice). That means "not finished yet", not a failure.
+pub(crate) fn is_wait_timeout(e: &IncusError) -> bool {
+    matches!(e, IncusError::Api { code: 500, message } if message.contains("context deadline exceeded"))
+}
+
 /// Percent-encode a query value (keeps `/` readable).
 pub(crate) fn encode_query(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -280,6 +287,7 @@ impl<T: Transport> Client<T> {
                         });
                     }
                 }
+                Err(e) if is_wait_timeout(&e) => {}
                 Err(e) if e.is_not_found() => {
                     self.untrack(&id.0);
                     return Ok(OperationEnd::Gone);
@@ -448,6 +456,7 @@ impl<T: Transport> Client<T> {
                 .await;
             let env = match env {
                 Ok(e) => e,
+                Err(e) if is_wait_timeout(&e) => continue,
                 Err(e) => {
                     // An operation the daemon no longer knows has ended; keep other errors tracked.
                     if e.is_not_found() {
@@ -543,10 +552,17 @@ impl<T: Transport> Client<T> {
         config: &std::collections::BTreeMap<String, String>,
     ) -> Result<(), IncusError> {
         let name = checked("network", name)?;
+        // Incus 6.0.0 resets the description to empty on a PATCH that does not repeat it, which
+        // would drop the hash-xcreen marker: send the current one back.
+        let description = self
+            .get_network(name)
+            .await?
+            .map(|n| n.description)
+            .unwrap_or_default();
         self.sync(
             Method::PATCH,
             format!("/1.0/networks/{name}"),
-            Some(&json!({"config": config})),
+            Some(&json!({"config": config, "description": description})),
         )
         .await
         .map(drop)
