@@ -102,7 +102,10 @@ impl Ctl for SystemCtl {
             if Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "systemctl timed out"));
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "systemctl timed out",
+                ));
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -231,7 +234,9 @@ pub fn read_pending(paths: &Paths) -> Result<Option<Pending>, RescueError> {
     };
     let st = rustix::fs::fstat(&fd)?;
     if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
-        return Err(RescueError::Untrusted("updates-state is not a regular file"));
+        return Err(RescueError::Untrusted(
+            "updates-state is not a regular file",
+        ));
     }
     if st.st_uid != paths.owner_uid {
         return Err(RescueError::Untrusted("updates-state is not owned by root"));

@@ -164,7 +164,11 @@ pub(crate) fn plan(
     keep: bool,
     now: u64,
 ) -> Result<Plan, CmdError> {
-    let want = if keep { UninstallMode::Keep } else { UninstallMode::Destroy };
+    let want = if keep {
+        UninstallMode::Keep
+    } else {
+        UninstallMode::Destroy
+    };
     let Some(mut st) = existing else {
         return Ok(Plan::Run(UninstallState {
             version: 1,
@@ -409,13 +413,7 @@ fn note_removed(st: &mut UninstallState, what: String) {
     }
 }
 
-fn teardown_entry(
-    t: Teardown,
-    kind: &str,
-    name: &str,
-    st: &mut UninstallState,
-    rep: &mut Report,
-) {
+fn teardown_entry(t: Teardown, kind: &str, name: &str, st: &mut UninstallState, rep: &mut Report) {
     match t {
         Teardown::Removed => note_removed(st, format!("{kind}:{name}")),
         Teardown::Absent => {}
@@ -670,7 +668,10 @@ mod tests {
         let Plan::Run(s) = plan(None, true, 9).unwrap() else {
             panic!()
         };
-        assert_eq!((s.mode, s.started, s.privd_done), (UninstallMode::Keep, 9, false));
+        assert_eq!(
+            (s.mode, s.started, s.privd_done),
+            (UninstallMode::Keep, 9, false)
+        );
         let Plan::Run(s) = plan(None, false, 9).unwrap() else {
             panic!()
         };

@@ -16,9 +16,7 @@ use hx_agent::privd::daemon::Ctx;
 use hx_agent::privd::progress::ProgressSender;
 use hx_agent::privd::runner::{RunOutput, Tool};
 use hx_agent::privd::state::{Flag, HostSetupRecord, StateStore};
-use hx_agent::privd::testing::{
-    FakeIncus, FakeProbe, FakeRunner, Harness, error_of, request,
-};
+use hx_agent::privd::testing::{FakeIncus, FakeProbe, FakeRunner, Harness, error_of, request};
 use hx_ipc::privd::pb::{
     self, ErrorCode, ErrorDetail, ProgressStage, Role, request::Command, response::Result as R,
 };
@@ -136,7 +134,11 @@ fn world() -> World {
     let h = Harness::start_with(GW, FakeProbe::default(), incus, runner(&host));
     h.daemon.register_desktop("main").unwrap();
     std::fs::write(&h.daemon.cfg.firewall_file, "table inet hx {}\n").unwrap();
-    std::fs::write(&h.daemon.cfg.sysctl_file, "fs.inotify.max_user_watches = 1\n").unwrap();
+    std::fs::write(
+        &h.daemon.cfg.sysctl_file,
+        "fs.inotify.max_user_watches = 1\n",
+    )
+    .unwrap();
     World { h, host }
 }
 
@@ -167,7 +169,11 @@ fn ok_uninstall(r: pb::Response) -> pb::UninstallResult {
 
 fn err_of(r: &pb::Response) -> (ErrorCode, ErrorDetail, Option<ProgressStage>) {
     let e = error_of(r).unwrap_or_else(|| panic!("expected an error, got {r:?}"));
-    (e.code(), e.detail(), e.stage.and_then(|s| ProgressStage::try_from(s).ok()))
+    (
+        e.code(),
+        e.detail(),
+        e.stage.and_then(|s| ProgressStage::try_from(s).ok()),
+    )
 }
 
 fn state_file(w: &World) -> Option<UninstallState> {
@@ -289,7 +295,11 @@ async fn destroy_mode_removes_the_desktop_the_host_objects_and_the_firewall() {
         "nft-table:inet hx",
         "docker-user-rules:2",
     ] {
-        assert!(has(&r.removed, removed), "{removed} missing from {:?}", r.removed);
+        assert!(
+            has(&r.removed, removed),
+            "{removed} missing from {:?}",
+            r.removed
+        );
     }
     assert!(has(
         &r.removed,
@@ -300,7 +310,11 @@ async fn destroy_mode_removes_the_desktop_the_host_objects_and_the_firewall() {
         &format!("file:{}", w.h.daemon.cfg.sysctl_file.display())
     ));
     // The live sysctl values are stated as kept: they are not reverted.
-    assert!(r.kept.iter().any(|k| k.starts_with("sysctl-values:")), "{:?}", r.kept);
+    assert!(
+        r.kept.iter().any(|k| k.starts_with("sysctl-values:")),
+        "{:?}",
+        r.kept
+    );
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
     // Everything is gone.
     assert!(!present(&w, "hx-main"));
@@ -338,9 +352,13 @@ async fn destroy_mode_removes_the_desktop_the_host_objects_and_the_firewall() {
     );
     // The snapshots went with the instance, and nothing else on the host was touched.
     let log = w.h.incus.log();
-    assert!(log.iter().any(|l| l == "DELETE /1.0/instances/hx-main/snapshots/hx-preupdate"));
     assert!(
-        !log.iter().any(|l| l.contains("incusbr0") || l.contains("profiles/default")),
+        log.iter()
+            .any(|l| l == "DELETE /1.0/instances/hx-main/snapshots/hx-preupdate")
+    );
+    assert!(
+        !log.iter()
+            .any(|l| l.contains("incusbr0") || l.contains("profiles/default")),
         "{log:?}"
     );
 }
@@ -360,7 +378,9 @@ async fn destroy_mode_is_idempotent() {
         .map(|c| format!("{:?} {}", c.tool, c.args.join(" ")))
         .collect();
     assert!(
-        new_calls.iter().all(|c| !c.contains("delete") && !c.contains("-D ")),
+        new_calls
+            .iter()
+            .all(|c| !c.contains("delete") && !c.contains("-D ")),
         "{new_calls:?}"
     );
 }
@@ -402,18 +422,31 @@ async fn destroy_needs_the_confirmation_and_admin() {
 async fn an_instance_without_the_marker_is_never_touched() {
     let w = world();
     // Same name as ours, but no `user.hx.*` key: someone else's.
-    w.h.incus.with(|s| s.instances.get_mut("hx-main").unwrap().config.clear());
+    w.h.incus
+        .with(|s| s.instances.get_mut("hx-main").unwrap().config.clear());
     let keep = ok_uninstall(admin(&w, uninstall_cmd(true)).await);
     assert!(keep.removed.is_empty(), "{:?}", keep.removed);
-    assert!(keep.warnings.iter().any(|m| m.contains("hx-main") && m.contains("marker")));
+    assert!(
+        keep.warnings
+            .iter()
+            .any(|m| m.contains("hx-main") && m.contains("marker"))
+    );
     assert!(devices_of(&w, "hx-main").contains(&"hx-link".to_string()));
 
     let destroy = ok_uninstall(admin(&w, uninstall_cmd(false)).await);
-    assert!(present(&w, "hx-main"), "an unmarked instance survives a destroy");
+    assert!(
+        present(&w, "hx-main"),
+        "an unmarked instance survives a destroy"
+    );
     assert!(devices_of(&w, "hx-main").contains(&"hx-link".to_string()));
     assert!(has(&destroy.kept, "desktop:main"));
     assert!(!has(&destroy.removed, "desktop:main"));
-    assert!(destroy.warnings.iter().any(|m| m.contains("hx-main") && m.contains("marker")));
+    assert!(
+        destroy
+            .warnings
+            .iter()
+            .any(|m| m.contains("hx-main") && m.contains("marker"))
+    );
     // The registry entry stays: the CLI removes /var/lib/hx as a whole.
     assert!(w.h.daemon.read_state(|s| s.desktops.contains_key("main")));
     // The marked host objects were still removed.
@@ -427,16 +460,27 @@ async fn host_objects_without_the_marker_are_left_with_a_warning() {
     put_object(&w.h.incus, "profiles/hx-desktop", "");
     put_object(&w.h.incus, "storage-pools/hx-pool", "not ours");
     let r = ok_uninstall(admin(&w, uninstall_cmd(false)).await);
-    for key in ["networks/hxbr0", "profiles/hx-desktop", "storage-pools/hx-pool"] {
+    for key in [
+        "networks/hxbr0",
+        "profiles/hx-desktop",
+        "storage-pools/hx-pool",
+    ] {
         assert!(object_present(&w, key), "{key} must survive");
     }
     for kept in ["network:hxbr0", "profile:hx-desktop", "pool:hx-pool"] {
         assert!(has(&r.kept, kept), "{kept} in {:?}", r.kept);
-        assert!(has(&r.warnings, &format!(
-            "{} `{}` has our name but not our marker; it was left alone",
-            kept.split(':').next().unwrap(),
-            kept.split(':').nth(1).unwrap()
-        )), "{:?}", r.warnings);
+        assert!(
+            has(
+                &r.warnings,
+                &format!(
+                    "{} `{}` has our name but not our marker; it was left alone",
+                    kept.split(':').next().unwrap(),
+                    kept.split(':').nth(1).unwrap()
+                )
+            ),
+            "{:?}",
+            r.warnings
+        );
     }
     // The marked ones went.
     assert!(has(&r.removed, "acl:hx-isolate"));
@@ -453,8 +497,15 @@ async fn unlinking_never_follows_a_symlink_planted_at_a_file_path() {
     std::fs::remove_file(fw).unwrap();
     std::os::unix::fs::symlink(&victim, fw).unwrap();
     ok_uninstall(admin(&w, uninstall_cmd(false)).await);
-    assert!(!fw.exists() && std::fs::symlink_metadata(fw).is_err(), "the link is gone");
-    assert_eq!(std::fs::read(&victim).unwrap(), b"not ours", "its target is not");
+    assert!(
+        !fw.exists() && std::fs::symlink_metadata(fw).is_err(),
+        "the link is gone"
+    );
+    assert_eq!(
+        std::fs::read(&victim).unwrap(),
+        b"not ours",
+        "its target is not"
+    );
 }
 
 // ----- the gate ---------------------------------------------------------------------------------
@@ -523,9 +574,15 @@ async fn a_command_that_took_its_lock_after_the_uninstall_began_does_not_run() {
     ok_uninstall(admin(&w, uninstall_cmd(true)).await);
     for e in [
         w.h.daemon.lock_host(&ctx).await.unwrap_err(),
-        w.h.daemon.lock_desktop(&ctx, "main", true).await.unwrap_err(),
+        w.h.daemon
+            .lock_desktop(&ctx, "main", true)
+            .await
+            .unwrap_err(),
     ] {
-        assert_eq!((e.code, e.detail), (ErrorCode::FailedPrecondition, ErrorDetail::Uninstalling));
+        assert_eq!(
+            (e.code, e.detail),
+            (ErrorCode::FailedPrecondition, ErrorDetail::Uninstalling)
+        );
     }
     // The background re-run of the host ruleset therefore does nothing either (it would write
     // the ruleset file again and load it).
@@ -546,11 +603,10 @@ async fn the_state_is_written_before_the_locks_are_awaited() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         cancel.cancel(CancelReason::Cancelled);
     });
-    let r = w
-        .h
-        .daemon
-        .handle(request(1, uninstall_cmd(true)), ctx)
-        .await;
+    let r =
+        w.h.daemon
+            .handle(request(1, uninstall_cmd(true)), ctx)
+            .await;
     assert_eq!(err_of(&r).0, ErrorCode::Cancelled);
     // Nothing was removed, but the gate is already up.
     assert!(state_file(&w).is_some());
@@ -609,13 +665,20 @@ async fn destroy_to_keep_is_refused_until_it_has_converged() {
     let (code, detail, stage) = err_of(&r);
     assert_eq!(
         (code, detail, stage),
-        (ErrorCode::Internal, ErrorDetail::Nft, Some(ProgressStage::Uninstall))
+        (
+            ErrorCode::Internal,
+            ErrorDetail::Nft,
+            Some(ProgressStage::Uninstall)
+        )
     );
     assert_eq!(state_file(&w).unwrap().mode, UninstallMode::Destroy);
     // Mid-destroy: a keep request is refused.
     let r = admin(&w, uninstall_cmd(true)).await;
     let (code, detail, _) = err_of(&r);
-    assert_eq!((code, detail), (ErrorCode::FailedPrecondition, ErrorDetail::Uninstalling));
+    assert_eq!(
+        (code, detail),
+        (ErrorCode::FailedPrecondition, ErrorDetail::Uninstalling)
+    );
     // Finish the destroy, then a keep request is answered from the converged destroy.
     w.host.lock().unwrap().fail_nft_delete = false;
     ok_uninstall(admin(&w, uninstall_cmd(false)).await);
@@ -650,7 +713,10 @@ async fn fails_then_resumes(
     assert_eq!(detail, expect_detail, "{r:?}");
     let st = state_file(w).expect("the state survives a failed step");
     assert!(!st.privd_done);
-    assert_eq!(st.done, expect_done, "the steps that completed before the failure");
+    assert_eq!(
+        st.done, expect_done,
+        "the steps that completed before the failure"
+    );
     for what in removed_before {
         assert!(has(&st.removed, what), "{what} in {:?}", st.removed);
     }
@@ -662,7 +728,11 @@ async fn fails_then_resumes(
     let r = ok_uninstall(admin(w, uninstall_cmd(false)).await);
     assert!(!r.keep_desktop);
     for what in removed_before {
-        assert!(has(&r.removed, what), "{what} lost across the resume: {:?}", r.removed);
+        assert!(
+            has(&r.removed, what),
+            "{what} lost across the resume: {:?}",
+            r.removed
+        );
     }
     assert!(state_file(w).unwrap().privd_done);
     // Converged: nothing of ours remains.
@@ -812,7 +882,11 @@ async fn a_host_without_docker_or_nft_still_uninstalls() {
     assert!(!has(&r.removed, "nft-table:inet hx"));
     assert!(!r.removed.iter().any(|s| s.starts_with("docker-user-rules")));
     // The DOCKER-USER flag is cleared, as after a destroyed host.
-    assert!(!w.h.daemon.flags_for("main").contains(&Flag::HostDockerForwarding));
+    assert!(
+        !w.h.daemon
+            .flags_for("main")
+            .contains(&Flag::HostDockerForwarding)
+    );
 }
 
 #[tokio::test]
@@ -821,11 +895,10 @@ async fn progress_names_the_uninstall_stage() {
     let (sender, queue) = ProgressSender::new(7);
     let mut ctx = Ctx::new(Role::Admin);
     ctx.progress = sender;
-    let r = w
-        .h
-        .daemon
-        .handle(request(7, uninstall_cmd(false)), ctx)
-        .await;
+    let r =
+        w.h.daemon
+            .handle(request(7, uninstall_cmd(false)), ctx)
+            .await;
     ok_uninstall(r);
     let mut frames = Vec::new();
     while let Some(p) = queue.pop() {
@@ -842,6 +915,9 @@ async fn the_audit_log_records_the_uninstall_without_secrets_or_paths_of_others(
     let w = world();
     ok_uninstall(admin(&w, uninstall_cmd(false)).await);
     let lines = w.h.audit.lines();
-    assert!(lines.iter().any(|l| l.contains("uninstall begun")), "{lines:?}");
+    assert!(
+        lines.iter().any(|l| l.contains("uninstall begun")),
+        "{lines:?}"
+    );
     assert!(lines.iter().any(|l| l.contains("Uninstall")), "{lines:?}");
 }

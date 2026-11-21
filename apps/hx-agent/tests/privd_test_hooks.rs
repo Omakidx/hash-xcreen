@@ -65,8 +65,14 @@ mod with_hooks {
         let Some(R::SetupHost(r)) = r.result else {
             panic!("{r:?}");
         };
-        assert!(!r.sysctl_applied, "the answer says the values are not in effect");
-        assert!(r.firewall_loaded, "the rest of the host setup is unaffected");
+        assert!(
+            !r.sysctl_applied,
+            "the answer says the values are not in effect"
+        );
+        assert!(
+            r.firewall_loaded,
+            "the rest of the host setup is unaffected"
+        );
         // The drop-in is still written: it applies at the next boot of a real host.
         assert!(h.daemon.cfg.sysctl_file.exists());
         assert!(
@@ -120,6 +126,9 @@ mod without_hooks {
         let h = harness(FakeProbe::default());
         let r = setup_host(&h).await;
         let e = error_of(&r).expect("SetupHost must fail");
-        assert_eq!((e.code(), e.detail()), (ErrorCode::Internal, ErrorDetail::Sysctl));
+        assert_eq!(
+            (e.code(), e.detail()),
+            (ErrorCode::Internal, ErrorDetail::Sysctl)
+        );
     }
 }

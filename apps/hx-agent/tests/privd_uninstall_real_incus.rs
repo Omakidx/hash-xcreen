@@ -154,7 +154,10 @@ async fn uninstall_keeps_then_destroys_hx1e_objects_on_a_real_incus() {
     assert!(!c.profile_exists(&n.compat_profile).await.unwrap());
     let after = world_snapshot().await;
     assert_eq!(before, after, "an object that is not ours changed");
-    evidence!("after", "no hx1e- object remains; the other objects are unchanged");
+    evidence!(
+        "after",
+        "no hx1e- object remains; the other objects are unchanged"
+    );
     if let Err(e) = result {
         std::panic::resume_unwind(e.into_panic());
     }
@@ -258,8 +261,15 @@ async fn run_real(c: Client<UnixTransport>, tmp: std::path::PathBuf) {
     evidence!("keep", "{keep:?}");
     assert!(keep.keep_desktop);
     assert_eq!(keep.removed, ["session-link:main"]);
-    let inst = c.get_instance(INSTANCE).await.unwrap().expect("the desktop stays");
-    assert!(!inst.devices.contains_key("hx-link"), "the proxy device is gone");
+    let inst = c
+        .get_instance(INSTANCE)
+        .await
+        .unwrap()
+        .expect("the desktop stays");
+    assert!(
+        !inst.devices.contains_key("hx-link"),
+        "the proxy device is gone"
+    );
     assert!(c.get_storage_pool(&n.pool).await.unwrap().is_some());
     assert!(c.get_network(&n.bridge).await.unwrap().is_some());
     assert!(c.acl_exists(&n.acl).await.unwrap());
@@ -289,7 +299,11 @@ async fn run_real(c: Client<UnixTransport>, tmp: std::path::PathBuf) {
         "acl:hx1e-isolate",
         "pool:hx1e-pool",
     ] {
-        assert!(destroy.removed.iter().any(|r| r == what), "{what} in {:?}", destroy.removed);
+        assert!(
+            destroy.removed.iter().any(|r| r == what),
+            "{what} in {:?}",
+            destroy.removed
+        );
     }
     assert!(destroy.warnings.is_empty(), "{:?}", destroy.warnings);
     assert!(c.get_instance(INSTANCE).await.unwrap().is_none());
@@ -304,7 +318,10 @@ async fn run_real(c: Client<UnixTransport>, tmp: std::path::PathBuf) {
         .map(|p| format!("{:?} {}", p.tool, p.args.join(" ")))
         .collect();
     evidence!("runner", "{calls:?}");
-    assert!(calls.iter().all(|c| c.contains("list") || c.contains("-L")), "{calls:?}");
+    assert!(
+        calls.iter().all(|c| c.contains("list") || c.contains("-L")),
+        "{calls:?}"
+    );
 
     // --- again: idempotent -----------------------------------------------------------------------
     let again = expect_uninstall(call(false).await);

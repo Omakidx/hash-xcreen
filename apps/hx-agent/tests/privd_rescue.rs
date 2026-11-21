@@ -185,7 +185,11 @@ fn a_pending_update_is_rolled_back_by_the_links_and_privd_is_started() {
         }
     );
     assert_eq!(f.current().as_deref(), Some("1.0.0"));
-    assert_eq!(f.previous().as_deref(), Some("1.1.0"), "the failed one is parked");
+    assert_eq!(
+        f.previous().as_deref(),
+        Some("1.1.0"),
+        "the failed one is parked"
+    );
     // Fixed arguments, in this order: the limit is reset, then the socket and the service start.
     let want: Vec<Vec<String>> = [RESET_ARGS, START_ARGS]
         .iter()
@@ -320,7 +324,11 @@ fn a_symlinked_state_file_is_refused() {
     let ctl = FakeCtl::default();
     assert_eq!(untrusted(run(&f.paths, &ctl)), "updates-state is a symlink");
     assert!(ctl.calls().is_empty());
-    assert_eq!(f.current().as_deref(), Some("1.1.0"), "nothing was restored");
+    assert_eq!(
+        f.current().as_deref(),
+        Some("1.1.0"),
+        "nothing was restored"
+    );
 }
 
 #[test]
@@ -343,7 +351,11 @@ fn a_state_file_with_the_wrong_mode_is_refused() {
     for mode in [0o644, 0o640, 0o660, 0o666, 0o700, 0o400] {
         std::fs::set_permissions(f.state_file(), std::fs::Permissions::from_mode(mode)).unwrap();
         let ctl = FakeCtl::default();
-        assert_eq!(untrusted(run(&f.paths, &ctl)), "updates-state is not mode 0600", "{mode:o}");
+        assert_eq!(
+            untrusted(run(&f.paths, &ctl)),
+            "updates-state is not mode 0600",
+            "{mode:o}"
+        );
         assert!(ctl.calls().is_empty());
         assert_eq!(f.current().as_deref(), Some("1.1.0"));
     }
@@ -361,8 +373,11 @@ fn a_state_file_or_directory_with_the_wrong_owner_or_writable_by_others_is_refus
         "the state directory is not owned by root or is writable by others"
     );
     // The directory is the right owner but writable by others.
-    std::fs::set_permissions(&f.paths.state_dir, std::fs::Permissions::from_mode(0o770 | 0o002))
-        .unwrap();
+    std::fs::set_permissions(
+        &f.paths.state_dir,
+        std::fs::Permissions::from_mode(0o770 | 0o002),
+    )
+    .unwrap();
     assert_eq!(
         untrusted(run(&f.paths, &FakeCtl::default())),
         "the state directory is not owned by root or is writable by others"
@@ -384,7 +399,7 @@ fn a_state_file_that_is_not_a_regular_file_is_refused() {
     std::fs::remove_dir(f.state_file()).unwrap();
     rustix::fs::mknodat(
         rustix::fs::CWD,
-        &f.state_file(),
+        f.state_file(),
         rustix::fs::FileType::Fifo,
         rustix::fs::Mode::from_raw_mode(0o600),
         0,
@@ -405,19 +420,34 @@ fn an_oversized_state_file_is_refused() {
     big.push_str(&"x".repeat(MAX_STATE_BYTES as usize));
     big.push_str(r#""}"#);
     f.write_state(&big);
-    assert_eq!(untrusted(run(&f.paths, &FakeCtl::default())), "updates-state is too large");
+    assert_eq!(
+        untrusted(run(&f.paths, &FakeCtl::default())),
+        "updates-state is too large"
+    );
 }
 
 #[test]
 fn a_corrupt_state_file_is_an_error_never_a_reset() {
     let f = fix(&["1.0.0", "1.1.0"]);
     f.pending_update();
-    for junk in ["{not json", "", r#"{"pending":{"version":1}}"#, r#"{"pending":"x"}"#] {
+    for junk in [
+        "{not json",
+        "",
+        r#"{"pending":{"version":1}}"#,
+        r#"{"pending":"x"}"#,
+    ] {
         f.write_state(junk);
         let ctl = FakeCtl::default();
-        assert!(matches!(run(&f.paths, &ctl), Err(RescueError::Corrupt)), "{junk:?}");
+        assert!(
+            matches!(run(&f.paths, &ctl), Err(RescueError::Corrupt)),
+            "{junk:?}"
+        );
         assert!(ctl.calls().is_empty());
-        assert_eq!(std::fs::read_to_string(f.state_file()).unwrap(), junk, "left as found");
+        assert_eq!(
+            std::fs::read_to_string(f.state_file()).unwrap(),
+            junk,
+            "left as found"
+        );
     }
     assert_eq!(f.current().as_deref(), Some("1.1.0"));
 }
@@ -468,7 +498,10 @@ fn only_pending_version_and_previous_are_read() {
     let f = fix(&["1.0.0"]);
     f.write_state(PENDING);
     let p = read_pending(&f.paths).unwrap().unwrap();
-    assert_eq!((p.version.as_str(), p.previous.as_deref()), ("1.1.0", Some("1.0.0")));
+    assert_eq!(
+        (p.version.as_str(), p.previous.as_deref()),
+        ("1.1.0", Some("1.0.0"))
+    );
     // Unknown and malformed *other* fields do not matter to it (privd owns their meaning), as long
     // as the document parses.
     f.write_state(
@@ -480,10 +513,23 @@ fn only_pending_version_and_previous_are_read() {
 
 #[test]
 fn the_helper_never_reads_the_environment_or_arguments_and_never_writes_updates_state() {
-    let src = |p: &str| std::fs::read_to_string(format!("{}/src/{p}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    let src = |p: &str| {
+        std::fs::read_to_string(format!("{}/src/{p}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+    };
     for file in ["bin/hx-privd-rescue.rs", "privd/rescue.rs"] {
         let text = src(file);
-        for needle in ["env::var", "env::vars", "var_os", "getenv", "set_var", "UpdateState", "save_json", "write_atomic", "fs::write", "OpenOptions"] {
+        for needle in [
+            "env::var",
+            "env::vars",
+            "var_os",
+            "getenv",
+            "set_var",
+            "UpdateState",
+            "save_json",
+            "write_atomic",
+            "fs::write",
+            "OpenOptions",
+        ] {
             // Mentions in comments are fine; code is not.
             let code: String = text
                 .lines()
@@ -493,7 +539,10 @@ fn the_helper_never_reads_the_environment_or_arguments_and_never_writes_updates_
             assert!(!code.contains(needle), "{file} uses {needle}");
         }
     }
-    assert!(src("privd/rescue.rs").contains(".env_clear()"), "systemctl runs with a cleared environment");
+    assert!(
+        src("privd/rescue.rs").contains(".env_clear()"),
+        "systemctl runs with a cleared environment"
+    );
 }
 
 #[test]
@@ -524,10 +573,12 @@ async fn the_old_privd_started_by_the_helper_completes_the_rollback_through_resu
     assert_eq!(env.layout().current().unwrap().as_deref(), Some("1.1.0"));
     let state_dir = env.h.daemon.cfg.state_dir.clone();
     let state_file = state_dir.join("updates-state");
-    assert!(UpdateState::load(&hx_agent::privd::state::StateStore::open(&state_dir).unwrap())
-        .unwrap()
-        .pending
-        .is_some());
+    assert!(
+        UpdateState::load(&hx_agent::privd::state::StateStore::open(&state_dir).unwrap())
+            .unwrap()
+            .pending
+            .is_some()
+    );
     let before = bytes_and_mtime(&state_file);
 
     // The helper, as systemd would run it after the start limit is hit.
@@ -545,7 +596,11 @@ async fn the_old_privd_started_by_the_helper_completes_the_rollback_through_resu
         }
     );
     assert_eq!(env.layout().current().unwrap().as_deref(), Some("1.0.0"));
-    assert_eq!(bytes_and_mtime(&state_file), before, "the helper never wrote updates-state");
+    assert_eq!(
+        bytes_and_mtime(&state_file),
+        before,
+        "the helper never wrote updates-state"
+    );
 
     // Privd starts again: the old binary (1.0.0), with `pending` still there.
     env.systemd.restarts.lock().unwrap().clear();
@@ -554,8 +609,12 @@ async fn the_old_privd_started_by_the_helper_completes_the_rollback_through_resu
 
     // It saw running_version != pending.version and ran rollback_now: bookkeeping, flag, both
     // units restarted, and `current` still the old version.
-    let st = UpdateState::load(&hx_agent::privd::state::StateStore::open(&state_dir).unwrap()).unwrap();
-    assert!(st.pending.is_none(), "pending is cleared by privd, not by the helper");
+    let st =
+        UpdateState::load(&hx_agent::privd::state::StateStore::open(&state_dir).unwrap()).unwrap();
+    assert!(
+        st.pending.is_none(),
+        "pending is cleared by privd, not by the helper"
+    );
     let rb = st.rolled_back.expect("rolled_back recorded");
     assert_eq!(rb.version, "1.1.0");
     assert!(rb.reason.contains("running version 1.0.0"), "{}", rb.reason);
