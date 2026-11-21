@@ -1882,3 +1882,61 @@ fn only_this_branchs_unit_files_exist_and_all_are_embedded() {
     let n = hx_agent::install::units::FILES.len();
     assert!(n >= 12);
 }
+
+#[test]
+fn loopback_link_local_and_multicast_resolvers_are_never_allowed_and_the_install_warns() {
+    // M2: IPAddressAllow has no port limit; 127.0.0.1 and 169.254.169.254 must never get one.
+    let (mut m, dir) = fresh();
+    std::fs::write(
+        path(&m, "/etc/resolv.conf"),
+        "nameserver 127.0.0.53\nnameserver 127.0.0.1\nnameserver 169.254.169.254\nnameserver fe80::1%eth0\nnameserver ::1\nnameserver ff02::1\nnameserver 10.0.0.2\nnameserver fd00::53\nnameserver 8.8.8.8\n",
+    )
+    .unwrap();
+    assert_eq!(
+        full_install(&mut m, &dir),
+        0,
+        "{}",
+        String::from_utf8_lossy(&m.err)
+    );
+    let d = m.read(paths::RESOLVERS_DROPIN).unwrap();
+    let allows: Vec<&str> = d
+        .lines()
+        .filter(|l| l.starts_with("IPAddressAllow="))
+        .collect();
+    assert_eq!(
+        allows,
+        ["IPAddressAllow=10.0.0.2/32", "IPAddressAllow=fd00::53/128"],
+        "{d}"
+    );
+    for bad in ["127.", "::1", "169.254", "fe80", "ff02"] {
+        assert!(!d.contains(bad), "{bad}");
+    }
+    let warns: Vec<String> = m
+        .json_lines()
+        .iter()
+        .filter(|v| v["t"] == "warn" && v["id"] == "config")
+        .map(|v| v["message"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0].contains("169.254.169.254")
+            && warns[0].contains("CheckUpdate needs systemd-resolved or a private resolver")
+    );
+    assert!(
+        m.state()
+            .unwrap()
+            .notes
+            .iter()
+            .any(|n| n.contains("CheckUpdate needs"))
+    );
+    // Only skipped nameservers: no drop-in at all, still a warning, and the install does not fail.
+    let (mut m2, dir2) = fresh();
+    std::fs::write(path(&m2, "/etc/resolv.conf"), "nameserver 127.0.0.1\n").unwrap();
+    assert_eq!(full_install(&mut m2, &dir2), 0);
+    assert!(!exists(&m2, paths::RESOLVERS_DROPIN));
+    assert!(
+        m2.json_lines()
+            .iter()
+            .any(|v| v["t"] == "warn" && v["id"] == "config")
+    );
+}

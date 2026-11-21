@@ -148,32 +148,48 @@ pub fn port_dropin(port: u16) -> String {
     )
 }
 
-fn in_denied_range(ip: IpAddr) -> bool {
+/// Addresses that are never allowed: `IPAddressAllow` has no port limit, so allowing loopback
+/// (every service on 127.0.0.1), link-local (the cloud metadata service at 169.254.169.254) or
+/// multicast to the fetcher would be far wider than a resolver.
+fn never_allowed(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(a) => {
-            let o = a.octets();
-            a.is_loopback()
-                || a.is_link_local()
-                || a.is_multicast()
-                || o[0] == 10
-                || (o[0] == 172 && (16..=31).contains(&o[1]))
-                || (o[0] == 192 && o[1] == 168)
-                || (o[0] == 100 && (64..=127).contains(&o[1]))
-        }
+        IpAddr::V4(a) => a.is_loopback() || a.is_link_local() || a.is_multicast(),
         IpAddr::V6(a) => {
-            let s = a.segments();
-            a.is_loopback()
-                || a.is_multicast()
-                || (s[0] & 0xffc0) == 0xfe80
-                || (s[0] & 0xfe00) == 0xfc00
+            a.is_loopback() || a.is_multicast() || (a.segments()[0] & 0xffc0) == 0xfe80
         }
     }
 }
 
-/// The resolvers of `resolv.conf` that the fetcher's `IPAddressDeny` would block and that systemd's
-/// stub addresses (127.0.0.53, 127.0.0.54) do not already allow.
-pub fn blocked_resolvers(resolv_conf: &str) -> Vec<IpAddr> {
-    let mut out: Vec<IpAddr> = Vec::new();
+/// Private ranges the fetcher's `IPAddressDeny` blocks and that a resolver may legitimately sit
+/// in: RFC 1918, 100.64/10 and fc00::/7. (The allowance has no port limit either; that known risk
+/// is accepted and documented.)
+fn private_range(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(a) => {
+            let o = a.octets();
+            o[0] == 10
+                || (o[0] == 172 && (16..=31).contains(&o[1]))
+                || (o[0] == 192 && o[1] == 168)
+                || (o[0] == 100 && (64..=127).contains(&o[1]))
+        }
+        IpAddr::V6(a) => (a.segments()[0] & 0xfe00) == 0xfc00,
+    }
+}
+
+/// What to do with the resolvers of `resolv.conf`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ResolverPlan {
+    /// Private resolvers that get an `IPAddressAllow`.
+    pub allow: Vec<IpAddr>,
+    /// Loopback, link-local and multicast nameservers that are skipped (never allowed).
+    pub skipped: Vec<IpAddr>,
+}
+
+/// Splits the nameservers of `resolv.conf`: private ones are allowed, loopback, link-local and
+/// multicast ones are skipped, public ones need nothing, and systemd-resolved's stubs
+/// (127.0.0.53, 127.0.0.54) are already allowed by the fetcher's unit.
+pub fn resolver_plan(resolv_conf: &str) -> ResolverPlan {
+    let mut plan = ResolverPlan::default();
     for line in resolv_conf.lines() {
         let Some(rest) = line.trim().strip_prefix("nameserver") else {
             continue;
@@ -188,11 +204,15 @@ pub fn blocked_resolvers(resolv_conf: &str) -> Vec<IpAddr> {
         if ip == IpAddr::from([127, 0, 0, 53]) || ip == IpAddr::from([127, 0, 0, 54]) {
             continue;
         }
-        if in_denied_range(ip) && !out.contains(&ip) {
-            out.push(ip);
+        if never_allowed(ip) {
+            if !plan.skipped.contains(&ip) {
+                plan.skipped.push(ip);
+            }
+        } else if private_range(ip) && !plan.allow.contains(&ip) {
+            plan.allow.push(ip);
         }
     }
-    out
+    plan
 }
 
 /// The resolver drop-in text, or `None` when no resolver needs an allowance.
@@ -216,7 +236,7 @@ fn config_wants(ctx: &Ctx<'_>) -> (String, String, String, Option<String>) {
         gatewayd_toml(ctx.opts.port),
         privd_toml(&ctx.opts.channel),
         port_dropin(ctx.opts.port),
-        resolvers_dropin(&blocked_resolvers(&resolv)),
+        resolvers_dropin(&resolver_plan(&resolv).allow),
     )
 }
 
@@ -237,6 +257,22 @@ pub fn config_check(ctx: &mut Ctx<'_>) -> Result<bool> {
 pub fn config_run(ctx: &mut Ctx<'_>) -> Result<Outcome> {
     let (g, p, d, r) = config_wants(ctx);
     ensure_dir(&ctx.paths.at(paths::ETC_HX), 0o755)?;
+    let skipped =
+        resolver_plan(&read_text(&ctx.paths.at(paths::RESOLV_CONF)).unwrap_or_default()).skipped;
+    if !skipped.is_empty() {
+        let list = skipped
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let note = format!(
+            "the nameserver(s) {list} in resolv.conf were not allowed for the update fetcher (loopback, link-local and multicast addresses are never allowed: the allowance has no port limit); CheckUpdate needs systemd-resolved or a private resolver"
+        );
+        ctx.warn("config", &note);
+        if !ctx.state.notes.iter().any(|n| *n == note) {
+            ctx.state.notes.push(note);
+        }
+    }
     put(ctx, paths::GATEWAYD_TOML, g.as_bytes(), 0o644)?;
     put(ctx, paths::PRIVD_TOML, p.as_bytes(), 0o644)?;
     put_dropin(ctx, paths::PORT_DROPIN, d.as_bytes())?;
@@ -386,28 +422,46 @@ mod tests {
     }
 
     #[test]
-    fn blocked_resolvers_are_those_in_the_denied_ranges_except_the_stubs() {
+    fn only_private_resolvers_are_allowed_and_loopback_link_local_multicast_are_skipped() {
         let conf = "nameserver 127.0.0.53\nnameserver 10.0.0.2\nnameserver 8.8.8.8\n\
                     nameserver 192.168.1.1\nnameserver fe80::1%eth0\nnameserver fd00::53\n\
                     nameserver 2001:4860:4860::8888\nnameserver 100.64.0.1\nnameserver 172.16.5.5\n\
-                    nameserver 10.0.0.2\nnameserver bogus\nsearch example.com\n";
-        let got: Vec<String> = blocked_resolvers(conf)
-            .iter()
-            .map(ToString::to_string)
-            .collect();
+                    nameserver 10.0.0.2\nnameserver 127.0.0.1\nnameserver ::1\n\
+                    nameserver 169.254.169.254\nnameserver ff02::1\nnameserver 224.0.0.251\n\
+                    nameserver bogus\nsearch example.com\n";
+        let p = resolver_plan(conf);
+        let allow: Vec<String> = p.allow.iter().map(ToString::to_string).collect();
         assert_eq!(
-            got,
+            allow,
             [
                 "10.0.0.2",
                 "192.168.1.1",
-                "fe80::1",
                 "fd00::53",
                 "100.64.0.1",
                 "172.16.5.5"
             ]
         );
-        assert!(blocked_resolvers("nameserver 127.0.0.54\nnameserver 1.1.1.1\n").is_empty());
-        assert!(blocked_resolvers("").is_empty());
+        let skipped: Vec<String> = p.skipped.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            skipped,
+            [
+                "fe80::1",
+                "127.0.0.1",
+                "::1",
+                "169.254.169.254",
+                "ff02::1",
+                "224.0.0.251"
+            ]
+        );
+        let text = resolvers_dropin(&p.allow).unwrap();
+        for bad in ["127.", "::1/", "169.254", "fe80", "ff02", "224."] {
+            assert!(!text.contains(bad), "{bad} in the drop-in:\n{text}");
+        }
+        assert_eq!(
+            resolver_plan("nameserver 127.0.0.54\nnameserver 1.1.1.1\n"),
+            ResolverPlan::default()
+        );
+        assert_eq!(resolver_plan(""), ResolverPlan::default());
     }
 
     #[test]

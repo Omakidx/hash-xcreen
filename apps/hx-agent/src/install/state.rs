@@ -143,6 +143,9 @@ pub struct InstallState {
     /// The desktop report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desktop: Option<DesktopReport>,
+    /// Notes for the operator that outlive the run (a nameserver that was not allowed, ...).
+    #[serde(default)]
+    pub notes: Vec<String>,
     /// Every stage of the mode is done.
     pub complete: bool,
     /// Last write (Unix seconds).
@@ -162,6 +165,7 @@ impl InstallState {
             stages: BTreeMap::new(),
             created: Created::default(),
             desktop: None,
+            notes: Vec::new(),
             complete: false,
             updated_unix: now,
         }
