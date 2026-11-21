@@ -213,6 +213,11 @@ fn the_docker_user_unit_applies_the_rules_privd_applies() {
         );
     }
     assert!(words(&u, "Unit", "After").contains(&"docker.service".to_string()));
+    // L5: it follows Docker and never pulls it in.
+    assert!(!u["Unit"].contains_key("Requires"));
+    assert!(!u["Unit"].contains_key("Wants"));
+    assert_eq!(words(&u, "Unit", "PartOf"), ["docker.service"]);
+    assert_eq!(words(&u, "Install", "WantedBy"), ["docker.service"]);
 }
 
 #[test]
