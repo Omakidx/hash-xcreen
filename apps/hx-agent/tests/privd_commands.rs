@@ -2377,3 +2377,108 @@ async fn n5_a_command_refused_by_its_own_rule_does_not_burn_a_mutating_slot() {
         ErrorCode::ResourceExhausted
     );
 }
+
+fn nesting_without_docker(h: &Harness) {
+    h.incus.with(|s| {
+        let i = s.instances.get_mut("hx-main").unwrap();
+        i.config.insert("security.nesting".into(), "true".into());
+        i.config.insert("boot.autostart".into(), "true".into());
+    });
+}
+
+#[tokio::test]
+async fn n9_nesting_without_docker_is_stopped_at_start_and_cannot_autostart() {
+    let h = Harness::start(GW);
+    make_ready(&h).await;
+    add_desktop(&h);
+    nesting_without_docker(&h);
+    h.daemon.enforce_isolation_all().await;
+    assert_eq!(
+        h.incus.with(|s| s.instances["hx-main"].status.clone()),
+        "Stopped"
+    );
+    assert!(
+        h.daemon
+            .flags_for("main")
+            .contains(&Flag::IsolationNotRestored)
+    );
+    assert_eq!(
+        h.incus
+            .with(|s| s.instances["hx-main"].config["boot.autostart"].clone()),
+        "false"
+    );
+    // Admin's start retries the rollback: the flag clears and autostart is back on.
+    ok(run(
+        &h,
+        Role::Admin,
+        Command::StartDesktop(pb::StartDesktopRequest {
+            desktop_id: "main".into(),
+        }),
+    )
+    .await);
+    assert!(
+        !h.daemon
+            .flags_for("main")
+            .contains(&Flag::IsolationNotRestored)
+    );
+    assert_eq!(
+        h.incus
+            .with(|s| s.instances["hx-main"].config["boot.autostart"].clone()),
+        "true"
+    );
+    assert_eq!(
+        h.incus
+            .with(|s| s.instances["hx-main"].config["security.nesting"].clone()),
+        "false"
+    );
+}
+
+#[tokio::test]
+async fn n9_any_admitted_desktop_command_enforces_it_and_a_docker_desktop_is_left_alone() {
+    let h = Harness::start(GW);
+    make_ready(&h).await;
+    add_desktop(&h);
+    nesting_without_docker(&h);
+    // A command that is not a start: SetLimits on the running, un-isolated desktop.
+    let r = run(
+        &h,
+        Role::Gateway,
+        Command::SetLimits(pb::SetLimitsRequest {
+            desktop_id: "main".into(),
+            limits: Some(pb::Limits {
+                cpu: 2,
+                memory_mib: 4096,
+                disk_gib: 20,
+            }),
+        }),
+    )
+    .await;
+    let _ = r;
+    assert_eq!(
+        h.incus.with(|s| s.instances["hx-main"].status.clone()),
+        "Stopped"
+    );
+    assert!(
+        h.daemon
+            .flags_for("main")
+            .contains(&Flag::IsolationNotRestored)
+    );
+    // A desktop whose Docker was enabled through privd (acknowledged) is not touched.
+    let h = Harness::start(GW);
+    make_ready(&h).await;
+    add_desktop(&h);
+    nesting_without_docker(&h);
+    h.incus.with(|s| {
+        s.instances
+            .get_mut("hx-main")
+            .unwrap()
+            .config
+            .insert("user.hx.docker_ack".into(), "1".into());
+    });
+    h.daemon.enforce_isolation_all().await;
+    assert_eq!(
+        h.incus.with(|s| s.instances["hx-main"].status.clone()),
+        "Running"
+    );
+    assert!(h.daemon.flags_for("main").is_empty());
+}

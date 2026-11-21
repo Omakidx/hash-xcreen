@@ -341,7 +341,68 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
                 "an Incus operation on this desktop did not end; an administrator must resolve it",
             ));
         }
+        // Isolation first (ipc.md 7 rule 11): checked on every admitted command that touches a
+        // desktop, not only on a start.
+        self.enforce_isolation(id).await;
         Ok(g)
+    }
+
+    /// Makes sure a desktop that must not run with reduced isolation is not running: if
+    /// `ISOLATION_NOT_RESTORED` is recorded, or `security.nesting` is on although Docker was never
+    /// enabled through privd (no `user.hx.docker_ack`), the instance is force-stopped, the flag is
+    /// set and `boot.autostart` is switched off so that a reboot cannot start it either.
+    /// Best effort: failures are logged, the next command tries again.
+    pub async fn enforce_isolation(&self, id: &str) {
+        let name = self.instance_name(id);
+        let client = self.incus.scoped();
+        let Ok(Some(inst)) = client.get_instance(&name).await else {
+            return;
+        };
+        if !instance_is_marked(&inst.config) {
+            return;
+        }
+        let meta = DesktopMeta::from_config(&inst);
+        let nesting = inst.config.get("security.nesting").map(String::as_str) == Some("true");
+        let flagged = self.flags_for(id).contains(&Flag::IsolationNotRestored);
+        if !(flagged || (nesting && meta.docker_ack.is_none())) {
+            return;
+        }
+        if inst.status.eq_ignore_ascii_case("running") {
+            if let Err(e) = client
+                .set_state(
+                    &name,
+                    hx_provision::incus::StateAction::Stop,
+                    true,
+                    Duration::from_secs(30),
+                )
+                .await
+            {
+                log::error(&format!("cannot stop `{name}` for isolation: {e}"));
+            }
+        }
+        if !flagged {
+            self.set_flag(Some(id), Flag::IsolationNotRestored, true);
+            self.audit_notice("needs_attention=ISOLATION_NOT_RESTORED (nesting without Docker)");
+        }
+        self.set_autostart(&client, &name, false).await;
+    }
+
+    /// `enforce_isolation` for every registered desktop (privd start).
+    pub async fn enforce_isolation_all(&self) {
+        let ids: Vec<String> = self.read_state(|s| s.desktops.keys().cloned().collect());
+        for id in ids {
+            self.enforce_isolation(&id).await;
+        }
+    }
+
+    /// Sets `boot.autostart` (the only non-`user.hx.*` key privd writes besides the limits).
+    pub async fn set_autostart(&self, client: &Client<T>, name: &str, on: bool) {
+        let cfg = [("boot.autostart".to_string(), on.to_string())]
+            .into_iter()
+            .collect();
+        if let Err(e) = client.patch_instance_config(name, &cfg).await {
+            log::error(&format!("cannot set boot.autostart on `{name}`: {e}"));
+        }
     }
 
     /// Takes the host lock.

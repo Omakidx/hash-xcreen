@@ -231,6 +231,10 @@ where
             Err(e) => log::error(&format!("host refresh at start failed: {e}")),
         }
         tokio::spawn(background(daemon.clone()));
+        // Isolation first: a desktop left with nesting on (or flagged) by a crash or a reboot is
+        // stopped now, not when someone next asks for it.
+        let d = daemon.clone();
+        tokio::spawn(async move { d.enforce_isolation_all().await });
     }
     tokio::pin!(shutdown);
     loop {

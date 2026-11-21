@@ -55,6 +55,7 @@ pub async fn restore_isolation<T: Transport + Clone + 'static>(
         match disable_docker(client, name).await {
             Ok(_) => {
                 d.set_flag(Some(id), Flag::IsolationNotRestored, false);
+                d.set_autostart(client, name, true).await;
                 return true;
             }
             Err(e) => crate::privd::log::error(&format!(
@@ -222,6 +223,7 @@ pub async fn disable<T: Transport + Clone + 'static>(
         })
         .await?;
     d.set_flag(Some(&id), Flag::IsolationNotRestored, false);
+    d.set_autostart(&client, &l.name, true).await;
     Ok(response::Result::DisableDocker(pb::DisableDockerResult {
         restarted: out.restarted,
     }))

@@ -294,6 +294,16 @@ pub async fn create_desktop<T: Transport + Clone + 'static>(
 
         let docker = if r.docker {
             progress.stage(ProgressStage::Docker, "enabling Docker");
+            // Recorded before nesting goes on, so the isolation check sees it as intended.
+            client
+                .patch_instance_config(
+                    &name,
+                    &[("user.hx.docker_ack".to_string(), d.now().to_string())]
+                        .into_iter()
+                        .collect(),
+                )
+                .await
+                .map_err(|e| CmdError::from(e).at_stage(ProgressStage::Docker))?;
             Some(enable_flow(d, ctx, &id, &name, &recipe_text(recipe), username.as_str()).await?)
         } else {
             None
