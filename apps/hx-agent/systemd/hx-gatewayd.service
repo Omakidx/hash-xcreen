@@ -1,12 +1,16 @@
 # hx-gatewayd: the internet-facing, unprivileged gateway (docs/ipc.md section 2, architecture 8.5).
 #
-# Installed by the installer next to hx-gatewayd-admin.socket and sysusers.d/hx-gatewayd.conf.
+# Installed by the installer next to hx-gatewayd-admin.socket, hx-gatewayd-public.socket and
+# sysusers.d/hx-gatewayd.conf.
 # The binary installs its own seccomp allowlist (apps/hx-agent/src/gateway/harden.rs) after it
 # has opened its sockets; the SystemCallFilter below is a second, coarser layer.
 #
-# The service has an empty capability bounding set, so it can only bind ports of 1024 and above.
-# The installer maps port 443 to the configured port (a firewall redirect or the
-# net.ipv4.ip_unprivileged_port_start sysctl) when the user asks for it.
+# The service has an empty capability bounding set, so it cannot bind a port below 1024 itself.
+# It does not have to: both public listeners (QUIC on UDP, WebSocket on TCP, the same port) are
+# created by systemd in hx-gatewayd-public.socket and handed over by socket activation, selected
+# by descriptor name (admin, public). The port is the installer's drop-in on that socket unit
+# (hx-gatewayd-public.socket.d/50-port.conf) and must equal `listen` in /etc/hx/gatewayd.toml:
+# the gateway refuses to start when they differ. No firewall redirect, no sysctl.
 
 [Unit]
 Description=hash-xcreen gateway (internet-facing, unprivileged)
@@ -15,11 +19,13 @@ After=network-online.target hx-privd.socket
 Wants=network-online.target hx-privd.socket
 # The admin socket is created by systemd (root:root 0600) and handed over: gatewayd is
 # unprivileged and cannot create it in /run/hx.
-Requires=hx-gatewayd-admin.socket
-After=hx-gatewayd-admin.socket
+Requires=hx-gatewayd-admin.socket hx-gatewayd-public.socket
+After=hx-gatewayd-admin.socket hx-gatewayd-public.socket
 
 [Service]
 Type=notify
+# The sockets handed over by socket activation (descriptor names admin and public).
+Sockets=hx-gatewayd-admin.socket hx-gatewayd-public.socket
 NotifyAccess=main
 ExecStart=/usr/lib/hx/current/hx-gatewayd --config /etc/hx/gatewayd.toml
 Restart=on-failure
@@ -64,8 +70,9 @@ ProtectClock=yes
 ProtectHostname=yes
 RemoveIPC=yes
 
-# Network: the public listener and the unix sockets (privd, the admin socket). PrivateUsers is
-# deliberately off: privd and the admin socket authenticate the peer by SO_PEERCRED uid.
+# Network: the public listeners (from systemd) and the unix sockets (privd, the admin socket).
+# PrivateUsers is deliberately off: privd and the admin socket authenticate the peer by
+# SO_PEERCRED uid.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictNamespaces=yes
 RestrictRealtime=yes
