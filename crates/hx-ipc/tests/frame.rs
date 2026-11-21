@@ -35,6 +35,22 @@ fn dec() -> Decoder<Test> {
 }
 
 #[test]
+fn debug_output_never_contains_body_bytes() {
+    // Kind 2 is the sensitive kind of the test policy. 0xAB = 171 would print as "171".
+    let wire = encode_frame(2, &[0xAB; 8], 100).unwrap();
+    let mut d = dec();
+    // Mid-frame: header and three body bytes are in.
+    d.feed(&wire[..8]).unwrap();
+    let shown = format!("{d:?}");
+    assert!(!shown.contains("171") && !shown.contains("ab"), "{shown}");
+    let (_, f) = d.feed(&wire[8..]).unwrap();
+    let f = f.unwrap();
+    let shown = format!("{f:?}");
+    assert!(!shown.contains("171"), "{shown}");
+    assert!(shown.contains("body_len: 8") && shown.contains("kind: 2"), "{shown}");
+}
+
+#[test]
 fn decodes_one_frame_exactly() {
     let wire = encode_frame(1, b"hello", 100).unwrap();
     assert_eq!(wire.len(), 5 + 5);

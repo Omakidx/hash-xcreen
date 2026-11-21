@@ -45,12 +45,23 @@ pub trait FramePolicy {
 }
 
 /// One complete frame as received. The body has not been interpreted.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct RawFrame {
     /// The kind byte.
     pub kind: u8,
     /// The body, `length - 1` bytes. Call `freeze()` for a zero-copy `Bytes`.
     pub body: BytesMut,
+}
+
+/// Shows the kind and the length only: a kind-2 body is a secret, and no body byte of any kind
+/// belongs in a log line.
+impl std::fmt::Debug for RawFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawFrame")
+            .field("kind", &self.kind)
+            .field("body_len", &self.body.len())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -63,7 +74,6 @@ enum Stage {
 /// blocking readers).
 ///
 /// After any error the decoder is poisoned: the connection must be closed.
-#[derive(Debug)]
 pub struct Decoder<P: FramePolicy> {
     policy: P,
     stage: Stage,
@@ -74,6 +84,19 @@ pub struct Decoder<P: FramePolicy> {
     body: BytesMut,
     filled: usize,
     poisoned: bool,
+}
+
+/// Shows the state and counters only, never buffered bytes (they may be a secret).
+impl<P: FramePolicy> std::fmt::Debug for Decoder<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Decoder")
+            .field("stage", &self.stage)
+            .field("kind", &self.kind)
+            .field("filled", &self.filled)
+            .field("body_len", &self.body.len())
+            .field("poisoned", &self.poisoned)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<P: FramePolicy> Decoder<P> {
