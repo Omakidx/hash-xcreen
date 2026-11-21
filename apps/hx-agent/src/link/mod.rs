@@ -97,8 +97,8 @@ pub use client::{LinkClient, LinkEvents, TransferSender};
 pub use config::LinkConfig;
 pub use policy::{
     Advice, Attached, BACKOFF_MAX, BACKOFF_MIN, DesktopLink, DesktopState, DialError, FAULT_WINDOW,
-    FAULTS_BEFORE_RESTART, IDLE_KEEP, RESTART_WINDOW, RESTARTS_BEFORE_UNAVAILABLE, ReconnectPolicy,
-    UNAVAILABLE_RETRY,
+    FAULTS_BEFORE_RESTART, IDLE_KEEP, INSTALLS_BEFORE_UNAVAILABLE, OUTDATED_GUESS_AFTER,
+    RESTART_WINDOW, RESTARTS_BEFORE_UNAVAILABLE, ReconnectPolicy, UNAVAILABLE_RETRY,
 };
 pub use types::{
     ConnectError, Counters, CursorUpdate, FailureClass, Frame, LinkClosed, LinkEvent, SendError,
