@@ -76,6 +76,12 @@ pub struct State {
     /// Type answered for any other path, when set.
     pub default_file_type: Option<String>,
     pub instance_patches: u32,
+    /// Instance-local devices by instance name, as `PATCH`/`PUT` set them.
+    pub devices: HashMap<String, BTreeMap<String, BTreeMap<String, String>>>,
+    /// Instance-local config by instance name, as `PATCH` sets it.
+    pub config: HashMap<String, BTreeMap<String, String>>,
+    /// Expanded (profile) devices answered for every instance.
+    pub expanded_devices: BTreeMap<String, BTreeMap<String, String>>,
     /// Waits that answer `Running` before an operation completes.
     pub pending_waits: HashMap<String, u32>,
     pub next: u64,
@@ -105,6 +111,9 @@ impl State {
             file_types: HashMap::new(),
             default_file_type: None,
             instance_patches: 0,
+            devices: HashMap::new(),
+            config: HashMap::new(),
+            expanded_devices: BTreeMap::new(),
             pending_waits: HashMap::new(),
             next: 0,
             overrides: HashMap::new(),
@@ -245,17 +254,44 @@ impl State {
                 self.new_op(Value::Null, 1)
             }
             ("GET", ["1.0", "instances", n]) => match self.instances.get(*n) {
-                Some(s) => sync(
-                    json!({"name":n,"status":s,"type":"container","profiles":["p"],"config":{}}),
-                ),
+                Some(s) => {
+                    let devices = self.devices.get(*n).cloned().unwrap_or_default();
+                    let mut expanded = self.expanded_devices.clone();
+                    expanded.extend(devices.clone());
+                    sync(json!({
+                        "name":n,"status":s,"type":"container","profiles":["p"],
+                        "architecture":"x86_64",
+                        "config":self.config.get(*n).cloned().unwrap_or_default(),
+                        "devices":devices,"expanded_devices":expanded,
+                    }))
+                }
                 None => not_found("instance"),
             },
+            ("PUT", ["1.0", "instances", n]) => {
+                if !self.instances.contains_key(*n) {
+                    return not_found("instance");
+                }
+                let devs: BTreeMap<String, BTreeMap<String, String>> =
+                    serde_json::from_value(body["devices"].clone()).unwrap_or_default();
+                self.devices.insert(n.to_string(), devs);
+                self.new_op(Value::Null, 0)
+            }
             ("DELETE", ["1.0", "instances", n]) => {
                 self.instances.remove(*n);
                 self.new_op(Value::Null, 0)
             }
-            ("PATCH", ["1.0", "instances", _]) => {
+            ("PATCH", ["1.0", "instances", n]) => {
                 self.instance_patches += 1;
+                if let Ok(devs) = serde_json::from_value::<BTreeMap<String, BTreeMap<String, String>>>(
+                    body["devices"].clone(),
+                ) {
+                    self.devices.entry(n.to_string()).or_default().extend(devs);
+                }
+                if let Ok(cfg) =
+                    serde_json::from_value::<BTreeMap<String, String>>(body["config"].clone())
+                {
+                    self.config.entry(n.to_string()).or_default().extend(cfg);
+                }
                 if self.fail_second_instance_patch && self.instance_patches == 2 {
                     return (
                         500,

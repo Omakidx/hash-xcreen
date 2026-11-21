@@ -128,6 +128,15 @@ pub struct Instance {
     /// Instance-level configuration.
     #[serde(default)]
     pub config: BTreeMap<String, String>,
+    /// CPU architecture (needed to replace an instance's definition).
+    #[serde(default)]
+    pub architecture: String,
+    /// Devices defined on the instance itself (not those that come from profiles).
+    #[serde(default)]
+    pub devices: BTreeMap<String, BTreeMap<String, String>>,
+    /// Devices after profiles are applied.
+    #[serde(default)]
+    pub expanded_devices: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 /// Run state of an instance (`GET /1.0/instances/<name>/state`).

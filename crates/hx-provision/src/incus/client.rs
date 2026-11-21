@@ -12,6 +12,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::error::IncusError;
+use super::link::{LinkOutcome, SESSION_LINK_DEVICE, SessionLink};
 use super::transport::{Request, Response, Transport, UnixTransport};
 use super::types::{
     Acl, ExecResult, ExecSpec, Instance, InstanceCreate, InstanceState, Network, Operation,
@@ -517,6 +518,83 @@ impl<T: Transport> Client<T> {
         )
         .await
         .map(drop)
+    }
+
+    /// Add the session-link proxy device ([`SessionLink`], ipc.md 6.11) to an instance.
+    ///
+    /// This is the only device-add call of the client and it takes only a [`SessionLink`], whose
+    /// constructor validates its inputs and fixes every other property, so the caller cannot add
+    /// anything else (a disk, a nic, another proxy, a unix socket pass-through).
+    ///
+    /// Converges: an identical device is left alone ([`LinkOutcome::Unchanged`]); a proxy device
+    /// of the same name with other options is replaced ([`LinkOutcome::Replaced`]); a device of
+    /// that name that is not a proxy device is refused rather than overwritten. The device
+    /// persists across restarts; Incus starts the proxy with the instance.
+    pub async fn add_session_link(
+        &self,
+        instance: &str,
+        link: &SessionLink,
+    ) -> Result<LinkOutcome, IncusError> {
+        let name = checked("instance", instance)?;
+        let want = link.device();
+        let current = self
+            .get_instance(name)
+            .await?
+            .ok_or_else(|| IncusError::Api {
+                code: 404,
+                message: format!("instance `{name}` not found"),
+            })?;
+        let outcome = match current.devices.get(SESSION_LINK_DEVICE) {
+            Some(d) if *d == want => return Ok(LinkOutcome::Unchanged),
+            Some(d) if d.get("type").map(String::as_str) != Some("proxy") => {
+                return Err(IncusError::InvalidArgument(format!(
+                    "device `{SESSION_LINK_DEVICE}` exists and is not a proxy device"
+                )));
+            }
+            Some(_) => LinkOutcome::Replaced,
+            None => LinkOutcome::Added,
+        };
+        self.run(
+            Method::PATCH,
+            format!("/1.0/instances/{name}"),
+            Some(&json!({"devices": {SESSION_LINK_DEVICE: want}})),
+            Duration::from_secs(60),
+            "adding the session link device",
+        )
+        .await?;
+        Ok(outcome)
+    }
+
+    /// Remove the session-link device if present (teardown). Returns whether it was removed.
+    /// Nothing else on the instance is touched.
+    pub async fn remove_session_link(&self, instance: &str) -> Result<bool, IncusError> {
+        let name = checked("instance", instance)?;
+        let Some(current) = self.get_instance(name).await? else {
+            return Ok(false);
+        };
+        if !current.devices.contains_key(SESSION_LINK_DEVICE) {
+            return Ok(false);
+        }
+        let mut devices = current.devices.clone();
+        devices.remove(SESSION_LINK_DEVICE);
+        // PATCH merges device maps and cannot delete a key, so write the instance's definition
+        // back with the device left out (what `incus config device remove` does).
+        let body = json!({
+            "architecture": current.architecture,
+            "config": current.config,
+            "devices": devices,
+            "profiles": current.profiles,
+            "ephemeral": false,
+        });
+        self.run(
+            Method::PUT,
+            format!("/1.0/instances/{name}"),
+            Some(&body),
+            Duration::from_secs(60),
+            "removing the session link device",
+        )
+        .await?;
+        Ok(true)
     }
 
     /// Start, stop or restart. `force` kills instead of asking init to shut down.
