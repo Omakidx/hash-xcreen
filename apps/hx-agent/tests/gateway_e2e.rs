@@ -1169,14 +1169,21 @@ async fn a_locked_pin_purpose_never_counts_or_revokes_and_waits() {
     assert!(matches!(err, CryptoError::PinNotAvailable), "{err}");
     assert_eq!(failed(&env), 1, "only the real wrong PIN counts");
     let asked = env.privd.with(|s| s.verify_ok + s.verify_fail);
-    // Seven reconnects with the right PIN: each told "not available", none counted, none
-    // revokes, and privd is not asked again while the verifier waits.
+    // The authenticator now holds the device for the wait. Seven reconnects with the right
+    // PIN: each told BACKOFF with the time left, none counted, none revokes, and privd is not
+    // asked again while the wait runs.
     for _ in 0..7 {
         let mut b = env.connect_unauth(&phone, "phone").await;
-        let err = within(b.submit(&hx_crypto::Pin::new(PIN).unwrap()))
+        let r = within(b.submit(&hx_crypto::Pin::new(PIN).unwrap()))
             .await
-            .unwrap_err();
-        assert!(matches!(err, CryptoError::PinNotAvailable), "{err}");
+            .unwrap();
+        match r {
+            PinReply::Backoff { retry_after } => {
+                assert!(!retry_after.is_zero(), "{retry_after:?}");
+                assert!(retry_after <= Duration::from_secs(60), "{retry_after:?}");
+            }
+            other => panic!("expected BACKOFF during the wait: {other:?}"),
+        }
     }
     assert_eq!(failed(&env), 1);
     assert_eq!(

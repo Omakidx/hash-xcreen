@@ -368,9 +368,9 @@ pub const LOCKED_WAIT: Duration = Duration::from_secs(60);
 /// | PIN purpose locked | `Locked` | attempt refunded, never revokes, client told `NOT_AVAILABLE` |
 ///
 /// After `Locked` the verifier answers `Locked` itself, without asking privd, for privd's
-/// `retry_after` (else [`LOCKED_WAIT`]): the authenticator sets no wait of its own on `Locked`
-/// (a proposed hx-crypto change), so this is what keeps reconnecting devices from hammering
-/// privd while the purpose is locked.
+/// `retry_after` (else [`LOCKED_WAIT`]), which it also passes in `Locked { retry_after }` so the
+/// authenticator holds the device for the same time; this keeps reconnecting devices from
+/// hammering privd while the purpose is locked.
 pub struct PrivdPinVerifier {
     store: Arc<VerifierStore>,
     privd: PrivdClient,
@@ -395,15 +395,16 @@ impl PrivdPinVerifier {
         self
     }
 
-    fn locked(&self) -> bool {
+    /// The wait left while the purpose is known to be locked.
+    fn locked(&self) -> Option<Duration> {
         let mut l = self.locked_until.lock().unwrap_or_else(|p| p.into_inner());
         match *l {
-            Some(t) if t > Instant::now() => true,
+            Some(t) if t > Instant::now() => Some(t - Instant::now()),
             Some(_) => {
                 *l = None;
-                false
+                None
             }
-            None => false,
+            None => None,
         }
     }
 
@@ -423,8 +424,10 @@ impl PinVerifier for PrivdPinVerifier {
         pin: Zeroizing<Vec<u8>>,
     ) -> BoxFuture<'a, PinVerdict> {
         Box::pin(async move {
-            if self.locked() {
-                return PinVerdict::Locked;
+            if let Some(left) = self.locked() {
+                return PinVerdict::Locked {
+                    retry_after: Some(left),
+                };
             }
             let Some(record) = self.store.pin_for(device) else {
                 return PinVerdict::Unavailable;
@@ -455,7 +458,9 @@ impl PinVerifier for PrivdPinVerifier {
                     };
                     tracing::error!("privd reports the PIN purpose locked; PIN logins wait");
                     self.lock_for(wait);
-                    PinVerdict::Locked
+                    PinVerdict::Locked {
+                        retry_after: Some(wait),
+                    }
                 }
                 Ok(Err(e)) => {
                     // The error carries no request content.
