@@ -872,7 +872,15 @@ async fn snapshots_list_create_delete() {
 async fn logs_show_the_journal_and_the_audit_log() {
     let w = World::start().await;
     let data = w.dir.path().join("journal.txt");
-    std::fs::write(&data, "2026-11-21T10:00:00+0000 host hx-privd[1]: started\n2026-11-21T10:00:01+0000 host hx-gatewayd[2]: listening\n").unwrap();
+    std::fs::write(
+        &data,
+        format!(
+            "{}\n{}\n",
+            journal_entry("hx-privd.service", 1, "hx-privd", "started"),
+            journal_entry("hx-gatewayd.service", 2, "hx-gatewayd", "listening")
+        ),
+    )
+    .unwrap();
     let argv = w.dir.path().join("argv.txt");
     let mut cfg = w.cfg.clone();
     cfg.journalctl = write_script(
@@ -891,7 +899,7 @@ async fn logs_show_the_journal_and_the_audit_log() {
     let r = cli(&cfg, &["logs", "-n", "7"], &[], &[]).await;
     assert_eq!(r.code, 0, "{r:?}");
     assert!(
-        r.stdout.contains("hx-privd[1]: started") && r.stdout.contains("cmd=ResetLockout"),
+        r.stdout.contains("hx-privd.service [1] started") && r.stdout.contains("cmd=ResetLockout"),
         "{}",
         r.stdout
     );
@@ -923,7 +931,7 @@ async fn logs_show_the_journal_and_the_audit_log() {
 fn hx_agent_journal_argv(n: u32) -> Vec<String> {
     vec![
         "--no-pager".into(),
-        "--output=short-iso".into(),
+        "--output=json".into(),
         "--lines".into(),
         n.to_string(),
         "_SYSTEMD_UNIT=hx-privd.service".into(),
@@ -968,7 +976,15 @@ async fn logs_refuse_an_audit_log_that_is_not_ours() {
 async fn logs_follow_streams_the_journal_and_new_audit_lines() {
     let w = World::start().await;
     let data = w.dir.path().join("journal.txt");
-    std::fs::write(&data, "journal-line-1\njournal-line-2\n").unwrap();
+    std::fs::write(
+        &data,
+        format!(
+            "{}\n{}\n",
+            journal_entry("hx-privd.service", 1, "x", "journal-line-1"),
+            journal_entry("hx-privd.service", 1, "x", "journal-line-2")
+        ),
+    )
+    .unwrap();
     let mut cfg = w.cfg.clone();
     // Prints two lines, waits a moment (so that the audit append below lands while following),
     // then ends: `--follow` ends with journalctl.
@@ -992,8 +1008,8 @@ async fn logs_follow_streams_the_journal_and_new_audit_lines() {
     appender.await.unwrap();
     assert_eq!(r.code, 0, "{r:?}");
     for needle in [
-        "journal| journal-line-1",
-        "journal| journal-line-2",
+        "journal| 2026-11-18T11:06:40Z hx-privd.service [1] journal-line-1",
+        "journal| 2026-11-18T11:06:40Z hx-privd.service [1] journal-line-2",
         "audit  | audit-old-1",
         "audit  | audit-new-2",
     ] {

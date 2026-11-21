@@ -78,7 +78,7 @@ text, shown for convenience, and never select a device. `devices list` shows 12 
 
 ### logs
 
-* **journal**: `journalctl --no-pager --output=short-iso --lines <n> [--follow]` with the match
+* **journal**: `journalctl --no-pager --output=json --lines <n> [--follow]` with the match
   `(_SYSTEMD_UNIT=hx-privd.service AND _UID=0) OR _SYSTEMD_UNIT=hx-gatewayd.service`. The argv is
   built from constants and the line count only; the environment is cleared, no shell is used. The
   match uses fields only journald sets, so a local user who writes to the journal cannot make a line

@@ -590,6 +590,19 @@ pub fn private_tempdir() -> tempfile::TempDir {
     d
 }
 
+/// One line of `journalctl --output=json`: the trusted fields journald sets, plus the
+/// sender-controlled `SYSLOG_IDENTIFIER` and `MESSAGE`.
+pub fn journal_entry(unit: &str, pid: u32, ident: &str, message: &str) -> String {
+    serde_json::json!({
+        "__REALTIME_TIMESTAMP": "1795000000000000",
+        "_SYSTEMD_UNIT": unit,
+        "_PID": pid.to_string(),
+        "SYSLOG_IDENTIFIER": ident,
+        "MESSAGE": message,
+    })
+    .to_string()
+}
+
 /// Writes an audit-log stand-in: private, as the CLI requires of the real one.
 pub fn write_audit(path: &Path, text: &str) {
     use std::os::unix::fs::PermissionsExt;

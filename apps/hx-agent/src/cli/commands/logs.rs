@@ -30,6 +30,8 @@ use crate::cli::{Config, Env, Outcome};
 
 /// Longest line kept; the rest of a longer line is dropped.
 const MAX_LINE: usize = 4096;
+/// Longest journal entry (one JSON object) read; a longer one is shown as unreadable.
+const MAX_ENTRY: usize = 65_536;
 /// Most journal lines read in one non-follow call.
 const MAX_JOURNAL_LINES: usize = 20_000;
 /// How much of the end of the audit file is looked at for a tail.
@@ -39,7 +41,7 @@ const POLL: Duration = Duration::from_millis(250);
 
 /// The argv of `journalctl` (after the program): constants and the line count only.
 pub fn journal_argv(lines: u32, follow: bool) -> Vec<String> {
-    let mut a: Vec<String> = ["--no-pager", "--output=short-iso", "--lines"]
+    let mut a: Vec<String> = ["--no-pager", "--output=json", "--lines"]
         .iter()
         .map(|s| (*s).to_owned())
         .collect();
@@ -62,6 +64,7 @@ pub fn journal_argv(lines: u32, follow: bool) -> Vec<String> {
 /// Reads lines of at most [`MAX_LINE`] bytes from a reader, without ever buffering a longer one.
 struct Lines<R: Read> {
     r: R,
+    max: usize,
     buf: Vec<u8>,
     chunk: [u8; 8192],
     pos: usize,
@@ -70,9 +73,10 @@ struct Lines<R: Read> {
 }
 
 impl<R: Read> Lines<R> {
-    fn new(r: R) -> Self {
+    fn new(r: R, max: usize) -> Self {
         Self {
             r,
+            max,
             buf: Vec::new(),
             chunk: [0; 8192],
             pos: 0,
@@ -90,9 +94,9 @@ impl<R: Read> Lines<R> {
                 if b == b'\n' {
                     let line = String::from_utf8_lossy(&self.buf).into_owned();
                     self.buf.clear();
-                    return Ok(Some(peer(&line, MAX_LINE)));
+                    return Ok(Some(peer(&line, self.max)));
                 }
-                if self.buf.len() < MAX_LINE {
+                if self.buf.len() < self.max {
                     self.buf.push(b);
                 }
             }
@@ -102,7 +106,7 @@ impl<R: Read> Lines<R> {
                 }
                 let line = String::from_utf8_lossy(&self.buf).into_owned();
                 self.buf.clear();
-                return Ok(Some(peer(&line, MAX_LINE)));
+                return Ok(Some(peer(&line, self.max)));
             }
             match self.r.read(&mut self.chunk) {
                 Ok(0) => self.eof = true,
@@ -115,6 +119,47 @@ impl<R: Read> Lines<R> {
             }
         }
     }
+}
+
+/// One journal entry (a JSON object from `journalctl --output=json`) as one safe line:
+/// `<time> <unit> [pid] message`. The unit, pid and time are fields only journald sets
+/// (`_SYSTEMD_UNIT`, `_PID`, `__REALTIME_TIMESTAMP`); the sender-controlled `SYSLOG_IDENTIFIER`
+/// is never shown, so a line cannot claim to come from another program. The message is folded
+/// onto one line and sanitized.
+fn render_entry(line: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return "(unreadable journal entry)".into();
+    };
+    let text = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_owned);
+    let time = text("__REALTIME_TIMESTAMP")
+        .and_then(|t| t.parse::<u64>().ok())
+        .map(|us| crate::cli::text::time(us / 1_000_000))
+        .unwrap_or_else(|| "-".into());
+    let unit = text("_SYSTEMD_UNIT").unwrap_or_else(|| "-".into());
+    let pid = text("_PID")
+        .map(|p| format!(" [{}]", peer(&p, 12)))
+        .unwrap_or_default();
+    // A message that is not valid UTF-8 (or has control bytes) comes as an array of numbers.
+    let message = match v.get("MESSAGE") {
+        Some(serde_json::Value::String(m)) => m.clone(),
+        Some(serde_json::Value::Array(a)) => {
+            let bytes: Vec<u8> = a
+                .iter()
+                .filter_map(|n| n.as_u64())
+                .map(|n| n as u8)
+                .collect();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+        _ => String::new(),
+    };
+    let folded = message.replace(['\n', '\r'], " ");
+    format!(
+        "{} {}{} {}",
+        time,
+        peer(&unit, 64),
+        pid,
+        peer(&folded, MAX_LINE)
+    )
 }
 
 fn spawn_journal(cfg: &Config, lines: u32, follow: bool) -> Result<Child, CliError> {
@@ -140,11 +185,11 @@ fn read_journal(cfg: &Config, lines: u32) -> Result<Vec<String>, CliError> {
         .stdout
         .take()
         .ok_or_else(|| CliError::failed("journalctl has no output"))?;
-    let mut rd = Lines::new(stdout);
+    let mut rd = Lines::new(stdout, MAX_ENTRY);
     let mut out = Vec::new();
     while out.len() < MAX_JOURNAL_LINES {
         match rd.next_line() {
-            Ok(Some(l)) => out.push(l),
+            Ok(Some(l)) => out.push(render_entry(&l)),
             Ok(None) => break,
             Err(e) => {
                 let _ = child.kill();
@@ -233,7 +278,7 @@ fn audit_tail(f: &mut File, n: usize) -> Result<Vec<String>, CliError> {
     } else {
         &data[..]
     };
-    let mut rd = Lines::new(slice);
+    let mut rd = Lines::new(slice, MAX_LINE);
     let mut all = Vec::new();
     while let Some(l) = rd.next_line().map_err(io)? {
         all.push(l);
@@ -311,9 +356,9 @@ fn follow_logs(env: &mut Env<'_>, lines: u32, journal: bool, audit: bool) -> Res
             .take()
             .ok_or_else(|| CliError::failed("journalctl has no output"))?;
         std::thread::spawn(move || {
-            let mut rd = Lines::new(stdout);
+            let mut rd = Lines::new(stdout, MAX_ENTRY);
             while let Ok(Some(l)) = rd.next_line() {
-                if tx.send(l).is_err() {
+                if tx.send(render_entry(&l)).is_err() {
                     break;
                 }
             }
@@ -430,7 +475,7 @@ mod tests {
             a,
             [
                 "--no-pager",
-                "--output=short-iso",
+                "--output=json",
                 "--lines",
                 "50",
                 "_SYSTEMD_UNIT=hx-privd.service",
@@ -448,7 +493,7 @@ mod tests {
         input.extend_from_slice(b"ok\x1b[31m line\n");
         input.extend(std::iter::repeat_n(b'x', MAX_LINE * 3));
         input.extend_from_slice(b"\nlast");
-        let mut rd = Lines::new(&input[..]);
+        let mut rd = Lines::new(&input[..], MAX_LINE);
         assert_eq!(rd.next_line().unwrap().unwrap(), "ok[31m line");
         assert_eq!(rd.next_line().unwrap().unwrap().len(), MAX_LINE);
         assert_eq!(rd.next_line().unwrap().unwrap(), "last");

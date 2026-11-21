@@ -332,13 +332,19 @@ async fn hostile_log_lines_are_scrubbed_bounded_and_cannot_forge_lines() {
     let dir = private_tempdir();
     let mut cfg = unreachable_config(dir.path());
     let journal = dir.path().join("journal.bin");
-    // ESC sequences, a bidi override, invalid UTF-8, a 1 MiB line, and a forged "audit" line.
+    // ESC sequences, a bidi override, invalid UTF-8 (as journald encodes it, an array of
+    // bytes), a multi-line message, a 1 MiB entry, plain garbage and a forged identifier.
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"ok \x1b[2J\x1b]0;pwned\x07 line\n");
-    bytes.extend_from_slice("bidi \u{202E}evil\n".as_bytes());
-    bytes.extend_from_slice(b"bad utf8 \xff\xfe end\n");
-    bytes.extend(std::iter::repeat_n(b'x', 1 << 20));
-    bytes.extend_from_slice(b"\nlast\n");
+    let line = |m: &str| journal_entry("hx-privd.service", 7, "hx-privd", m) + "\n";
+    bytes.extend_from_slice(line("ok \x1b[2J\x1b]0;pwned\x07 line").as_bytes());
+    bytes.extend_from_slice(line("bidi \u{202E}evil").as_bytes());
+    bytes.extend_from_slice(line("two\nFORGED: lines\r\nhere").as_bytes());
+    bytes.extend_from_slice(
+        b"{\"_SYSTEMD_UNIT\":\"hx-privd.service\",\"MESSAGE\":[98,97,100,32,255,254,32,101,110,100]}\n",
+    );
+    bytes.extend_from_slice(b"\x1b[31mnot json at all\n");
+    bytes.extend_from_slice(line(&"x".repeat(1 << 20)).as_bytes());
+    bytes.extend_from_slice(line("last").as_bytes());
     std::fs::write(&journal, &bytes).unwrap();
     cfg.journalctl = write_script(
         dir.path(),
@@ -353,6 +359,22 @@ async fn hostile_log_lines_are_scrubbed_bounded_and_cannot_forge_lines() {
     assert_eq!(r.code, 0, "{r:?}");
     assert_clean(&r);
     assert!(r.stdout.contains("ok [2J]0;pwned line"), "{}", r.stdout);
+    assert!(r.stdout.contains("two FORGED: lines  here"), "{}", r.stdout);
+    assert!(
+        r.stdout.contains("bad  end") || r.stdout.contains("bad"),
+        "{}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("(unreadable journal entry)"),
+        "{}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("hx-privd.service [7] last"),
+        "{}",
+        r.stdout
+    );
     assert!(
         r.stdout.lines().all(|l| l.len() <= 4096 + 1),
         "lines are bounded"
@@ -362,7 +384,8 @@ async fn hostile_log_lines_are_scrubbed_bounded_and_cannot_forge_lines() {
     let f = cli(&cfg, &["logs", "--follow", "--journal"], &[], &[]).await;
     assert_clean(&f);
     assert!(
-        f.stdout.contains("journal| ok [2J]0;pwned line"),
+        f.stdout
+            .contains("hx-privd.service [7] ok [2J]0;pwned line"),
         "{}",
         f.stdout
     );

@@ -188,3 +188,45 @@ async fn l2_reinstating_a_revoked_device_needs_a_confirmation() {
         2
     );
 }
+
+// ----------------------------------------------------------------------------------------- L3
+
+#[tokio::test]
+async fn l3_the_journal_line_is_labelled_by_the_trusted_unit_not_the_identifier() {
+    let dir = private_tempdir();
+    let mut cfg = unreachable_config(dir.path());
+    let data = dir.path().join("journal.json");
+    // A line from the gateway unit whose sender-controlled identifier claims to be privd.
+    std::fs::write(
+        &data,
+        journal_entry("hx-gatewayd.service", 42, "hx-privd", "pretending") + "\n",
+    )
+    .unwrap();
+    cfg.journalctl = write_script(
+        dir.path(),
+        "journalctl",
+        &format!("cat '{}'\n", data.display()),
+    );
+    let r = cli(&cfg, &["logs", "--journal"], &[], &[]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(
+        r.stdout.contains("hx-gatewayd.service [42] pretending"),
+        "{}",
+        r.stdout
+    );
+    assert!(
+        !r.stdout
+            .lines()
+            .any(|l| l.contains("pretending") && l.contains("hx-privd")),
+        "the identifier is never shown: {}",
+        r.stdout
+    );
+    let j = cli(&cfg, &["logs", "--journal", "--json"], &[], &[])
+        .await
+        .json();
+    let l = j["data"]["journal"][0].as_str().unwrap();
+    assert!(
+        l.contains("hx-gatewayd.service") && !l.contains("hx-privd"),
+        "{l}"
+    );
+}
