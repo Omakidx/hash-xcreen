@@ -69,6 +69,10 @@ RemoveIPC=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictNamespaces=yes
 RestrictRealtime=yes
+# The gateway talks to the internet and to unix sockets only. Loopback, link-local and multicast
+# are not peers it ever needs (privd and the admin socket are AF_UNIX, which this does not
+# touch), so a compromised process cannot probe local services or the neighbourhood.
+IPAddressDeny=localhost link-local multicast
 
 # Memory: nothing is swapped (a PIN may be in a buffer, docs/ipc.md section 5.2), nothing is
 # dumped, nothing is writable and executable. mlockall at start is fatal when it fails.
@@ -84,7 +88,12 @@ SystemCallFilter=~@privileged @resources @mount @debug @module @reboot @swap @ra
 SystemCallFilter=setrlimit prlimit64 getrlimit mlockall
 SystemCallErrorNumber=EPERM
 
-# Bounds.
+# Bounds. mlockall pins everything the process maps, so the memory limit is a real budget: the
+# binary and the runtime (tens of MiB), one Argon2id verification per device in flight (64 MiB
+# each), and the QUIC buffers of the live sessions (at most 32, docs/protocol.md 1: 64 MiB
+# receive windows are caps, not usage). MemoryHigh throttles before MemoryMax kills.
+MemoryHigh=1536M
+MemoryMax=2G
 TasksMax=512
 LimitNOFILE=8192
 

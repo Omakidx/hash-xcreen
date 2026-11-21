@@ -58,6 +58,14 @@ fn write_private(path: &Path, bytes: &[u8]) {
 }
 
 async fn start_binary(debug_log: bool) -> Running {
+    start_binary_mode(debug_log, None).await
+}
+
+async fn start_binary_with(mode: &str) -> Running {
+    start_binary_mode(false, Some(mode)).await
+}
+
+async fn start_binary_mode(debug_log: bool, mode: Option<&str>) -> Running {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
     std::fs::create_dir(&state).unwrap();
@@ -83,7 +91,9 @@ async fn start_binary(debug_log: bool) -> Running {
             privd.path.display(),
             admin.display(),
             identity.display(),
-            std::env::var("HX_TEST_SECCOMP").unwrap_or("enforce".into())
+            mode.map(str::to_owned)
+                .or_else(|| std::env::var("HX_TEST_SECCOMP").ok())
+                .unwrap_or_else(|| "enforce".into())
         ),
     )
     .unwrap();
@@ -593,4 +603,35 @@ fn log_mode_lets_the_same_call_through() {
     assert!(out.status.success(), "{out:?}");
     assert!(made.exists());
     assert!(String::from_utf8_lossy(&out.stdout).contains("SURVIVED"));
+}
+
+/// N1: `seccomp = "log"` is loud at start, and the unit denies the address ranges the gateway
+/// never talks to and caps memory.
+#[tokio::test(flavor = "multi_thread")]
+async fn log_mode_warns_loudly_at_start() {
+    let mut g = start_binary_with("log").await;
+    let pid = g.child.id();
+    let _ = Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status();
+    let log = tokio::task::spawn_blocking(move || {
+        let _ = g.child.wait();
+        std::fs::read_to_string(&g.log).unwrap_or_default()
+    })
+    .await
+    .unwrap();
+    assert!(log.contains("seccomp is in LOG mode"), "{log}");
+    assert!(log.contains("NOT blocked"), "{log}");
+}
+
+#[test]
+fn the_unit_restricts_addresses_and_memory() {
+    let unit = include_str!("../systemd/hx-gatewayd.service");
+    let has = |l: &str| unit.lines().any(|x| x.trim() == l);
+    assert!(has("IPAddressDeny=localhost link-local multicast"));
+    assert!(has("MemoryMax=2G"));
+    assert!(has("MemoryHigh=1536M"));
+    assert!(has("CapabilityBoundingSet="));
+    assert!(has("RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX"));
 }

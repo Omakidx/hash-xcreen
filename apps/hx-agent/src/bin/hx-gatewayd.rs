@@ -21,7 +21,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use hx_agent::gateway::admin::{self, AdminPolicy};
-use hx_agent::gateway::config::GatewayConfig;
+use hx_agent::gateway::config::{GatewayConfig, SeccompMode};
 use hx_agent::gateway::desktop::UnavailableLink;
 use hx_agent::gateway::harden;
 use hx_agent::gateway::server::{Gateway, StartOptions, load_identity};
@@ -145,6 +145,14 @@ async fn run(args: Args) -> Result<(), String> {
     let mut int = signal(SignalKind::interrupt()).map_err(|e| e.to_string())?;
 
     harden::process_limits(config.mlock).map_err(|e| e.to_string())?;
+    if config.seccomp == SeccompMode::Log {
+        // Log mode lets every syscall through: it is for finding a missing entry while
+        // developing a build, never a production setting.
+        tracing::warn!(
+            "WARNING: seccomp is in LOG mode: system calls outside the allowlist are logged but \
+             NOT blocked. Set seccomp = \"enforce\" in production."
+        );
+    }
     harden::install_seccomp(config.seccomp).map_err(|e| e.to_string())?;
 
     gateway.begin();
