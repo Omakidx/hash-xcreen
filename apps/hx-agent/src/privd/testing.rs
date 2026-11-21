@@ -695,6 +695,28 @@ impl FakeIncus {
                 let mode = header("x-incus-mode")
                     .and_then(|m| u32::from_str_radix(&m, 8).ok())
                     .unwrap_or(0o644);
+                // Real Incus creates one directory with mkdir, not mkdir -p: a directory whose
+                // parent does not exist is `404 Not Found` (seen in the nested-Incus installer
+                // run, where InstallSession pushed /var/lib/hx/session into a desktop that has no
+                // /var/lib/hx). The directories every distro image has count as existing.
+                if kind == "directory" {
+                    const IMAGE_DIRS: &[&str] = &[
+                        "/", "/etc", "/home", "/opt", "/root", "/run", "/tmp", "/usr", "/var",
+                        "/var/lib", "/var/log",
+                    ];
+                    let parent = std::path::Path::new(&p)
+                        .parent()
+                        .map(|d| d.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let exists = parent.is_empty()
+                        || IMAGE_DIRS.contains(&parent.as_str())
+                        || s.file_meta
+                            .get(&parent)
+                            .is_some_and(|(k, _)| k == "directory");
+                    if !exists {
+                        return Ok(err_response(404, "Not Found"));
+                    }
+                }
                 if kind == "file" {
                     s.files.insert(p.clone(), req.body.to_vec());
                 }
