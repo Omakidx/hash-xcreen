@@ -34,7 +34,7 @@ pub mod wire;
 
 pub use auth::{
     Authenticator, AuthenticatorConfig, BoxFuture, DEFAULT_LOCKED_WAIT, MAX_LOCKED_WAIT, Outcome,
-    PinVerdict, PinVerifier, RegistryView,
+    PinVerdict, PinVerifier, RegistryView, RevocationGuard, RevocationPermit,
 };
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use error::{Error, Result};

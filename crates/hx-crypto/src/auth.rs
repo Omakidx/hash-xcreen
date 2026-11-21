@@ -110,6 +110,9 @@ pub struct AuthenticatorConfig {
     /// answer ([`PinVerdict::Unavailable`]); the device is also held that long server-side
     /// (default 2 s).
     pub unavailable_retry: Duration,
+    /// How long a lockout revocation waits for the [`RevocationGuard`] before it revokes
+    /// anyway (default 5 s). The lockout is never skipped: a slow or stuck hook only delays it.
+    pub revocation_guard_timeout: Duration,
 }
 
 impl Default for AuthenticatorConfig {
@@ -127,6 +130,7 @@ impl Default for AuthenticatorConfig {
             watch_interval: Duration::from_secs(5),
             min_hash_budget: Duration::from_secs(1),
             unavailable_retry: Duration::from_secs(2),
+            revocation_guard_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -196,6 +200,38 @@ pub trait PinVerifier: Send + Sync + 'static {
         device: &'a DeviceId,
         pin: Zeroizing<Vec<u8>>,
     ) -> BoxFuture<'a, PinVerdict>;
+}
+
+/// Proof that a [`RevocationGuard`] was entered. Dropping it leaves the guard.
+pub type RevocationPermit = Box<dyn Send + 'static>;
+
+/// Lets the caller serialize the revocations the authenticator makes by itself.
+///
+/// A PIN-lockout revocation (the 5th wrong PIN) happens inside the [`Authenticator`], so the
+/// application cannot wrap it in its own lock the way it wraps an operator's `revoke`. When a
+/// guard is installed ([`Authenticator::set_revocation_guard`]) the authenticator awaits
+/// [`enter`](Self::enter) right before it persists a lockout revocation and holds the returned
+/// permit until the revocation is persisted **and announced** on
+/// [`Authenticator::subscribe_revocations`], then drops it.
+///
+/// The guard only serializes and attributes; it cannot veto. The lockout always revokes, even
+/// the last active device, because a guesser must not get unlimited tries. If `enter` takes
+/// longer than [`AuthenticatorConfig::revocation_guard_timeout`] the revocation goes ahead
+/// without the permit.
+///
+/// How the gateway uses it: implement `enter` by taking the same async mutex that serializes
+/// its own revocations (the one under which it enforces "never zero active devices") and
+/// return the owned lock guard as the permit. Because the guard is entered while the
+/// authenticator holds the device's PIN guard, the gateway must never hold that revocation
+/// lock while it waits for a PIN check or for `reset_lockout` on the same device (they wait for
+/// the device guard): take the revocation lock last, and do not call back into the
+/// authenticator's PIN path from `enter`. Under the lock the gateway's "last device" check
+/// sees a consistent count: once the permit is held, a lockout revocation of another device
+/// is either fully visible or not started. A lockout revocation can still take the count to
+/// zero (that is intended); the gateway can notice it from the announcement.
+pub trait RevocationGuard: Send + Sync + 'static {
+    /// Wait until revoking `device` may proceed, and return the permit to hold meanwhile.
+    fn enter<'a>(&'a self, device: &'a DeviceId) -> BoxFuture<'a, RevocationPermit>;
 }
 
 /// The local check: constant-time Argon2id comparison on a blocking thread.
@@ -284,6 +320,7 @@ struct Inner {
     clock: Arc<dyn Clock>,
     window: PairingWindow,
     pin: RwLock<Option<Arc<dyn PinVerifier>>>,
+    revocation_guard: RwLock<Option<Arc<dyn RevocationGuard>>>,
     config: AuthenticatorConfig,
     revocations: broadcast::Sender<DeviceId>,
     /// Earliest time each device may try its PIN again (memory only).
@@ -325,6 +362,7 @@ impl Authenticator {
                 window: PairingWindow::new(clock.clone(), config.pairing.clone()),
                 clock,
                 pin: RwLock::new(None),
+                revocation_guard: RwLock::new(None),
                 config,
                 revocations,
                 not_before: Mutex::new(HashMap::new()),
@@ -362,6 +400,22 @@ impl Authenticator {
         if let Ok(mut p) = self.inner.pin.write() {
             *p = Some(verifier);
         }
+    }
+
+    /// Install the [`RevocationGuard`] the authenticator enters around a PIN-lockout
+    /// revocation. Takes effect for the next lockout.
+    pub fn set_revocation_guard(&self, guard: Arc<dyn RevocationGuard>) {
+        if let Ok(mut g) = self.inner.revocation_guard.write() {
+            *g = Some(guard);
+        }
+    }
+
+    fn revocation_guard(&self) -> Option<Arc<dyn RevocationGuard>> {
+        self.inner
+            .revocation_guard
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
     }
 
     fn pin_verifier(&self) -> Option<Arc<dyn PinVerifier>> {
@@ -894,6 +948,24 @@ impl Authenticator {
                 }
                 PinVerdict::Wrong => {}
             }
+            // The attempt that reaches the limit revokes. Let the caller serialize that, and keep
+            // its permit until the revocation is persisted and announced.
+            let _permit = if counted >= max {
+                match this.revocation_guard() {
+                    Some(g) => tokio::time::timeout(
+                        this.inner.config.revocation_guard_timeout,
+                        g.enter(&id),
+                    )
+                    .await
+                    .map_err(|_| {
+                        tracing::error!(device = %id, "revocation guard timed out; revoking anyway");
+                    })
+                    .ok(),
+                    None => None,
+                }
+            } else {
+                None
+            };
             let revoked = this
                 .commit(move |r, tx, now| {
                     let revoked = r.revoke_if_failed(&id, max, now)?;
