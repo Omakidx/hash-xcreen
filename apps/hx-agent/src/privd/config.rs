@@ -52,6 +52,11 @@ pub struct PrivdConfig {
     pub passwd_file: PathBuf,
     /// Group file.
     pub group_file: PathBuf,
+    /// The directory of the link sockets (`/run/hx/link`, made by tmpfiles).
+    pub link_dir: PathBuf,
+    /// What `link_dir` must look like (owner, group, mode; not a symlink) before privd adds a
+    /// proxy device whose host side listens in it; `None` skips the check (tests only).
+    pub expected_link_dir: Option<FileMeta>,
     /// Names of Incus objects.
     pub naming: Naming,
     /// Prefix of instance names: instance = prefix + desktop id (`hx-` in production; tests of
@@ -85,6 +90,12 @@ impl PrivdConfig {
             zoneinfo_dir: "/usr/share/zoneinfo".into(),
             passwd_file,
             group_file: "/etc/group".into(),
+            link_dir: "/run/hx/link".into(),
+            expected_link_dir: Some(FileMeta {
+                mode: 0o750,
+                uid: 0,
+                gid: gateway.gid,
+            }),
             naming: Naming::production(),
             instance_prefix: "hx-".into(),
             gateway,
@@ -114,6 +125,8 @@ impl PrivdConfig {
             zoneinfo_dir: "/usr/share/zoneinfo".into(),
             passwd_file: dir.join("passwd"),
             group_file: dir.join("group"),
+            link_dir: dir.join("link"),
+            expected_link_dir: None,
             naming: Naming::production(),
             instance_prefix: "hx-".into(),
             gateway,

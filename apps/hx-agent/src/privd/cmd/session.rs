@@ -41,6 +41,17 @@ pub async fn provision_link_inner<T: Transport + Clone + 'static>(
     id: &str,
     instance: &str,
 ) -> Result<String, CmdError> {
+    // The host-side socket listens in this directory: it must be what tmpfiles made (root, the
+    // gateway's group, 0750, not a symlink), or the gateway could replace sockets in it.
+    if let Some(expected) = &d.cfg.expected_link_dir
+        && let Some(v) = crate::privd::identity::link_dir_violation(&d.cfg.link_dir, expected)
+    {
+        crate::privd::log::error(&format!("link directory: {v}"));
+        return Err(CmdError::precondition(
+            ErrorDetail::Unspecified,
+            "the link directory is not root:hx-gatewayd 0750; refusing to add the proxy device",
+        ));
+    }
     let link = SessionLink::new(id, (d.cfg.gateway.uid, d.cfg.gateway.gid), DESKTOP_IDS)?;
     let path = link.socket_path();
     d.run_cancellable(ctx, client, Some(id), async {

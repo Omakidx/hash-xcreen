@@ -2269,3 +2269,77 @@ async fn l4_a_sealed_user_password_is_unimplemented_not_used_as_plaintext() {
             .with(|s| !s.execs.iter().any(|e| e.contains("chpasswd")))
     );
 }
+
+#[tokio::test]
+async fn l8_the_link_directory_is_checked_before_the_proxy_device_is_added() {
+    use hx_agent::privd::config::PrivdConfig;
+    use hx_agent::privd::daemon::Deps;
+    use hx_agent::privd::identity::{FileMeta, GatewayIdentity};
+    use hx_agent::privd::testing::FakeIncus;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let me = rustix::process::getuid().as_raw();
+    let gid = rustix::process::getgid().as_raw();
+    let mut cfg = PrivdConfig::for_tests(dir.path(), GatewayIdentity { uid: GW, gid: GW });
+    cfg.expected_link_dir = Some(FileMeta {
+        mode: 0o750,
+        uid: me,
+        gid,
+    });
+    let link = cfg.link_dir.clone();
+    let incus = FakeIncus::new();
+    incus.add_desktop("hx-main", "ubuntu-24.04-xfce-basic", "alice", true);
+    let d = Daemon::new(
+        cfg,
+        incus.client(),
+        Deps {
+            runner: FakeRunner::new(),
+            probe: Arc::new(FakeProbe::default()),
+            clock: Arc::new(hx_agent::privd::clock::ManualClock::new(1_800_000_000)),
+            audit: Arc::new(hx_agent::privd::audit::MemoryAudit::default()),
+        },
+    )
+    .unwrap();
+    d.register_desktop("main").unwrap();
+    let provision = || {
+        d.handle(
+            mk(
+                Command::ProvisionSessionLink(pb::ProvisionSessionLinkRequest {
+                    desktop_id: "main".into(),
+                }),
+                &[],
+            ),
+            ctx(Role::Admin, &[]),
+        )
+    };
+    // Missing directory: fail closed, no device.
+    assert_eq!(err(&provision().await).0, ErrorCode::FailedPrecondition);
+    // Wrong mode.
+    std::fs::create_dir(&link).unwrap();
+    std::fs::set_permissions(&link, std::fs::Permissions::from_mode(0o770)).unwrap();
+    assert_eq!(err(&provision().await).0, ErrorCode::FailedPrecondition);
+    // A symlink to a good directory is not accepted either.
+    std::fs::remove_dir(&link).unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o750)).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert_eq!(err(&provision().await).0, ErrorCode::FailedPrecondition);
+    assert!(incus.with(|s| !s.instances["hx-main"].devices.contains_key("hx-link")));
+    // The right directory: the device is added.
+    std::fs::remove_file(&link).unwrap();
+    std::fs::create_dir(&link).unwrap();
+    std::fs::set_permissions(&link, std::fs::Permissions::from_mode(0o750)).unwrap();
+    ok(provision().await);
+    assert!(incus.with(|s| s.instances["hx-main"].devices.contains_key("hx-link")));
+    // The self-checks report the same directory problems.
+    std::fs::write(
+        dir.path().join("passwd"),
+        format!("hx-gatewayd:x:{GW}:{GW}::/:/usr/sbin/nologin\n"),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("group"), format!("hx-gatewayd:x:{GW}:\n")).unwrap();
+    std::fs::set_permissions(&link, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let v = d.run_self_checks();
+    assert!(v.iter().any(|x| x.0.contains("expected 750")), "{v:?}");
+}

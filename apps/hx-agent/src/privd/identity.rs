@@ -273,6 +273,44 @@ pub fn check_privd_socket(meta: &FileMeta, expected: &FileMeta) -> Option<Violat
     None
 }
 
+/// The link directory must be a real directory (not a symlink) with exactly `expected` owner,
+/// group and mode (ipc.md 3 and 11: `root:hx-gatewayd 0750`, so the gateway can traverse it but
+/// not create, rename or delete a socket in it). `None` when it is as required.
+pub fn link_dir_violation(path: &Path, expected: &FileMeta) -> Option<Violation> {
+    let m = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) => {
+            return Some(Violation(format!(
+                "the link directory {} cannot be examined: {e}",
+                path.display()
+            )));
+        }
+    };
+    if m.file_type().is_symlink() || !m.is_dir() {
+        return Some(Violation(format!(
+            "{} is not a plain directory",
+            path.display()
+        )));
+    }
+    let got = FileMeta {
+        mode: m.mode() & 0o7777,
+        uid: m.uid(),
+        gid: m.gid(),
+    };
+    (got != *expected).then(|| {
+        Violation(format!(
+            "{} is {:o} {}:{}, expected {:o} {}:{}",
+            path.display(),
+            got.mode,
+            got.uid,
+            got.gid,
+            expected.mode,
+            expected.uid,
+            expected.gid
+        ))
+    })
+}
+
 /// The gids of the forbidden groups, from group-file text.
 pub fn forbidden_gids(groups: &[GroupEntry]) -> Vec<u32> {
     groups
@@ -322,6 +360,9 @@ pub fn run_self_checks(cfg: &PrivdConfig) -> Vec<Violation> {
         out.push(Violation(
             "the Incus socket carries a POSIX ACL; remove it (setfacl -b)".into(),
         ));
+    }
+    if let Some(expected) = &cfg.expected_link_dir {
+        out.extend(link_dir_violation(&cfg.link_dir, expected));
     }
     match FileMeta::of(&cfg.socket_path) {
         Ok(m) => out.extend(check_privd_socket(&m, &cfg.expected_socket)),
