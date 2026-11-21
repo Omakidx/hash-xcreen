@@ -876,6 +876,18 @@ fn units_and_credentials(l1: &L1, server_hex: &str) {
         "hx-privd.socket, hx-gatewayd-{admin,public}.socket, incus.socket (active) and hx-host-firewall.service (enabled; it only reloads the ruleset at boot, privd loaded it now); 443 tcp+udp listening",
     );
 
+    // The whole boot transaction, not just our units: an ordering cycle through an hx unit makes
+    // systemd delete a start job at boot (it deleted systemd-tmpfiles-setup.service once).
+    let dt = l1.exec("systemd-analyze verify default.target 2>&1");
+    let cyc: Vec<String> = format!("{}{}", dt.stdout, dt.stderr)
+        .lines()
+        .filter(|l| l.contains("ordering cycle") || l.contains("deleted to break"))
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        cyc.is_empty(),
+        "ordering cycle in the boot transaction: {cyc:?}"
+    );
     let v = l1.exec("systemd-analyze verify /usr/local/lib/systemd/system/hx-privd.service /usr/local/lib/systemd/system/hx-privd.socket /usr/local/lib/systemd/system/hx-gatewayd.service /usr/local/lib/systemd/system/hx-gatewayd-admin.socket /usr/local/lib/systemd/system/hx-gatewayd-public.socket /usr/local/lib/systemd/system/hx-host-firewall.service /usr/local/lib/systemd/system/hx-privd-rescue.service 2>&1");
     let text = format!("{}{}", v.stdout, v.stderr);
     let bad: Vec<&str> = text

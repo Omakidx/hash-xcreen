@@ -55,6 +55,10 @@ units)
     [ "$(systemctl is-enabled hx-host-firewall.service)" = enabled ] || fail "hx-host-firewall.service is not enabled"
     ss -H -ltnu | grep -q ':443 ' || fail "nothing listens on 443"
     [ "$(ss -H -ltnu | grep -c ':443 ')" -ge 2 ] || fail "443 must listen for tcp and udp"
+    # The whole boot transaction: an ordering cycle through an hx unit makes systemd delete a start
+    # job at boot (it once deleted systemd-tmpfiles-setup.service).
+    cyc=$(systemd-analyze verify default.target 2>&1 | grep -E 'ordering cycle|deleted to break' || true)
+    [ -z "$cyc" ] || fail "ordering cycle in the boot transaction: $cyc"
     out=$(systemd-analyze verify /usr/local/lib/systemd/system/hx-privd.service /usr/local/lib/systemd/system/hx-privd.socket \
         /usr/local/lib/systemd/system/hx-gatewayd.service /usr/local/lib/systemd/system/hx-gatewayd-admin.socket \
         /usr/local/lib/systemd/system/hx-gatewayd-public.socket /usr/local/lib/systemd/system/hx-host-firewall.service \

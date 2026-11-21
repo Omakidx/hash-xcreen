@@ -303,6 +303,38 @@ fn the_fetcher_sees_none_of_the_agents_other_state() {
     );
 }
 
+/// Found by the nested-Incus installer run: the mount was `WantedBy=local-fs.target` with default
+/// dependencies (so ordered Before= it) and After= systemd-tmpfiles-setup.service, which is itself
+/// After=local-fs.target. systemd broke that cycle at boot by deleting the start job of
+/// tmpfiles-setup, and no tmpfiles.d entry of the host was applied after a reboot.
+#[test]
+fn the_fetchers_mount_is_not_a_local_fs_mount_so_it_cannot_cycle_with_tmpfiles() {
+    let m = parse(&read("var-lib-hx-updates.mount"));
+    assert_eq!(m["Unit"]["DefaultDependencies"], ["no"]);
+    assert!(
+        m["Unit"]["After"]
+            .iter()
+            .any(|v| v == "systemd-tmpfiles-setup.service"),
+        "the mount point is made by tmpfiles"
+    );
+    let wanted = &m["Install"]["WantedBy"];
+    assert!(
+        !wanted.iter().any(|v| v == "local-fs.target"),
+        "WantedBy=local-fs.target orders the mount before tmpfiles-setup's own dependency: {wanted:?}"
+    );
+    assert!(
+        wanted.iter().any(|v| v == "multi-user.target"),
+        "{wanted:?}"
+    );
+    // Without default dependencies the unit still stops cleanly at shutdown.
+    for key in ["Before", "Conflicts"] {
+        assert!(
+            m["Unit"][key].iter().any(|v| v == "umount.target"),
+            "{key}=umount.target"
+        );
+    }
+}
+
 #[test]
 fn the_fetchers_directory_is_a_size_capped_tmpfs() {
     let m = parse(&read("var-lib-hx-updates.mount"));
