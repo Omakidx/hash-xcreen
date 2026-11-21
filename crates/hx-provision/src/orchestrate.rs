@@ -172,7 +172,7 @@ impl<T: Transport> Executor for IncusExecutor<'_, T> {
                 let path = format!("{WORK_DIR}/{}", unique_name("stdin"));
                 if let Err(e) = self
                     .client
-                    .push_file(&self.instance, &path, secret.expose(), 0o600)
+                    .push_secret_file(&self.instance, &path, secret, 0o600)
                     .await
                 {
                     // The daemon may have stored the file before failing: remove it.

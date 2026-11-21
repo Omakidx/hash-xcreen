@@ -1126,6 +1126,22 @@ impl<T: Transport> Client<T> {
         .await
     }
 
+    /// [`Client::push_file`] for a secret. The request body is held by a zeroizing owner
+    /// (`Bytes::from_owner`), so the one copy this makes is wiped when the body is dropped, instead
+    /// of leaving an ordinary heap copy of the password behind. (The socket and hyper's write
+    /// buffer still see the bytes in transit; that is unavoidable, and why the file is 0600 in a
+    /// 0700 directory and deleted at once.)
+    pub async fn push_secret_file(
+        &self,
+        instance: &str,
+        path: &str,
+        content: &crate::exec::Secret,
+        mode: u32,
+    ) -> Result<(), IncusError> {
+        self.file_request(instance, path, "file", mode, secret_body(content))
+            .await
+    }
+
     /// Create a directory owned by root with `mode` (existing directories are left alone).
     pub async fn push_dir(&self, instance: &str, path: &str, mode: u32) -> Result<(), IncusError> {
         self.file_request(instance, path, "directory", mode, Bytes::new())
@@ -1310,6 +1326,41 @@ impl<T: Transport> Client<T> {
     }
 }
 
+/// Owner of a secret request body: zeroized when the last `Bytes` that refers to it is dropped.
+pub(crate) struct SecretBody(zeroize::Zeroizing<Vec<u8>>);
+
+impl AsRef<[u8]> for SecretBody {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for SecretBody {}
+
+pub(crate) fn secret_body(secret: &crate::exec::Secret) -> Bytes {
+    Bytes::from_owner(SecretBody(zeroize::Zeroizing::new(
+        secret.expose().to_vec(),
+    )))
+}
+
 fn decode<D: serde::de::DeserializeOwned>(what: &str, v: Value) -> Result<D, IncusError> {
     serde_json::from_value(v).map_err(|e| IncusError::Protocol(format!("cannot read {what}: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+
+    #[test]
+    fn a_secret_body_is_zeroized_on_drop_and_carries_the_bytes() {
+        assert_zeroize_on_drop::<SecretBody>();
+        let s = crate::exec::Secret::from_slice(b"user:pw\n");
+        let b = secret_body(&s);
+        assert_eq!(&b[..], b"user:pw\n");
+        // A clone shares the same owner (no second, unwiped copy), and the owner outlives both.
+        let c = b.clone();
+        assert_eq!(b.as_ptr(), c.as_ptr());
+    }
 }
