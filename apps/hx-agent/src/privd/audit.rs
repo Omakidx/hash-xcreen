@@ -9,7 +9,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use hx_ipc::privd::pb::{self, ErrorCode, Role};
@@ -22,17 +22,48 @@ use super::timefmt::rfc3339;
 pub trait AuditSink: Send + Sync {
     /// Appends one line (no trailing newline). Never fails the caller: a write error is logged.
     fn append(&self, line: &str);
+
+    /// Reopens the underlying file (after `logrotate` moved it; the daemon calls it on SIGHUP).
+    fn reopen(&self) {}
 }
 
-/// The append-only file sink.
+/// Default size at which privd rotates the audit file itself (to `audit.log.1`): a Gateway can
+/// make privd write lines, so the file must never grow without bound.
+pub const DEFAULT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+struct Current {
+    file: File,
+    written: u64,
+}
+
+/// The append-only file sink. It rotates itself once at `max_bytes` (one backup, `<path>.1`) and
+/// reopens `path` on [`AuditSink::reopen`] (SIGHUP, from the shipped logrotate snippet).
 pub struct FileAudit {
-    file: Mutex<File>,
+    path: PathBuf,
+    max_bytes: u64,
+    cur: Mutex<Current>,
+}
+
+fn open_file(path: &Path) -> io::Result<Current> {
+    let file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o640)
+        .custom_flags(OFlags::NOFOLLOW.bits() as i32)
+        .open(path)?;
+    let written = file.metadata()?.len();
+    Ok(Current { file, written })
 }
 
 impl FileAudit {
     /// Opens `path` for append (creating it 0640; the directory 0750). A symlink at the path is
     /// refused.
     pub fn open(path: &Path) -> io::Result<Self> {
+        Self::open_with_max(path, DEFAULT_MAX_BYTES)
+    }
+
+    /// [`FileAudit::open`] with another rotation size.
+    pub fn open_with_max(path: &Path, max_bytes: u64) -> io::Result<Self> {
         if let Some(dir) = path.parent() {
             use std::os::unix::fs::DirBuilderExt;
             std::fs::DirBuilder::new()
@@ -40,27 +71,43 @@ impl FileAudit {
                 .mode(0o750)
                 .create(dir)?;
         }
-        let file = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .mode(0o640)
-            .custom_flags(OFlags::NOFOLLOW.bits() as i32)
-            .open(path)?;
         Ok(Self {
-            file: Mutex::new(file),
+            path: path.to_path_buf(),
+            max_bytes,
+            cur: Mutex::new(open_file(path)?),
         })
     }
 }
 
 impl AuditSink for FileAudit {
     fn append(&self, line: &str) {
-        let Ok(mut f) = self.file.lock() else { return };
+        let Ok(mut cur) = self.cur.lock() else { return };
         let mut buf = String::with_capacity(line.len() + 1);
         buf.push_str(line);
         buf.push('\n');
+        if cur.written + buf.len() as u64 > self.max_bytes {
+            let mut backup = self.path.clone().into_os_string();
+            backup.push(".1");
+            // Replace the single backup; if anything fails keep writing to the current file
+            // (losing the cap beats losing the log).
+            if std::fs::rename(&self.path, &backup).is_ok()
+                && let Ok(fresh) = open_file(&self.path)
+            {
+                *cur = fresh;
+            }
+        }
         // One write call per line, so lines from different connections never interleave.
-        if let Err(e) = f.write_all(buf.as_bytes()) {
-            super::log::error(&format!("cannot write the audit log: {e}"));
+        match cur.file.write_all(buf.as_bytes()) {
+            Ok(()) => cur.written += buf.len() as u64,
+            Err(e) => super::log::error(&format!("cannot write the audit log: {e}")),
+        }
+    }
+
+    fn reopen(&self) {
+        let Ok(mut cur) = self.cur.lock() else { return };
+        match open_file(&self.path) {
+            Ok(fresh) => *cur = fresh,
+            Err(e) => super::log::error(&format!("cannot reopen the audit log: {e}")),
         }
     }
 }
@@ -226,6 +273,26 @@ mod tests {
         // The hostile text stays inside the quoted label, with its quote neutralised.
         assert!(l.contains("label=\"x_"));
         assert!(l.contains("event=DEVICE_ADDED device=abababab"));
+    }
+
+    #[test]
+    fn the_file_sink_rotates_at_its_cap_and_reopens_after_an_external_rotation() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("audit.log");
+        let a = FileAudit::open_with_max(&p, 100).unwrap();
+        for i in 0..50 {
+            a.append(&format!("line {i:04}"));
+        }
+        let main = std::fs::metadata(&p).unwrap().len();
+        let backup = std::fs::metadata(d.path().join("audit.log.1"))
+            .unwrap()
+            .len();
+        assert!(main <= 100 && backup <= 100, "{main} {backup}");
+        // logrotate moves the file; SIGHUP makes privd write to a fresh one.
+        std::fs::rename(&p, d.path().join("moved")).unwrap();
+        a.reopen();
+        a.append("after");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "after\n");
     }
 
     #[test]

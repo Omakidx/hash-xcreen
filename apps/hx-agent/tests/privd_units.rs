@@ -214,3 +214,12 @@ fn the_docker_user_unit_applies_the_rules_privd_applies() {
     }
     assert!(words(&u, "Unit", "After").contains(&"docker.service".to_string()));
 }
+
+#[test]
+fn m2_the_audit_log_is_rotated_with_a_sighup_to_privd() {
+    let text = read("logrotate.d/hx-audit");
+    assert!(text.contains(AUDIT_LOG));
+    assert!(text.contains("create 0640 root root"));
+    assert!(text.contains("postrotate"));
+    assert!(text.contains("--signal=HUP hx-privd.service"));
+}

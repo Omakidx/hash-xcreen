@@ -2075,3 +2075,66 @@ async fn a_gateway_setup_host_keeps_the_admins_extra_addresses_and_private_netwo
         "private networks stay allowed"
     );
 }
+
+#[tokio::test]
+async fn m2_a_gateway_flood_of_reads_is_limited_and_the_audit_log_stays_bounded() {
+    let runner = FakeRunner::new();
+    let h = Harness::start_with(GW, FakeProbe::default(), FakeIncus::new(), runner.clone());
+    make_ready(&h).await;
+    let before = h.audit.lines().len();
+    let mut exhausted = 0;
+    for _ in 0..10_000 {
+        let r = run(
+            &h,
+            Role::Gateway,
+            Command::GetDesktop(pb::GetDesktopRequest {
+                desktop_id: "main".into(),
+            }),
+        )
+        .await;
+        if code_is(&r, ErrorCode::ResourceExhausted) {
+            exhausted += 1;
+        }
+    }
+    let lines = h.audit.lines().len() - before;
+    assert!(exhausted >= 9_900, "{exhausted} limited");
+    assert!(lines < 100, "{lines} audit lines for 10 000 requests");
+    // The suppressed refusals are summarised, not lost silently.
+    h.clock.advance_secs(2);
+    let _ = run(&h, Role::Gateway, Command::BeginSetup(Default::default())).await;
+    assert!(
+        h.audit
+            .lines()
+            .iter()
+            .any(|l| l.contains("refusals suppressed"))
+    );
+    // Admin is not subject to the Gateway windows.
+    for _ in 0..100 {
+        let r = run(
+            &h,
+            Role::Admin,
+            Command::GetDesktop(pb::GetDesktopRequest {
+                desktop_id: "main".into(),
+            }),
+        )
+        .await;
+        assert_ne!(code(&r), ErrorCode::ResourceExhausted);
+    }
+}
+
+fn code_is(r: &pb::Response, c: ErrorCode) -> bool {
+    error_of(r).is_some_and(|e| e.code() == c)
+}
+
+#[tokio::test]
+async fn m2_get_host_info_forks_iptables_and_nft_at_most_once_every_five_seconds() {
+    let runner = FakeRunner::new();
+    let h = Harness::start_with(GW, FakeProbe::default(), FakeIncus::new(), runner.clone());
+    for _ in 0..10 {
+        ok(run(&h, Role::Admin, Command::GetHostInfo(Default::default())).await);
+    }
+    assert_eq!(runner.calls().len(), 2);
+    h.clock.advance_secs(6);
+    ok(run(&h, Role::Admin, Command::GetHostInfo(Default::default())).await);
+    assert_eq!(runner.calls().len(), 4);
+}

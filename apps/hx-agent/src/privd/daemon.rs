@@ -152,6 +152,10 @@ pub struct Daemon<T: Transport + Clone + 'static> {
     pub(crate) locks: Locks,
     pub(crate) catalog: Catalog,
     conns: Arc<ConnCounter>,
+    /// Refusals not written to the audit log since the last line that was.
+    suppressed: std::sync::atomic::AtomicU64,
+    /// `(unix ms, docker_on_host, host_firewall_loaded)` of the last host probe.
+    pub(crate) host_probe: Mutex<Option<(u64, bool, bool)>>,
 }
 
 impl Daemon<UnixTransport> {
@@ -211,6 +215,8 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
             locks: Locks::new(),
             catalog,
             conns: Arc::new(ConnCounter::default()),
+            suppressed: std::sync::atomic::AtomicU64::new(0),
+            host_probe: Mutex::new(None),
         }))
     }
 
@@ -487,33 +493,40 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
         let info = command_info(cmd);
         let desktop = auth::desktop_of(cmd).map(str::to_string);
         let result = self.admit_and_run(&req, cmd, &mut ctx).await;
-        let outcome = audit::outcome_name(result.as_ref().err().map(|e| e.code));
-        self.audit.append(&audit::request_line(
-            self.now(),
-            &RequestRecord {
-                request_id,
-                role: ctx.role,
-                peer_uid: ctx.peer.uid,
-                peer_pid: ctx.peer.pid,
-                command: info.name,
-                desktop_id: desktop.as_deref(),
-                outcome,
-                duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            },
-        ));
+        let refusal = result.as_ref().err().is_some_and(|e| {
+            matches!(
+                e.code,
+                ErrorCode::PermissionDenied
+                    | ErrorCode::InvalidArgument
+                    | ErrorCode::ResourceExhausted
+                    | ErrorCode::FailedPrecondition
+            )
+        });
+        // A Gateway that keeps provoking refusals must not be able to grow the audit log or the
+        // journal at will: at most 5 refusal lines a second, the rest are counted and summarised.
+        if self.audit_slot(ctx.role, refusal) {
+            let outcome = audit::outcome_name(result.as_ref().err().map(|e| e.code));
+            self.audit.append(&audit::request_line(
+                self.now(),
+                &RequestRecord {
+                    request_id,
+                    role: ctx.role,
+                    peer_uid: ctx.peer.uid,
+                    peer_pid: ctx.peer.pid,
+                    command: info.name,
+                    desktop_id: desktop.as_deref(),
+                    outcome,
+                    duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                },
+            ));
+        }
         match result {
             Ok(r) => pb::Response {
                 request_id,
                 result: Some(r),
             },
             Err(e) => {
-                if matches!(
-                    e.code,
-                    ErrorCode::PermissionDenied
-                        | ErrorCode::InvalidArgument
-                        | ErrorCode::ResourceExhausted
-                        | ErrorCode::FailedPrecondition
-                ) {
+                if refusal && self.last_refusal_logged(ctx.role) {
                     // Refusals are visible at warning level: a compromised gatewayd probing the
                     // command set must show up (ipc.md 8).
                     log::warn(&format!(
@@ -529,6 +542,53 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
         }
     }
 
+    /// Whether a request's audit line is written. Only refusals of a Gateway are limited (5 a
+    /// second); when a line is written after some were suppressed, a notice says how many.
+    fn audit_slot(&self, role: Role, refusal: bool) -> bool {
+        if role != Role::Gateway || !refusal {
+            return true;
+        }
+        if lock(&self.limiter).admit("audit:refusal", 1000, 5).is_err() {
+            self.suppressed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+        let n = self
+            .suppressed
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
+        if n > 0 {
+            self.audit_notice(&format!("{n} refusals suppressed"));
+        }
+        true
+    }
+
+    /// Same limit for the warning line on stderr (shares the bucket's verdict loosely: it only
+    /// logs when the refusal bucket still has room).
+    fn last_refusal_logged(&self, role: Role) -> bool {
+        role != Role::Gateway || lock(&self.limiter).admit("log:refusal", 1000, 5).is_ok()
+    }
+
+    /// Admission of an invalid request from a connection (the server's reject path): a Gateway
+    /// gets 20 a second, the excess is answered `RESOURCE_EXHAUSTED` and not audited.
+    pub fn admit_reject(&self, role: Role) -> bool {
+        if role != Role::Gateway {
+            return true;
+        }
+        let ok = lock(&self.limiter)
+            .admit("gateway:reject", 1000, 20)
+            .is_ok();
+        if !ok {
+            self.suppressed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        ok
+    }
+
+    /// Reopens the audit file (SIGHUP, after `logrotate`).
+    pub fn reopen_audit(&self) {
+        self.audit.reopen();
+    }
+
     async fn admit_and_run(
         &self,
         req: &pb::Request,
@@ -536,6 +596,12 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
         ctx: &mut Ctx,
     ) -> Result<Reply, CmdError> {
         let info = command_info(cmd);
+        // Reads cost host work (Incus calls, forks): a Gateway gets 20 a second.
+        if ctx.role == Role::Gateway && info.class == hx_ipc::privd::CommandClass::R {
+            lock(&self.limiter)
+                .admit("gateway:read", 1000, 20)
+                .map_err(|ms| CmdError::exhausted("too many read requests per second", ms))?;
+        }
         let phase = self.phase();
         auth::authorize(ctx.role, req, phase)?;
         if info.reserved {

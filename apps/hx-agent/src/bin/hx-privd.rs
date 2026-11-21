@@ -57,6 +57,19 @@ fn main() -> ExitCode {
         if !violations.is_empty() {
             return fail("the host account policy self-checks failed; refusing to start");
         }
+        // logrotate sends SIGHUP after moving the audit log: reopen it.
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            if let Ok(mut hup) = signal(SignalKind::hangup()) {
+                let d = daemon.clone();
+                tokio::spawn(async move {
+                    while hup.recv().await.is_some() {
+                        d.reopen_audit();
+                        log::info("audit log reopened");
+                    }
+                });
+            }
+        }
         let shutdown = async {
             use tokio::signal::unix::{SignalKind, signal};
             let (Ok(mut term), Ok(mut int)) = (

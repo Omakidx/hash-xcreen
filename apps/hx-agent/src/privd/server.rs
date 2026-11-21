@@ -413,12 +413,19 @@ impl<T: Transport + Clone + 'static> Conn<T> {
     /// frames it announced (zeroized on drop), so the stream stays in sync. More than the
     /// contract's maximum of announced slots, or anything but secret frames, closes the connection.
     async fn reject(&mut self, request_id: u64, secrets: usize, what: &str) -> Result<(), String> {
-        let e = CmdError::invalid(format!("invalid request: {what}"));
+        let admitted = self.d.admit_reject(self.role);
+        let e = if admitted {
+            CmdError::invalid(format!("invalid request: {what}"))
+        } else {
+            CmdError::exhausted("too many invalid requests per second", 1000)
+        };
         send_error(&self.stream, request_id, &e)
             .await
             .map_err(|()| "cannot send an error".to_string())?;
-        self.d
-            .audit_notice(&format!("a request failed validation: {what}"));
+        if admitted {
+            self.d
+                .audit_notice(&format!("a request failed validation: {what}"));
+        }
         if secrets > privd::MAX_SECRET_SLOTS {
             return Err("too many secret slots announced".into());
         }
