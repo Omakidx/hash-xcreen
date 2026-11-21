@@ -420,7 +420,7 @@ async fn locked_sets_the_verifiers_wait_and_attempts_during_it_are_not_counted()
     // Parallel attempts during the wait: BACKOFF with what is left, never verified, never
     // counted, never revoking.
     e.clock.advance(Duration::from_secs(2));
-    let mut conns = vec![e.open().await, e.open().await, e.open().await];
+    let mut conns = [e.open().await, e.open().await, e.open().await];
     let replies = within(join_all(
         conns
             .iter_mut()
