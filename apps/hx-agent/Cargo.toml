@@ -12,11 +12,29 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+argon2 = "0.6.0"
+bytes.workspace = true
+getrandom = "0.4"
 hx-crypto.workspace = true
 hx-ipc = { workspace = true, features = ["privd", "link"] }
 hx-proto.workspace = true
 hx-provision.workspace = true
 hx-transport.workspace = true
+libc = "0.2"
+listenfd = "1.0.2"
+rustix = { workspace = true, features = ["fs", "mm", "process", "net"] }
+seccompiler = "0.5"
+serde = { version = "1", features = ["derive"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "signal"] }
+toml = "0.8"
 tracing.workspace = true
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
+zeroize.workspace = true
+
+[dev-dependencies]
+hmac = "0.12"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+sha2 = "0.10"
+tempfile = "3.27.0"
