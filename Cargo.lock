@@ -736,14 +736,17 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "bytes",
+ "crossbeam-channel",
  "getrandom 0.4.3",
  "hkdf",
  "hmac",
  "hx-agent",
+ "hx-capture",
  "hx-crypto",
  "hx-ipc",
  "hx-proto",
  "hx-provision",
+ "hx-session",
  "hx-transport",
  "hyper",
  "libc",
@@ -763,6 +766,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "x11rb",
  "zeroize",
 ]
 
@@ -868,9 +872,11 @@ dependencies = [
 name = "hx-session"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "crossbeam-channel",
  "hx-capture",
  "hx-codec",
+ "hx-ipc",
  "hx-proto",
  "rustix",
  "thiserror",

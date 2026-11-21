@@ -18,6 +18,7 @@ hx-proto = { path = "crates/hx-proto", version = "0.1.0" }
 hx-crypto = { path = "crates/hx-crypto", version = "0.1.0" }
 hx-ipc = { path = "crates/hx-ipc", version = "0.1.0", default-features = false }
 hx-provision = { path = "crates/hx-provision", version = "0.1.0" }
+hx-session = { path = "apps/hx-session", version = "0.1.0" }
 hx-transport = { path = "crates/hx-transport", version = "0.1.0" }
 bytes = "1"
 crossbeam-channel = "0.5"

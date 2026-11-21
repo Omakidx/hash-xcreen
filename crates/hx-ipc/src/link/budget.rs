@@ -4,10 +4,18 @@
 //! sleeps or reads a socket.
 //!
 //! **Byte budget (section 13).** A token bucket per lane and direction: sustained rate, burst of
-//! two seconds. The reader asks [`ByteBudget::allowance`] before it reads and reads at most that
-//! many bytes; at zero it stops reading, so the kernel buffer fills and the session's writes
-//! block (backpressure) rather than the gateway reading and discarding. A lane whose bucket stays
-//! empty for three consecutive seconds **while the session still has data to send** is a
+//! two seconds. The reader asks [`ByteBudget::allowance`] before it reads a frame; at zero it
+//! stops reading, so the kernel buffer fills and the session's writes block (backpressure)
+//! rather than the gateway reading and discarding.
+//!
+//! **Debt is never forgiven.** A frame is read whole, and its size is charged afterwards with
+//! [`ByteBudget::consume`]; the bucket may go **negative** (at most by one frame), and reading
+//! waits until refills have paid the debt off. A bucket that saturated at zero instead would let
+//! a peer sending frames larger than the bucket run at line speed (measured: about 1 GiB/s
+//! against a 16 MiB/s budget; docs/ipc.md review M2).
+//!
+//! A lane whose bucket stays empty (at or below zero, never recovering above a quarter of the
+//! burst) for three consecutive seconds **while the session still has data to send** is a
 //! violation ([`ByteBudget::violated`]); a pause caused by downstream flow control is not, which
 //! is why the caller reports whether the peer has pending data ([`ByteBudget::note_pending`]).
 
@@ -45,7 +53,8 @@ pub const STARVATION_LIMIT: Duration = Duration::from_secs(3);
 pub struct ByteBudget {
     rate: u64,
     burst: u64,
-    tokens: u64,
+    /// Signed: negative is debt from a frame that was larger than what was left.
+    tokens: i64,
     last: Instant,
     starved_since: Option<Instant>,
 }
@@ -58,7 +67,7 @@ impl ByteBudget {
         Self {
             rate,
             burst,
-            tokens: burst,
+            tokens: i64::try_from(burst).unwrap_or(i64::MAX),
             last: now,
             starved_since: None,
         }
@@ -77,35 +86,51 @@ impl ByteBudget {
             return;
         }
         let add = u64::try_from(add).unwrap_or(u64::MAX);
-        self.tokens = self.tokens.saturating_add(add).min(self.burst);
+        let cap = i64::try_from(self.burst).unwrap_or(i64::MAX);
+        self.tokens = self
+            .tokens
+            .saturating_add(i64::try_from(add).unwrap_or(i64::MAX))
+            .min(cap);
         // Advance only by the time those bytes account for, so fractions are not lost.
         let used_ns = u128::from(add) * 1_000_000_000 / u128::from(self.rate);
         self.last += Duration::from_nanos(u64::try_from(used_ns).unwrap_or(u64::MAX));
-        if self.tokens == self.burst {
+        if self.tokens >= i64::try_from(self.burst).unwrap_or(i64::MAX) {
             self.last = now;
         }
     }
 
-    /// How many bytes may be read now. Zero means stop reading this lane.
+    /// How many bytes may be read now. Zero means stop reading this lane (the bucket is empty
+    /// or in debt).
     pub fn allowance(&mut self, now: Instant) -> u64 {
         self.refill(now);
-        self.tokens
+        u64::try_from(self.tokens).unwrap_or(0)
     }
 
-    /// Records `n` bytes read (saturating at zero tokens).
+    /// Records `n` bytes read. The bucket goes negative when `n` exceeds what was left: the debt
+    /// is paid by later refills before anything more may be read.
     pub fn consume(&mut self, n: u64, now: Instant) {
         self.refill(now);
-        self.tokens = self.tokens.saturating_sub(n);
+        self.tokens = self
+            .tokens
+            .saturating_sub(i64::try_from(n).unwrap_or(i64::MAX));
+    }
+
+    /// Bytes of debt (zero when the bucket is not negative).
+    pub fn debt(&self) -> u64 {
+        u64::try_from(self.tokens.saturating_neg()).unwrap_or(0)
     }
 
     /// Reports, once per loop turn, whether the peer still has data waiting (the socket is
-    /// readable). Starvation starts counting when the bucket is empty and the peer has data;
-    /// it resets as soon as either stops being true.
+    /// readable). Starvation starts counting when the bucket is empty (zero or in debt) and the
+    /// peer has data. It resets when the peer has nothing pending, or when the bucket has
+    /// recovered above a quarter of the burst. Merely touching zero between two frames does not
+    /// reset it, or a peer that always has the next frame ready would never be flagged.
     pub fn note_pending(&mut self, peer_has_data: bool, now: Instant) {
         self.refill(now);
-        if self.tokens == 0 && peer_has_data {
+        let healthy = self.tokens > i64::try_from(self.burst / 4).unwrap_or(i64::MAX);
+        if self.tokens <= 0 && peer_has_data {
             self.starved_since.get_or_insert(now);
-        } else {
+        } else if !peer_has_data || healthy {
             self.starved_since = None;
         }
     }
@@ -254,7 +279,8 @@ mod tests {
         let mut total = 0;
         for i in 1..=10 {
             total += b.allowance(at(t0, i * 100));
-            b.consume(b.tokens, at(t0, i * 100));
+            let n = b.allowance(at(t0, i * 100));
+            b.consume(n, at(t0, i * 100));
         }
         assert_eq!(total, 3, "ten 100 ms steps are one second of 3 B/s");
     }
@@ -303,6 +329,69 @@ mod tests {
         assert!(!b.violated(at(t0, 4_000)), "only 2.8 s since the restart");
         drain(&mut b, at(t0, 4_200), true);
         assert!(b.violated(at(t0, 4_200)));
+    }
+
+    /// The reviewer's simulation (docs/ipc.md review M2): a reader that checks the allowance at a
+    /// frame boundary, reads a whole frame, and charges it afterwards.
+    fn flood(rate: u64, frame: u64, secs: u64) -> (u64, bool) {
+        let t0 = Instant::now();
+        let mut now = t0;
+        let mut b = ByteBudget::new(rate, now);
+        let (mut bytes, mut violated) = (0u64, false);
+        while now < t0 + Duration::from_secs(secs) {
+            if b.allowance(now) == 0 {
+                b.note_pending(true, now);
+                if b.violated(now) {
+                    violated = true;
+                    break;
+                }
+                now += Duration::from_millis(10);
+                continue;
+            }
+            b.note_pending(true, now);
+            b.consume(frame + 5, now);
+            // The kernel hands over the next frame at once: it is already waiting.
+            b.note_pending(true, now);
+            bytes += frame + 5;
+        }
+        (bytes, violated)
+    }
+
+    #[test]
+    fn debt_is_not_forgiven_so_large_frames_cannot_outrun_the_budget() {
+        let t0 = Instant::now();
+        let mut b = ByteBudget::new(1_000, t0);
+        b.consume(2_000, t0);
+        // A frame four times what was left: the bucket goes into debt and stays at zero
+        // allowance until refills have paid it.
+        b.consume(4_000, t0);
+        assert_eq!(b.debt(), 4_000);
+        assert_eq!(b.allowance(at(t0, 3_900)), 0);
+        assert_eq!(b.allowance(at(t0, 4_000)), 0);
+        assert!(b.allowance(at(t0, 4_500)) > 0);
+        assert_eq!(b.debt(), 0);
+
+        // 4 MiB frames against the 16 MiB/s media budget: at most the budget plus the burst
+        // plus one frame passes, not line speed. (Unfixed: about 1 GiB/s.)
+        let rate = lane_rate(Role::Gateway, Lane::Media).unwrap();
+        let (bytes, violated) = flood(rate, 4 * MIB, 2);
+        assert!(bytes <= rate * (2 + 2) + 4 * MIB + 5, "{bytes}");
+        assert!(
+            !violated,
+            "two seconds are within the three-second tolerance"
+        );
+        let (bytes, violated) = flood(rate, 4 * MIB, 10);
+        // The starvation rule still fires as specified: a peer that always has the next frame
+        // ready is flagged after three seconds of an empty bucket.
+        assert!(violated, "sustained full speed must be a violation");
+        assert!(bytes <= rate * (2 + 6) + 4 * MIB, "{bytes}");
+        // The same for the small-frame lanes.
+        for lane in [Lane::Ctl, Lane::Bulk] {
+            let rate = lane_rate(Role::Gateway, lane).unwrap();
+            let (bytes, violated) = flood(rate, 64 * 1024, 10);
+            assert!(violated, "{lane:?}");
+            assert!(bytes <= rate * 9 + 64 * 1024, "{lane:?} {bytes}");
+        }
     }
 
     #[test]
