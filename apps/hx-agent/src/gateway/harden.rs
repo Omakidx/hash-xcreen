@@ -188,6 +188,9 @@ fn plain() -> Vec<(i64, &'static str)> {
         SYS_poll,
         SYS_access,
         SYS_getrlimit,
+        // std and glibc call `rename` and `unlink` directly here (the registry's atomic write).
+        SYS_rename,
+        SYS_unlink,
     ]);
     #[cfg(not(target_arch = "x86_64"))]
     v.extend(syscalls![SYS_getrlimit]);
@@ -221,7 +224,12 @@ pub fn build_filter(mode: SeccompMode) -> Result<BpfProgram, HardenError> {
     const FIONCLEX: u64 = 0x5450;
     rules.insert(
         libc::SYS_ioctl,
-        vec![eq(1, FIONBIO)?, eq(1, FIONREAD)?, eq(1, FIOCLEX)?, eq(1, FIONCLEX)?],
+        vec![
+            eq(1, FIONBIO)?,
+            eq(1, FIONREAD)?,
+            eq(1, FIOCLEX)?,
+            eq(1, FIONCLEX)?,
+        ],
     );
     // socket: only the three families the unit's RestrictAddressFamilies allows.
     rules.insert(
@@ -250,8 +258,7 @@ pub fn build_filter(mode: SeccompMode) -> Result<BpfProgram, HardenError> {
 /// Installs the allowlist on every thread of the process (`TSYNC`). Irreversible.
 pub fn install_seccomp(mode: SeccompMode) -> Result<(), HardenError> {
     let program = build_filter(mode)?;
-    seccompiler::apply_filter_all_threads(&program)
-        .map_err(|e| HardenError::Seccomp(e.to_string()))
+    seccompiler::apply_filter_all_threads(&program).map_err(|e| HardenError::Seccomp(e.to_string()))
 }
 
 #[cfg(test)]
@@ -277,7 +284,10 @@ mod tests {
             "SYS_unshare",
             "SYS_process_vm_readv",
         ] {
-            assert!(!names.contains(&forbidden), "{forbidden} must not be allowed");
+            assert!(
+                !names.contains(&forbidden),
+                "{forbidden} must not be allowed"
+            );
         }
         let mut sorted = names.clone();
         sorted.dedup();

@@ -80,6 +80,8 @@ pub struct EnvOptions {
     pub takeover_deny: bool,
     pub admin_policy: AdminPolicy,
     pub manage_idle_s: u64,
+    pub max_file_bytes: Option<u64>,
+    pub link_unavailable: bool,
 }
 
 impl Default for EnvOptions {
@@ -88,6 +90,8 @@ impl Default for EnvOptions {
             takeover_deny: false,
             admin_policy: AdminPolicy::OnlyUid(my_uid()),
             manage_idle_s: 300,
+            max_file_bytes: None,
+            link_unavailable: false,
         }
     }
 }
@@ -106,8 +110,11 @@ impl Env {
         let privd = FakePrivd::start(dir.path());
         let mut config = GatewayConfig::with_listen("127.0.0.1:0".parse().unwrap(), state);
         config.privd_socket = privd.path.clone();
-        config.argon2_min_memory_kib = 8;
+        config.argon2_min_memory_kib = 32;
         config.manage_idle_s = o.manage_idle_s;
+        if let Some(m) = o.max_file_bytes {
+            config.max_file_bytes = m;
+        }
         if o.takeover_deny {
             config.takeover = hx_agent::gateway::takeover::TakeoverPolicy::Deny;
         }
@@ -116,6 +123,7 @@ impl Env {
         let server_key = new_key();
         let clock = Arc::new(ManualClock::new());
         let link = Arc::new(RecordingLink::default());
+        *link.unavailable.lock().unwrap() = o.link_unavailable;
         let mut opts = StartOptions::new(config, server_key.clone(), link.clone());
         opts.admin_listener = Some(admin::bind(&admin_path).expect("admin socket"));
         opts.admin_policy = o.admin_policy;
@@ -150,11 +158,22 @@ impl Env {
 
     /// Pairs `device` using a fresh token from the authenticator.
     pub async fn pair(&self, device: &Arc<IdentityKey>, name: &str) {
-        self.pair_with(device, name, TransportPreference::Quic).await
+        self.pair_with(device, name, TransportPreference::Quic)
+            .await
     }
 
-    pub async fn pair_with(&self, device: &Arc<IdentityKey>, name: &str, pref: TransportPreference) {
-        let token = self.gw.authenticator().pairing().issue_token().expect("token");
+    pub async fn pair_with(
+        &self,
+        device: &Arc<IdentityKey>,
+        name: &str,
+        pref: TransportPreference,
+    ) {
+        let token = self
+            .gw
+            .authenticator()
+            .pairing()
+            .issue_token()
+            .expect("token");
         let cred = PairingCredential::parse(&token.to_text()).expect("parse");
         let paired = within(pair_device(
             &self.target(pref),
@@ -199,7 +218,8 @@ impl Env {
 
     /// Connects `device` and submits `pin`: the authorized connection.
     pub async fn login(&self, device: &Arc<IdentityKey>, name: &str, pin: &str) -> Connection {
-        self.login_with(device, name, pin, TransportPreference::Quic).await
+        self.login_with(device, name, pin, TransportPreference::Quic)
+            .await
     }
 
     pub async fn login_with(
@@ -254,10 +274,7 @@ pub fn ctl(m: Ctl) -> ControlMessage {
 }
 
 /// Receives control messages until one matches `pick`, within the global wait.
-pub async fn recv_until<T>(
-    conn: &Connection,
-    mut pick: impl FnMut(&Ctl) -> Option<T>,
-) -> T {
+pub async fn recv_until<T>(conn: &Connection, mut pick: impl FnMut(&Ctl) -> Option<T>) -> T {
     within(async {
         loop {
             let m = conn.recv_control().await.expect("control message");
@@ -275,7 +292,7 @@ pub async fn recv_until<T>(
 pub struct AdminClient {
     stream: UnixStream,
     decoder: Decoder<PrivdPolicy>,
-    next_id: u64,
+    pub next_id: u64,
 }
 
 impl AdminClient {
@@ -304,10 +321,21 @@ impl AdminClient {
 
     async fn write(&mut self, f: &apb::Frame) -> Result<(), String> {
         let bytes = ipc_admin::encode_message(f, Side::Server).map_err(|e| e.to_string())?;
-        self.stream.write_all(&bytes).await.map_err(|e| e.to_string())
+        self.stream
+            .write_all(&bytes)
+            .await
+            .map_err(|e| e.to_string())
     }
 
-    async fn read(&mut self) -> Result<Incoming, String> {
+    /// Writes bytes as they are (to send what the validating encoder would refuse).
+    pub async fn send_raw(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.stream
+            .write_all(bytes)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    pub async fn read(&mut self) -> Result<Incoming, String> {
         let mut buf = [0u8; 4096];
         loop {
             let n = tokio::time::timeout(WAIT, self.stream.read(&mut buf))
@@ -356,7 +384,10 @@ impl AdminClient {
         self.write(&req).await?;
         if let Some(s) = secret {
             let framed = privd::encode_secret(id, 0, s).map_err(|e| e.to_string())?;
-            self.stream.write_all(&framed).await.map_err(|e| e.to_string())?;
+            self.stream
+                .write_all(&framed)
+                .await
+                .map_err(|e| e.to_string())?;
         }
         match self.read().await? {
             Incoming::Message(apb::Frame {
@@ -380,13 +411,21 @@ pub struct RawClient {
 }
 
 impl RawClient {
-    pub async fn connect(addr: std::net::SocketAddr, device: &Arc<IdentityKey>, server: PublicKey) -> Self {
+    pub async fn connect(
+        addr: std::net::SocketAddr,
+        device: &Arc<IdentityKey>,
+        server: PublicKey,
+    ) -> Self {
         let mut tls = (*tls::client_config_session(device, server).expect("tls")).clone();
         tls.alpn_protocols = vec![b"hx/1".to_vec()];
         let q = quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("quic tls");
         let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("endpoint");
         ep.set_default_client_config(quinn::ClientConfig::new(Arc::new(q)));
-        let conn = ep.connect(addr, "hx.invalid").expect("connect").await.expect("handshake");
+        let conn = ep
+            .connect(addr, "hx.invalid")
+            .expect("connect")
+            .await
+            .expect("handshake");
         let (send, recv) = conn.open_bi().await.expect("control stream");
         Self {
             _endpoint: ep,

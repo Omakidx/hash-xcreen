@@ -107,7 +107,12 @@ impl FakePrivd {
         let refuse = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let conn_ids = Arc::new(AtomicU64::new(0));
-        let (st, rf, sp, ids) = (state.clone(), refuse.clone(), stop.clone(), conn_ids.clone());
+        let (st, rf, sp, ids) = (
+            state.clone(),
+            refuse.clone(),
+            stop.clone(),
+            conn_ids.clone(),
+        );
         std::thread::spawn(move || {
             while !sp.load(Ordering::Relaxed) {
                 match listener.accept() {
@@ -167,13 +172,14 @@ impl FakePrivd {
         f(&mut self.state.lock().unwrap())
     }
 
-    /// Waits until `pred` holds on the state (events are recorded in the background).
-    pub fn wait_for(&self, pred: impl Fn(&State) -> bool) -> bool {
+    /// Waits until `pred` holds on the state (events are recorded in the background). Async so
+    /// that a current-thread test runtime keeps running the gateway's tasks meanwhile.
+    pub async fn wait_for(&self, pred: impl Fn(&State) -> bool) -> bool {
         for _ in 0..200 {
             if pred(&self.state.lock().unwrap()) {
                 return true;
             }
-            std::thread::sleep(Duration::from_millis(25));
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
         false
     }
@@ -203,7 +209,13 @@ fn send_with_fd(stream: &UnixStream, frame: pb::Frame) {
     let mut space = [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(1))];
     let mut anc = SendAncillaryBuffer::new(&mut space);
     assert!(anc.push(SendAncillaryMessage::ScmRights(&fds)));
-    sendmsg(stream, &[std::io::IoSlice::new(&bytes)], &mut anc, SendFlags::empty()).unwrap();
+    sendmsg(
+        stream,
+        &[std::io::IoSlice::new(&bytes)],
+        &mut anc,
+        SendFlags::empty(),
+    )
+    .unwrap();
 }
 
 fn error(code: pb::ErrorCode, detail: pb::ErrorDetail, retryable: bool) -> pb::response::Result {
@@ -246,7 +258,8 @@ fn serve(mut stream: UnixStream, state: Arc<Mutex<State>>, conn: u32) {
     }
     loop {
         stream.set_read_timeout(Some(Duration::from_secs(600))).ok();
-        let Some(Incoming::Message(pb::Frame { frame: Some(f) })) = next_idle(&mut decoder, &stream)
+        let Some(Incoming::Message(pb::Frame { frame: Some(f) })) =
+            next_idle(&mut decoder, &stream)
         else {
             return;
         };
@@ -283,7 +296,9 @@ fn serve(mut stream: UnixStream, state: Arc<Mutex<State>>, conn: u32) {
                 }
             }
         }
-        let Some(cmd) = req.command.clone() else { return };
+        let Some(cmd) = req.command.clone() else {
+            return;
+        };
         let name = privd::command_info(&cmd).name.to_string();
         {
             let mut s = state.lock().unwrap();
@@ -326,7 +341,11 @@ fn serve(mut stream: UnixStream, state: Arc<Mutex<State>>, conn: u32) {
             }
             C::PepperEnrol(r) => {
                 let pepper = state.lock().unwrap().pepper;
-                let m = mac(&pepper, r.purpose, secrets.first().map(|v| &v[..]).unwrap_or(&[]));
+                let m = mac(
+                    &pepper,
+                    r.purpose,
+                    secrets.first().map(|v| &v[..]).unwrap_or(&[]),
+                );
                 R::PepperEnrol(pb::PepperEnrolResult {
                     mac: bytes::Bytes::copy_from_slice(&m),
                     version: 1,

@@ -745,6 +745,7 @@ dependencies = [
  "hx-transport",
  "libc",
  "listenfd",
+ "prost",
  "quinn",
  "rustix",
  "rustls",

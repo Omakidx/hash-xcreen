@@ -26,12 +26,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hx_crypto::{Authenticator, PairingToken};
+use hx_ipc::ReadError;
 use hx_ipc::admin::{self, Incoming, pb};
 use hx_ipc::frame::Decoder;
 use hx_ipc::peer::{self, peer_credentials};
 use hx_ipc::privd::{self, PrivdPolicy, Side, pb as privd_pb};
 use hx_ipc::text::sanitize_text;
-use hx_ipc::ReadError;
 use hx_proto::channel::CloseCode;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
@@ -90,7 +90,11 @@ impl SetupMirror {
     fn state(&self, now: u64) -> pb::SetupWindowState {
         pb::SetupWindowState {
             open: self.is_open(now),
-            expires_at_unix_s: if self.is_open(now) { self.expires_unix } else { 0 },
+            expires_at_unix_s: if self.is_open(now) {
+                self.expires_unix
+            } else {
+                0
+            },
         }
     }
 }
@@ -335,7 +339,10 @@ async fn connection(mut stream: UnixStream, state: Arc<AdminState>) -> Result<()
                 None => Err(error(privd_pb::ErrorCode::InvalidArgument, "no command")),
             }
         } else {
-            Err(error(privd_pb::ErrorCode::InvalidArgument, "request_id was used before"))
+            Err(error(
+                privd_pb::ErrorCode::InvalidArgument,
+                "request_id was used before",
+            ))
         };
         let result = match result {
             Ok(r) => r,
@@ -371,7 +378,11 @@ async fn handle(
     let now = now_unix();
     match cmd {
         C::Status(_) => {
-            let setup = st.setup.lock().unwrap_or_else(|p| p.into_inner()).state(now);
+            let setup = st
+                .setup
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .state(now);
             Ok(R::Status(pb::StatusResult {
                 gatewayd_version: env!("CARGO_PKG_VERSION").into(),
                 listening: st.listening,
@@ -414,7 +425,10 @@ async fn handle(
         }
         C::RevokeDevice(r) => {
             let id = device_id(&r.device_id).ok_or_else(|| {
-                error(privd_pb::ErrorCode::InvalidArgument, "device_id must be 16 bytes")
+                error(
+                    privd_pb::ErrorCode::InvalidArgument,
+                    "device_id must be 16 bytes",
+                )
             })?;
             match st.devices.revoke_by_operator(id).await {
                 Ok(Some(n)) => Ok(R::RevokeDevice(pb::RevokeDeviceResult {
@@ -426,7 +440,10 @@ async fn handle(
         }
         C::ReinstateDevice(r) => {
             let id = device_id(&r.device_id).ok_or_else(|| {
-                error(privd_pb::ErrorCode::InvalidArgument, "device_id must be 16 bytes")
+                error(
+                    privd_pb::ErrorCode::InvalidArgument,
+                    "device_id must be 16 bytes",
+                )
             })?;
             match st.devices.reinstate(id).await {
                 Ok(Some(_)) => {
@@ -447,7 +464,10 @@ async fn handle(
             let target = match &r.target {
                 Some(Target::DeviceId(b)) => {
                     let id = device_id(b).ok_or_else(|| {
-                        error(privd_pb::ErrorCode::InvalidArgument, "device_id must be 16 bytes")
+                        error(
+                            privd_pb::ErrorCode::InvalidArgument,
+                            "device_id must be 16 bytes",
+                        )
                     })?;
                     let known = st
                         .devices
@@ -483,10 +503,17 @@ async fn handle(
         C::CreatePairingToken(_) => {
             // The token is secret slot 0. Read, validated, wiped on drop.
             let secret = secrets.pop().ok_or_else(|| {
-                error(privd_pb::ErrorCode::InvalidArgument, "the token secret is missing")
+                error(
+                    privd_pb::ErrorCode::InvalidArgument,
+                    "the token secret is missing",
+                )
             })?;
-            let text = std::str::from_utf8(secret.expose())
-                .map_err(|_| error(privd_pb::ErrorCode::InvalidArgument, "the token is not text"))?;
+            let text = std::str::from_utf8(secret.expose()).map_err(|_| {
+                error(
+                    privd_pb::ErrorCode::InvalidArgument,
+                    "the token is not text",
+                )
+            })?;
             PairingToken::parse(text)
                 .map_err(|_| error(privd_pb::ErrorCode::InvalidArgument, "not a pairing token"))?;
             Err(error(
@@ -511,7 +538,9 @@ async fn handle(
         }
         C::SetupWindow(r) => {
             let mut m = st.setup.lock().unwrap_or_else(|p| p.into_inner());
-            match pb::SetupWindowAction::try_from(r.action).unwrap_or(pb::SetupWindowAction::Unspecified) {
+            match pb::SetupWindowAction::try_from(r.action)
+                .unwrap_or(pb::SetupWindowAction::Unspecified)
+            {
                 pb::SetupWindowAction::Open => {
                     *m = SetupMirror {
                         opened_unix: now,
@@ -530,7 +559,10 @@ async fn handle(
                 }
                 pb::SetupWindowAction::Close => *m = SetupMirror::default(),
                 pb::SetupWindowAction::Unspecified => {
-                    return Err(error(privd_pb::ErrorCode::InvalidArgument, "setup_window.action"));
+                    return Err(error(
+                        privd_pb::ErrorCode::InvalidArgument,
+                        "setup_window.action",
+                    ));
                 }
             }
             Ok(R::SetupWindow(pb::SetupWindowResult {
@@ -538,7 +570,10 @@ async fn handle(
             }))
         }
         C::CloseSessions(_) => {
-            let n = st.live.close_all(CloseCode::Shutdown, "closed by the operator").await;
+            let n = st
+                .live
+                .close_all(CloseCode::Shutdown, "closed by the operator")
+                .await;
             Ok(R::CloseSessions(pb::CloseSessionsResult {
                 sessions_closed: u32::try_from(n).unwrap_or(u32::MAX),
             }))

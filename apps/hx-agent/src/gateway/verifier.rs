@@ -290,10 +290,7 @@ impl VerifierStore {
     }
 
     fn read(&self) -> State {
-        self.state
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
+        self.state.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// The PIN verifier for `id`: its own, else the shared one. `None` if no PIN is set.
@@ -413,9 +410,7 @@ fn persist(path: &Path, state: &State) -> Result<(), VerifierError> {
     f.write_all(render(state).as_bytes()).map_err(io)?;
     f.sync_all().map_err(io)?;
     fs::rename(&tmp, path).map_err(io)?;
-    fs::File::open(dir)
-        .and_then(|d| d.sync_all())
-        .map_err(io)?;
+    fs::File::open(dir).and_then(|d| d.sync_all()).map_err(io)?;
     Ok(())
 }
 
@@ -499,7 +494,10 @@ mod tests {
         own.mac = [1; 32];
         store.set_pin(Some(id), own.clone()).unwrap();
         store.set_password(record()).unwrap();
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let again = VerifierStore::open(&path).unwrap();
         assert_eq!(again.pin_for(&id), Some(own));
         assert_eq!(again.pin_for(&device_id(&[4; 16]).unwrap()), Some(record()));
@@ -514,7 +512,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let path = dir.path().join("verifiers");
-        VerifierStore::open(&path).unwrap().set_pin(None, record()).unwrap();
+        VerifierStore::open(&path)
+            .unwrap()
+            .set_pin(None, record())
+            .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(VerifierStore::open(&path).is_err());
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();

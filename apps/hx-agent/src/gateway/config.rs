@@ -149,7 +149,8 @@ impl GatewayConfig {
 
     /// Reads and parses the file at `path`.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let text = std::fs::read_to_string(path).map_err(|e| ConfigError::Read(e.kind().to_string()))?;
+        let text =
+            std::fs::read_to_string(path).map_err(|e| ConfigError::Read(e.kind().to_string()))?;
         Self::from_toml(&text)
     }
 
@@ -245,7 +246,8 @@ mod tests {
         ] {
             assert!(GatewayConfig::from_toml(bad).is_err(), "{bad}");
         }
-        let deny = GatewayConfig::from_toml("listen = \"127.0.0.1:1\"\ntakeover = \"deny\"").unwrap();
+        let deny =
+            GatewayConfig::from_toml("listen = \"127.0.0.1:1\"\ntakeover = \"deny\"").unwrap();
         assert_eq!(deny.takeover, TakeoverPolicy::Deny);
     }
 
@@ -253,7 +255,8 @@ mod tests {
     fn identity_path_resolution() {
         let c = GatewayConfig::from_toml("listen = \"127.0.0.1:1\"").unwrap();
         assert_eq!(
-            c.identity_path(Some(Path::new("/run/credentials/x"))).unwrap(),
+            c.identity_path(Some(Path::new("/run/credentials/x")))
+                .unwrap(),
             PathBuf::from("/run/credentials/x/identity")
         );
         assert!(c.identity_path(None).is_err());

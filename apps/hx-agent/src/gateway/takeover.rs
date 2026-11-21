@@ -102,7 +102,11 @@ mod tests {
         assert_eq!(l.permit(), Err(Refusal::RateLimited), "first is 599 s old");
         clock.advance(Duration::from_secs(1));
         assert_eq!(l.permit(), Ok(()), "the first one aged out");
-        assert_eq!(l.permit(), Err(Refusal::RateLimited), "the second is 540 s old");
+        assert_eq!(
+            l.permit(),
+            Err(Refusal::RateLimited),
+            "the second is 540 s old"
+        );
     }
 
     #[test]

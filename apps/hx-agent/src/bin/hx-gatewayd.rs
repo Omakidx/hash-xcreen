@@ -83,7 +83,9 @@ fn init_logging() {
 fn admin_listener(config: &GatewayConfig) -> Result<UnixListener, String> {
     let mut fds = listenfd::ListenFd::from_env();
     if let Ok(Some(std_listener)) = fds.take_unix_listener(0) {
-        std_listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+        std_listener
+            .set_nonblocking(true)
+            .map_err(|e| e.to_string())?;
         return UnixListener::from_std(std_listener).map_err(|e| e.to_string());
     }
     admin::bind(&config.admin_socket).map_err(|e| format!("cannot create the admin socket: {e}"))
@@ -111,7 +113,11 @@ fn notify_ready() {
 async fn run(args: Args) -> Result<(), String> {
     let config = GatewayConfig::load(&args.config).map_err(|e| e.to_string())?;
     let creds = std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from);
-    let identity = load_identity(&config.identity_path(creds.as_deref()).map_err(|e| e.to_string())?)?;
+    let identity = load_identity(
+        &config
+            .identity_path(creds.as_deref())
+            .map_err(|e| e.to_string())?,
+    )?;
 
     // The state directory is the unit's `StateDirectory` (0700); create it for a manual run.
     if !config.state_dir.exists() {
@@ -122,7 +128,11 @@ async fn run(args: Args) -> Result<(), String> {
             .map_err(|e| format!("cannot create the state directory: {}", e.kind()))?;
     }
 
-    let mut opts = StartOptions::new(config.clone(), Arc::new(identity), Arc::new(UnavailableLink));
+    let mut opts = StartOptions::new(
+        config.clone(),
+        Arc::new(identity),
+        Arc::new(UnavailableLink),
+    );
     opts.admin_listener = Some(admin_listener(&config)?);
     if let Some(uid) = args.admin_allow_uid {
         tracing::warn!(uid, "DEBUG BUILD: the admin socket also accepts this uid");

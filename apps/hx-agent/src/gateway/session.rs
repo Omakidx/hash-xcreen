@@ -53,7 +53,9 @@ use hx_proto::version::Features;
 use hx_transport::Connection;
 use tokio::sync::{Mutex, broadcast};
 
-use super::desktop::{AttachRequest, DesktopLink, DesktopSupervisor, DetachReason, LinkClient, LinkError};
+use super::desktop::{
+    AttachRequest, DesktopLink, DesktopSupervisor, DetachReason, LinkClient, LinkError,
+};
 use super::devices::{DeviceNotice, DeviceService};
 use super::live::LiveSessions;
 use super::privd_client::PrivdClient;
@@ -156,7 +158,13 @@ impl SessionManager {
     pub async fn serve(self: &Arc<Self>, conn: Connection, device: DeviceRecord) {
         let Ok(live_guard) = self.live.register(device.id, conn.clone()) else {
             tracing::warn!(device = %short_id(&device.id), "too many live sessions; refusing");
-            goodbye(&conn, CloseCode::Busy, "too many sessions", "too many sessions").await;
+            goodbye(
+                &conn,
+                CloseCode::Busy,
+                "too many sessions",
+                "too many sessions",
+            )
+            .await;
             return;
         };
         let mut s = Session {
@@ -181,7 +189,9 @@ impl SessionManager {
         }
         let mut active = self.active.lock().await;
         // A stale entry (its connection already closed) is not an active client.
-        if active.as_ref().is_some_and(|a| a.conn.close_info().is_some())
+        if active
+            .as_ref()
+            .is_some_and(|a| a.conn.close_info().is_some())
             && let Some(stale) = active.take()
         {
             stale.client.detach(DetachReason::Left).await;
@@ -212,7 +222,10 @@ impl SessionManager {
                 let privd = self.privd.clone();
                 let (id, label) = (*device.id.as_bytes(), new_name.clone());
                 tokio::spawn(async move {
-                    if let Err(e) = privd.record_event(AuditEvent::Takeover, Some(id), &label).await {
+                    if let Err(e) = privd
+                        .record_event(AuditEvent::Takeover, Some(id), &label)
+                        .await
+                    {
                         tracing::warn!(error = %e, "TAKEOVER was not recorded in the audit log");
                     }
                 });
@@ -278,7 +291,10 @@ async fn goodbye(conn: &Connection, code: CloseCode, message: &str, reason: &str
         message: message.to_owned(),
         ..Default::default()
     }));
-    if tokio::time::timeout(SEND_TIMEOUT, conn.send_control(&m)).await.is_ok() {
+    if tokio::time::timeout(SEND_TIMEOUT, conn.send_control(&m))
+        .await
+        .is_ok()
+    {
         let _ = conn.ping(GOODBYE_FLUSH).await;
     }
     conn.close(code, reason).await;
@@ -309,7 +325,10 @@ async fn notify_displaced(old: &Connection, new_name: &str, new_id: &DeviceId) {
         )
     };
     let m = pb::ControlMessage::new(Ctl::Goodbye(goodbye_msg));
-    if tokio::time::timeout(SEND_TIMEOUT, old.send_control(&m)).await.is_ok() {
+    if tokio::time::timeout(SEND_TIMEOUT, old.send_control(&m))
+        .await
+        .is_ok()
+    {
         let _ = old.ping(GOODBYE_FLUSH).await;
     }
     let old = old.clone();
@@ -364,6 +383,11 @@ impl Session {
                 Flow::Continue => {}
                 Flow::End(close) => {
                     if let Some((code, reason)) = close {
+                        // A QUIC close discards what the peer has not read yet: let it read
+                        // what was just sent (a self-revoke's answer) unless it misbehaved.
+                        if code != CloseCode::ProtocolError {
+                            let _ = self.conn.ping(GOODBYE_FLUSH).await;
+                        }
                         self.conn.close(code, reason).await;
                     }
                     return;
@@ -446,7 +470,9 @@ impl Session {
             Some(Ctl::Hello(_) | Ctl::HelloAck(_) | Ctl::Refuse(_)) => {
                 violation("handshake message after the handshake")
             }
-            Some(Ctl::Pairing(_) | Ctl::Auth(_)) => violation("pairing or auth after authorization"),
+            Some(Ctl::Pairing(_) | Ctl::Auth(_)) => {
+                violation("pairing or auth after authorization")
+            }
             // Ping and Pong never surface; a message with no variant never validates.
             Some(Ctl::Ping(_) | Ctl::Pong(_)) | None => Flow::Continue,
         }
@@ -482,7 +508,13 @@ impl Session {
                 Flow::End(None)
             }
             Claim::Unavailable => {
-                goodbye(&self.conn, CloseCode::Busy, "desktop unavailable", "desktop unavailable").await;
+                goodbye(
+                    &self.conn,
+                    CloseCode::Busy,
+                    "desktop unavailable",
+                    "desktop unavailable",
+                )
+                .await;
                 Flow::End(None)
             }
         }
@@ -519,7 +551,12 @@ impl Session {
                 } else {
                     self.revokes.push_back(now);
                     match device_id(&r.device_id) {
-                        Some(target) => self.mgr.devices.revoke_by_device(self.device.id, target).await,
+                        Some(target) => {
+                            self.mgr
+                                .devices
+                                .revoke_by_device(self.device.id, target)
+                                .await
+                        }
                         None => pb::RevokeStatus::NotFound,
                     }
                 };

@@ -102,9 +102,14 @@ pub enum LoginError {
 
 enum Verdict {
     Right,
-    Wrong { failed: u32, revoked: bool },
+    Wrong {
+        failed: u32,
+        revoked: bool,
+    },
     /// privd failed after the attempt was counted: neither right nor wrong.
-    Unavailable { counted: u32 },
+    Unavailable {
+        counted: u32,
+    },
     Locked,
 }
 
@@ -205,7 +210,11 @@ impl Login {
     }
 
     fn device_lock(&self, id: &DeviceId) -> Arc<tokio::sync::Mutex<()>> {
-        let mut m = self.0.device_locks.lock().unwrap_or_else(|p| p.into_inner());
+        let mut m = self
+            .0
+            .device_locks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         m.entry(*id).or_default().clone()
     }
 
@@ -295,7 +304,8 @@ impl Login {
                 .map(|t| t.saturating_duration_since(self.0.clock.now()))
                 .unwrap_or(Duration::ZERO);
             if !wait.is_zero() {
-                self.send_result(conn, AuthStatus::Backoff, left, wait).await?;
+                self.send_result(conn, AuthStatus::Backoff, left, wait)
+                    .await?;
                 continue;
             }
             let Some(verifier) = self.0.verifiers.pin_for(&device.id) else {
@@ -350,7 +360,9 @@ impl Login {
                 }
             }
         }
-        Err(LoginError::Protocol("too many PIN attempts on one connection"))
+        Err(LoginError::Protocol(
+            "too many PIN attempts on one connection",
+        ))
     }
 
     /// Count, hash, verify with privd, record: one detached unit that owns the per-device
@@ -376,9 +388,10 @@ impl Login {
                     // A malformed PIN is a failure without a hash.
                     Err(_) => Some(false),
                     Ok(p) => {
-                        let input = tokio::task::spawn_blocking(move || verifier_input(&verifier, &p))
-                            .await
-                            .map_err(|_| hx_crypto::Error::Protocol("PIN task failed"))?;
+                        let input =
+                            tokio::task::spawn_blocking(move || verifier_input(&verifier, &p))
+                                .await
+                                .map_err(|_| hx_crypto::Error::Protocol("PIN task failed"))?;
                         match input {
                             Err(()) => None,
                             Ok((expected, output)) => {
@@ -406,7 +419,8 @@ impl Login {
             match right {
                 None => Ok(Verdict::Unavailable { counted }),
                 Some(true) => {
-                    this.reg(move |r| r.record_pin_success(&id, now_unix)).await?;
+                    this.reg(move |r| r.record_pin_success(&id, now_unix))
+                        .await?;
                     this.set_not_before(&id, None);
                     Ok(Verdict::Right)
                 }
@@ -414,7 +428,10 @@ impl Login {
                     // The same rule as `revoke_if_failed`, through the authenticator so that the
                     // revocation is persisted, announced and its live sessions closed.
                     let revoked = if counted >= max {
-                        this.0.auth.revoke(&id, RevokeReason::TooManyPinFailures).await?
+                        this.0
+                            .auth
+                            .revoke(&id, RevokeReason::TooManyPinFailures)
+                            .await?
                     } else {
                         false
                     };

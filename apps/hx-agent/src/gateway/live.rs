@@ -56,7 +56,11 @@ impl LiveSessions {
     }
 
     /// Registers `conn` for `device`, or refuses when a cap is reached.
-    pub fn register(self: &Arc<Self>, device: DeviceId, conn: Connection) -> Result<LiveGuard, Full> {
+    pub fn register(
+        self: &Arc<Self>,
+        device: DeviceId,
+        conn: Connection,
+    ) -> Result<LiveGuard, Full> {
         let mut map = self.map.lock().unwrap_or_else(|p| p.into_inner());
         if map.len() >= MAX_LIVE_SESSIONS
             || map.values().filter(|(d, _)| *d == device).count() >= MAX_SESSIONS_PER_DEVICE

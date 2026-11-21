@@ -50,7 +50,12 @@ async fn verify_answers_only_yes_or_no_and_enrol_is_the_only_mac() {
     );
     assert_eq!(
         fake.commands(),
-        ["PepperEnrol", "PepperVerify", "PepperVerify", "PepperVerify"]
+        [
+            "PepperEnrol",
+            "PepperVerify",
+            "PepperVerify",
+            "PepperVerify"
+        ]
     );
     fake.with(|s| {
         assert_eq!((s.verify_ok, s.verify_fail), (1, 2));

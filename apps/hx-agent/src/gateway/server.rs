@@ -88,7 +88,11 @@ pub struct StartOptions {
 
 impl StartOptions {
     /// Production defaults around `config`, `identity` and `link`.
-    pub fn new(config: GatewayConfig, identity: Arc<IdentityKey>, link: Arc<dyn DesktopLink>) -> Self {
+    pub fn new(
+        config: GatewayConfig,
+        identity: Arc<IdentityKey>,
+        link: Arc<dyn DesktopLink>,
+    ) -> Self {
         Self {
             config,
             identity,
@@ -197,7 +201,12 @@ impl Gateway {
             clock,
         );
         let server = Arc::new(
-            Server::bind(config.listen, tls::server_config(&identity)?, server_options).await?,
+            Server::bind(
+                config.listen,
+                tls::server_config(&identity)?,
+                server_options,
+            )
+            .await?,
         );
         let shared = Arc::new(Shared {
             auth: auth.clone(),
@@ -337,7 +346,9 @@ async fn handle_pending(sh: Arc<Shared>, pending: PendingSession) {
         Intent::Pair => pair(&sh, pending).await,
         Intent::Session => session(&sh, pending).await,
         Intent::Unspecified => {
-            let _ = pending.refuse(RefuseReason::Unauthorized, "not authorized").await;
+            let _ = pending
+                .refuse(RefuseReason::Unauthorized, "not authorized")
+                .await;
         }
     }
 }
@@ -355,7 +366,9 @@ async fn pair(sh: &Shared, pending: PendingSession) {
         }
         Ok(Outcome::Authorized { connection, .. }) => {
             // `authenticate` never authorizes: its PIN is unset and sessions are handled below.
-            connection.close(CloseCode::InternalError, "unexpected").await;
+            connection
+                .close(CloseCode::InternalError, "unexpected")
+                .await;
         }
         Ok(Outcome::Refused(_)) => {}
         Err(e) => tracing::debug!(error = %e, "pairing ended without success"),
@@ -438,7 +451,8 @@ pub fn load_identity(path: &Path) -> Result<IdentityKey, String> {
     if bytes.len() == 32 {
         seed.copy_from_slice(&bytes);
     } else {
-        let text = std::str::from_utf8(&bytes).map_err(|_| "the identity credential is not a key")?;
+        let text =
+            std::str::from_utf8(&bytes).map_err(|_| "the identity credential is not a key")?;
         let raw = zeroize::Zeroizing::new(
             super::util::unhex(text.trim()).ok_or("the identity credential is not a key")?,
         );

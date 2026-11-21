@@ -145,6 +145,9 @@ pub struct PepperMac {
     pub version: u8,
 }
 
+/// Bound on the liveness ping of [`PrivdClient::ensure_connected`].
+const PING_TIMEOUT: Duration = Duration::from_secs(1);
+
 struct Conn {
     stream: UnixStream,
     decoder: Decoder<PrivdPolicy>,
@@ -206,7 +209,11 @@ impl Conn {
     async fn recv(&mut self) -> Result<Incoming, PrivdError> {
         let raw = match read_frame(&self.stream, &mut self.decoder).await {
             Ok(Some(raw)) => raw,
-            Ok(None) => return Err(PrivdError::Unavailable("privd closed the connection".into())),
+            Ok(None) => {
+                return Err(PrivdError::Unavailable(
+                    "privd closed the connection".into(),
+                ));
+            }
             Err(ReadError::Io(e)) => {
                 return Err(PrivdError::Unavailable(format!("read: {}", e.kind())));
             }
@@ -308,6 +315,29 @@ impl Conn {
         }
     }
 
+    /// A connection-level `Ping`: proves privd is alive and reading on this connection.
+    async fn ping(&mut self, nonce: u64) -> Result<(), PrivdError> {
+        let frame = pb::Frame {
+            frame: Some(pb::frame::Frame::Ping(pb::Ping { nonce })),
+        };
+        let bytes = privd::encode_message(&frame, Side::Server)
+            .map_err(|e| PrivdError::InvalidRequest(e.to_string()))?;
+        self.write(&bytes)
+            .await
+            .map_err(|e| PrivdError::Unavailable(format!("write: {}", e.kind())))?;
+        loop {
+            match self.recv().await? {
+                Incoming::Message(pb::Frame {
+                    frame: Some(pb::frame::Frame::Pong(p)),
+                }) if p.nonce == nonce => return Ok(()),
+                Incoming::Message(pb::Frame {
+                    frame: Some(pb::frame::Frame::Progress(_)),
+                }) => {}
+                _ => return Err(PrivdError::Protocol("unexpected frame".into())),
+            }
+        }
+    }
+
     /// Best effort `Cancel` for a request we stop waiting for. The connection is dropped right
     /// after by the caller.
     async fn cancel(&mut self, request_id: u64) {
@@ -375,7 +405,8 @@ impl PrivdClient {
             .push(conn);
     }
 
-    /// Checks that privd can be reached and speaks our version, without sending a command.
+    /// Checks that privd can be reached **right now**: a live idle connection answers a
+    /// connection-level `Ping`, otherwise a new connection is opened (`Hello` and role check).
     /// Used before a PIN attempt is counted, so that an outage is never charged to a device.
     pub async fn ensure_connected(&self) -> Result<(), PrivdError> {
         let _permit = self
@@ -384,8 +415,12 @@ impl PrivdClient {
             .acquire()
             .await
             .map_err(|_| PrivdError::Unavailable("client closed".into()))?;
-        while let Some(conn) = self.take_idle() {
-            if !conn.is_stale() {
+        let nonce = self.0.next_id.fetch_add(1, Ordering::Relaxed);
+        while let Some(mut conn) = self.take_idle() {
+            if conn.is_stale() {
+                continue;
+            }
+            if let Ok(Ok(())) = tokio::time::timeout(PING_TIMEOUT, conn.ping(nonce)).await {
                 self.put_idle(conn);
                 return Ok(());
             }
@@ -410,9 +445,8 @@ impl PrivdClient {
             .map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX))
             .unwrap_or(0);
         let deadline_ms = info.effective_deadline_ms(requested_ms);
-        let until = Instant::now()
-            + Duration::from_millis(u64::from(deadline_ms))
-            + self.0.opts.margin;
+        let until =
+            Instant::now() + Duration::from_millis(u64::from(deadline_ms)) + self.0.opts.margin;
         let _permit = tokio::time::timeout_at(until, self.0.permits.acquire())
             .await
             .map_err(|_| PrivdError::Timeout)?
@@ -441,9 +475,11 @@ impl PrivdClient {
         // nothing was processed, so one retry on a fresh connection is safe.
         if was_reused && write_failed(&outcome) {
             conn = connect_until(&self.0, until).await?;
-            outcome =
-                tokio::time::timeout_at(until, conn.run(request_id, deadline_ms, &command, secrets))
-                    .await;
+            outcome = tokio::time::timeout_at(
+                until,
+                conn.run(request_id, deadline_ms, &command, secrets),
+            )
+            .await;
         }
         match outcome {
             Ok(Ok(result)) => {
@@ -593,6 +629,8 @@ async fn connect_until(inner: &Inner, until: Instant) -> Result<Conn, PrivdError
 
 /// True if the failure was a write error (as opposed to the connection ending while waiting
 /// for the answer, after which the effect of the command is unknown and nothing is retried).
-fn write_failed(outcome: &Result<Result<pb::response::Result, PrivdError>, tokio::time::error::Elapsed>) -> bool {
+fn write_failed(
+    outcome: &Result<Result<pb::response::Result, PrivdError>, tokio::time::error::Elapsed>,
+) -> bool {
     matches!(outcome, Ok(Err(PrivdError::Unavailable(m))) if m.starts_with("write:"))
 }

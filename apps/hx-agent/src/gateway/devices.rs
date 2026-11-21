@@ -56,7 +56,11 @@ pub struct DeviceService {
 /// at pairing, but a registry file is data, not trust.
 pub fn device_info(rec: &DeviceRecord, current: bool) -> pb::DeviceInfo {
     let (status, reason, at) = match rec.revoked {
-        None => (pb::DeviceStatus::Active, pb::DeviceRevokeReason::Unspecified, 0),
+        None => (
+            pb::DeviceStatus::Active,
+            pb::DeviceRevokeReason::Unspecified,
+            0,
+        ),
         Some(r) => (
             pb::DeviceStatus::Revoked,
             match r.reason {
@@ -97,7 +101,9 @@ impl DeviceService {
             loop {
                 match rx.recv().await {
                     Ok(id) => {
-                        let Some(svc) = Weak::upgrade(&weak) else { break };
+                        let Some(svc) = Weak::upgrade(&weak) else {
+                            break;
+                        };
                         svc.announce_revoked(id);
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -192,7 +198,8 @@ impl DeviceService {
                 }
                 match privd
                     .record_event(event, id.map(|d| *d.as_bytes()), &label)
-                    .await {
+                    .await
+                {
                     Ok(()) => return,
                     Err(e) if e.is_retryable() => {}
                     Err(e) => {
@@ -207,7 +214,10 @@ impl DeviceService {
 
     /// The `DeviceList` for `requester`: active devices first, then revoked ones, newest first
     /// in each group, at most [`MAX_DEVICE_LIST`] entries.
-    pub fn device_list(&self, requester: Option<DeviceId>) -> Result<pb::DeviceList, hx_crypto::Error> {
+    pub fn device_list(
+        &self,
+        requester: Option<DeviceId>,
+    ) -> Result<pb::DeviceList, hx_crypto::Error> {
         let mut records = self.records()?;
         records.sort_by_key(|r| {
             (
@@ -225,7 +235,11 @@ impl DeviceService {
     }
 
     /// A paired device revokes `target` (protocol 5.9, "Revoking").
-    pub async fn revoke_by_device(&self, requester: DeviceId, target: DeviceId) -> pb::RevokeStatus {
+    pub async fn revoke_by_device(
+        &self,
+        requester: DeviceId,
+        target: DeviceId,
+    ) -> pb::RevokeStatus {
         use pb::RevokeStatus as S;
         let _serial = self.revoke_lock.lock().await;
         let records = match self.records() {
@@ -282,7 +296,10 @@ impl DeviceService {
     }
 
     /// The operator lifts a revocation or clears a lock. `Ok(None)` if unknown.
-    pub async fn reinstate(&self, target: DeviceId) -> Result<Option<DeviceRecord>, hx_crypto::Error> {
+    pub async fn reinstate(
+        &self,
+        target: DeviceId,
+    ) -> Result<Option<DeviceRecord>, hx_crypto::Error> {
         let Some(rec) = self.auth.registry().get(&target)? else {
             return Ok(None);
         };
