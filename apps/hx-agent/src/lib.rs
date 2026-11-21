@@ -5,7 +5,9 @@
 //! - [`gateway`]: the internet-facing, unprivileged gateway.
 //! - [`link`]: the gateway side of the session link to `hx-session` (ipc.md Part 2).
 
-#![forbid(unsafe_code)]
+// `deny`, not `forbid`: `privd::activation` holds the one audited `unsafe` block of the crate
+// (adopting the socket-activation descriptor); everything else is safe code.
+#![deny(unsafe_code)]
 
 pub mod gateway;
 pub mod link;

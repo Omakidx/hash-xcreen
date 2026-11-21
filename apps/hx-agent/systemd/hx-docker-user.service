@@ -1,0 +1,20 @@
+# Re-applies the DOCKER-USER accept rules for the desktop bridge after Docker (re)creates its
+# chains (docs/ipc.md 6.4 step 5). On a host that runs Docker, forwarded traffic from our bridge is
+# dropped by Docker's FORWARD policy unless DOCKER-USER accepts it. Only constants appear here;
+# nothing is taken from a caller. hx-privd applies the same two rules when SetupHost runs.
+
+[Unit]
+Description=hash-xcreen DOCKER-USER rules for the desktop bridge
+Documentation=https://github.com/Omakidx/hash-xcreen/blob/main/docs/ipc.md
+After=docker.service
+# Follows Docker, never starts it: an administrator who disabled Docker keeps it disabled. The unit
+# is wanted by docker.service (so it runs whenever Docker starts) and restarts with it.
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'iptables -n -L DOCKER-USER >/dev/null 2>&1 || exit 0; iptables -C DOCKER-USER -i hxbr0 -j ACCEPT 2>/dev/null || iptables -I DOCKER-USER 1 -i hxbr0 -j ACCEPT; iptables -C DOCKER-USER -o hxbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -I DOCKER-USER 1 -o hxbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT'
+
+[Install]
+WantedBy=docker.service

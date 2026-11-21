@@ -27,6 +27,8 @@ Every language, library, tool and external service hash-xcreen uses, and why. It
 | Async runtime | **tokio** (networking only) | Standard for quinn and HTTP; kept out of the media hot path |
 | Incus API client | Incus REST API over its unix socket (`hyper` 1.x with `hyper-util`, `http-body-util` and `bytes`; `serde` + `serde_json`; `tokio` for the socket and timeouts) | No CLI scraping; typed requests from `hx-privd` |
 | Recipe engine | `toml` 0.8 + `serde` (unknown keys rejected), `sha2` (file hashes in the equivalence manifest), `thiserror` (typed errors), `zeroize` (the desktop password in `hx_provision::Secret` is zeroized on drop and not `Clone`) | Pure, deterministic parsing and resolution in `hx-provision` |
+| Root daemon (`hx-privd`) | `rustix` (`mm`, `process`, `fs`, `net`: `mlockall`, `PR_SET_DUMPABLE`, `RLIMIT_CORE`, `statvfs`, socket-activation checks, with one audited `unsafe` block to adopt the `sd_listen_fds` descriptor), `hmac`, `hkdf`, `sha2`, `subtle`, `getrandom` (pepper verifiers, constant-time compare), `serde` + `serde_json` (state files, `ip -j` output), `prost` (recovering the request id of a rejected request), `bytes`, `zeroize`; fixed-argv `nft`, `sysctl`, `iptables`, `ip`, `blkid` through a closed `Tool` set with a cleared environment; units hardened with systemd sandboxing | Typed command set over a socket-activated unix socket, secrets in `Zeroizing` buffers read without an intermediate copy; no shell, no caller-supplied program, path or Incus parameter (docs/ipc.md Part 1) |
+| Gateway process (`hx-gatewayd`) | `toml` 0.8 + `serde` (configuration file, unknown keys rejected), `tracing-subscriber` (`fmt` only, no `env-filter`: logs to stderr, so the journal), `listenfd` (systemd socket activation for the admin socket: the unprivileged gateway cannot create a root-owned socket in `/run/hx`), `argon2` (the PIN's Argon2id step, the same parameters as `hx-crypto`; the pepper step stays in privd), `getrandom`, `libc` (syscall and address-family numbers for the seccomp allowlist only), `rustix` (`mlockall`, `PR_SET_DUMPABLE` and rlimits as safe calls) | Everything the gateway needs beyond the transport, with no `unsafe` in our code |
 
 ## Streaming
 
@@ -102,6 +104,7 @@ Every language, library, tool and external service hash-xcreen uses, and why. It
 |---|---|
 | Workspace | One Cargo workspace; `--locked` builds; one semver version for all components |
 | Test runner | `cargo nextest`; `proptest` for property tests; `criterion` for microbenchmarks |
+| Gateway test support | `tempfile`, `hmac` + `sha2` (a fake `hx-privd` that derives its own pepper), `quinn` + `rustls` (a raw QUIC client that can announce protocol 1.0, for the takeover fallback), `strace` as an optional development aid for deriving the seccomp allowlist | Tests of `hx-gatewayd` against a privd written from `docs/ipc.md` alone |
 | UI tests | Slint testing backend; screenshot comparison; **Playwright** for the web client |
 | Network simulation | `tc netem` profiles in CI |
 | CI | GitHub Actions (Incus on Linux runners, KVM for installer VMs); a dedicated self-hosted runner for performance |

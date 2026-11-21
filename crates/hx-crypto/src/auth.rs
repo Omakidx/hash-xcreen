@@ -1,9 +1,58 @@
 //! The server-side authenticator: decides, for every [`PendingSession`], between pairing and
 //! a PIN-protected session, and authorizes the connection only after the peer proved itself
 //! (protocol §11.2 to §11.5).
+//!
+//! # Where the PIN is checked: [`PinVerifier`]
+//!
+//! By default the PIN is checked against a local [`PinHash`] ([`Authenticator::set_pin`]).
+//! A deployment whose verifier has a secret step it cannot compute itself (the gateway: the
+//! last step is `HMAC(pepper, Argon2id(pin))`, computed by `hx-privd`) installs a
+//! [`PinVerifier`] instead with [`Authenticator::set_pin_verifier`]. The authenticator keeps
+//! owning every security rule of §11.4 (counting before checking, the per-device lock, the
+//! backoff, the 5th failure revokes); the verifier only answers with a [`PinVerdict`].
+//!
+//! ```no_run
+//! use std::{sync::Arc, time::Duration};
+//! use hx_crypto::{
+//!     DeviceId, PairingToken,
+//!     auth::{Authenticator, BoxFuture, PinVerdict, PinVerifier},
+//! };
+//! use zeroize::Zeroizing;
+//!
+//! /// What the gateway implements: Argon2id locally, then ask privd for the yes/no.
+//! struct PrivdPin; // holds the privd client and the stored per-device verifiers
+//!
+//! impl PinVerifier for PrivdPin {
+//!     fn has_pin(&self, _device: &DeviceId) -> bool {
+//!         true // a verifier is stored for this device
+//!     }
+//!     fn verify<'a>(
+//!         &'a self,
+//!         _device: &'a DeviceId,
+//!         _pin: Zeroizing<Vec<u8>>,
+//!     ) -> BoxFuture<'a, PinVerdict> {
+//!         Box::pin(async move {
+//!             // 1. Argon2id(pin) on a blocking thread.
+//!             // 2. `PepperVerify` to privd, bounded by a timeout.
+//!             //    yes -> Right, no -> Wrong, privd down or timed out -> Unavailable,
+//!             //    PIN purpose locked -> Locked.
+//!             PinVerdict::Unavailable
+//!         })
+//!     }
+//! }
+//!
+//! # fn demo(auth: &Authenticator, token_from_installer: &str) -> hx_crypto::Result<()> {
+//! auth.set_pin_verifier(Arc::new(PrivdPin));
+//! // `CreatePairingToken`: install the token the installer created (capped at the window's
+//! // token ttl), so the first device can pair with it exactly once.
+//! let token = PairingToken::parse(token_from_installer)?;
+//! auth.pairing().install_token(&token, Duration::from_secs(15 * 60))?;
+//! # Ok(()) }
+//! ```
 
 use std::{
     collections::HashMap,
+    future::Future,
     sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
@@ -15,6 +64,7 @@ use hx_proto::{
 };
 use hx_transport::{Connection, PendingSession, ServerHello};
 use tokio::sync::broadcast;
+use zeroize::Zeroizing;
 
 use crate::{
     clock::{Clock, SystemClock},
@@ -56,6 +106,10 @@ pub struct AuthenticatorConfig {
     /// A PIN attempt is not started (and not counted) if less than this remains of
     /// `pin_timeout`, so a hash is not begun that the deadline would cut off (default 1 s).
     pub min_hash_budget: Duration,
+    /// How long a client is told to wait (`BACKOFF`) when the [`PinVerifier`] could not
+    /// answer ([`PinVerdict::Unavailable`]); the device is also held that long server-side
+    /// (default 2 s).
+    pub unavailable_retry: Duration,
 }
 
 impl Default for AuthenticatorConfig {
@@ -72,14 +126,89 @@ impl Default for AuthenticatorConfig {
             pairing: PairingLimits::default(),
             watch_interval: Duration::from_secs(5),
             min_hash_budget: Duration::from_secs(1),
+            unavailable_retry: Duration::from_secs(2),
         }
     }
 }
 
-struct PinVerdict {
-    right: bool,
-    failed: u32,
-    revoked: bool,
+/// A boxed, sendable future (what [`PinVerifier::verify`] returns), so the trait stays
+/// object safe without extra dependencies.
+pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// What a [`PinVerifier`] found out about one PIN.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinVerdict {
+    /// The PIN is right.
+    Right,
+    /// The PIN is wrong: counted, backed off, and the 5th consecutive one revokes the device.
+    Wrong,
+    /// The verifier could not decide (a remote check failed or timed out). Not the device's
+    /// fault: the attempt is refunded, the device is never revoked for it, and the client is
+    /// told to retry (`BACKOFF`).
+    Unavailable,
+    /// The verifier refuses to check PINs at all (for example `hx-privd` locked the PIN
+    /// purpose after its global failure cap). Not a wrong PIN: the attempt is refunded, the
+    /// client gets `NOT_AVAILABLE` and the connection ends.
+    Locked,
+}
+
+/// Decides whether a PIN is right. The authenticator calls it **inside** the per-device guard
+/// and after the attempt was counted, so an implementation needs no rate limiting of its own
+/// against one device, but it must:
+///
+/// * bound every external call with a timeout and answer [`PinVerdict::Unavailable`] when it
+///   fires: a verifier that never returns would hold that device's guard forever;
+/// * answer [`PinVerdict::Wrong`] only for a definite "no": a failure to ask is `Unavailable`,
+///   because a `Wrong` counts toward revocation and an `Unavailable` is refunded;
+/// * never log or keep the PIN.
+///
+/// The PIN's format (6 to 16 digits) is checked by the authenticator first; a malformed PIN
+/// never reaches the verifier.
+pub trait PinVerifier: Send + Sync + 'static {
+    /// True if a PIN can be checked for `device` at all. When false the client gets
+    /// `NOT_AVAILABLE` (and, before `HelloAck`, the uniform "not set up yet" refusal).
+    fn has_pin(&self, _device: &DeviceId) -> bool {
+        true
+    }
+
+    /// Check `pin` for `device`.
+    fn verify<'a>(
+        &'a self,
+        device: &'a DeviceId,
+        pin: Zeroizing<Vec<u8>>,
+    ) -> BoxFuture<'a, PinVerdict>;
+}
+
+/// The local check: constant-time Argon2id comparison on a blocking thread.
+impl PinVerifier for PinHash {
+    fn verify<'a>(
+        &'a self,
+        _device: &'a DeviceId,
+        pin: Zeroizing<Vec<u8>>,
+    ) -> BoxFuture<'a, PinVerdict> {
+        let hash = self.clone();
+        Box::pin(async move {
+            match tokio::task::spawn_blocking(move || hash.verify(&pin)).await {
+                Ok(true) => PinVerdict::Right,
+                // A panicked hash task is not a "right" and fails closed.
+                Ok(false) | Err(_) => PinVerdict::Wrong,
+            }
+        })
+    }
+}
+
+/// What one counted attempt came to.
+enum Judged {
+    Right,
+    Wrong {
+        failed: u32,
+        revoked: bool,
+    },
+    /// Refunded; `failed` is the counter afterwards.
+    Unavailable {
+        failed: u32,
+    },
+    Locked,
 }
 
 /// What [`Authenticator::authenticate`] did with a session.
@@ -132,7 +261,7 @@ struct Inner {
     registry: Arc<dyn DeviceRegistry>,
     clock: Arc<dyn Clock>,
     window: PairingWindow,
-    pin: RwLock<Option<Arc<PinHash>>>,
+    pin: RwLock<Option<Arc<dyn PinVerifier>>>,
     config: AuthenticatorConfig,
     revocations: broadcast::Sender<DeviceId>,
     /// Earliest time each device may try its PIN again (memory only).
@@ -198,14 +327,22 @@ impl Authenticator {
         self.inner.identity.public()
     }
 
-    /// Set or replace the PIN verifier. Until one is set, sessions are refused.
+    /// Set or replace the PIN verifier with a local hash. Until one is set, sessions are
+    /// refused.
     pub fn set_pin(&self, hash: PinHash) {
+        self.set_pin_verifier(Arc::new(hash));
+    }
+
+    /// Set or replace the PIN check with a custom [`PinVerifier`] (for example one that asks
+    /// `hx-privd` for the peppered yes/no). Takes effect for the next attempt. Until a
+    /// verifier is set, sessions are refused.
+    pub fn set_pin_verifier(&self, verifier: Arc<dyn PinVerifier>) {
         if let Ok(mut p) = self.inner.pin.write() {
-            *p = Some(Arc::new(hash));
+            *p = Some(verifier);
         }
     }
 
-    fn pin_hash(&self) -> Option<Arc<PinHash>> {
+    fn pin_verifier(&self) -> Option<Arc<dyn PinVerifier>> {
         self.inner.pin.read().ok().and_then(|p| p.clone())
     }
 
@@ -258,6 +395,22 @@ impl Authenticator {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&id);
+        Ok(done)
+    }
+
+    /// An operator's lockout reset: zero the device's failure counter (without stamping
+    /// `last_seen`) and drop its backoff wait. It waits for any PIN check running for the
+    /// device, so it cannot interleave with an attempt. A revocation is not lifted (use
+    /// [`reinstate`](Self::reinstate)). Returns false if the device is unknown.
+    pub async fn reset_lockout(&self, id: &DeviceId) -> Result<bool> {
+        let id = *id;
+        let _guard = self.device_lock(&id).lock_owned().await;
+        let done = match self.reg(move |r| r.reset_pin_failures(&id)).await {
+            Ok(()) => true,
+            Err(Error::UnknownDevice) => false,
+            Err(e) => return Err(e),
+        };
+        self.set_not_before(&id, None);
         Ok(done)
     }
 
@@ -433,7 +586,7 @@ impl Authenticator {
                 .refuse(pending, RefuseReason::Unauthorized, "not authorized")
                 .await;
         }
-        if self.pin_hash().is_none() {
+        if self.pin_verifier().is_none_or(|v| !v.has_pin(&device.id)) {
             return self
                 .refuse(
                     pending,
@@ -563,9 +716,12 @@ impl Authenticator {
         let cfg = &self.inner.config;
         for _ in 0..cfg.max_pin_messages {
             let m = conn.recv_control().await?;
-            let Some(Body::Pin(attempt)) = AuthMessage::from_control(&m)?.body else {
+            let Some(Body::Pin(mut attempt)) = AuthMessage::from_control(&m)?.body else {
                 return Err(Error::Protocol("expected a PIN attempt"));
             };
+            // Move the PIN out of the message into a zeroizing buffer.
+            let pin = Zeroizing::new(std::mem::take(&mut attempt.pin));
+            drop(attempt);
 
             // From here to the verdict nothing else may try this device's PIN. The guard is
             // owned so that the counting unit below keeps it even if this future is dropped.
@@ -596,78 +752,114 @@ impl Authenticator {
                     .await?;
                 continue;
             }
-            let Some(hash) = self.pin_hash() else {
-                self.send_result(conn, AuthStatus::NotAvailable, left, Duration::ZERO)
-                    .await?;
-                return Err(Error::PinNotAvailable);
+            let verifier = match self.pin_verifier() {
+                Some(v) if v.has_pin(&device.id) => v,
+                _ => {
+                    self.send_result(conn, AuthStatus::NotAvailable, left, Duration::ZERO)
+                        .await?;
+                    return Err(Error::PinNotAvailable);
+                }
             };
             // Do not begin a hash the deadline would cut off.
             if deadline.saturating_duration_since(std::time::Instant::now()) < cfg.min_hash_budget {
                 return Err(Error::Timeout("PIN exchange"));
             }
 
-            let verdict = self
-                .check_pin(device.id, hash, attempt.pin.clone(), guard)
-                .await?;
-            drop(attempt);
-            if verdict.right {
-                return Ok(());
+            match self.check_pin(device.id, verifier, pin, guard).await? {
+                Judged::Right => return Ok(()),
+                Judged::Locked => {
+                    tracing::error!(device = %device.id, "the PIN verifier is locked; PIN logins are refused");
+                    let _ = self
+                        .send_result(conn, AuthStatus::NotAvailable, left, Duration::ZERO)
+                        .await;
+                    return Err(Error::PinNotAvailable);
+                }
+                Judged::Unavailable { failed } => {
+                    tracing::warn!(device = %device.id, "the PIN verifier could not answer; the client is asked to retry");
+                    self.send_result(
+                        conn,
+                        AuthStatus::Backoff,
+                        cfg.max_pin_failures.saturating_sub(failed),
+                        cfg.unavailable_retry,
+                    )
+                    .await?;
+                }
+                Judged::Wrong { failed, revoked } => {
+                    tracing::warn!(remote = %conn.remote_addr(), device = %device.id, failed, "wrong PIN");
+                    if revoked {
+                        tracing::warn!(device = %device.id, "device revoked after too many wrong PINs");
+                        let _ = self
+                            .send_result(conn, AuthStatus::Revoked, 0, Duration::ZERO)
+                            .await;
+                        return Err(Error::Revoked);
+                    }
+                    self.send_result(
+                        conn,
+                        AuthStatus::WrongPin,
+                        cfg.max_pin_failures.saturating_sub(failed),
+                        backoff_after(failed),
+                    )
+                    .await?;
+                }
             }
-            tracing::warn!(remote = %conn.remote_addr(), device = %device.id, failed = verdict.failed, "wrong PIN");
-            if verdict.revoked {
-                tracing::warn!(device = %device.id, "device revoked after too many wrong PINs");
-                let _ = self
-                    .send_result(conn, AuthStatus::Revoked, 0, Duration::ZERO)
-                    .await;
-                return Err(Error::Revoked);
-            }
-            let retry = backoff_after(verdict.failed);
-            self.send_result(
-                conn,
-                AuthStatus::WrongPin,
-                cfg.max_pin_failures.saturating_sub(verdict.failed),
-                retry,
-            )
-            .await?;
         }
         Err(Error::Protocol("too many PIN attempts on one connection"))
     }
 
-    /// Count the attempt, hash, then record the outcome, as one detached unit that owns the
+    /// Count the attempt, verify, then record the outcome, as one detached unit that owns the
     /// per-device guard: if the caller is cancelled (deadline, disconnect) the attempt is
     /// still counted and a wrong PIN still counts toward revocation. The attempt is counted
-    /// **before** the hash starts and cleared only by a correct PIN.
+    /// **before** the verifier is asked and is cleared only by a correct PIN, or refunded
+    /// (exactly once) when the verifier could not judge it.
+    ///
+    /// The guard is held for the whole verifier round trip, so a slow verifier (a remote
+    /// check) delays other attempts on this device instead of letting them run in parallel.
     async fn check_pin(
         &self,
         id: DeviceId,
-        hash: Arc<PinHash>,
-        pin: Vec<u8>,
+        verifier: Arc<dyn PinVerifier>,
+        pin: Zeroizing<Vec<u8>>,
         guard: tokio::sync::OwnedMutexGuard<()>,
-    ) -> Result<PinVerdict> {
+    ) -> Result<Judged> {
         let this = self.clone();
         let max = self.inner.config.max_pin_failures;
         tokio::spawn(async move {
             let _guard = guard;
-            let pin = zeroize::Zeroizing::new(pin);
             let counted = this.reg(move |r| r.begin_pin_attempt(&id)).await?;
             // An earlier attempt at the limit was cut off before its verdict: it counted.
-            let right = counted <= max
-                && match Pin::from_bytes(&pin) {
-                    Ok(p) => tokio::task::spawn_blocking(move || hash.verify(p.as_bytes()))
-                        .await
-                        .map_err(|_| Error::Protocol("PIN task failed"))?,
-                    Err(_) => false,
-                };
+            // A malformed PIN is a failure without a check.
+            let verdict = if counted > max || Pin::from_bytes(&pin).is_err() {
+                PinVerdict::Wrong
+            } else {
+                verifier.verify(&id, pin).await
+            };
             let now_unix = this.inner.clock.unix_secs();
-            if right {
-                this.reg(move |r| r.record_pin_success(&id, now_unix))
-                    .await?;
-                this.set_not_before(&id, None);
-                return Ok(PinVerdict {
-                    right: true,
-                    failed: 0,
-                    revoked: false,
-                });
+            match verdict {
+                PinVerdict::Right => {
+                    this.reg(move |r| r.record_pin_success(&id, now_unix))
+                        .await?;
+                    this.set_not_before(&id, None);
+                    return Ok(Judged::Right);
+                }
+                PinVerdict::Unavailable | PinVerdict::Locked => {
+                    // Not judged, so not a failure: give the attempt back. If that write
+                    // fails the attempt stays counted, which errs on the safe side.
+                    let failed = match this.reg(move |r| r.refund_pin_attempt(&id)).await {
+                        Ok(left) => left,
+                        Err(e) => {
+                            tracing::error!(error = %e, "could not refund a PIN attempt");
+                            counted
+                        }
+                    };
+                    if verdict == PinVerdict::Locked {
+                        return Ok(Judged::Locked);
+                    }
+                    // Hold the device for the wait the client is told, before the guard is
+                    // released, so retries do not hammer the verifier.
+                    this.set_not_before(&id, Some(this.inner.config.unavailable_retry));
+                    return Ok(Judged::Unavailable { failed });
+                }
+                PinVerdict::Wrong => {}
             }
             let revoked = this
                 .commit(move |r, tx, now| {
@@ -681,8 +873,7 @@ impl Authenticator {
             // The wait starts here, before the guard is released: another connection that
             // takes the lock next must see it.
             this.set_not_before(&id, Some(backoff_after(counted)));
-            Ok(PinVerdict {
-                right: false,
+            Ok(Judged::Wrong {
                 failed: counted,
                 revoked,
             })

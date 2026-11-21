@@ -50,6 +50,91 @@ fn caps() -> impl Strategy<Value = pb::Capabilities> {
         )
 }
 
+fn device_id() -> impl Strategy<Value = Bytes> {
+    proptest::collection::vec(any::<u8>(), 16..=16).prop_map(Bytes::from)
+}
+
+/// A valid `DeviceInfo`: a sanitised name, and a revocation only on revoked devices.
+fn device_info() -> impl Strategy<Value = pb::DeviceInfo> {
+    (
+        device_id(),
+        any::<String>(),
+        (any::<u64>(), any::<u64>()),
+        prop_oneof![
+            Just((1i32, 0i32, 0u64)),
+            (1i32..=2, any::<u64>()).prop_map(|(r, t)| (2i32, r, t)),
+        ],
+        any::<bool>(),
+    )
+        .prop_map(
+            |(
+                device_id,
+                name,
+                (created_unix, last_seen_unix),
+                (status, revoke_reason, revoked_unix),
+                current,
+            )| {
+                pb::DeviceInfo {
+                    device_id,
+                    name: sanitize_device_name(&name),
+                    created_unix,
+                    last_seen_unix,
+                    status,
+                    revoke_reason,
+                    revoked_unix,
+                    current,
+                }
+            },
+        )
+}
+
+fn device_mgmt() -> impl Strategy<Value = pb::DeviceMgmt> {
+    use pb::device_mgmt::Body as B;
+    let id = 1u32..=u32::MAX;
+    prop_oneof![
+        id.clone().prop_map(|request_id| pb::DeviceMgmt {
+            request_id,
+            body: Some(B::List(pb::ListDevices {})),
+        }),
+        (id.clone(), device_id()).prop_map(|(request_id, device_id)| pb::DeviceMgmt {
+            request_id,
+            body: Some(B::Revoke(pb::RevokeDevice { device_id })),
+        }),
+        (id.clone(), 1i32..=6).prop_map(|(request_id, status)| pb::DeviceMgmt {
+            request_id,
+            body: Some(B::RevokeResult(pb::RevokeResult { status })),
+        }),
+        (
+            id,
+            proptest::collection::vec(device_info(), 0..=8),
+            any::<bool>()
+        )
+            .prop_map(|(request_id, mut devices, truncated)| {
+                // At most one device is "current".
+                for d in devices.iter_mut().skip(1) {
+                    d.current = false;
+                }
+                pb::DeviceMgmt {
+                    request_id,
+                    body: Some(B::DeviceList(pb::DeviceList { devices, truncated })),
+                }
+            }),
+        (
+            1i32..=3,
+            device_info(),
+            prop_oneof![Just(Bytes::new()), device_id()]
+        )
+            .prop_map(|(kind, device, by_device_id)| pb::DeviceMgmt {
+                request_id: 0,
+                body: Some(B::Event(pb::DeviceEvent {
+                    kind,
+                    device: Some(device),
+                    by_device_id,
+                })),
+            }),
+    ]
+}
+
 fn server_stats() -> impl Strategy<Value = pb::ServerStats> {
     (
         1u32..=60_000,
@@ -186,6 +271,7 @@ fn control() -> impl Strategy<Value = ControlMessage> {
                 peer_device_id: Bytes::from(id),
             })),
         server_stats().prop_map(Ctl::ServerStats),
+        device_mgmt().prop_map(Ctl::DeviceMgmt),
         proptest::collection::vec(any::<u8>(), 0..=4096).prop_map(|d| Ctl::Pairing(pb::Opaque {
             data: Bytes::from(d)
         })),
@@ -1221,4 +1307,277 @@ fn view_config_stats_flag_defaults_off() {
         message::decode::<ControlMessage>(&message::encode(&m).unwrap()).unwrap(),
         m
     );
+}
+
+// ---------------------------------------------------------------- 1.2 device management
+
+fn mgmt(request_id: u32, body: pb::device_mgmt::Body) -> ControlMessage {
+    ControlMessage::new(Ctl::DeviceMgmt(pb::DeviceMgmt {
+        request_id,
+        body: Some(body),
+    }))
+}
+
+fn info(status: i32, reason: i32) -> pb::DeviceInfo {
+    pb::DeviceInfo {
+        device_id: Bytes::from(vec![7u8; 16]),
+        name: "phone".into(),
+        status,
+        revoke_reason: reason,
+        revoked_unix: if status == 2 { 5 } else { 0 },
+        ..Default::default()
+    }
+}
+
+fn device_list(devices: Vec<pb::DeviceInfo>) -> ControlMessage {
+    mgmt(
+        1,
+        pb::device_mgmt::Body::DeviceList(pb::DeviceList {
+            devices,
+            truncated: false,
+        }),
+    )
+}
+
+proptest! {
+    /// Every valid device-management message survives encode and decode unchanged, and the
+    /// direction helper agrees with the variant.
+    #[test]
+    fn device_mgmt_round_trips(m in device_mgmt()) {
+        let c = ControlMessage::new(Ctl::DeviceMgmt(m.clone()));
+        let bytes = message::encode(&c).unwrap();
+        prop_assert_eq!(message::decode::<ControlMessage>(&bytes).unwrap(), c);
+        use pb::device_mgmt::Body as B;
+        let server_sends = matches!(
+            m.body,
+            Some(B::DeviceList(_) | B::RevokeResult(_) | B::Event(_))
+        );
+        prop_assert_eq!(
+            m.direction(),
+            Some(if server_sends {
+                message::MgmtDirection::ServerToClient
+            } else {
+                message::MgmtDirection::ClientToServer
+            })
+        );
+    }
+
+    /// Request ids: a request or its answer needs a non-zero id, an event must have none.
+    #[test]
+    fn device_mgmt_request_id_rules(m in device_mgmt(), other in 1u32..=u32::MAX) {
+        use pb::device_mgmt::Body as B;
+        let is_event = matches!(m.body, Some(B::Event(_)));
+        let mut wrong = m.clone();
+        wrong.request_id = if is_event { other } else { 0 };
+        prop_assert!(ControlMessage::new(Ctl::DeviceMgmt(wrong)).validate().is_err());
+    }
+
+    /// A device id of any length but 16 is rejected in a revoke request and in every device.
+    #[test]
+    fn device_ids_must_be_16_bytes(len in (0usize..64).prop_filter("not 16", |l| *l != 16)) {
+        let id = Bytes::from(vec![1u8; len]);
+        let revoke = mgmt(
+            1,
+            pb::device_mgmt::Body::Revoke(pb::RevokeDevice { device_id: id.clone() }),
+        );
+        prop_assert!(revoke.validate().is_err());
+        let mut d = info(1, 0);
+        d.device_id = id;
+        prop_assert!(device_list(vec![d]).validate().is_err());
+    }
+
+    /// Names that are too long or carry control, bidi or invisible characters are rejected.
+    #[test]
+    fn device_names_are_checked(
+        extra in 1usize..64,
+        bad in prop_oneof![
+            Just('\u{1b}'), Just('\u{202E}'), Just('\u{200B}'), Just('\n'), Just('\u{85}')
+        ],
+    ) {
+        let mut long = info(1, 0);
+        long.name = "a".repeat(MAX_DEVICE_NAME + extra);
+        prop_assert!(device_list(vec![long]).validate().is_err());
+        let mut tricky = info(1, 0);
+        tricky.name = format!("ph{bad}one");
+        prop_assert!(device_list(vec![tricky]).validate().is_err());
+    }
+
+    /// The decoders stay total on arbitrary bytes inside the new envelope.
+    #[test]
+    fn device_mgmt_decode_is_total(body in proptest::collection::vec(any::<u8>(), 0..127)) {
+        // field 12 (device_mgmt), length-delimited
+        let mut buf = vec![0x62u8, body.len() as u8];
+        buf.extend_from_slice(&body);
+        let _ = message::decode::<ControlMessage>(&buf);
+    }
+}
+
+#[test]
+fn device_mgmt_status_and_revocation_must_agree() {
+    assert!(device_list(vec![info(1, 0)]).validate().is_ok());
+    assert!(device_list(vec![info(2, 1)]).validate().is_ok());
+    assert!(device_list(vec![info(2, 2)]).validate().is_ok());
+    assert!(
+        device_list(vec![info(2, 0)]).validate().is_err(),
+        "revoked without a reason"
+    );
+    assert!(
+        device_list(vec![info(1, 1)]).validate().is_err(),
+        "active with a reason"
+    );
+    assert!(
+        device_list(vec![info(0, 0)]).validate().is_err(),
+        "unspecified status"
+    );
+    assert!(
+        device_list(vec![info(3, 0)]).validate().is_err(),
+        "unknown status"
+    );
+    assert!(
+        device_list(vec![info(2, 9)]).validate().is_err(),
+        "unknown reason"
+    );
+    let mut active_with_time = info(1, 0);
+    active_with_time.revoked_unix = 1;
+    assert!(device_list(vec![active_with_time]).validate().is_err());
+}
+
+#[test]
+fn device_list_limits() {
+    let many = |n: usize, current: usize| {
+        device_list(
+            (0..n)
+                .map(|i| {
+                    let mut d = info(1, 0);
+                    d.device_id = Bytes::from(vec![i as u8; 16]);
+                    d.current = i < current;
+                    d
+                })
+                .collect(),
+        )
+    };
+    let max = hx_proto::channel::MAX_DEVICE_LIST;
+    assert!(many(max, 1).validate().is_ok());
+    assert!(many(max + 1, 0).validate().is_err());
+    assert!(many(3, 2).validate().is_err(), "two current devices");
+    // The largest legal list fits one control message.
+    let worst = (0..max)
+        .map(|i| pb::DeviceInfo {
+            device_id: Bytes::from(vec![i as u8; 16]),
+            name: "n".repeat(MAX_DEVICE_NAME),
+            created_unix: u64::MAX,
+            last_seen_unix: u64::MAX,
+            status: 2,
+            revoke_reason: 2,
+            revoked_unix: u64::MAX,
+            current: false,
+        })
+        .collect();
+    assert!(
+        message::encode(&device_list(worst)).is_ok(),
+        "128 worst-case devices fit 64 KiB"
+    );
+}
+
+#[test]
+fn device_event_rules() {
+    use pb::device_mgmt::Body as B;
+    let event = |kind, device: Option<pb::DeviceInfo>, by: Vec<u8>| {
+        mgmt(
+            0,
+            B::Event(pb::DeviceEvent {
+                kind,
+                device,
+                by_device_id: Bytes::from(by),
+            }),
+        )
+    };
+    assert!(event(2, Some(info(2, 1)), vec![]).validate().is_ok());
+    assert!(event(1, Some(info(1, 0)), vec![3; 16]).validate().is_ok());
+    assert!(event(0, Some(info(1, 0)), vec![]).validate().is_err());
+    assert!(event(4, Some(info(1, 0)), vec![]).validate().is_err());
+    assert!(event(1, None, vec![]).validate().is_err());
+    assert!(event(1, Some(info(1, 0)), vec![3; 15]).validate().is_err());
+    // An empty body is not a message.
+    let empty = ControlMessage::new(Ctl::DeviceMgmt(pb::DeviceMgmt {
+        request_id: 1,
+        body: None,
+    }));
+    assert!(empty.validate().is_err());
+    assert_eq!(pb::DeviceMgmt::default().direction(), None);
+}
+
+#[test]
+fn revoke_result_status_must_be_known() {
+    use pb::device_mgmt::Body as B;
+    for status in 1..=6 {
+        assert!(
+            mgmt(1, B::RevokeResult(pb::RevokeResult { status }))
+                .validate()
+                .is_ok()
+        );
+    }
+    for status in [0, 7, -1] {
+        assert!(
+            mgmt(1, B::RevokeResult(pb::RevokeResult { status }))
+                .validate()
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn device_mgmt_variant_is_unknown_to_a_1_1_peer() {
+    // Why the variant is gated by minor and feature bit (protocol 4.6): a peer that does not
+    // know field 12 decodes an envelope without a variant and would close the connection.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct Old {
+        #[prost(oneof = "OldBody", tags = "7")]
+        message: Option<OldBody>,
+    }
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    enum OldBody {
+        #[prost(message, tag = "7")]
+        Ping(pb::Ping),
+    }
+    let m = mgmt(1, pb::device_mgmt::Body::List(pb::ListDevices {}));
+    let old = <Old as prost::Message>::decode(prost::Message::encode_to_vec(&m).as_slice())
+        .expect("decodes");
+    assert!(old.message.is_none());
+}
+
+#[test]
+fn device_management_feature_exists_from_1_2_only() {
+    assert!(!Features::defined_up_to(0).contains(Features::DEVICE_MANAGEMENT));
+    assert!(!Features::defined_up_to(1).contains(Features::DEVICE_MANAGEMENT));
+    assert!(Features::defined_up_to(2).contains(Features::DEVICE_MANAGEMENT));
+    assert!(Features::defined_up_to(2).contains(Features::SERVER_STATS));
+    assert_eq!(ProtocolVersion::CURRENT.minor, 2);
+    let all = hx_proto::version::capabilities(&[], Features(u64::MAX));
+    for minor in [0, 1] {
+        let older = ProtocolVersion { major: 1, minor };
+        let n = negotiate(ProtocolVersion::CURRENT, &all, older, &all).unwrap();
+        assert!(
+            !n.features.contains(Features::DEVICE_MANAGEMENT),
+            "a 1.{minor} peer never gets the bit"
+        );
+    }
+    let n = negotiate(
+        ProtocolVersion::CURRENT,
+        &all,
+        ProtocolVersion::CURRENT,
+        &all,
+    )
+    .unwrap();
+    assert!(n.features.contains(Features::DEVICE_MANAGEMENT));
+    // A 1.2 client that only offers some bits gets exactly those.
+    let client = hx_proto::version::capabilities(&[], Features::CLIPBOARD);
+    let n = negotiate(
+        ProtocolVersion::CURRENT,
+        &all,
+        ProtocolVersion::CURRENT,
+        &client,
+    )
+    .unwrap();
+    assert!(!n.features.contains(Features::DEVICE_MANAGEMENT));
 }

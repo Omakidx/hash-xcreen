@@ -1,0 +1,101 @@
+# hx-gatewayd: the internet-facing, unprivileged gateway (docs/ipc.md section 2, architecture 8.5).
+#
+# Installed by the installer next to hx-gatewayd-admin.socket and sysusers.d/hx-gatewayd.conf.
+# The binary installs its own seccomp allowlist (apps/hx-agent/src/gateway/harden.rs) after it
+# has opened its sockets; the SystemCallFilter below is a second, coarser layer.
+#
+# The service has an empty capability bounding set, so it can only bind ports of 1024 and above.
+# The installer maps port 443 to the configured port (a firewall redirect or the
+# net.ipv4.ip_unprivileged_port_start sysctl) when the user asks for it.
+
+[Unit]
+Description=hash-xcreen gateway (internet-facing, unprivileged)
+Documentation=https://github.com/Omakidx/hash-xcreen
+After=network-online.target hx-privd.socket
+Wants=network-online.target hx-privd.socket
+# The admin socket is created by systemd (root:root 0600) and handed over: gatewayd is
+# unprivileged and cannot create it in /run/hx.
+Requires=hx-gatewayd-admin.socket
+After=hx-gatewayd-admin.socket
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/lib/hx/current/hx-gatewayd --config /etc/hx/gatewayd.toml
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=10s
+
+# Identity: a dedicated system user (sysusers.d/hx-gatewayd.conf) in no other group.
+User=hx-gatewayd
+Group=hx-gatewayd
+SupplementaryGroups=
+
+# State and secrets. The registry and the verifiers live in the state directory (0700). The
+# identity key arrives as an encrypted credential, decrypted into a tmpfs visible to this unit
+# only ($CREDENTIALS_DIRECTORY); the Drive token and the pepper are never loaded here.
+StateDirectory=hx-gatewayd
+StateDirectoryMode=0700
+RuntimeDirectory=hx-gatewayd
+RuntimeDirectoryMode=0700
+LoadCredentialEncrypted=identity:/etc/hx/creds/identity.cred
+UMask=0077
+
+# Privilege: none. No capabilities, no setuid, no new privileges.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+LockPersonality=yes
+PrivateDevices=yes
+DevicePolicy=closed
+
+# File system: read-only except the state directory.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RemoveIPC=yes
+
+# Network: the public listener and the unix sockets (privd, the admin socket). PrivateUsers is
+# deliberately off: privd and the admin socket authenticate the peer by SO_PEERCRED uid.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+# The gateway talks to the internet and to unix sockets only. Loopback, link-local and multicast
+# are not peers it ever needs (privd and the admin socket are AF_UNIX, which this does not
+# touch), so a compromised process cannot probe local services or the neighbourhood.
+IPAddressDeny=localhost link-local multicast
+
+# Memory: nothing is swapped (a PIN may be in a buffer, docs/ipc.md section 5.2), nothing is
+# dumped, nothing is writable and executable. mlockall at start is fatal when it fails.
+LimitMEMLOCK=infinity
+LimitCORE=0
+MemoryDenyWriteExecute=yes
+
+# System calls: the second layer under the binary's own allowlist.
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @debug @module @reboot @swap @raw-io @obsolete @cpu-emulation
+# Needed by the hardening code itself: RLIMIT_CORE, mlockall.
+SystemCallFilter=setrlimit prlimit64 getrlimit mlockall
+SystemCallErrorNumber=EPERM
+
+# Bounds. mlockall pins everything the process maps, so the memory limit is a real budget: the
+# binary and the runtime (tens of MiB), one Argon2id verification per device in flight (64 MiB
+# each), and the QUIC buffers of the live sessions (at most 32, docs/protocol.md 1: 64 MiB
+# receive windows are caps, not usage). MemoryHigh throttles before MemoryMax kills.
+MemoryHigh=1536M
+MemoryMax=2G
+TasksMax=512
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target

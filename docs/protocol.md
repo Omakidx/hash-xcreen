@@ -1,6 +1,6 @@
-# Wire protocol (version 1.1)
+# Wire protocol (version 1.2)
 
-This document defines protocol 1.0 and its additive revision 1.1 (§4.5 lists exactly what 1.1 adds; everything tagged "1.1" is absent from a 1.0 peer). The contract between hash-xcreen's session/agent side (the **server**) and its viewers (the **client**: desktop app now, browser and others later). The code in `crates/hx-proto` (messages, media header, versioning) and `crates/hx-transport` (QUIC and WebSocket transports) implements exactly what is written here. If the two disagree, that is a bug in one of them: fix it and update this file in the same branch.
+This document defines protocol 1.0 and its additive revisions 1.1 and 1.2 (§4.5 and §4.6 list exactly what each adds; everything tagged "1.1" is absent from a 1.0 peer, everything tagged "1.2" from a 1.1 peer). The contract between hash-xcreen's session/agent side (the **server**) and its viewers (the **client**: desktop app now, browser and others later). The code in `crates/hx-proto` (messages, media header, versioning) and `crates/hx-transport` (QUIC and WebSocket transports) implements exactly what is written here. If the two disagree, that is a bug in one of them: fix it and update this file in the same branch.
 
 Design background is in [architecture.md](architecture.md) §6–§8. Pairing and authentication (workstream 1B) are specified in §11.
 
@@ -60,7 +60,7 @@ Every QUIC stream and every datagram begins with a one-byte **channel id**. WebS
 
 | Id | Channel | Direction | QUIC transport | Priority | Messages |
 |---|---|---|---|---|---|
-| `0x01` | Control | both | One client-opened **bidirectional** stream, opened first | High (50) | `ControlMessage`, length-prefixed (includes the 1.1 `ServerStats`, §5.8, and the takeover `Goodbye`, §5.7) |
+| `0x01` | Control | both | One client-opened **bidirectional** stream, opened first | High (50) | `ControlMessage`, length-prefixed (includes the 1.1 `ServerStats`, §5.8, the takeover `Goodbye`, §5.7, and the 1.2 `DeviceMgmt`, §5.9) |
 | `0x02` | Input (keys, buttons, scroll) | client → server | One long-lived client-opened unidirectional stream | Highest (100) | `InputEvent`, length-prefixed |
 | `0x03` | Mouse motion | client → server | **Datagrams**, latest wins | Highest (datagrams are sent ahead of stream data) | `MouseMove` datagram (§7.1) |
 | `0x04` | Cursor | server → client | One long-lived server-opened unidirectional stream | High (50) | `CursorEvent`, length-prefixed |
@@ -112,7 +112,7 @@ A receiver that sees a value above its limit treats it as a protocol error (reli
 
 | Field | # | Type | Meaning |
 |---|---|---|---|
-| `version` | 1 | `Version` | Client protocol `major.minor` (this document: `1.1`; a client that implements only 1.0 sends `1.0`) |
+| `version` | 1 | `Version` | Client protocol `major.minor` (this document: `1.2`; a client that implements only 1.0 sends `1.0`) |
 | `capabilities` | 2 | `Capabilities` | What the client can decode and do |
 | `intent` | 3 | `Intent` | `INTENT_SESSION` (1) normal session, `INTENT_PAIR` (2) pairing, §11. `INTENT_UNSPECIFIED` (0) is invalid |
 | `software` | 4 | string | e.g. `hx-desktop 0.1.0`, informational, at most 128 bytes |
@@ -143,7 +143,7 @@ A receiver that sees a value above its limit treats it as a protocol error (reli
 
 ### 4.2 Version rules
 
-- The version is `major.minor`; this document defines `1.0` and `1.1`.
+- The version is `major.minor`; this document defines `1.0`, `1.1` and `1.2`.
 - **Different major** (the `Hello` major differs from the ALPN/path major or from the server's): the server answers `Refuse{reason: UPDATE_REQUIRED, version: <server version>}` and closes with `UPDATE_REQUIRED` (§8). The client shows an "update required" message. No other message is processed. The `Hello` of a different major is parsed only as far as `version` (field 1); every other field of it is ignored.
 - **Same major, different minor**: accepted. The negotiated minor is `min(client.minor, server.minor)`. Both sides then use only features available at the negotiated minor and present in both capability sets (§4.3). Unknown protobuf fields are ignored (standard protobuf behaviour), so a newer minor can add fields and messages that an older peer skips; a newer minor MUST NOT send a new message type on a channel to a peer whose negotiated minor predates it (a `ControlMessage` whose only variant is unknown to the receiver has no variant set and is malformed, so a new control variant is never safe to send to an older peer).
 - Security properties (authentication, authorization, size limits, the restricted state) are never gated by a minor version or a feature bit: every peer enforces them regardless of what was negotiated.
@@ -154,7 +154,7 @@ A receiver that sees a value above its limit treats it as a protocol error (reli
 
 Capabilities advertised in `HelloAck` are an *offer*: negotiated features take effect only when the server authorizes the connection (§2.1). For an `INTENT_PAIR` hello the server advertises no features and no codecs, so a pairing connection can never carry anything but control messages.
 
-`features` is a bitmask. Both sides compute `negotiated = client.features & server.features & mask(negotiated_minor)` (bits 0 to 2 exist from 1.0, bit 3 from 1.1) and `codecs = client.video_codecs ∩ server.video_codecs`, in the server's order of preference. Bits unknown to a side are ignored by that side.
+`features` is a bitmask. Both sides compute `negotiated = client.features & server.features & mask(negotiated_minor)` (bits 0 to 2 exist from 1.0, bit 3 from 1.1, bit 4 from 1.2) and `codecs = client.video_codecs ∩ server.video_codecs`, in the server's order of preference. Bits unknown to a side are ignored by that side.
 
 | Bit | Name | Introduced | Enables |
 |---|---|---|---|
@@ -162,6 +162,7 @@ Capabilities advertised in `HelloAck` are an *offer*: negotiated features take e
 | 1 | `CLIPBOARD` | 1.0 | Clipboard channel `0x07` |
 | 2 | `FILE_TRANSFER` | 1.0 | Files channel `0x08` |
 | 3 | `SERVER_STATS` | 1.1 | `ServerStats` control messages (§5.8), sent only while the client has asked for them (`ViewConfig.stats_enabled`) |
+| 4 | `DEVICE_MANAGEMENT` | 1.2 | `DeviceMgmt` control messages (§5.9): list paired devices, revoke one, and the server's change notices |
 
 An empty `codecs` intersection is not a handshake error; the server then answers `StreamInfo` only after a `ViewConfig` with a codec that is in the intersection, and rejects other codecs with `Goodbye` (code `PROTOCOL_ERROR`). Video, cursor, input, mouse and control are always available (not feature-gated).
 
@@ -180,6 +181,16 @@ Decision: **a minor bump to 1.1, not an unversioned addition to 1.0.** Three of 
 | `TAKEN_OVER` close code (9) and `Goodbye.peer_device_name` / `peer_device_id` | §5.2, §5.7, §8 | Negotiated minor at least 1; for minor 0 the server uses `BUSY` instead (§5.7) |
 | `ServerStats` (`ControlMessage.server_stats` = 11), `ViewConfig.stats_enabled` (9) | §5.2, §5.8 | Negotiated feature `SERVER_STATS` |
 | `Capabilities.max_file_bytes` (3) | §4.1, §5.6 | Minor at least 1 for the advertisement; the 4 GiB ceiling itself applies to every peer (§4.2: size limits are never gated) |
+
+### 4.6 What 1.2 adds
+
+Decision: **a minor bump to 1.2, with a new feature bit**, for the client-facing device-management route that 1.1 left open (§5.7, step 4). One addition: the `DeviceMgmt` control variant (`ControlMessage.device_mgmt` = 12, §5.9). It is not skippable by a 1.1 peer (an unknown variant decodes as a `ControlMessage` with no variant set, which closes the connection with `PROTOCOL_ERROR`, §4.2), so it is gated twice: by the negotiated minor (at least 2) and by the feature bit `DEVICE_MANAGEMENT`, which carries the client's consent.
+
+Why 1.2 and not an additive bit inside 1.1: `Features::defined_up_to(1)` is the 1.1 feature mask and §4.5 is what "1.1" means to every implementation already built; a peer that says 1.1 must keep meaning exactly that, so that the negotiated minor alone tells both sides which messages exist. Nothing in 1.0 or 1.1 changes meaning, so there is no new major and the ALPN stays `hx/1`. A 1.1 client still works against a 1.2 server (it never gets the bit), and a 1.2 client against a 1.1 server sees no `DEVICE_MANAGEMENT` in `HelloAck` and offers no device management in its UI.
+
+| Addition | Where | Gated by |
+|---|---|---|
+| `DeviceMgmt` (`ControlMessage.device_mgmt` = 12): `ListDevices`, `DeviceList`, `RevokeDevice`, `RevokeResult`, `DeviceEvent` | §5.2, §5.9 | Negotiated minor at least 2 **and** feature `DEVICE_MANAGEMENT` |
 
 ## 5. Messages
 
@@ -214,6 +225,7 @@ A `oneof` envelope. Exactly one variant MUST be set, else the message is invalid
 | `stats` | 9 | C → S | Client decode statistics |
 | `goodbye` | 10 | both | Orderly end, informational |
 | `server_stats` | 11 | S → C | **1.1.** Numeric statistics for the stats overlay, §5.8 |
+| `device_mgmt` | 12 | both | **1.2.** Device management: list and revoke paired devices, change notices, §5.9 |
 | `pairing` | 100 | both | **Owned by 1B.** Opaque pairing envelope, §11 |
 | `auth` | 101 | both | **Owned by 1B.** Opaque PIN/auth envelope, §11 |
 
@@ -303,7 +315,7 @@ When a second authenticated client displaces the active one (ipc.md §18), the s
 1. The server sends `Goodbye{code: TAKEN_OVER, message, peer_device_name, peer_device_id}` on the control channel, finishes the control stream, waits for it to be delivered (at most 1 s), then closes the connection with code `TAKEN_OVER` (QUIC application code 9; WebSocket close code 4009). The close reason is a fixed text (`taken over`) and never carries the name.
 2. `peer_device_name` is the **new device's name after sanitisation**: the `device_name` it paired with, with control characters (C0, C1, DEL), bidirectional controls and invisible characters (the sets rejected in file names, §3.1) removed, surrounding whitespace trimmed, and cut to at most 64 bytes on a character boundary. It may be empty. A receiver rejects a `Goodbye` whose name is longer than 64 bytes or still contains one of those characters (the same total-validation rule as every other message; the client then treats the close as a plain `TAKEN_OVER` without a name). `hx_proto::message::sanitize_device_name` is the reference implementation.
 3. `peer_device_id` is the new device's 16-byte device id (§11.1), or empty if the server will not say. The name is chosen by the other device and can imitate another ("My phone"), so the client MUST display it as plain text (no markup, no formatting) next to the first 8 hex digits of the id, and never use either for authorization.
-4. The displaced client's UI states that another device took over and offers **"Revoke that device"** (a stolen device that gets used is the likely reason to be displaced). The wire protocol adds no revoke message and no new authentication: the action uses the existing authenticated device-management path, that is the server's `RevokeDevice` (ipc.md §9; revocation closes that device's live sessions, §11.5), and `peer_device_id` is the identifier to hand to it. How a remote client reaches that path is outside this document (§13); a client that has none offers only the notice.
+4. The displaced client's UI states that another device took over and offers **"Revoke that device"** (a stolen device that gets used is the likely reason to be displaced). The action is the 1.2 `RevokeDevice` request (§5.9) with `peer_device_id` as the device id, sent on a new **authenticated session** of the displaced device: it connects and passes its PIN as usual but does **not** send a `ViewConfig`, so it claims the desktop from nobody (§5.9, "Claiming the desktop"). The displaced connection itself is closed (item 6), so the request cannot ride on it. A client that negotiated no `DEVICE_MANAGEMENT` (a 1.1 server) offers only the notice.
 5. To a peer whose negotiated minor is 0 the server cannot use the new code: it sends `Goodbye{code: BUSY, message: "another device took over this desktop"}` and closes with `BUSY`.
 6. A client that sees close code `TAKEN_OVER` MUST NOT reconnect automatically (it would displace the other device in turn); reconnecting is a user action.
 
@@ -328,6 +340,49 @@ All fields are `uint32`; counts are for the interval, as for `ClientStats`.
 | `rtt_us` | 11 | The server's smoothed transport round-trip time in microseconds; 0 if unknown |
 
 Rules: it is sent only after authorization, only if `SERVER_STATS` was negotiated, and only while the client's latest `ViewConfig` has `stats_enabled = true`; **at most once per second** per connection (nominal interval 1000 ms). A client MAY drop messages that arrive faster than 4 per second (counted, never a protocol error) and ignores one it did not ask for. A `ServerStats` from a client, or sent when not negotiated, is a protocol error (`PROTOCOL_ERROR`). Counters the server cannot measure are 0. The values are diagnostic only and never feed any trust decision.
+
+### 5.9 Device management (1.2)
+
+Lets a client list the devices paired with the server and revoke one: the "Revoke that device" action after a takeover (§5.7) and Server details → Security in the app (userflow: "Paired devices: name, last seen; Revoke any device"). It is one control variant, `ControlMessage.device_mgmt` (field 12, `DeviceMgmt`), used in both directions and negotiated by the feature `DEVICE_MANAGEMENT` (§4.3, §4.6).
+
+`DeviceMgmt` = `request_id` (1, uint32) and one body (`oneof`):
+
+| Body | # | Direction | Fields |
+|---|---|---|---|
+| `list` (`ListDevices`) | 10 | C → S | none |
+| `device_list` (`DeviceList`) | 11 | S → C | `devices` (1, repeated `DeviceInfo`, at most 128), `truncated` (2, bool) |
+| `revoke` (`RevokeDevice`) | 12 | C → S | `device_id` (1, bytes, exactly 16) |
+| `revoke_result` (`RevokeResult`) | 13 | S → C | `status` (1, `RevokeStatus`) |
+| `event` (`DeviceEvent`) | 14 | S → C | `kind` (1, `DeviceEventKind`), `device` (2, `DeviceInfo`), `by_device_id` (3, bytes, empty or 16) |
+
+`DeviceInfo`: `device_id` (1, 16 bytes), `name` (2, string: the label the device chose at pairing, **already sanitised** by the server as in §5.7, at most 64 bytes; a receiver rejects a longer one or one that still contains a control, bidirectional or invisible character; show it as plain text next to the first 8 hex digits of the id and never use it for authorization), `created_unix` (3), `last_seen_unix` (4, 0 = never), `status` (5, `DeviceStatus`: `ACTIVE` 1 or `REVOKED` 2), `revoke_reason` (6, `DeviceRevokeReason`: `USER` 1 or `TOO_MANY_PIN_FAILURES` 2, set exactly when revoked), `revoked_unix` (7, set only when revoked), `current` (8, true on the entry of the device that asked, in a `DeviceList` only, at most one).
+
+`RevokeStatus`: `OK` 1, `NOT_FOUND` 2, `ALREADY_REVOKED` 3, `LAST_ACTIVE_DEVICE` 4, `RATE_LIMITED` 5, `FAILED` 6 (a server fault). `UNSPECIFIED` (0) is invalid. `DeviceEventKind`: `ADDED` 1, `REVOKED` 2, `REINSTATED` 3.
+
+**Request ids.** A request and its answer carry the same non-zero `request_id`, chosen by the client; a `DeviceEvent` carries 0 and nothing else may. A client may have several requests outstanding; the server processes the requests of one connection in arrival order and answers each exactly once.
+
+**Authorization.** Device management is available only on a connection that is **authorized** (§2.1: the pinned key checked and the PIN passed) and that negotiated `DEVICE_MANAGEMENT`:
+
+- While the connection is restricted the transport already treats the variant as a protocol error (§2.1 lists the only control messages processed). It is never available on a pairing connection (§11.2), which stays restricted.
+- A `DeviceMgmt` from a client that did not negotiate the feature, a body that only the server may send (`device_list`, `revoke_result`, `event`), a request with `request_id` 0 or an event with a non-zero one is a protocol error (`PROTOCOL_ERROR`). `hx_proto::pb::DeviceMgmt::direction` tells a receiver which way a body may travel, because the transport cannot see it (one envelope carries both directions).
+- Authority comes from the authenticated session alone, never from a field: `device_id` names the **target**, and any authenticated paired device may target any device. That is the intended model (a stolen device is revoked from another device, architecture §8.1) and it rests on the PIN: a thief who holds a device key but not its PIN cannot reach this route.
+- The server re-reads the registry for every request and limits the rate: **at most 10 revoke requests per minute per device, counted over all its connections**; further ones are answered `RATE_LIMITED` and change nothing. `list` is bounded by the 128-entry cap.
+
+**Listing.** `ListDevices` returns the registry entries, **revoked ones included** (so that a device that was offline when a revocation happened learns about it on its next list), active devices first, then revoked ones, newest first within each group. At most 128 entries are returned; `truncated` says there were more.
+
+**Revoking.** `RevokeDevice` is a revocation by a user (`revoke_reason` `USER`). Rules:
+
+1. Unknown id: `NOT_FOUND`. Already revoked: `ALREADY_REVOKED`, nothing changes (so a retry after a lost answer is safe).
+2. **Self-revoke is allowed** (the "sign out and forget this device" action), **except that the last active device cannot be revoked**: if the revocation would leave the server with no active device, the answer is `LAST_ACTIVE_DEVICE` and nothing changes. The requester is itself an active device, so only a self-revoke can reach that case; revoking *another* device is always allowed. Recovery from "every device is gone" is the operator's (the root CLI), not a protocol path.
+3. On `OK` the registry change is persisted first, then every live session of the target is closed with `UNAUTHORIZED` (§11.5; for a self-revoke the `RevokeResult` is sent first and the connection is closed afterwards), and the change is announced (below). **Reinstating is not offered**: lifting a revocation needs the Linux password (§11.3, architecture §8.3), which the operator or the re-pairing flow supplies.
+4. **Cooling-off.** A device that holds a stolen key's PIN can revoke the owner's other devices; the owner's counter-revocation must win. If a device is revoked (by another device, the operator or the PIN lockout, but not by itself) **less than 60 seconds** after it revoked other devices, the server **undoes those revocations**: the targets become active again and every live session gets a `DeviceEvent` `REINSTATED` (and the audit log a `DEVICE_REINSTATED`). Only revocations that a device made (reason `USER`) are undone, never an operator's or a lockout's; a self-revoke (a sign-out) undoes nothing. The window is kept in memory, so a server restart ends it. A client that sees one of its devices revoked by an unfamiliar device therefore has a minute to revoke that device.
+5. Every revocation is written to the server's audit log (`RecordEvent` `DEVICE_REVOKED`, ipc.md §6.15) whoever caused it (a device, the operator, or the PIN lockout): the audit log is the record that a compromised gateway cannot edit.
+
+**Change notices.** Whenever the registry changes (a device pairs, is revoked by anyone, or is reinstated by the operator) the server sends a `DeviceEvent` to **every live authorized session that negotiated `DEVICE_MANAGEMENT`**, the actor's own included, with `device` as it is after the change and `by_device_id` set to the device that caused it, or empty if it was the operator, the PIN lockout or the server itself. This is how a revocation is "shown to all paired devices": online devices get the event, offline ones find the revoked entry in their next `DeviceList`. A client shows it as a notice ("Phone revoked by Laptop") and never acts on it beyond display. The server sends at most one event per change and bounds every write to the control channel (5 s): a client that does not read its control channel for that long is disconnected (`BUSY`), because a half-written message cannot be skipped (the next `ListDevices` is authoritative after a reconnect).
+
+**Claiming the desktop.** Authenticating claims nothing: the server applies its one-active-client rule and the takeover policy (§5.7, ipc.md §18) when the client sends its first `ViewConfig`, not when the PIN is accepted. A client that connects only to manage devices (the "Revoke that device" path after `TAKEN_OVER`, or a settings screen) therefore never sends `ViewConfig`, displaces nobody and is not displaced. The server closes a session that has sent no `ViewConfig` within 5 minutes of authorization with `NO_ERROR` (configurable).
+
+Limits: a `DeviceList` of 128 worst-case entries stays below the 64 KiB control message limit (§3.1; checked by a test). Field validation and `hx_proto::message::MgmtDirection` are in `crates/hx-proto`.
 
 ## 6. Media (video) channel
 
@@ -491,6 +546,8 @@ There are none on the wire. The sender SHOULD interleave: control, input, mouse 
 | File header with `size` above the effective limit (§5.6) | `STOP_SENDING` `TRANSFER_REJECTED` (WebSocket: `abort`), continue |
 | `ServerStats` from a client, or without `SERVER_STATS` negotiated | Close, `PROTOCOL_ERROR` |
 | `Goodbye` with an over-long or unsanitised `peer_device_name`, or a `peer_device_id` of other than 0 or 16 bytes | Malformed (as any invalid message) |
+| `DeviceMgmt` without negotiated `DEVICE_MANAGEMENT`, a server-only body from a client, or a request id that breaks §5.9 | Close, `PROTOCOL_ERROR` |
+| `DeviceMgmt` while restricted | Close, `PROTOCOL_ERROR` (transport, §2.1) |
 | Close `TAKEN_OVER` | End the session, show the notice (§5.7), do not reconnect automatically |
 | Control message sent by the wrong role (`ViewConfig`, `RequestKeyframe`, `ClientStats` from the server; `StreamInfo` and `ServerStats` from the client) | Close, `PROTOCOL_ERROR` |
 | `Hello`, `HelloAck` or `Refuse` after the handshake | Close, `PROTOCOL_ERROR` |
@@ -548,7 +605,7 @@ Flow: `PairStart` → `PairServerHello` → `PairClientConfirm` → `PairServerC
 
 **Secrets.** Two kinds, both used as the SPAKE2 password (Ed25519 group, identities `"hx-pair-client"` and `"hx-pair-server"`, the client is side A):
 
-- **Token** (from the one-liner and the app): an 8-byte random id plus a 32-byte random secret, written `hxt1-` plus lowercase RFC 4648 base32 without padding. The id is a public lookup label; the SPAKE2 password is `"hx-pair-token" || secret`. Valid 15 minutes by default (configurable); 5 started attempts.
+- **Token** (from the one-liner and the app): an 8-byte random id plus a 32-byte random secret, written `hxt1-` plus lowercase RFC 4648 base32 without padding. The id is a public lookup label; the SPAKE2 password is `"hx-pair-token" || secret`. Valid 15 minutes by default (configurable); 5 started attempts. A token need not be generated by the server: the installer creates one and the server installs it (`PairingWindow::install_token`), with exactly the rules above (single use, 5 attempts, same eviction). A caller may give a token or a code a shorter life (`install_token`, `issue_token_with_ttl`, `issue_code_with_ttl`); a longer one is capped at the configured value, and a zero life is refused.
 - **Code** (interactive install): 8 symbols from the 32-symbol Crockford alphabet (`0-9 A-Z` without `I L O U`), written `XXXX-XXXX`; parsing ignores case and separators and maps `O`→`0`, `I` and `L`→`1`. 40 bits of entropy. The SPAKE2 password is `"hx-pair-code" || the 8 normalised symbols`. Valid 15 minutes by default; **3 started attempts**, then invalidated. A code has no id: the server uses its active code.
 
 The server keeps secrets in memory only (SPAKE2 needs the plaintext, so hashing at rest would not help) and never persists them. Token expiry uses the monotonic clock, which on Linux does not advance while the machine is suspended: after a suspend a token can outlive its 15 wall-clock minutes by the length of the suspend. Pairing windows are short-lived and opened by an operator, so this is accepted.
@@ -588,6 +645,17 @@ The channel is TLS 1.3 with both keys pinned, so the PIN travels in clear inside
 4. A malformed PIN (wrong length or a non-digit) is answered `WRONG_PIN` without a hash computation and counts as a failure.
 5. The registry check is repeated immediately before `authorize()`; a revocation that happened while the exchange ran ends the connection.
 
+**Where the check runs.** By default the Argon2id comparison is local (`Authenticator::set_pin`). A deployment whose verifier ends in a step only another process can compute (the gateway: `HMAC(pepper, Argon2id(pin))` is computed by `hx-privd`, [ipc.md](ipc.md) §5.3 and §6.15) installs a `PinVerifier` with `Authenticator::set_pin_verifier`. The rules 1 to 5 stay with the authenticator; the verifier only returns a verdict, and the PIN's format (rule 4) is checked before it is asked:
+
+| Verdict | Effect |
+|---|---|
+| `Right` | As a correct PIN today: the counter is reset, `last_seen` is stamped, the connection is authorized. |
+| `Wrong` | As a wrong PIN today: the attempt stays counted, the backoff starts, the 5th consecutive one revokes. |
+| `Unavailable` (the check could not be made: privd down, timeout) | The attempt is **refunded** (`refund_pin_attempt`, one saturating decrement), never revokes and is never a failure. The client gets `BACKOFF` with `unavailable_retry` (default 2 s), and the device is held for that long server-side. If the refund itself cannot be written the attempt stays counted (safe side). |
+| `Locked` (the verifier refuses to check PINs at all, e.g. privd's global cap) | Refunded like `Unavailable`; the client gets `NOT_AVAILABLE` and the connection ends. |
+
+The attempt is still counted before the verifier is asked, and the per-device guard is held, and the backoff set, across the whole verifier round trip, in the same detached unit as today, so a slow verifier delays other attempts on that device instead of letting them run in parallel, and a cut-off attempt is still counted (a cut-off `Unavailable` is still refunded when the verifier answers). A verifier that never returns would hold its device's guard, so it must bound its own calls. `status = NOT_AVAILABLE` is also sent when the verifier has no PIN for the device (`PinVerifier::has_pin`).
+
 ### 11.5 Application obligations (summary of §13)
 
 On **every** `PendingSession` the application looks the peer key up in the current registry. The key comes from the connection's single raw-public-key "certificate"; more than one entry, or one that is not a 44-byte Ed25519 SPKI, is refused. `Hello.software` and `Hello.device_name` are stripped of control characters and truncated before they are logged, shown or stored. Revoking a device closes its live sessions (`UNAUTHORIZED`) and announces the revocation on a channel for other components (for example `hx-session` supervision). Secrets (tokens, codes, PINs, keys, `K`) are never written to logs, command lines or `Debug` output; their types print `[redacted]`. Wiping them from memory is **best effort**: the types hold them in zeroizing buffers, but `spake2`'s internal state, the protobuf and `Bytes` buffers, and the transport's buffers are not wiped, and a process dump of a running agent can contain secrets (hence the agent runs unprivileged with core dumps off, architecture §8.5).
@@ -599,6 +667,7 @@ On **every** `PendingSession` the application looks the peer key up in the curre
 - Never call `authorize()` on an `Outcome::Paired` connection: it is a pairing connection with no features.
 - Post-pairing password and PIN setup is allowed only for first-time setup, or when the request proves the current Linux password. It must finish inside the transport's authorization deadline (30 s by default; the pairing exchange itself may take up to 20 s of it).
 - CLI revoke, remove and reinstate go through the agent. `reinstate` only after the Linux password was verified by `hx-privd`'s peppered verifier (`PepperVerify`, a failure-capped yes/no check, with `PepperEnrol` for setting it up; see [ipc.md](ipc.md) §6.15).
+- An operator's lockout reset (zero the failure counter of a device that is not revoked) is `Authenticator::reset_lockout` (`DeviceRegistry::reset_pin_failures` underneath, which does not stamp `last_seen`); it waits for a running PIN check of that device and also drops the in-memory wait.
 - Clients must sanitise `Refuse.message` (and any server text) before showing it; the server's refusal text for unknown, revoked and unsetup cases is deliberately uniform.
 - The identity seed is root-only (`systemd-creds`), the registry directory must not be writable by group or others, and the registry file is 0600 and owned by the agent user.
 
@@ -611,9 +680,9 @@ A TLS or certificate verification failure while connecting (QUIC TLS alert, reje
 - Phase 3 (WebTransport): the `h3` path currently holds its pre-authentication slot for the whole lifetime of the handler it dispatches to, not only until authorization. The Phase 3 handler must release or re-account the slot once the browser session is authorized, or long-lived WebTransport sessions would exhaust the pre-authentication limits.
 - Application-layer policy owned by 1B/1C: re-check pinned/revoked keys on every `PendingSession`, close live sessions on revocation, sanitize `Hello.software` and `Hello.device_name` before display or logging, clamp input coordinates in the injector, and treat transfer file names as hints.
 - `hx-transport` does not yet enforce the 1.1 rules for `ServerStats` (rejecting it from a client or when `SERVER_STATS` was not negotiated, §5.8) nor apply `Negotiated::max_file_bytes` to incoming file headers (§5.6); the gateway/transport round must add both, and until then the application layer does.
-- The wire protocol has no message for a client to revoke a device after a takeover (§5.7): the client reaches the existing device-management path (`RevokeDevice`), whose remote client-facing transport is not specified here.
+- Resolved in 1.2: the client-facing "Revoke that device" route is `DeviceMgmt` (§5.9).
 - Fuzz targets for 1H: `MediaHeader::decode`, `decode_datagram`, `message::decode::<ControlMessage | InputEvent | CursorEvent | TransferHeader>`, `message::decode_framed`, `version::peek_hello_version`, `file_name_problem`, and the WebSocket message router.
 
 ## 14. Schema location
 
-The protobuf schema is `crates/hx-proto/proto/hx.proto` (package `hx.v1`); field numbers there are the numbers in this document. The messages inside the `pairing` and `auth` envelopes (§11) are defined by `crates/hx-crypto/src/wire.rs`. Field numbers are never reused. Adding fields or messages is a minor-version change (§4.2); the 1.1 additions are listed in §4.5.
+The protobuf schema is `crates/hx-proto/proto/hx.proto` (package `hx.v1`); field numbers there are the numbers in this document. The messages inside the `pairing` and `auth` envelopes (§11) are defined by `crates/hx-crypto/src/wire.rs`. Field numbers are never reused. Adding fields or messages is a minor-version change (§4.2); the 1.1 additions are listed in §4.5 and the 1.2 additions in §4.6.
