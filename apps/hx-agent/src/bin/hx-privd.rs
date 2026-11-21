@@ -8,6 +8,8 @@
 //! the configuration (the gateway uid from the `hx-gatewayd` passwd entry), the inherited socket,
 //! the daemon (state, pepper, audit log), and the account-policy self-checks, which must pass.
 
+#![forbid(unsafe_code)]
+
 use std::process::ExitCode;
 
 use hx_agent::privd::activation;
@@ -36,6 +38,12 @@ fn main() -> ExitCode {
         Ok(c) => c,
         Err(e) => return fail(&format!("configuration: {e}")),
     };
+    // Adopt the activation descriptor before any runtime thread exists, so that nothing else can
+    // have opened descriptor 3 (see `activation`).
+    let listener = match activation::from_env(&cfg.socket_path) {
+        Ok(l) => l,
+        Err(e) => return fail(&format!("socket activation: {e}")),
+    };
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -45,10 +53,6 @@ fn main() -> ExitCode {
         Err(e) => return fail(&format!("cannot start the runtime: {e}")),
     };
     rt.block_on(async move {
-        let listener = match activation::from_env(&cfg.socket_path) {
-            Ok(l) => l,
-            Err(e) => return fail(&format!("socket activation: {e}")),
-        };
         let daemon = match Daemon::system(cfg) {
             Ok(d) => d,
             Err(e) => return fail(&format!("cannot start: {e}")),

@@ -57,3 +57,69 @@ fn l2_secret_bytes_are_never_copied_into_unzeroized_owners() {
         }
     }
 }
+
+/// N1: `unsafe` lives only in the files named here, each with exactly one `allow(unsafe_code)`
+/// and every `unsafe` block under it commented with `SAFETY:`. A new file that needs `unsafe`
+/// must be added to this list on purpose, in review.
+#[test]
+fn n1_unsafe_code_is_confined_to_the_audited_modules() {
+    const ALLOWED: [&str; 2] = ["privd/activation.rs", "privd/peergroups.rs"];
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut found = Vec::new();
+    for (path, text) in sources("src") {
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let code: Vec<&str> = text
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        let allows = code
+            .iter()
+            .filter(|l| l.contains("allow(unsafe_code)"))
+            .count();
+        let blocks = code.iter().filter(|l| l.contains("unsafe {")).count();
+        if allows > 0 || blocks > 0 {
+            found.push((rel.clone(), allows, blocks));
+        }
+        if ALLOWED.contains(&rel.as_str()) {
+            assert_eq!(allows, 1, "{rel}: exactly one allow(unsafe_code)");
+            let safety = text.matches("// SAFETY:").count();
+            assert!(
+                blocks >= 1 && safety >= blocks,
+                "{rel}: every unsafe block needs a SAFETY comment"
+            );
+        } else {
+            assert!(
+                allows == 0 && blocks == 0,
+                "{rel} may not contain unsafe code"
+            );
+        }
+    }
+    let mut names: Vec<&str> = found.iter().map(|f| f.0.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names, ALLOWED,
+        "exactly the audited files contain unsafe code"
+    );
+}
+
+/// N1: the daemon binary itself forbids unsafe code and adopts the socket before it builds a
+/// runtime (no thread can have opened descriptor 3 by then).
+#[test]
+fn n1_the_binary_forbids_unsafe_and_adopts_the_socket_before_the_runtime() {
+    let bin =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/hx-privd.rs"))
+            .unwrap();
+    assert!(bin.contains("#![forbid(unsafe_code)]"));
+    let adopt = bin.find("activation::from_env").expect("adopts the socket");
+    let runtime = bin
+        .find("tokio::runtime::Builder")
+        .expect("builds a runtime");
+    assert!(
+        adopt < runtime,
+        "from_env must run before the runtime exists"
+    );
+}
