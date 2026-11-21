@@ -1,0 +1,214 @@
+// hx-gatewayd admin socket (docs/ipc.md section 9).
+//
+// Same framing, Hello, error model and limits as the privd socket (ipc.md section 4); its own
+// command set. The package is `hx.gatewayd_admin.v1` because protobuf identifiers cannot
+// contain a hyphen (ipc.md writes `hx.gatewayd-admin.v1`).
+syntax = "proto3";
+
+package hx.gatewayd_admin.v1;
+
+import "privd.proto";
+
+message HelloAck {
+  uint32 major = 1;
+  uint32 minor = 2;
+  string gatewayd_version = 3;
+}
+
+enum AdminSecretKind {
+  ADMIN_SECRET_KIND_UNSPECIFIED = 0;
+  // The one-liner's pairing token (decision 14): written by the installer as a secret frame.
+  ADMIN_SECRET_KIND_PAIRING_TOKEN = 1;
+}
+
+message AdminSecretSlot {
+  // 0 to 255.
+  uint32 slot = 1;
+  AdminSecretKind kind = 2;
+  uint32 length = 3;
+}
+
+// ----- commands -----
+
+message StatusRequest {}
+
+message ListDevicesRequest {}
+
+message RevokeDeviceRequest {
+  // 16 bytes.
+  bytes device_id = 1;
+}
+
+message ReinstateDeviceRequest {
+  bytes device_id = 1;
+}
+
+message SetPinVerifierRequest {
+  oneof target {
+    // 16 bytes.
+    bytes device_id = 1;
+    // true = every device.
+    bool all = 2;
+  }
+  // The verifier of ipc.md section 5.3 (format owned by 1B), at most 128 bytes.
+  bytes verifier = 3;
+}
+
+message SetPasswordVerifierRequest {
+  bytes verifier = 1;
+}
+
+// The token is secret slot 0 (kind PAIRING_TOKEN); it is never a protobuf field.
+message CreatePairingTokenRequest {
+  // 60 to 900.
+  uint32 expires_in_s = 1;
+}
+
+message CreatePairingCodeRequest {
+  uint32 expires_in_s = 1;
+}
+
+enum SetupWindowAction {
+  SETUP_WINDOW_ACTION_UNSPECIFIED = 0;
+  SETUP_WINDOW_ACTION_OPEN = 1;
+  SETUP_WINDOW_ACTION_EXTEND = 2;
+  SETUP_WINDOW_ACTION_CLOSE = 3;
+}
+
+message SetupWindowRequest {
+  SetupWindowAction action = 1;
+  // Required for open and extend.
+  uint32 expires_in_s = 2;
+}
+
+message CloseSessionsRequest {}
+
+message Request {
+  uint64 request_id = 1;
+  uint32 deadline_ms = 2;
+  repeated AdminSecretSlot secret_slots = 3;
+  oneof command {
+    StatusRequest status = 10;
+    ListDevicesRequest list_devices = 11;
+    RevokeDeviceRequest revoke_device = 12;
+    ReinstateDeviceRequest reinstate_device = 13;
+    SetPinVerifierRequest set_pin_verifier = 14;
+    SetPasswordVerifierRequest set_password_verifier = 15;
+    CreatePairingTokenRequest create_pairing_token = 16;
+    CreatePairingCodeRequest create_pairing_code = 17;
+    SetupWindowRequest setup_window = 18;
+    CloseSessionsRequest close_sessions = 19;
+  }
+}
+
+// ----- results -----
+
+enum CertificateState {
+  CERTIFICATE_STATE_UNSPECIFIED = 0;
+  CERTIFICATE_STATE_NONE = 1;
+  CERTIFICATE_STATE_VALID = 2;
+  CERTIFICATE_STATE_EXPIRING = 3;
+  CERTIFICATE_STATE_ERROR = 4;
+}
+
+// Session-link state, informational for updates (ipc.md sections 6.12, 19.2).
+enum LinkState {
+  LINK_STATE_UNSPECIFIED = 0;
+  LINK_STATE_DOWN = 1;
+  LINK_STATE_CONNECTING = 2;
+  LINK_STATE_UP = 3;
+  LINK_STATE_SESSION_OUTDATED = 4;
+  LINK_STATE_SESSION_UNAVAILABLE = 5;
+}
+
+message SetupWindowState {
+  bool open = 1;
+  uint64 expires_at_unix_s = 2;
+}
+
+message StatusResult {
+  string gatewayd_version = 1;
+  bool listening = 2;
+  uint32 connected_clients = 3;
+  CertificateState certificate = 4;
+  uint64 certificate_not_after_unix_s = 5;
+  SetupWindowState setup_window = 6;
+  LinkState session_link = 7;
+  uint32 link_faults_10min = 8;
+  uint64 registry_version = 9;
+}
+
+enum DeviceState {
+  DEVICE_STATE_UNSPECIFIED = 0;
+  DEVICE_STATE_ACTIVE = 1;
+  DEVICE_STATE_REVOKED = 2;
+  DEVICE_STATE_LOCKED = 3;
+}
+
+message Device {
+  bytes device_id = 1;
+  // Untrusted text: sanitize before printing.
+  string name = 2;
+  uint64 created_unix_s = 3;
+  uint64 last_seen_unix_s = 4;
+  DeviceState state = 5;
+}
+
+message ListDevicesResult {
+  repeated Device devices = 1;
+}
+
+message RevokeDeviceResult {
+  uint32 sessions_closed = 1;
+}
+
+message ReinstateDeviceResult {}
+message SetPinVerifierResult {}
+message SetPasswordVerifierResult {}
+message CreatePairingTokenResult {
+  uint64 expires_at_unix_s = 1;
+}
+
+message CreatePairingCodeResult {
+  // The short code to print.
+  string code = 1;
+  uint64 expires_at_unix_s = 2;
+}
+
+message SetupWindowResult {
+  SetupWindowState state = 1;
+}
+
+message CloseSessionsResult {
+  uint32 sessions_closed = 1;
+}
+
+message Response {
+  uint64 request_id = 1;
+  oneof result {
+    hx.privd.v1.Error error = 2;
+    StatusResult status = 10;
+    ListDevicesResult list_devices = 11;
+    RevokeDeviceResult revoke_device = 12;
+    ReinstateDeviceResult reinstate_device = 13;
+    SetPinVerifierResult set_pin_verifier = 14;
+    SetPasswordVerifierResult set_password_verifier = 15;
+    CreatePairingTokenResult create_pairing_token = 16;
+    CreatePairingCodeResult create_pairing_code = 17;
+    SetupWindowResult setup_window = 18;
+    CloseSessionsResult close_sessions = 19;
+  }
+}
+
+// Kind-1 body of the admin socket: exactly one variant, else invalid.
+message Frame {
+  oneof frame {
+    hx.privd.v1.Hello hello = 1;
+    HelloAck hello_ack = 2;
+    Request request = 3;
+    hx.privd.v1.Cancel cancel = 4;
+    hx.privd.v1.Ping ping = 5;
+    hx.privd.v1.Pong pong = 6;
+    Response response = 8;
+  }
+}
