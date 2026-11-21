@@ -13,11 +13,13 @@
 //! whole sequence runs as **one detached task**: the future these functions return only waits for
 //! its result. If the caller drops it (cancel, closed connection, deadline), the task still runs
 //! to its end, bounded by its own timeouts, and sweeps. A cancel can therefore never land between
-//! writing the secret file and removing it. The caller answers `CANCELLED` after the task is done
-//! if it wants to; it cannot interrupt it.
+//! writing the secret file and removing it. On a cancel the caller should keep polling the future
+//! until it resolves (and hold its per-desktop lock until then) and only then answer `CANCELLED`:
+//! a second request on the same desktop would run its pre-sweep and delete this task's stdin file.
+//! The task uses its own [`Client::scoped`] client, so a `cancel_in_flight` on the caller's client
+//! never sees its operations.
 //!
-//! The functions need a tokio runtime and a `'static` client (clone it; clones share the
-//! transport).
+//! The functions need a tokio runtime and a `'static` client (a clone is made internally).
 //!
 //! # The check
 //!
@@ -79,7 +81,9 @@ pub async fn check_user_password<T>(
 where
     T: Transport + Clone + 'static,
 {
-    let (client, instance, user) = (client.clone(), instance.to_string(), user.clone());
+    // A scoped client: the shielded task's operations are not in the caller's in-flight set, so a
+    // `cancel_in_flight` on the request's client cannot touch them.
+    let (client, instance, user) = (client.scoped(), instance.to_string(), user.clone());
     shield(async move {
         run_swept(&client, &instance, async |exec| {
             check(exec, &user, &secrets).await
@@ -106,7 +110,9 @@ pub async fn change_user_password<T>(
 where
     T: Transport + Clone + 'static,
 {
-    let (client, instance, user) = (client.clone(), instance.to_string(), user.clone());
+    // A scoped client: the shielded task's operations are not in the caller's in-flight set, so a
+    // `cancel_in_flight` on the request's client cannot touch them.
+    let (client, instance, user) = (client.scoped(), instance.to_string(), user.clone());
     shield(async move {
         run_swept(&client, &instance, async |exec| {
             if require_current {

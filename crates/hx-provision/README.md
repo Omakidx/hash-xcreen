@@ -87,7 +87,12 @@ follow; `hx-gatewayd` and everything else unprivileged is never allowed to influ
 - **Set a password: `password::change_user_password(&client, instance, &username, secrets,
   require_current)`.** Outside the setup window always `require_current = true`. The whole
   sequence (sweep, check, `chpasswd`, sweep) runs as one detached task, so dropping the future
-  (cancel, deadline) cannot leave the 0600 file behind; answer `CANCELLED` afterwards. The check
+  (cancel, deadline) cannot leave the 0600 file behind. **On `Cancel`, keep polling the future
+  until it resolves, hold the `desktop:<id>` lock until then, and only then answer `CANCELLED`**
+  (ipc.md 4: "only then"); a dropped future is the fallback, not the plan. Never run a second
+  request on the same desktop meanwhile: its pre-sweep would delete the first task's stdin file.
+  The task uses its own `scoped()` client, so `cancel_in_flight` on the request's client does not
+  see (and cannot cancel) its operations. The check
   runs `session::PASSWORD_CHECK_HELPER <login>` with the candidate on stdin and trusts only its
   exit status (0 match, 1 wrong, anything else `CheckUnavailable`, fail closed). Contract of the
   helper: `hx_provision::session`. Map `PasswordChange::CurrentPasswordWrong` to

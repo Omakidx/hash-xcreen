@@ -263,6 +263,42 @@ async fn standalone_check_reports_the_three_outcomes() {
     }
 }
 
+/// The shielded task's operations belong to the task, not to the request's client: a
+/// `cancel_in_flight` on the caller's client sees none of them and cannot cancel a secret path.
+#[tokio::test]
+async fn the_callers_client_does_not_see_the_shielded_operations() {
+    let fake = fake_with_running_c1().await;
+    fake.rule(PASSWORD_CHECK_HELPER, 0, "", "");
+    fake.with(|s| s.stuck_ops = true); // the task's first exec stays pending
+    let client = fake.client().scoped();
+    let c2 = client.clone();
+    let task =
+        tokio::spawn(
+            async move { change_user_password(&c2, "c1", &user(), secrets(), true).await },
+        );
+    for _ in 0..300 {
+        if fake.log().iter().any(|r| r.path.ends_with("/exec")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        fake.log().iter().any(|r| r.path.ends_with("/exec")),
+        "exec is pending"
+    );
+    assert!(client.in_flight_operations().is_empty());
+    assert_eq!(client.cancel_in_flight(Duration::from_secs(1)).await, Ok(0));
+    assert!(
+        fake.log()
+            .iter()
+            .all(|r| r.method != "DELETE" || !r.path.contains("/operations/")),
+        "no operation of the secret path was cancelled"
+    );
+    // Let it finish.
+    fake.with(|s| s.stuck_ops = false);
+    assert_eq!(task.await.unwrap().unwrap(), PasswordChange::Changed);
+}
+
 /// The point of the shield: the caller drops the future in the middle (here: while the check is
 /// running at the daemon); the sequence still runs to its end and sweeps.
 #[tokio::test]
@@ -278,12 +314,12 @@ async fn dropping_the_future_mid_flight_still_finishes_and_sweeps() {
             async move { change_user_password(&c2, "c1", &user(), secrets(), true).await },
         );
     for _ in 0..300 {
-        if !client.in_flight_operations().is_empty() {
+        if fake.log().iter().any(|r| r.path.ends_with("/exec")) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(!client.in_flight_operations().is_empty());
+    assert!(fake.log().iter().any(|r| r.path.ends_with("/exec")));
     // Cancel: drop the caller's future.
     task.abort();
     let _ = task.await;
