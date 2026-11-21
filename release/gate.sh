@@ -1,0 +1,93 @@
+#!/bin/sh
+# The release gate (design D7), runnable locally and from the `gate` job of release.yml.
+#
+#   release/gate.sh [--tag vX.Y.Z]
+#
+# Checks (all of them run; any failure makes the exit status 1):
+#   1. --tag, when given: it matches the ipc.md 6.12 rule 1 syntax and equals "v" + the workspace
+#      version;
+#   2. apps/hx-agent/release-keys/current.pub AND next.pub are provisioned (a minisign public key,
+#      not the word UNPROVISIONED) and parse (42 bytes, algorithm "Ed"), and are different keys;
+#   3. installer/install.sh embeds exactly those two keys (KEY_CURRENT, KEY_NEXT);
+#   4. the compile-time gate exists: feature `release-build` in apps/hx-agent/Cargo.toml and its
+#      const assertion in privd/update/keys.rs (the build itself, with --features release-build,
+#      is the real enforcement and fails on an unprovisioned key).
+# `cargo deny` and `cargo audit` are separate jobs of the same workflow.
+set -u
+export LC_ALL=C
+here=$(cd "$(dirname "$0")" && pwd)
+root=$(cd "$here/.." && pwd)
+tag=''
+while [ $# -gt 0 ]; do
+    case $1 in
+    --tag) tag=${2:?}; shift 2 ;;
+    *) echo "gate.sh: unknown option $1" >&2; exit 2 ;;
+    esac
+done
+
+fail=0
+bad() { echo "GATE FAIL: $*" >&2; fail=1; }
+good() { echo "gate ok:   $*"; }
+
+# the verification helpers of the shipped installer (test mode)
+set -- --hx-lib
+# shellcheck source=../installer/install.sh
+. "$root/installer/install.sh"
+
+# ---- 1. tag ----
+ws=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version *= *"\(.*\)"$/\1/p' "$root/Cargo.toml" | head -n 1)
+if [ -z "$ws" ]; then
+    bad "cannot read the workspace version from Cargo.toml"
+elif [ -n "$tag" ]; then
+    if ! printf '%s\n' "$tag" | grep -Eq '^v[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}(-(alpha|beta|rc)\.[0-9]{1,4})?$'; then
+        bad "tag '$tag' does not match the release version syntax"
+    elif [ "$tag" != "v$ws" ]; then
+        bad "tag '$tag' is not v$ws (the workspace version)"
+    else
+        good "tag $tag equals the workspace version"
+    fi
+fi
+
+# ---- 2. keys ----
+keyline() { # file : the key line, or UNPROVISIONED
+    _l=$(grep -v '^[[:space:]]*#' "$1" | grep -v '^untrusted comment:' | grep -v '^[[:space:]]*$' | head -n 1 | tr -d '[:space:]')
+    printf '%s' "$_l"
+}
+kc=$(keyline "$root/apps/hx-agent/release-keys/current.pub")
+kn=$(keyline "$root/apps/hx-agent/release-keys/next.pub")
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+idc='' idn=''
+for which in current next; do
+    if [ "$which" = current ]; then k=$kc; else k=$kn; fi
+    if [ -z "$k" ] || [ "$k" = UNPROVISIONED ]; then
+        bad "release-keys/$which.pub is UNPROVISIONED: a release needs both keys (the maintainer provisions them)"
+        continue
+    fi
+    if b64_file "$k" "$tmp/$which.raw" 42 && [ "$(dd if="$tmp/$which.raw" bs=1 count=2 2>/dev/null)" = Ed ]; then
+        good "release-keys/$which.pub is a minisign public key"
+        id=$(hex_of "$tmp/$which.raw" 2 8)
+        if [ "$which" = current ]; then idc=$id; else idn=$id; fi
+    else
+        bad "release-keys/$which.pub does not hold a valid minisign public key line"
+    fi
+done
+if [ -n "$idc" ] && [ "$idc" = "$idn" ]; then bad "current.pub and next.pub are the same key"; fi
+
+# ---- 3. install.sh embeds the same keys ----
+if [ "$KEY_CURRENT" = "$kc" ] && [ "$KEY_NEXT" = "$kn" ]; then
+    good "install.sh embeds the keys of release-keys/*.pub"
+else
+    bad "install.sh KEY_CURRENT / KEY_NEXT differ from release-keys/current.pub / next.pub"
+fi
+
+# ---- 4. the compile-time gate exists ----
+if grep -q '^release-build' "$root/apps/hx-agent/Cargo.toml" &&
+    grep -q 'feature = "release-build"' "$root/apps/hx-agent/src/privd/update/keys.rs"; then
+    good "the release-build compile-time gate is present"
+else
+    bad "the release-build gate is missing from Cargo.toml or keys.rs"
+fi
+
+[ "$fail" = 0 ] && echo "release gate: PASSED" || echo "release gate: BLOCKED" >&2
+exit "$fail"

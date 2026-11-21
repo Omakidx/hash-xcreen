@@ -10,6 +10,18 @@
 //!
 //! Tests inject their own key through [`UpdateKeys::from_public_keys`], which exists only with
 //! the `test-support` feature (a release build never has it).
+//!
+//! # The release gate (design D7, C12)
+//!
+//! - Feature `release-build` (only the release workflow enables it) makes the build fail unless
+//!   **both** `CURRENT` and `NEXT` hold a key: an `UNPROVISIONED` file is a compile error, so a
+//!   binary that could never verify an update, or that has no key to rotate to, cannot ship.
+//! - `release-build` together with `test-support` or `test-release-key` is a compile error: a
+//!   release binary never carries a test hook or a test key.
+//! - Feature `test-release-key` adds one more key, taken at build time from the environment
+//!   variable `HX_TEST_RELEASE_PUBKEY` (the base64 key line of a test key, for example
+//!   `test-release.pubkey` made by `release/make-test-release.sh`). It exists so the installer
+//!   test harness can run the real binaries against a test-signed release.
 
 use minisign_verify::{PublicKey, Signature};
 
@@ -17,6 +29,59 @@ use super::verify::VerifyError;
 
 const CURRENT: &str = include_str!("../../../release-keys/current.pub");
 const NEXT: &str = include_str!("../../../release-keys/next.pub");
+
+#[cfg(all(
+    feature = "release-build",
+    any(feature = "test-support", feature = "test-release-key")
+))]
+compile_error!(
+    "feature `release-build` must not be combined with `test-support` or `test-release-key`: \
+     a release binary carries no test hook and no test key"
+);
+
+/// A test key injected at build time (`test-release-key` only).
+#[cfg(feature = "test-release-key")]
+const TEST_KEY: Option<&str> = option_env!("HX_TEST_RELEASE_PUBKEY");
+
+/// `const` substring search (the gate below runs at compile time).
+#[cfg_attr(not(any(test, feature = "release-build")), allow(dead_code))]
+const fn contains(hay: &str, needle: &str) -> bool {
+    let (h, n) = (hay.as_bytes(), needle.as_bytes());
+    if n.len() > h.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i + n.len() <= h.len() {
+        let mut j = 0;
+        while j < n.len() && h[i + j] == n[j] {
+            j += 1;
+        }
+        if j == n.len() {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// A key file that carries a key: no `UNPROVISIONED` marker and a minisign key line (`RW`, the
+/// base64 start of the `Ed` algorithm bytes) somewhere in it.
+#[cfg_attr(not(any(test, feature = "release-build")), allow(dead_code))]
+const fn provisioned(text: &str) -> bool {
+    !contains(text, "UNPROVISIONED") && contains(text, "RW")
+}
+
+#[cfg(feature = "release-build")]
+const _: () = {
+    assert!(
+        provisioned(CURRENT),
+        "release-build: apps/hx-agent/release-keys/current.pub is UNPROVISIONED"
+    );
+    assert!(
+        provisioned(NEXT),
+        "release-build: apps/hx-agent/release-keys/next.pub is UNPROVISIONED"
+    );
+};
 
 /// The keys a release signature is checked against.
 #[derive(Clone)]
@@ -41,9 +106,14 @@ fn parse_key(text: &str) -> Option<PublicKey> {
 impl UpdateKeys {
     /// The keys compiled into this binary (the unprovisioned or malformed ones are left out).
     pub fn embedded() -> Self {
-        Self {
-            keys: [CURRENT, NEXT].into_iter().filter_map(parse_key).collect(),
-        }
+        let keys: Vec<PublicKey> = [CURRENT, NEXT].into_iter().filter_map(parse_key).collect();
+        #[cfg(feature = "test-release-key")]
+        let keys = {
+            let mut keys = keys;
+            keys.extend(TEST_KEY.and_then(parse_key));
+            keys
+        };
+        Self { keys }
     }
 
     /// True when no key is available: every update is refused.
@@ -94,6 +164,43 @@ mod tests {
                 None => assert!(text.contains("UNPROVISIONED"), "{name}"),
                 Some(_) => assert!(parse_key(text).is_some(), "{name} is not a valid key"),
             }
+        }
+    }
+
+    #[test]
+    fn the_provisioned_gate_tells_a_key_from_the_placeholder() {
+        assert!(!provisioned("UNPROVISIONED\n"));
+        assert!(!provisioned("# note\nUNPROVISIONED\n"));
+        assert!(!provisioned(""));
+        assert!(provisioned(
+            "untrusted comment: minisign public key: X\nRWQabcdefgh\n"
+        ));
+        assert!(contains("abcdef", "cde") && !contains("abc", "abcd") && contains("a", "a"));
+    }
+
+    #[test]
+    fn the_const_gate_agrees_with_the_runtime_parser_on_the_shipped_files() {
+        for text in [CURRENT, NEXT] {
+            if provisioned(text) {
+                assert!(parse_key(text).is_some(), "a provisioned file must parse");
+            } else {
+                assert!(key_line(text).is_none());
+            }
+        }
+    }
+
+    /// Run with `HX_TEST_RELEASE_PUBKEY="$(cat <dir>/test-release.pubkey)" cargo test -p hx-agent
+    /// --features test-release-key --lib privd::update::keys` (release/make-test-release.sh).
+    #[cfg(feature = "test-release-key")]
+    #[test]
+    fn the_test_key_is_embedded_when_given_at_build_time() {
+        let before = [CURRENT, NEXT].into_iter().filter_map(parse_key).count();
+        match TEST_KEY {
+            Some(k) => {
+                assert!(parse_key(k).is_some(), "HX_TEST_RELEASE_PUBKEY is not a key");
+                assert_eq!(UpdateKeys::embedded().len(), before + 1);
+            }
+            None => assert_eq!(UpdateKeys::embedded().len(), before),
         }
     }
 
