@@ -107,7 +107,7 @@ pub fn read_package(root: &std::path::Path, rel: &str) -> Result<Option<Vec<u8>>
         rustix::io::Errno::NOENT => CmdError::internal("the release directory is missing"),
         e => CmdError::from(std::io::Error::from(e)),
     })?;
-    let f = match rustix::fs::openat2(
+    let f = match crate::privd::update::beneath::open_beneath(
         &dir,
         rel,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,

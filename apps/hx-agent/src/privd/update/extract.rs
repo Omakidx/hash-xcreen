@@ -223,7 +223,13 @@ fn open_dir(root: BorrowedFd<'_>, comps: &[String], create: bool) -> Result<Owne
     let mut cur = rustix::io::fcntl_dupfd_cloexec(root, 0).map_err(io::Error::from)?;
     for c in comps {
         let open = |fd: &OwnedFd| {
-            rustix::fs::openat2(fd, c.as_str(), dir_oflags(), Mode::empty(), resolve_flags())
+            super::beneath::open_beneath(
+                fd,
+                c.as_str(),
+                dir_oflags(),
+                Mode::empty(),
+                resolve_flags(),
+            )
         };
         cur = match open(&cur) {
             Ok(fd) => fd,
@@ -345,7 +351,7 @@ pub fn extract_tar_gz(
                     return Err(ExtractError::TooLarge);
                 }
                 let parent = open_dir(root, parents, true)?;
-                let fd = rustix::fs::openat2(
+                let fd = super::beneath::open_beneath(
                     &parent,
                     name,
                     OFlags::WRONLY

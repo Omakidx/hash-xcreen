@@ -147,7 +147,7 @@ impl Layout {
         let root = self.open()?;
         let name = format!(".incoming-{version}-{}", rand_hex()?);
         rustix::fs::mkdirat(&root, name.as_str(), Mode::from_raw_mode(0o700))?;
-        let fd = rustix::fs::openat2(
+        let fd = super::beneath::open_beneath(
             &root,
             name.as_str(),
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -209,7 +209,7 @@ impl Layout {
             return Err("not a version".into());
         }
         let root = self.open().map_err(|e| e.to_string())?;
-        let vdir = rustix::fs::openat2(
+        let vdir = super::beneath::open_beneath(
             &root,
             dir_name,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -220,7 +220,7 @@ impl Layout {
         let beneath =
             ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS;
         for name in REQUIRED_BINARIES.iter().copied().chain([VERSION_FILE]) {
-            let fd = rustix::fs::openat2(
+            let fd = super::beneath::open_beneath(
                 &vdir,
                 name,
                 OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,

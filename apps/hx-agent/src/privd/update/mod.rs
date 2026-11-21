@@ -37,6 +37,7 @@
 //! | [`health`] | the 90 s health check |
 //! | [`system`] | the systemd and socket seams (fakes in tests) |
 
+pub mod beneath;
 pub mod extract;
 pub mod fetchdir;
 pub mod health;
