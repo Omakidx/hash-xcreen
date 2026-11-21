@@ -245,7 +245,7 @@ Every stage has a `check()` and a `run()`. It is skipped only when it is recorde
 | # | Stage | Owner | What it does |
 |---|---|---|---|
 | 1 | `preflight` | installer | Read-only checks (§5.2). Fails with a clear message before anything changes. `install.sh` has already done the bootstrap checks (§5.6). |
-| 2 | `packages` | installer | `btrfs-progs`, `nftables`, `ca-certificates` |
+| 2 | `packages` | installer | `btrfs-progs`, `nftables`, `ca-certificates`, `dnsmasq-base` (Incus only recommends it, and a managed bridge needs it) |
 | 3 | `incus` | installer | Install or adopt Incus (§4.2), `systemctl enable --now incus.socket`, wait for its socket |
 | 4 | `release` | installer | Unpack the verified release into `/usr/lib/hx/<version>` and create `current` (§5.6) |
 | 5 | `system-files` | installer | sysusers, tmpfiles, logrotate, the rescue helper (§5.5, §5.7) |

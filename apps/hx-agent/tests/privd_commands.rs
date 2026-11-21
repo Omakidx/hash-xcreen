@@ -1312,6 +1312,61 @@ fn host_runner() -> Arc<FakeRunner> {
     })
 }
 
+/// Found by the nested-Incus installer run: the installer's `units` stage calls `GetHostInfo`
+/// (the probe is cached for 5 s), then `SetupHost` loads the firewall, and the `GetHostInfo`
+/// right after answered the cached `host_firewall_loaded = false`, so the first install on a
+/// clean host failed at stage `host`.
+#[tokio::test]
+async fn host_info_right_after_setup_host_sees_the_firewall_that_setup_host_loaded() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let loaded = Arc::new(AtomicBool::new(false));
+    let l = loaded.clone();
+    let runner = FakeRunner::with(move |p| {
+        let code = match (p.tool, p.args.first().map(String::as_str)) {
+            (Tool::Nft, Some("-f")) => {
+                l.store(true, Ordering::SeqCst);
+                0
+            }
+            (Tool::Nft, Some("list")) if !l.load(Ordering::SeqCst) => 1,
+            (Tool::Iptables, Some("-C")) => 1,
+            _ => 0,
+        };
+        let stdout = if p.tool == Tool::Ip {
+            r#"[{"ifname":"eth0","addr_info":[{"family":"inet","local":"203.0.113.9"}]},
+                {"ifname":"hxbr0","addr_info":[{"family":"inet","local":"10.99.0.1"}]}]"#
+        } else {
+            ""
+        };
+        RunOutput {
+            code: Some(code),
+            stdout: stdout.into(),
+            ..Default::default()
+        }
+    });
+    let h = Harness::start_with(GW, FakeProbe::default(), FakeIncus::new(), runner);
+    h.incus.with(|s| s.pool_exists = false);
+    let R::GetHostInfo(before) =
+        ok(run(&h, Role::Admin, Command::GetHostInfo(Default::default())).await)
+    else {
+        panic!()
+    };
+    assert!(!before.host_firewall_loaded, "nothing is loaded yet");
+    let R::SetupHost(r) = ok(run(&h, Role::Admin, Command::SetupHost(Default::default())).await)
+    else {
+        panic!()
+    };
+    assert!(r.firewall_loaded);
+    let R::GetHostInfo(after) =
+        ok(run(&h, Role::Admin, Command::GetHostInfo(Default::default())).await)
+    else {
+        panic!()
+    };
+    assert!(
+        after.host_firewall_loaded,
+        "the 5 s probe cache must not hide what SetupHost just loaded"
+    );
+}
+
 #[tokio::test]
 async fn setup_host_loads_and_persists_the_generated_ruleset_through_the_runner() {
     let runner = host_runner();

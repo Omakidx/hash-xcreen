@@ -143,7 +143,7 @@ impl FetchDir {
             name: name.to_string(),
             source,
         };
-        let fd = rustix::fs::openat2(
+        let fd = super::beneath::open_beneath(
             &self.fd,
             name,
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,

@@ -4,7 +4,7 @@
 # not touched.
 #
 #   release/make-test-release.sh --out DIR [--version V] [--channel stable|beta]
-#       [--bin-dir DIR] [--session-dir DIR] [--timestamp UNIX] [--min-previous V]
+#       [--bin-dir DIR] [--session-dir DIR] [--timestamp UNIX] [--min-previous V] [--key-dir DIR]
 #
 # DIR (must not exist, or be empty) receives:
 #   hx-<V>-x86_64.tar.gz          deterministic ustar tarball (release/assemble.sh)
@@ -17,7 +17,15 @@
 #                                 HX_TEST_RELEASE_PUBKEY="$(cat DIR/test-release.pubkey)" and
 #                                 --features test-release-key and privd's `extract` /
 #                                 UpdateKeys accept the release too
-#   private/{current,next}/       the test secret keys (mode 0700; re-sign or tamper in tests)
+#   private/{current,next}/       the test secret keys (mode 0700; re-sign or tamper in tests); with
+#                                 --key-dir they live in that directory instead (see below)
+#
+# --key-dir DIR: use (and create, when missing) the test keys DIR/{current,next} instead of making
+# new ones. The agent binaries embed the test CURRENT key at build time (HX_TEST_RELEASE_PUBKEY), so
+# a run with real binaries needs the key BEFORE the build: make the key dir first (any run of this
+# script with --key-dir creates it, or `openssl-minisign.sh keygen DIR/current` and `.../next`),
+# build with HX_TEST_RELEASE_PUBKEY="$(cat DIR/current/key.line)", then run this script again with
+# --bin-dir and the same --key-dir. Nothing is written to DIR/private in that case.
 #
 # Defaults: --version is the workspace version, --channel stable, --timestamp now. Without
 # --bin-dir the binaries are small shell stubs (the stub hx-agent prints how it was started and
@@ -33,7 +41,7 @@ root=$(cd "$here/.." && pwd)
 
 die() { echo "make-test-release.sh: $*" >&2; exit 2; }
 
-out='' version='' channel=stable bin='' sess='' ts='' minprev=''
+out='' version='' channel=stable bin='' sess='' ts='' minprev='' keydir=''
 while [ $# -gt 0 ]; do
     case $1 in
     --out) out=${2:?}; shift 2 ;;
@@ -43,6 +51,7 @@ while [ $# -gt 0 ]; do
     --session-dir) sess=${2:?}; shift 2 ;;
     --timestamp) ts=${2:?}; shift 2 ;;
     --min-previous) minprev=${2:?}; shift 2 ;;
+    --key-dir) keydir=${2:?}; shift 2 ;;
     *) die "unknown option $1" ;;
     esac
 done
@@ -107,14 +116,23 @@ else
 fi
 
 # ---- keys, signature, patched install.sh ----
-mkdir -p "$out/private"
-chmod 0700 "$out/private"
-sh "$here/openssl-minisign.sh" keygen "$out/private/current"
-sh "$here/openssl-minisign.sh" keygen "$out/private/next"
-sh "$here/openssl-minisign.sh" sign "$out/private/current" "$out/manifest-x86_64.json" \
+if [ -n "$keydir" ]; then
+    keys=$keydir
+else
+    keys=$out/private
+fi
+mkdir -p "$keys"
+chmod 0700 "$keys"
+for k in current next; do
+    if [ ! -s "$keys/$k/key.line" ] || [ ! -s "$keys/$k/secret.pem" ]; then
+        rm -rf "${keys:?}/$k"
+        sh "$here/openssl-minisign.sh" keygen "$keys/$k"
+    fi
+done
+sh "$here/openssl-minisign.sh" sign "$keys/current" "$out/manifest-x86_64.json" \
     "hx-manifest v$version channel=$channel arch=x86_64"
-cur=$(cat "$out/private/current/key.line")
-nxt=$(cat "$out/private/next/key.line")
+cur=$(cat "$keys/current/key.line")
+nxt=$(cat "$keys/next/key.line")
 printf '%s\n' "$cur" >"$out/test-release.pubkey"
 sed -e "s|^KEY_CURRENT='.*'\$|KEY_CURRENT='$cur'|" -e "s|^KEY_NEXT='.*'\$|KEY_NEXT='$nxt'|" \
     "$root/installer/install.sh" >"$out/install.sh"
