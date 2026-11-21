@@ -660,3 +660,26 @@ fn the_service_takes_both_sockets_and_stays_unprivileged() {
     let admin = include_str!("../systemd/hx-gatewayd-admin.socket");
     assert!(unit(admin)("FileDescriptorName=admin"));
 }
+
+/// N4: activation removes `LISTEN_*` from the environment, which is only sound while the
+/// process is single-threaded, so `main` adopts the sockets before it builds the runtime.
+#[test]
+fn the_binary_adopts_the_sockets_before_it_builds_the_runtime() {
+    let bin = include_str!("../src/bin/hx-gatewayd.rs");
+    let adopt = bin
+        .find("activation::from_process(")
+        .expect("adopts the sockets");
+    let runtime = bin
+        .find("tokio::runtime::Builder")
+        .expect("builds a runtime");
+    assert!(
+        adopt < runtime,
+        "from_process must run before the runtime exists"
+    );
+    let run = bin.find("async fn run(").unwrap();
+    let main = bin.find("fn main()").unwrap();
+    assert!(
+        !bin[run..main].contains("activation::from_process("),
+        "no activation inside the async part"
+    );
+}
