@@ -902,6 +902,63 @@ async fn build_on_server_runs_create_start_ready_build_post_in_order() {
     );
 }
 
+/// The build stage only *enables* units and writes `tmpfiles.d` entries; they take effect at a
+/// boot. A desktop that is "ready" must have booted into what was built (found by the
+/// end-to-end run on a real Incus: `hx-session.service` failed with 226/NAMESPACE because
+/// `/var/lib/hx-session/clipboard` did not exist, and Xorg and XFCE were not running).
+#[tokio::test]
+async fn build_on_server_restarts_the_container_after_the_post_stage() {
+    let fake = Fake::start().await;
+    let c = fake.client();
+    let plan = tiny_plan();
+    let naming = Naming::with_prefix("hx1d-test-").unwrap();
+    let spec = DesktopSpec::for_plan(
+        "hx1d-test-c1",
+        naming,
+        &plan,
+        Limits {
+            cpu: Some(1),
+            memory_mib: Some(1024),
+            disk_gib: None,
+            processes: None,
+        },
+    );
+    let secrets = Secrets::none().with_user_password(PASSWORD).unwrap();
+    build_on_server(&c, &plan, &spec, &secrets, &mut |_| {})
+        .await
+        .unwrap();
+    let log = fake.log();
+    let state_path = "PUT /1.0/instances/hx1d-test-c1/state";
+    let actions: Vec<(usize, String)> = log
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.key() == state_path)
+        .map(|(i, r)| (i, r.json()["action"].as_str().unwrap_or("").to_string()))
+        .collect();
+    assert_eq!(
+        actions.iter().map(|(_, a)| a.as_str()).collect::<Vec<_>>(),
+        ["start", "restart"],
+        "start for the build, restart to boot into it"
+    );
+    // Every build and post step ran before the restart; only the readiness polling follows it.
+    let restart_at = actions[1].0;
+    let polls = |r: &&common::Recorded| {
+        r.key().ends_with("/exec") && r.json().to_string().contains("is-system-running")
+    };
+    let last_step_exec = log
+        .iter()
+        .rposition(|r| r.key().ends_with("/exec") && !polls(&r))
+        .unwrap();
+    assert!(
+        last_step_exec < restart_at,
+        "no build or post step after the restart"
+    );
+    assert!(
+        log[restart_at..].iter().any(|r| polls(&r)),
+        "the system is waited for until it is running again"
+    );
+}
+
 #[tokio::test]
 async fn build_failure_leaves_the_container_and_reports_the_step() {
     let fake = Fake::start().await;

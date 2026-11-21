@@ -55,6 +55,7 @@ zeroize.workspace = true
 [dev-dependencies]
 rustix = { workspace = true, features = ["pty", "termios", "fs"] } # a pseudo-terminal for the hidden-prompt test
 crossbeam-channel.workspace = true
+ffmpeg-next.workspace = true # the end-to-end test decodes the frames it receives
 hx-capture.workspace = true
 hx-session.workspace = true
 x11rb = { workspace = true, features = ["xtest"] }
