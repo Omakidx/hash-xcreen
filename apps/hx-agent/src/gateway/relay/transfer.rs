@@ -55,7 +55,12 @@ pub(super) struct TransferCtx {
     /// The effective file limit: the lower of the negotiated one and the link's.
     pub max_file_bytes: u64,
     pub features: Features,
+    /// Bumped on a takeover: every transfer, both directions, is aborted.
     pub abort: watch::Receiver<u64>,
+    /// Bumped when the client's policy turns the clipboard off: its transfers are aborted.
+    pub abort_clip: watch::Receiver<u64>,
+    /// Bumped when the policy turns files off.
+    pub abort_file: watch::Receiver<u64>,
 }
 
 impl TransferCtx {
@@ -185,6 +190,10 @@ async fn run_inbound(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut abort = cx.abort.clone();
+    let mut kind_abort = match channel {
+        pb::TransferChannel::File => cx.abort_file.clone(),
+        _ => cx.abort_clip.clone(),
+    };
     let mut sender = match cx.link.begin_transfer(channel, t.header.clone()).await {
         Ok(s) => s,
         Err(_) => {
@@ -197,6 +206,7 @@ async fn run_inbound(
             biased;
             _ = shutdown.changed() => Step::Stop,
             _ = abort.changed() => Step::Stop,
+            _ = kind_abort.changed() => Step::Stop,
             r = tokio::time::timeout(IDLE, t.next_chunk()) => {
                 Step::Chunk(r.map_err(|_| ()).and_then(|r| r.map_err(|_| ())))
             }
@@ -226,8 +236,15 @@ async fn run_inbound(
     }
 }
 
+/// How often the session may start transfers: clipboard 4 a second, files 16 per 10 s.
+struct Rates {
+    clip: TokenBucket,
+    file: TokenBucket,
+}
+
 struct Out {
     sender: TransferSender,
+    kind: TransferKind,
 }
 
 /// Bridges the session's transfers to the client.
@@ -237,20 +254,29 @@ pub(super) async fn outbound(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut abort = cx.abort.clone();
+    let mut abort_clip = cx.abort_clip.clone();
+    let mut abort_file = cx.abort_file.clone();
     let mut active: HashMap<u32, Out> = HashMap::new();
-    let mut clip_rate = TokenBucket::new(4, 4);
+    let mut rates = Rates {
+        clip: TokenBucket::new(4, 4),
+        // 16 files a copy (ipc.md 16), about one copy every 10 s.
+        file: TokenBucket::with_rate(1.6, 16),
+    };
     loop {
         while let Some(ev) = inbox.pop() {
             enum Sig {
                 Shutdown,
                 Abort,
+                Kind(TransferKind),
                 Done,
             }
             let sig = tokio::select! {
                 biased;
                 _ = shutdown.changed() => Sig::Shutdown,
                 _ = abort.changed() => Sig::Abort,
-                () = handle(&cx, &mut active, &mut clip_rate, ev) => Sig::Done,
+                _ = abort_clip.changed() => Sig::Kind(TransferKind::Clipboard),
+                _ = abort_file.changed() => Sig::Kind(TransferKind::File),
+                () = handle(&cx, &mut active, &mut rates, ev) => Sig::Done,
             };
             match sig {
                 Sig::Shutdown => {
@@ -258,6 +284,7 @@ pub(super) async fn outbound(
                     return;
                 }
                 Sig::Abort => abort_all(&cx, &mut active),
+                Sig::Kind(k) => abort_kind(&cx, &mut active, k),
                 Sig::Done => {}
             }
         }
@@ -271,7 +298,24 @@ pub(super) async fn outbound(
                 abort_all(&cx, &mut active);
                 inbox.clear(&cx.link);
             }
+            _ = abort_clip.changed() => abort_kind(&cx, &mut active, TransferKind::Clipboard),
+            _ = abort_file.changed() => abort_kind(&cx, &mut active, TransferKind::File),
             () = inbox.notify.notified() => {}
+        }
+    }
+}
+
+/// The policy for `kind` was switched off: its running transfers (session to client) end.
+fn abort_kind(cx: &TransferCtx, active: &mut HashMap<u32, Out>, kind: TransferKind) {
+    let ids: Vec<u32> = active
+        .iter()
+        .filter(|(_, o)| o.kind == kind)
+        .map(|(id, _)| *id)
+        .collect();
+    for id in ids {
+        if let Some(o) = active.remove(&id) {
+            o.sender.abort();
+            cx.link.abort_transfer(id, RESET_TRANSFER_ERROR);
         }
     }
 }
@@ -286,7 +330,7 @@ fn abort_all(cx: &TransferCtx, active: &mut HashMap<u32, Out>) {
 async fn handle(
     cx: &TransferCtx,
     active: &mut HashMap<u32, Out>,
-    clip_rate: &mut TokenBucket,
+    rates: &mut Rates,
     ev: TransferEvent,
 ) {
     match ev {
@@ -306,8 +350,9 @@ async fn handle(
             let refuse = !cx.allowed(kind)
                 || active.len() >= MAX_CONCURRENT
                 || active.contains_key(&id)
-                || (kind == TransferKind::Clipboard && !clip_rate.allow(Instant::now()))
-                || (kind == TransferKind::File && header.size > cx.max_file_bytes);
+                || (kind == TransferKind::Clipboard && !rates.clip.allow(Instant::now()))
+                || (kind == TransferKind::File
+                    && (header.size > cx.max_file_bytes || !rates.file.allow(Instant::now())));
             if refuse {
                 cx.link.abort_transfer(id, STOP_TRANSFER_REJECTED);
                 return;
@@ -316,7 +361,7 @@ async fn handle(
             // `Aborted`, which closes its client stream.
             match tokio::time::timeout(OPEN_TIMEOUT, cx.conn.open_transfer(kind, header)).await {
                 Ok(Ok(sender)) => {
-                    active.insert(id, Out { sender });
+                    active.insert(id, Out { sender, kind });
                 }
                 _ => cx.link.abort_transfer(id, STOP_TRANSFER_REJECTED),
             }

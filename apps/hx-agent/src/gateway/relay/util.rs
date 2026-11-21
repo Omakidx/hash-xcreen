@@ -21,8 +21,13 @@ pub(super) struct TokenBucket {
 
 impl TokenBucket {
     pub(super) fn new(rate_per_s: u32, burst: u32) -> Self {
+        Self::with_rate(f64::from(rate_per_s), burst)
+    }
+
+    /// `rate` events a second (fractions allowed) with a burst of `burst`.
+    pub(super) fn with_rate(rate: f64, burst: u32) -> Self {
         Self {
-            rate: f64::from(rate_per_s),
+            rate,
             burst: f64::from(burst.max(1)),
             tokens: f64::from(burst.max(1)),
             last: Instant::now(),

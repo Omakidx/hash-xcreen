@@ -67,6 +67,8 @@ pub(super) struct ClientRelay {
     max_file_bytes: u64,
     shutdown: watch::Sender<bool>,
     abort: watch::Sender<u64>,
+    abort_clip: watch::Sender<u64>,
+    abort_file: watch::Sender<u64>,
     detached: AtomicBool,
     goodbye_code: AtomicU32,
     /// Tasks that must be waited for are not tracked: they all end on `shutdown`.
@@ -84,6 +86,8 @@ impl ClientRelay {
         let display = link.info().display;
         let (shutdown, _) = watch::channel(false);
         let (abort, _) = watch::channel(0u64);
+        let (abort_clip, _) = watch::channel(0u64);
+        let (abort_file, _) = watch::channel(0u64);
         Arc::new(Self {
             input: Arc::new(InputPath::new(
                 link.clone(),
@@ -112,6 +116,8 @@ impl ClientRelay {
             core,
             shutdown,
             abort,
+            abort_clip,
+            abort_file,
             detached: AtomicBool::new(false),
             goodbye_code: AtomicU32::new(NO_GOODBYE),
             started: AtomicU64::new(0),
@@ -123,8 +129,13 @@ impl ClientRelay {
     pub(super) fn apply_view(&self, view: &ViewConfig, codec: VideoCodec) -> pb::StreamConfig {
         let clipboard = view.clipboard_enabled && self.features.contains(Features::CLIPBOARD);
         let files = self.features.contains(Features::FILE_TRANSFER);
-        self.clipboard_ok.store(clipboard, Relaxed);
-        self.files_ok.store(files, Relaxed);
+        // A policy that turns off ends what runs under it, in both directions.
+        if self.clipboard_ok.swap(clipboard, Relaxed) && !clipboard {
+            self.abort_clip.send_modify(|g| *g += 1);
+        }
+        if self.files_ok.swap(files, Relaxed) && !files {
+            self.abort_file.send_modify(|g| *g += 1);
+        }
         self.link.set_policy(clipboard, files);
         self.stats.on.store(
             view.stats_enabled && self.features.contains(Features::SERVER_STATS),
@@ -192,6 +203,8 @@ impl ClientRelay {
             max_file_bytes: self.max_file_bytes,
             features: self.features,
             abort: self.abort.subscribe(),
+            abort_clip: self.abort_clip.subscribe(),
+            abort_file: self.abort_file.subscribe(),
         };
         tokio::spawn(transfer::inbound(tcx.clone(), rx()));
         tokio::spawn(transfer::outbound(tcx, self.inbox.clone(), rx()));
