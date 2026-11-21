@@ -251,7 +251,7 @@ async fn an_unknown_or_malformed_prefix_changes_nothing() {
     let a = new_key();
     w.gw.pair(&a, "alice").await;
     let ha = device_hex(&a);
-    let nope = unused_prefix(&[ha.clone()]);
+    let nope = unused_prefix(std::slice::from_ref(&ha));
     let r = cli(&w.cfg, &["devices", "revoke", &nope], &[], &[]).await;
     assert_eq!(r.code, 5, "{r:?}");
     assert!(

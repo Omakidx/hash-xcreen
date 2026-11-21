@@ -195,6 +195,9 @@ impl FrameSource {
     }
 }
 
+/// `(request_id, slot, bytes)` of every secret frame a stand-in received.
+pub type SecretLog = Arc<Mutex<Vec<(u64, u8, Vec<u8>)>>>;
+
 pub type Handled<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 /// What a privd handler answers: progress frames, then the response (its `request_id` is set
@@ -220,7 +223,7 @@ pub type PrivdHandler =
 pub struct ScriptedPrivd {
     pub path: PathBuf,
     /// Every `(request_id, slot, bytes)` secret frame received.
-    pub secrets: Arc<Mutex<Vec<(u64, u8, Vec<u8>)>>>,
+    pub secrets: SecretLog,
     /// Every request received, in order.
     pub requests: Arc<Mutex<Vec<pb::Request>>>,
     /// Every raw request body (protobuf bytes), to prove that no secret is inside.
@@ -248,7 +251,7 @@ impl ScriptedPrivd {
         use prost::Message;
         let path = dir.join(name);
         let listener = UnixListener::bind(&path).expect("bind privd stand-in");
-        let secrets: Arc<Mutex<Vec<(u64, u8, Vec<u8>)>>> = Arc::default();
+        let secrets: SecretLog = Arc::default();
         let requests: Arc<Mutex<Vec<pb::Request>>> = Arc::default();
         let encoded: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
         let (s2, r2, e2) = (secrets.clone(), requests.clone(), encoded.clone());
@@ -393,7 +396,7 @@ pub type AdminHandler =
 /// A gatewayd admin-socket stand-in.
 pub struct ScriptedAdmin {
     pub path: PathBuf,
-    pub secrets: Arc<Mutex<Vec<(u64, u8, Vec<u8>)>>>,
+    pub secrets: SecretLog,
     pub requests: Arc<Mutex<Vec<apb::Request>>>,
     pub encoded: Arc<Mutex<Vec<Vec<u8>>>>,
 }
@@ -403,7 +406,7 @@ impl ScriptedAdmin {
         use prost::Message;
         let path = dir.join(name);
         let listener = UnixListener::bind(&path).expect("bind admin stand-in");
-        let secrets: Arc<Mutex<Vec<(u64, u8, Vec<u8>)>>> = Arc::default();
+        let secrets: SecretLog = Arc::default();
         let requests: Arc<Mutex<Vec<apb::Request>>> = Arc::default();
         let encoded: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
         let (s2, r2, e2) = (secrets.clone(), requests.clone(), encoded.clone());
