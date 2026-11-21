@@ -87,6 +87,7 @@ impl ClientRelay {
         Arc::new(Self {
             input: Arc::new(InputPath::new(
                 link.clone(),
+                request.connection.clone(),
                 epoch,
                 core.epoch.clone(),
                 display,

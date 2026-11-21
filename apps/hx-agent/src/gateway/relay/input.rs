@@ -46,6 +46,7 @@ const MAX_RELATIVE: i32 = 32_768;
 /// The way from one client's input to the session.
 pub(super) struct InputPath {
     link: LinkClient,
+    conn: Connection,
     epoch: u32,
     current: Arc<AtomicU32>,
     open: Mutex<bool>,
@@ -58,12 +59,14 @@ pub(super) struct InputPath {
 impl InputPath {
     pub(super) fn new(
         link: LinkClient,
+        conn: Connection,
         epoch: u32,
         current: Arc<AtomicU32>,
         display: (u32, u32),
     ) -> Self {
         let p = Self {
             link,
+            conn,
             epoch,
             current,
             open: Mutex::new(true),
@@ -101,7 +104,9 @@ impl InputPath {
     /// Forwards one validated event. `true` if it went to the session.
     pub(super) fn forward(&self, ev: InputEvent) -> bool {
         let open = lock(&self.open);
-        if !*open || self.current.load(Relaxed) != self.epoch {
+        // Events the transport queued before the connection closed (a revoked device) are still
+        // readable after the close: they must not reach the session.
+        if !*open || self.current.load(Relaxed) != self.epoch || self.conn.close_info().is_some() {
             self.refused.fetch_add(1, Relaxed);
             return false;
         }
@@ -134,7 +139,7 @@ impl InputPath {
     /// Forwards pointer motion (coalesced by the transport; coalesced again by the link).
     pub(super) fn mouse(&self, relative: bool, x: i32, y: i32) -> bool {
         let open = lock(&self.open);
-        if !*open || self.current.load(Relaxed) != self.epoch {
+        if !*open || self.current.load(Relaxed) != self.epoch || self.conn.close_info().is_some() {
             self.refused.fetch_add(1, Relaxed);
             return false;
         }

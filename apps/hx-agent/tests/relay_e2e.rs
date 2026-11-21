@@ -1019,3 +1019,33 @@ async fn a_client_flooding_view_configs_input_and_motion_cannot_make_the_link_fa
     while c.frames.try_recv().is_ok() {}
     c.next_frame(15).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn input_queued_before_a_close_does_not_reach_the_desktop_after_it() {
+    let Some(rig) = Rig::start(RigOptions::default()).await else {
+        return;
+    };
+    let dev = rig.device("laptop").await;
+    let mut c = rig.client(&dev, "laptop").await;
+    c.view(|_| {}).await;
+    c.next_frame(15).await;
+    let (w, _root) = watcher(&rig.x);
+    // 1500 events at once: the relay paces them (500 free, the rest at 2000 a second, about
+    // 0.5 s), so most are still queued in the transport when the connection is closed.
+    let key = |pressed| InputEvent {
+        event: Some(In::Key(KeyEvent {
+            scancode: 0x04,
+            pressed,
+        })),
+    };
+    for i in 0..1_500 {
+        c.conn.send_input(&key(i % 2 == 0)).await.unwrap();
+    }
+    c.conn.close(CloseCode::NoError, "bye").await;
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let reached = key_events(&w, 5_000, Duration::from_millis(500)).len();
+    assert!(
+        reached < 1_500,
+        "events queued before the close were forwarded after it: {reached}"
+    );
+}
