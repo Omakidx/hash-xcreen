@@ -19,6 +19,8 @@ enum VideoCodec {
 message Capabilities {
   repeated VideoCodec video_codecs = 1;
   uint64 features = 2;
+  // 1.1: largest file transfer this side accepts; 0 = not stated; at most 4 GiB.
+  uint64 max_file_bytes = 3;
 }
 
 enum Intent {
@@ -65,6 +67,8 @@ message ViewConfig {
   uint32 scale_percent = 6;
   bool audio_enabled = 7;
   bool clipboard_enabled = 8;
+  // 1.1: send ServerStats (requires the SERVER_STATS feature).
+  bool stats_enabled = 9;
 }
 
 message StreamInfo {
@@ -97,6 +101,25 @@ message ClientStats {
 message Goodbye {
   uint32 code = 1;
   string message = 2;
+  // 1.1, only with close code TAKEN_OVER: the new device's sanitized name (at most 64 bytes)
+  // and its 16-byte device id (empty or 16 bytes).
+  string peer_device_name = 3;
+  bytes peer_device_id = 4;
+}
+
+// 1.1: numeric-only statistics for the stats overlay. No string or bytes field, ever.
+message ServerStats {
+  uint32 interval_ms = 1;
+  uint32 frames = 2;
+  uint32 keyframes = 3;
+  uint32 dropped_frames = 4;
+  uint32 bitrate_kbps = 5;
+  uint32 target_bitrate_kbps = 6;
+  uint32 fps_ceiling = 7;
+  uint32 encode_p95_us = 8;
+  uint32 total_p95_us = 9;
+  uint32 queue_depth_max = 10;
+  uint32 rtt_us = 11;
 }
 
 // Opaque carrier for messages owned by workstream 1B (pairing, PIN/auth).
@@ -116,6 +139,7 @@ message ControlMessage {
     Pong pong = 8;
     ClientStats stats = 9;
     Goodbye goodbye = 10;
+    ServerStats server_stats = 11;
     Opaque pairing = 100;
     Opaque auth = 101;
   }
