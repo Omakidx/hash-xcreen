@@ -16,11 +16,12 @@ use serde_json::{Value, json};
 use super::error::IncusError;
 use super::limits::{LimitsApplied, LimitsUpdate};
 use super::link::{LinkOutcome, SESSION_LINK_DEVICE, SessionLink};
+use super::marker::{NETWORK_DESCRIPTION, POOL_DESCRIPTION};
 use super::operation::{OperationEnd, OperationId};
 use super::transport::{Request, Response, Transport, UnixTransport};
 use super::types::{
-    Acl, ExecResult, ExecSpec, Instance, InstanceCreate, InstanceState, Network, Operation,
-    ProfileSpec, ServerInfo, Snapshot, StateAction, StoragePool,
+    Acl, ExecResult, ExecSpec, Instance, InstanceCreate, InstanceState, Network, ObjectInfo,
+    Operation, ProfileSpec, ServerInfo, Snapshot, StateAction, StoragePool,
 };
 
 /// Default timeout of a plain request.
@@ -497,7 +498,7 @@ impl<T: Transport> Client<T> {
         config: &std::collections::BTreeMap<String, String>,
     ) -> Result<(), IncusError> {
         checked("storage pool", name)?;
-        let body = json!({"name": name, "driver": driver, "config": config});
+        let body = json!({"name": name, "driver": driver, "config": config, "description": POOL_DESCRIPTION});
         self.sync(Method::POST, "/1.0/storage-pools".into(), Some(&body))
             .await
             .map(drop)
@@ -529,7 +530,7 @@ impl<T: Transport> Client<T> {
         config: &std::collections::BTreeMap<String, String>,
     ) -> Result<(), IncusError> {
         checked("network", name)?;
-        let body = json!({"name": name, "type": "bridge", "config": config});
+        let body = json!({"name": name, "type": "bridge", "config": config, "description": NETWORK_DESCRIPTION});
         self.sync(Method::POST, "/1.0/networks".into(), Some(&body))
             .await
             .map(drop)
@@ -557,6 +558,15 @@ impl<T: Transport> Client<T> {
         self.sync(Method::DELETE, format!("/1.0/networks/{name}"), None)
             .await
             .map(drop)
+    }
+
+    /// The ACL (name, description, users), or `None`.
+    pub async fn get_acl(&self, name: &str) -> Result<Option<ObjectInfo>, IncusError> {
+        let name = checked("network ACL", name)?;
+        self.get_optional(format!("/1.0/network-acls/{name}"))
+            .await?
+            .map(|v| decode("network ACL", v))
+            .transpose()
     }
 
     /// Whether the ACL exists.
@@ -601,6 +611,15 @@ impl<T: Transport> Client<T> {
     }
 
     // --- profiles --------------------------------------------------------------------------
+
+    /// The profile (name, description, users), or `None`.
+    pub async fn get_profile(&self, name: &str) -> Result<Option<ObjectInfo>, IncusError> {
+        let name = checked("profile", name)?;
+        self.get_optional(format!("/1.0/profiles/{name}"))
+            .await?
+            .map(|v| decode("profile", v))
+            .transpose()
+    }
 
     /// Whether the profile exists.
     pub async fn profile_exists(&self, name: &str) -> Result<bool, IncusError> {

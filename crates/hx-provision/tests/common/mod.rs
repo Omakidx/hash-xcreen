@@ -76,6 +76,8 @@ pub struct State {
     /// Type answered for any other path, when set.
     pub default_file_type: Option<String>,
     pub instance_patches: u32,
+    /// Descriptions of networks, by name (set from the create request).
+    pub descriptions: HashMap<String, String>,
     /// Instance-local devices by instance name, as `PATCH`/`PUT` set them.
     pub devices: HashMap<String, BTreeMap<String, BTreeMap<String, String>>>,
     /// Instance-local config by instance name, as `PATCH` sets it.
@@ -117,6 +119,7 @@ impl State {
             file_types: HashMap::new(),
             default_file_type: None,
             instance_patches: 0,
+            descriptions: HashMap::new(),
             devices: HashMap::new(),
             config: HashMap::new(),
             expanded_devices: BTreeMap::new(),
@@ -205,11 +208,17 @@ impl State {
             },
             ("POST", ["1.0", "storage-pools"]) => {
                 let n = body["name"].as_str().unwrap_or_default().to_string();
-                self.pools.insert(n.clone(), json!({"name":n,"driver":body["driver"],"config":body["config"],"status":"Created"}));
+                self.pools.insert(n.clone(), json!({"name":n,"driver":body["driver"],"config":body["config"],"status":"Created","description":body["description"]}));
                 sync(Value::Null)
             }
+            ("DELETE", ["1.0", "storage-pools", n]) => match self.pools.remove(*n) {
+                Some(_) => sync(Value::Null),
+                None => not_found("pool"),
+            },
             ("GET", ["1.0", "networks", n]) => match self.networks.get(*n) {
-                Some(c) => sync(json!({"name":n,"type":"bridge","config":c,"status":"Created"})),
+                Some(c) => sync(
+                    json!({"name":n,"type":"bridge","config":c,"status":"Created","description":self.descriptions.get(*n).cloned().unwrap_or_default()}),
+                ),
                 None => not_found("network"),
             },
             ("POST", ["1.0", "networks"]) => {
@@ -219,9 +228,25 @@ impl State {
                 if cfg.get("ipv4.address").map(String::as_str) == Some("auto") {
                     cfg.insert("ipv4.address".into(), "10.99.1.1/24".into());
                 }
+                self.descriptions.insert(
+                    n.clone(),
+                    body["description"].as_str().unwrap_or_default().to_string(),
+                );
                 self.networks.insert(n, cfg);
                 sync(Value::Null)
             }
+            ("DELETE", ["1.0", "networks", n]) => match self.networks.remove(*n) {
+                Some(_) => sync(Value::Null),
+                None => not_found("network"),
+            },
+            ("DELETE", ["1.0", "network-acls", n]) => match self.acls.remove(*n) {
+                Some(_) => sync(Value::Null),
+                None => not_found("acl"),
+            },
+            ("DELETE", ["1.0", "profiles", n]) => match self.profiles.remove(*n) {
+                Some(_) => sync(Value::Null),
+                None => not_found("profile"),
+            },
             ("PATCH", ["1.0", "networks", n]) => {
                 let add: BTreeMap<String, String> =
                     serde_json::from_value(body["config"].clone()).unwrap_or_default();

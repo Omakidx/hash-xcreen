@@ -91,6 +91,12 @@ pub struct StoragePool {
     /// Pool status (`Created`).
     #[serde(default)]
     pub status: String,
+    /// Description (carries the hash-xcreen marker on pools we created).
+    #[serde(default)]
+    pub description: String,
+    /// API paths of the objects that use it.
+    #[serde(default)]
+    pub used_by: Vec<String>,
 }
 
 /// A network as reported by the daemon.
@@ -108,6 +114,26 @@ pub struct Network {
     /// Network status.
     #[serde(default)]
     pub status: String,
+    /// Description (carries the hash-xcreen marker on networks we created).
+    #[serde(default)]
+    pub description: String,
+    /// API paths of the objects that use it.
+    #[serde(default)]
+    pub used_by: Vec<String>,
+}
+
+/// A profile or network ACL as reported by the daemon (the parts teardown needs).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+pub struct ObjectInfo {
+    /// Name.
+    #[serde(default)]
+    pub name: String,
+    /// Description (carries the hash-xcreen marker on objects we created).
+    #[serde(default)]
+    pub description: String,
+    /// API paths of the objects that use it.
+    #[serde(default)]
+    pub used_by: Vec<String>,
 }
 
 /// An instance as reported by the daemon.

@@ -432,6 +432,9 @@ impl DesktopSpec {
         config.insert("security.guestapi".into(), "false".into());
         config.insert("security.idmap.isolated".into(), "true".into());
         config.insert("boot.autostart".into(), "true".into());
+        // The hash-xcreen marker (ipc.md 7, rule 8): teardown deletes only instances that have a
+        // `user.hx.*` key. `hx-privd` moves the state on to `ready` (or `failed`) later.
+        config.insert(crate::incus::INSTANCE_STATE_KEY.into(), "creating".into());
         config.insert(
             "limits.processes".into(),
             self.limits
@@ -490,6 +493,10 @@ pub enum ProvisionError {
     /// Bad input.
     #[error("invalid request: {0}")]
     Invalid(String),
+    /// A destructive call was refused because the object does not carry the hash-xcreen marker
+    /// (privd: `PERMISSION_DENIED` or `FAILED_PRECONDITION`).
+    #[error("`{0}` does not carry the hash-xcreen marker; refusing to delete it")]
+    NotOurs(String),
     /// The requested mode or feature is named but not implemented (privd: `UNIMPLEMENTED`).
     #[error("not implemented: {0}")]
     Unimplemented(String),

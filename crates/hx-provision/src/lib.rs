@@ -30,6 +30,7 @@ pub mod password;
 pub mod plan;
 pub mod recipe;
 pub mod session;
+pub mod teardown;
 pub mod user;
 
 pub use catalog::{Addon, Catalog, Desktop, Distro, Preset, RecipeId};
