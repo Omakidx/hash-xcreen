@@ -16,8 +16,9 @@
 //! - Feature `release-build` (only the release workflow enables it) makes the build fail unless
 //!   **both** `CURRENT` and `NEXT` hold a key: an `UNPROVISIONED` file is a compile error, so a
 //!   binary that could never verify an update, or that has no key to rotate to, cannot ship.
-//! - `release-build` together with `test-support` or `test-release-key` is a compile error: a
-//!   release binary never carries a test hook or a test key.
+//! - `release-build` together with any test hook (`test-support`, `test-release-key`,
+//!   `gateway-test-hooks`, `install-test-hooks`, `privd-test-hooks`) is a compile error: a release
+//!   binary never carries a test hook or a test key.
 //! - Feature `test-release-key` adds one more key, taken at build time from the environment
 //!   variable `HX_TEST_RELEASE_PUBKEY` (the base64 key line of a test key, for example
 //!   `test-release.pubkey` made by `release/make-test-release.sh`). It exists so the installer
@@ -32,10 +33,17 @@ const NEXT: &str = include_str!("../../../release-keys/next.pub");
 
 #[cfg(all(
     feature = "release-build",
-    any(feature = "test-support", feature = "test-release-key")
+    any(
+        feature = "test-support",
+        feature = "test-release-key",
+        feature = "gateway-test-hooks",
+        feature = "install-test-hooks",
+        feature = "privd-test-hooks"
+    )
 ))]
 compile_error!(
-    "feature `release-build` must not be combined with `test-support` or `test-release-key`: \
+    "feature `release-build` must not be combined with a test feature (`test-support`, \
+     `test-release-key`, `gateway-test-hooks`, `install-test-hooks`, `privd-test-hooks`): \
      a release binary carries no test hook and no test key"
 );
 
