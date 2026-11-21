@@ -545,6 +545,45 @@ async fn a_device_the_verifier_has_no_pin_for_is_refused_before_anything_is_aske
 }
 
 #[tokio::test]
+async fn unknown_revoked_and_no_pin_devices_get_the_same_refusal() {
+    let v = Scripted::without_pin();
+    let e = env(AuthenticatorConfig::default(), &v).await;
+    let refusal = |device: Arc<IdentityKey>| {
+        let (t, sk) = (e.target(), e.server_key.public());
+        async move {
+            let r = within(connect_with_pin(
+                &t,
+                &device,
+                sk,
+                &pin(PIN),
+                &SessionOptions {
+                    preference: PREF,
+                    ..Default::default()
+                },
+            ))
+            .await;
+            match r {
+                Err(Error::Refused { reason, message }) => (reason, message),
+                other => panic!("expected a refusal: {other:?}"),
+            }
+        }
+    };
+    let no_pin = refusal(e.device.clone()).await;
+    let unknown = refusal(new_key()).await;
+    e.auth
+        .set_pin_verifier(Scripted::new(PinVerdict::Right, Duration::ZERO));
+    e.auth
+        .revoke(&e.id(), RevokeReason::User)
+        .await
+        .expect("revoke");
+    let revoked = refusal(e.device.clone()).await;
+    assert_eq!(no_pin.0, RefuseReason::Unauthorized);
+    assert_eq!(no_pin, unknown);
+    assert_eq!(no_pin, revoked);
+    assert_eq!(no_pin.1, "not authorized");
+}
+
+#[tokio::test]
 async fn a_local_pin_hash_is_a_verifier_and_set_pin_is_unchanged() {
     use hx_crypto::{PinHash, PinParams};
     let cheap = PinParams {

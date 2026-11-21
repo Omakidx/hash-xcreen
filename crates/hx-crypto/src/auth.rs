@@ -185,7 +185,7 @@ fn locked_wait(retry_after: Option<Duration>) -> Duration {
 /// never reaches the verifier.
 pub trait PinVerifier: Send + Sync + 'static {
     /// True if a PIN can be checked for `device` at all. When false the client gets
-    /// `NOT_AVAILABLE` (and, before `HelloAck`, the uniform "not set up yet" refusal).
+    /// `NOT_AVAILABLE` (and, before `HelloAck`, the same uniform refusal as for an unknown or revoked device).
     fn has_pin(&self, _device: &DeviceId) -> bool {
         true
     }
@@ -511,7 +511,7 @@ impl Authenticator {
             Ok(k) => k,
             Err(_) => {
                 return self
-                    .refuse(pending, RefuseReason::Unauthorized, "not authorized")
+                    .refuse(pending, RefuseReason::Unauthorized, NOT_AUTHORIZED)
                     .await;
             }
         };
@@ -524,7 +524,7 @@ impl Authenticator {
             Err(e) => {
                 tracing::error!(error = %e, "registry lookup failed; refusing");
                 let _ = self
-                    .refuse(pending, RefuseReason::Unauthorized, "not authorized")
+                    .refuse(pending, RefuseReason::Unauthorized, NOT_AUTHORIZED)
                     .await;
                 return Err(e);
             }
@@ -535,7 +535,7 @@ impl Authenticator {
             Intent::Pair => self.pair(pending, key, known).await,
             Intent::Session => self.session(pending, known, rx).await,
             Intent::Unspecified => {
-                self.refuse(pending, RefuseReason::Unauthorized, "not authorized")
+                self.refuse(pending, RefuseReason::Unauthorized, NOT_AUTHORIZED)
                     .await
             }
         }
@@ -561,7 +561,7 @@ impl Authenticator {
     ) -> Result<Outcome> {
         if known.as_ref().is_some_and(DeviceRecord::is_revoked) {
             return self
-                .refuse(pending, RefuseReason::Unauthorized, "not authorized")
+                .refuse(pending, RefuseReason::Unauthorized, NOT_AUTHORIZED)
                 .await;
         }
         if !self.inner.window.is_open() {
@@ -619,21 +619,17 @@ impl Authenticator {
     ) -> Result<Outcome> {
         let Some(device) = known else {
             return self
-                .refuse(pending, RefuseReason::Unauthorized, "not authorized")
+                .refuse(pending, RefuseReason::Unauthorized, NOT_AUTHORIZED)
                 .await;
         };
         if device.is_revoked() {
             return self
-                .refuse(pending, RefuseReason::Unauthorized, "not authorized")
+                .refuse(pending, RefuseReason::Unauthorized, NOT_AUTHORIZED)
                 .await;
         }
         if self.pin_verifier().is_none_or(|v| !v.has_pin(&device.id)) {
             return self
-                .refuse(
-                    pending,
-                    RefuseReason::Unauthorized,
-                    "server is not set up yet",
-                )
+                .refuse(pending, RefuseReason::Unauthorized, NOT_AUTHORIZED)
                 .await;
         }
         let conn = pending
@@ -959,6 +955,10 @@ impl Authenticator {
         });
     }
 }
+
+/// The one refusal text for an unknown device, a revoked device and a device with no PIN
+/// (protocol §11.6), so a refusal never tells which case applies.
+const NOT_AUTHORIZED: &str = "not authorized";
 
 /// How long to let the peer read our last message (a failure verdict) before closing. A QUIC
 /// close discards stream data the peer has not read yet, so closing at once would turn "wrong

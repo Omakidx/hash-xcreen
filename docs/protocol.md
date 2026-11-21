@@ -669,7 +669,7 @@ On **every** `PendingSession` the application looks the peer key up in the curre
 - CLI revoke, remove and reinstate go through the agent. `reinstate` only after the Linux password was verified by `hx-privd`'s peppered verifier (`PepperVerify`, a failure-capped yes/no check, with `PepperEnrol` for setting it up; see [ipc.md](ipc.md) §6.15).
 - An operator's lockout reset (zero the failure counter of a device that is not revoked) is `Authenticator::reset_lockout` (`DeviceRegistry::reset_pin_failures` underneath, which does not stamp `last_seen`); it waits for a running PIN check of that device and also drops the in-memory wait.
 - `Authenticator::is_backing_off(&DeviceId)` (and `backoff_remaining`, the wait left) tell whether a device's PIN is held back right now: a wrong-PIN backoff, an `Unavailable` hold or a `Locked` wait. It is an in-memory lookup, for the admin device list.
-- Clients must sanitise `Refuse.message` (and any server text) before showing it; the server's refusal text for unknown, revoked and unsetup cases is deliberately uniform.
+- Clients must sanitise `Refuse.message` (and any server text) before showing it; the server's refusal text for unknown, revoked and no-PIN cases is deliberately one fixed string (`not authorized`, with `UNAUTHORIZED`), so a refusal never tells which case applies.
 - The identity seed is root-only (`systemd-creds`), the registry directory must not be writable by group or others, and the registry file is 0600 and owned by the agent user.
 
 ## 12. Client behaviour on security failures
