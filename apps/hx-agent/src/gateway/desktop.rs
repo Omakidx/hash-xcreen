@@ -314,6 +314,8 @@ pub mod recording {
         pub events: Arc<Mutex<Vec<Event>>>,
         /// Make `attach` fail with `Unavailable` when set.
         pub unavailable: Arc<Mutex<bool>>,
+        /// How long `attach` takes (a slow dial of the desktop).
+        pub attach_delay: Arc<Mutex<Duration>>,
     }
 
     impl RecordingLink {
@@ -367,8 +369,12 @@ pub mod recording {
             request: AttachRequest,
         ) -> BoxFuture<'_, Result<Arc<dyn LinkClient>, LinkError>> {
             let unavailable = *self.unavailable.lock().unwrap();
+            let delay = *self.attach_delay.lock().unwrap();
             let events = self.events.clone();
             Box::pin(async move {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
                 if unavailable {
                     return Err(LinkError::Unavailable);
                 }

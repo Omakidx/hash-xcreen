@@ -1246,3 +1246,34 @@ async fn clipboard_images_and_copied_files_travel_to_the_gateway_and_images_back
     assert_eq!((h.name.as_str(), h.size), ("copied.bin", 5_000));
     assert_eq!(body, content);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clipboard_that_cannot_start_is_reported_not_silently_off() {
+    // No usable staging location (what a read-only runtime directory amounts to): the session
+    // must say so with an event, and carry on without the clipboard.
+    let Some(env) = Env::start(|cfg| {
+        if let Some(c) = cfg.clipboard.as_mut() {
+            c.staging_base = Some(PathBuf::from("no-such-dir/hx-staging"));
+        }
+    }) else {
+        return;
+    };
+    let (link, mut ev) = env.connect().await;
+    link.start(1, stream_config()).unwrap();
+    let mut said = None;
+    until(&link, &mut ev, Duration::from_secs(10), true, |e| {
+        if let LinkEvent::Event(se) = e
+            && se.kind == pb::EventKind::ClipboardError
+        {
+            said = Some(se.message.clone());
+        }
+        said.is_some()
+    })
+    .await;
+    assert!(said.unwrap().contains("clipboard could not start"));
+    // Streaming works regardless.
+    until(&link, &mut ev, Duration::from_secs(10), true, |e| {
+        matches!(e, LinkEvent::Frame(_))
+    })
+    .await;
+}

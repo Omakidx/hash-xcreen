@@ -623,6 +623,30 @@ impl PrivdClient {
             _ => Err(PrivdError::Protocol("unexpected result variant".into())),
         }
     }
+
+    /// `RestartSession` (section 6.11): restarts `hx-session` after repeated link faults
+    /// (section 19.2). privd rate limits it.
+    pub async fn restart_session(&self, desktop_id: &str) -> Result<(), PrivdError> {
+        let command = Command::RestartSession(pb::RestartSessionRequest {
+            desktop_id: desktop_id.to_owned(),
+        });
+        match self.call(command, &[], None).await? {
+            pb::response::Result::RestartSession(_) => Ok(()),
+            _ => Err(PrivdError::Protocol("unexpected result variant".into())),
+        }
+    }
+
+    /// `InstallSession` (section 6.11): pushes the `hx-session` package of the agent release into
+    /// the desktop (an outdated or incompatible session, section 19.2). privd rate limits it.
+    pub async fn install_session(&self, desktop_id: &str) -> Result<(), PrivdError> {
+        let command = Command::InstallSession(pb::InstallSessionRequest {
+            desktop_id: desktop_id.to_owned(),
+        });
+        match self.call(command, &[], None).await? {
+            pb::response::Result::InstallSession(_) => Ok(()),
+            _ => Err(PrivdError::Protocol("unexpected result variant".into())),
+        }
+    }
 }
 
 async fn connect_until(inner: &Inner, until: Instant) -> Result<Conn, PrivdError> {

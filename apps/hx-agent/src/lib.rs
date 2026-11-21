@@ -2,6 +2,7 @@
 //! `hx-agent` and `hx-backup-worker` binaries.
 //!
 //! - [`privd`]: the root daemon and its fixed command set ([ipc.md](../../docs/ipc.md) Part 1).
+//! - [`fetcher`]: the sandboxed update downloader (ipc.md 6.12).
 //! - [`gateway`]: the internet-facing, unprivileged gateway.
 //! - [`link`]: the gateway side of the session link to `hx-session` (ipc.md Part 2).
 
@@ -9,6 +10,8 @@
 // (adopting the socket-activation descriptor); everything else is safe code.
 #![deny(unsafe_code)]
 
+pub mod cli;
+pub mod fetcher;
 pub mod gateway;
 pub mod link;
 pub mod privd;

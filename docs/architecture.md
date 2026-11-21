@@ -205,7 +205,11 @@ hash-xcreen ships **one fixed OAuth client** for every install. With `drive.file
 
 ### 5.5 Updates
 
-- Agent: self-update from signed releases on the stable or beta channel, with automatic rollback when the new version fails its health check.
+- Agent: self-update from signed releases on the stable or beta channel, with automatic rollback when the new version fails its health check. The mechanics are in [ipc.md](ipc.md) §6.12; in short:
+  - **Release.** A signed manifest (minisign: version, channel, arch, artifact name, size, SHA-256, signing time, minimum previous version) and a `hx-<version>-<arch>.tar.gz` of the agent binaries plus the per-distro `hx-session` packages. The signature is checked against two public keys compiled into `hx-privd` (the current key and the next, §13); a build with no key refuses updates.
+  - **Fetch.** `hx-privd` never speaks HTTP. A sandboxed `hx-update-fetcher@<job>.service` (dynamic user, no capabilities, IP sockets only, release hosts only) downloads bytes into a directory privd treats as hostile: read once through a directory descriptor with `openat2`, digest and signature checked over the copy, manifest timestamp never older than the highest seen, version strictly newer than the running one.
+  - **Layout.** `/usr/lib/hx/<version>/` per release, with `current` and `previous` symlinks that privd switches atomically (`symlinkat` + `renameat`); the units run `/usr/lib/hx/current/<binary>`; two versions are kept. A `preupdate` snapshot of the desktop is taken first.
+  - **Switch and check.** privd records the pending update, switches `current`, answers, restarts gatewayd and re-execs itself (the socket unit keeps the socket). The new process judges within 90 s: privd answers, gatewayd has a stable `MainPID` for 30 s, gatewayd's admin socket answers `Status`. Failure restores the version recorded before the switch (explicitly, never a blind flip) and flags `UPDATE_ROLLED_BACK`; the release is offered again but never re-applied automatically, and Gateway may not re-apply it for 24 h. The fetch directory is a size-capped tmpfs and the fetcher unit denies directory creation, links and renames, so a compromised fetcher can neither fill the disk nor plant what root cannot remove. What the installer and release pipeline owe this mechanism is listed in the privd README ("What 1E must provide").
 - `hx-session`: pushed into the container by the agent; only the streaming process restarts, user apps keep running.
 - The desktop's own packages are the user's responsibility (`apt upgrade`).
 

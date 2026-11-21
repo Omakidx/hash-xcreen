@@ -40,6 +40,16 @@ const MAX_CONCURRENT: usize = 4;
 const RECENT_ABORTS: usize = 64;
 /// Files pushed from one local copy.
 const MAX_PUSHED_FILES: usize = 16;
+/// Files the client sends within this long of each other (or while another is still arriving)
+/// are one paste: they are offered together as one file-list clipboard.
+const BATCH_GAP: Duration = Duration::from_secs(3);
+
+/// The files received from the client in the current paste (see [`BATCH_GAP`]).
+#[derive(Default)]
+struct Batch {
+    files: Vec<crate::clipboard::ReceivedEntry>,
+    last: Option<std::time::Instant>,
+}
 
 enum Kind {
     Clipboard { mime: String, buf: Vec<u8> },
@@ -87,6 +97,7 @@ fn send_abort(ctx: &LinkCtx, id: u32, code: u32) {
 pub(crate) fn reader_loop(ctx: &Arc<LinkCtx>, mut reader: LaneReader) {
     let mut incoming: HashMap<u32, Incoming> = HashMap::new();
     let mut recent: VecDeque<u32> = VecDeque::new();
+    let mut batch = Batch::default();
     loop {
         let raw = match reader.next(&ctx.closed) {
             Ok(r) => r,
@@ -104,7 +115,7 @@ pub(crate) fn reader_loop(ctx: &Arc<LinkCtx>, mut reader: LaneReader) {
                 break;
             }
         };
-        if let Err(why) = handle(ctx, &mut incoming, &mut recent, frame) {
+        if let Err(why) = handle(ctx, &mut incoming, &mut recent, &mut batch, frame) {
             ctx.close(&format!("bulk lane violation: {why}"));
             break;
         }
@@ -127,6 +138,7 @@ fn handle(
     ctx: &Arc<LinkCtx>,
     incoming: &mut HashMap<u32, Incoming>,
     recent: &mut VecDeque<u32>,
+    batch: &mut Batch,
     frame: LinkFrame,
 ) -> Result<(), &'static str> {
     match frame {
@@ -169,7 +181,10 @@ fn handle(
                 send_abort(ctx, id, RESET_TRANSFER_ERROR);
                 return Ok(());
             }
-            finish(ctx, t);
+            let more_files = incoming
+                .values()
+                .any(|o| matches!(o.kind, Kind::File { .. }));
+            finish(ctx, batch, more_files, t);
             Ok(())
         }
         LinkFrame::TransferAbort { id, .. } => {
@@ -279,11 +294,12 @@ fn on_open(
 }
 
 /// A completed transfer. A file is already on disk; a clipboard becomes the local selection.
-fn finish(ctx: &Arc<LinkCtx>, t: Incoming) {
+fn finish(ctx: &Arc<LinkCtx>, batch: &mut Batch, more_files: bool, t: Incoming) {
     let (mime, buf) = match t.kind {
         Kind::Clipboard { mime, buf } => (mime, buf),
         Kind::File { file } => {
-            file.finish();
+            let name = file.finish();
+            offer_received(ctx, batch, more_files, name, t.size);
             return;
         }
     };
@@ -305,6 +321,39 @@ fn finish(ctx: &Arc<LinkCtx>, t: Incoming) {
     });
     let offer = hx_session_offer(canonical);
     if let Err(e) = mgr.offer(Selection::Clipboard, offer, source) {
+        ctx.event(pb::EventKind::ClipboardError, &e.to_string());
+    }
+}
+
+/// A file from the client is complete: it joins the current paste, and the whole paste is offered
+/// as a file-list clipboard that points into the received directory, so that the user can paste
+/// it in the file manager. Without the clipboard (switched off, or no X display) the file simply
+/// stays in the directory.
+fn offer_received(
+    ctx: &Arc<LinkCtx>,
+    batch: &mut Batch,
+    more_files: bool,
+    name: String,
+    size: u64,
+) {
+    let now = std::time::Instant::now();
+    if !more_files && batch.last.is_none_or(|l| now.duration_since(l) > BATCH_GAP) {
+        batch.files.clear();
+    }
+    batch.last = Some(now);
+    if batch.files.len() >= crate::clipboard::MAX_FILES {
+        return;
+    }
+    batch
+        .files
+        .push(crate::clipboard::ReceivedEntry { name, size });
+    if !ctx.clipboard_on.load(Relaxed) {
+        return;
+    }
+    let Some(mgr) = &ctx.manager else { return };
+    if let Err(e) =
+        mgr.offer_received_files(Selection::Clipboard, ctx.received.path(), &batch.files)
+    {
         ctx.event(pb::EventKind::ClipboardError, &e.to_string());
     }
 }

@@ -4,8 +4,8 @@
 //! over SPAKE2, then pinned key plus PIN, `hx-crypto`), owns the device registry, applies the
 //! one-active-client and takeover policy, serves the client-facing device management of
 //! protocol 1.2 and the root-only admin socket, and talks to the root `hx-privd` for everything
-//! that needs privilege or the pepper. Relaying media between a client and the desktop is the
-//! next round's work and plugs in behind [`desktop`].
+//! that needs privilege or the pepper. [`relay`] relays media, input, clipboard and files between
+//! a client and the desktop behind the [`desktop`] seam.
 //!
 //! # Map
 //!
@@ -18,6 +18,7 @@
 //! | [`takeover`] | takeover policy and the 3-per-10-minutes limit |
 //! | [`devices`] | list, revoke, change notices, audit events (protocol 5.9) |
 //! | [`desktop`] | **the seam** for the session link, its stub, and the privd supervisor |
+//! | [`relay`] | the real desktop link: the relay between a client and `hx-session` |
 //! | [`admin`] | the root-only admin socket (ipc.md 9) |
 //! | [`live`] | the set of live sessions and its caps |
 //! | [`config`] | the configuration file |
@@ -40,6 +41,7 @@ pub mod harden;
 pub(crate) mod ipc_io;
 pub mod live;
 pub mod privd_client;
+pub mod relay;
 pub mod server;
 pub mod session;
 pub mod takeover;

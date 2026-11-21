@@ -561,7 +561,13 @@ async fn launch<T: Transport>(
 }
 
 /// Build path: create the container from the recipe's base image, start it, wait for `running`,
-/// run the build stage and then the post stage.
+/// run the build stage and then the post stage, then restart the container and wait for
+/// `running` again.
+///
+/// The restart is the boot into what was built. The build only *enables* units (they are not
+/// started) and writes `tmpfiles.d` entries (applied at boot), so without it a finished desktop
+/// has no Xorg, no XFCE and no `/var/lib/hx-session` directories, and `hx-session.service` fails
+/// with `226/NAMESPACE`. The prebuilt path boots into the image and needs no such step.
 ///
 /// On failure the container is left in place for inspection; use [`destroy_instance`] to remove it.
 pub async fn build_on_server<T: Transport>(
@@ -575,6 +581,15 @@ pub async fn build_on_server<T: Transport>(
     let exec = IncusExecutor::new(client, spec.name.clone());
     let build = apply_stage(&exec, plan, Stage::Build, &Secrets::none(), on_progress).await?;
     let post = run_post_stage(client, &spec.name, plan, secrets, on_progress).await?;
+    client
+        .set_state(
+            &spec.name,
+            StateAction::Restart,
+            false,
+            Duration::from_secs(60),
+        )
+        .await?;
+    wait_system_running(client, &spec.name, ReadyOptions::default()).await?;
     Ok(ProvisionReport {
         build: Some(build),
         post: Some(post),

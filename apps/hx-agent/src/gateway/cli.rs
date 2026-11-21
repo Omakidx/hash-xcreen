@@ -4,6 +4,11 @@
 //! tests that cannot run as root, and only in a binary built with the Cargo feature
 //! `gateway-test-hooks` (the crate's own tests enable it through a dev-dependency on itself).
 //! A production build does not recognise the flag at all: it is an unknown argument.
+//!
+//! `--link-socket <path>` (same feature) replaces the link socket after the configuration is
+//! validated, for a test that cannot create `/run/hx/link` (it needs root) but runs the real
+//! binary against privd's real proxy device. The configuration file's own `link_socket` keeps its
+//! `/run/hx/link/` check; only this flag, absent from a production build, bypasses it.
 
 use std::path::PathBuf;
 
@@ -17,6 +22,8 @@ pub struct Args {
     pub config: PathBuf,
     /// Test builds only: one uid that may use the admin socket besides root.
     pub admin_allow_uid: Option<u32>,
+    /// Test builds only: the link socket to dial instead of `/run/hx/link/<desktop_id>.sock`.
+    pub link_socket: Option<PathBuf>,
     /// `--version` was given.
     pub version: bool,
 }
@@ -30,6 +37,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(
     let mut out = Args {
         config: DEFAULT_CONFIG.into(),
         admin_allow_uid: None,
+        link_socket: None,
         version: false,
     };
     let mut it = args.into_iter();
@@ -39,6 +47,13 @@ pub fn parse_args<I: IntoIterator<Item = String>>(
             "--admin-allow-uid" if test_hooks => {
                 let v = it.next().ok_or("--admin-allow-uid needs a uid")?;
                 out.admin_allow_uid = Some(v.parse().map_err(|_| "bad uid")?);
+            }
+            "--link-socket" if test_hooks => {
+                let v = PathBuf::from(it.next().ok_or("--link-socket needs a path")?);
+                if !v.is_absolute() {
+                    return Err("--link-socket needs an absolute path".into());
+                }
+                out.link_socket = Some(v);
             }
             "--version" => out.version = true,
             other => return Err(format!("unknown argument {other:?}")),
@@ -61,6 +76,8 @@ mod tests {
         assert!(e.contains("unknown argument"), "{e}");
         // Whatever else is given, the flag never takes effect.
         assert!(parse_args(args(&["--config", "/x", "--admin-allow-uid", "0"]), false).is_err());
+        let e = parse_args(args(&["--link-socket", "/tmp/l.sock"]), false).unwrap_err();
+        assert!(e.contains("unknown argument"), "{e}");
     }
 
     #[test]
@@ -70,6 +87,10 @@ mod tests {
         assert_eq!(a.config, PathBuf::from("/x"));
         assert!(parse_args(args(&["--admin-allow-uid", "nope"]), true).is_err());
         assert!(parse_args(args(&["--admin-allow-uid"]), true).is_err());
+        let l = parse_args(args(&["--link-socket", "/tmp/l.sock"]), true).unwrap();
+        assert_eq!(l.link_socket, Some(PathBuf::from("/tmp/l.sock")));
+        assert!(parse_args(args(&["--link-socket", "rel.sock"]), true).is_err());
+        assert!(parse_args(args(&["--link-socket"]), true).is_err());
     }
 
     #[test]

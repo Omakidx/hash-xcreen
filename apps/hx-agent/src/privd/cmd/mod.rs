@@ -20,3 +20,5 @@ pub mod power;
 pub mod session;
 pub mod setup;
 pub mod snapshot;
+pub mod update;
+pub mod update_resume;

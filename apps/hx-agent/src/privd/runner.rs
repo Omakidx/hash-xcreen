@@ -36,6 +36,9 @@ pub enum Tool {
     Ip,
     /// `blkid`: probe a pool device for signatures.
     Blkid,
+    /// `systemctl`: start the update fetcher unit and restart the agent's own units
+    /// (ipc.md 6.12; only `update::system` builds its argument vectors).
+    Systemctl,
 }
 
 impl Tool {
@@ -47,6 +50,7 @@ impl Tool {
             Tool::Iptables => &["/usr/sbin/iptables", "/sbin/iptables", "/usr/bin/iptables"],
             Tool::Ip => &["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"],
             Tool::Blkid => &["/usr/sbin/blkid", "/sbin/blkid", "/usr/bin/blkid"],
+            Tool::Systemctl => &["/usr/bin/systemctl", "/bin/systemctl"],
         }
     }
 
@@ -67,6 +71,7 @@ impl Tool {
             Tool::Iptables => "iptables",
             Tool::Ip => "ip",
             Tool::Blkid => "blkid",
+            Tool::Systemctl => "systemctl",
         }
     }
 
@@ -249,6 +254,7 @@ mod tests {
             Tool::Iptables,
             Tool::Ip,
             Tool::Blkid,
+            Tool::Systemctl,
         ] {
             assert!(t.candidates().iter().all(|p| p.starts_with('/')));
         }
