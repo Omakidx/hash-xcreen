@@ -1,0 +1,177 @@
+# hx-privd
+
+The root daemon that serves the fixed, typed command set of [docs/ipc.md](../../../../docs/ipc.md)
+Part 1 over `/run/hx/privd.sock`. `hx-gatewayd`, the root CLI and the installer drive Incus only
+through it. The code is the library module `hx_agent::privd`; `src/bin/hx-privd.rs` is a thin
+`main`.
+
+## Running it
+
+```text
+hx-privd.socket   (systemd creates /run/hx/privd.sock, root:hx-gatewayd 0660)
+  └─ hx-privd.service   (root, started through the socket; no arguments, no environment)
+```
+
+Units and tmpfiles are in `apps/hx-agent/systemd/`; a test parses them and asserts the values of
+ipc.md section 3. Startup order of the binary: `umask 0077`; process hardening (a failure is
+fatal); configuration (the gateway uid from the `hx-gatewayd` passwd entry); the inherited socket;
+the daemon (state directory, pepper, audit log); the account-policy self-checks (must pass). The
+daemon takes **no** command-line argument and reads **no** environment variable that changes its
+behaviour: every path and the gateway user are compiled in (`PrivdConfig::production`).
+
+## Public library API
+
+| Item | Use |
+|---|---|
+| `PrivdConfig::production()` | Paths and the gateway identity, from constants and `/etc/passwd` |
+| `activation::from_env(path)` | The activated socket (`sd_listen_fds`), checked to be a listening unix stream socket bound to `path` |
+| `hardening::apply()` | `PR_SET_DUMPABLE=0`, `RLIMIT_CORE=0`, `mlockall` |
+| `Daemon::system(cfg)` | The production daemon (real Incus socket, runner, probe, clock, audit log) |
+| `Daemon::new(cfg, incus, Deps)` | A daemon over any `hx_provision::incus::Transport` and collaborators |
+| `Daemon::run_self_checks()` | Re-runs the ipc.md section 3 account-policy checks; sets or clears `HOST_ACCOUNT_POLICY` |
+| `Daemon::handle(request, Ctx)` | One request end to end (authorize, rate-limit, run, audit) |
+| `serve(daemon, listener, ServeOptions, shutdown)` | The accept loop |
+| `auth::authorize(role, request, phase)` | The pure authorization decision, table-tested |
+| `privd::testing` (feature `test-support`) | `FakeIncus`, `FakeRunner`, `FakeProbe`, `Harness`, `RawClient` |
+
+**Test-only constructors.** `PrivdConfig::for_tests`, `Daemon::new_with_catalog` and the
+`testing` module exist only with the `test-support` feature. The crate enables it for its own tests
+through a dev-dependency on itself; the binary never has it. The gateway uid is injected only
+through `PrivdConfig::for_tests` (a test passes its own uid to be the Gateway).
+
+## On-disk state
+
+All under `/var/lib/hx` (the unit's `StateDirectory=hx`, 0700, root). Every write is atomic
+(temporary file, `fsync`, `rename`, `fsync` of the directory). A file that exists but does not parse
+is an error: privd refuses to start rather than reset a lockout or a window.
+
+| File | Content | Mode |
+|---|---|---|
+| `privd-state` | JSON: phase and setup window (`return_to`, start, expiry), desktop registry with per-desktop attention flags, host-wide flags, the last `SetupHost` options | 0600 |
+| `ratelimit` | JSON: `PepperVerify` failure times per purpose and the locks, `PepperEnrol` call times, current-password check times | 0600 |
+| `pepper.key` | 32 random bytes, the verifier pepper (never sent). `systemd-creds` sealing (`/etc/hx/creds/pepper.cred` of ipc.md section 2) is a follow-up | 0600 |
+| `owner-key` | the enrolled owner public key (Phase 2 shape) | 0644 |
+
+Other files privd writes: `/etc/hx/host-firewall.nft` (0600, the generated ruleset, loaded at boot
+by `hx-host-firewall.service`), `/etc/sysctl.d/90-hx-incus.conf` (0644), `/var/log/hx/audit.log`
+(append-only, 0640). Instance metadata is in the Incus instance config (`user.hx.state`,
+`username`, `recipe`, `created`, `docker_ack`, `session_version`).
+
+The registry exists because `hx-provision`'s client has no "list instances" call: privd manages
+exactly the desktops it created (an id is written before its instance exists, so a crash leaves a
+record to clean up) and never touches an instance it did not.
+
+## Authorization
+
+`Daemon::handle` runs, in order: `hx_ipc` validation (done when the frame is decoded) → class →
+`hx_ipc::privd::gateway_denied` (class `X`, Admin-only arguments by presence, `DeleteSnapshot` kinds,
+the `SetUserPassword` current password) → phase gates (`A`: READY or SETUP_OPEN; `S`: SETUP_OPEN only;
+`EnableDocker` after setup is `PERMISSION_DENIED`) → `UNIMPLEMENTED` for reserved commands → rate
+limits → the command, which re-checks the rules that need state (`ISOLATION_NOT_RESTORED`, locks,
+caps, ownership). The role is the peer uid and nothing else; no message has a role field.
+
+A request that decodes but breaks a validation rule is answered `INVALID_ARGUMENT` naming the field
+(ipc.md section 4 error table) and the connection stays usable: the secret frames it announced are
+swallowed. `hx_ipc::privd::decode` reports such a request as a violation without a request id, so
+the server re-decodes a rejected body (at most 4 KiB, where skipping `hx-ipc`'s pre-scan costs
+nothing) to find the id. Anything that breaks the framing (length, kind, truncation, garbage,
+ancillary data) closes the connection without a reply.
+
+## Setup window, verifiers, audit
+
+* **Window.** `BeginSetup` (Admin) opens it for 2 hours by default (`return_to` remembers the phase it
+  came from); `ExtendSetup` (Admin) clamps the total to 24 hours; expiry closes it lazily on the next
+  request and is persisted; `FinishSetup` needs a `ready` desktop unless Admin passes `force`.
+* **`PepperVerify`** answers `ok` only. Failures are counted globally per purpose (PIN 10/h and
+  50/day, PASSWORD 5/h and 20/day); reaching a cap locks the purpose until Admin's `ResetLockout`.
+  The failure that reaches the cap is answered `ok: false`; the next call is `RESOURCE_EXHAUSTED`
+  (`LOCKED`). The check, the comparison and the count happen under one lock, so concurrent callers
+  cannot overshoot the cap. Wrong current passwords of `SetUserPassword` are charged to the same
+  PASSWORD budget (and refused while it is locked). All counts are written to disk on every change.
+* **`PepperEnrol`** returns the MAC (the only command that does): Gateway 5/day after setup and
+  60/hour during `SETUP_OPEN`, Admin unlimited.
+* **Audit log.** One `key=value` line per completed request (`request_id`, role, uid, pid, command,
+  desktop id, outcome, duration), plus `RecordEvent` entries and notices; labels are sanitized and
+  quoted, argument values are never logged.
+
+## Cancellation and deadlines
+
+`Cancel`, a closed connection and an expired deadline (the command's maximum from
+`hx_ipc::privd::command_info`, shortened by `deadline_ms`) stop the running command:
+
+* Secret sections (`SetUserPassword`, `PepperVerify`, `PepperEnrol`) are **shielded**: they run to
+  completion; privd keeps polling `change_user_password`, holds the `desktop:<id>` lock until it
+  resolves, and only then answers `CANCELLED` or `DEADLINE_EXCEEDED` (the effect of a finished
+  change stands).
+* Everything else is dropped, the request's Incus operations are cancelled and waited for (at most
+  30 s); if one will not end, the answer is `INTERNAL` and the desktop gets `STUCK_OPERATION`.
+* `CreateDesktop`: Incus 6.0.0 refuses to cancel exec operations, so privd cancels what it can,
+  force-stops and deletes the unfinished instance (which ends the rest), waits for the operations and
+  removes the registry record, **then** answers `CANCELLED` (or the error that stopped it).
+
+One request per connection is in flight; one command at a time per desktop (a lock with at most 4
+waiters and a 10 s wait). `Ping` is answered at once, at most 10 times a second.
+
+## Command coverage
+
+| Command | Status |
+|---|---|
+| GetHostInfo | implemented (Incus down leaves `incus_version` unset) |
+| GetRecipientKey | `UNIMPLEMENTED`: sealed secrets (HPKE) are Phase 2 |
+| BeginSetup, ExtendSetup, FinishSetup | implemented |
+| SetupHost | implemented: `ensure_host`, the ruleset (`nft -c -f`, `nft -f`, persisted), sysctl, `DOCKER-USER`; `pool_device` is verified (block device, whole disk, not mounted or held, `blkid -p`) |
+| CreateDesktop | implemented for the build path; `PREBUILT` and `image_file` are `UNIMPLEMENTED` (they need the fetcher and signature verification) |
+| GetDesktop, ListDesktops | implemented |
+| StartDesktop, StopDesktop, RestartDesktop | implemented |
+| SetLimits | implemented; the disk floor is the configured size (see follow-ups) |
+| SetUserPassword | implemented |
+| EnableDocker, DisableDocker | implemented; `HOST_NETWORK_ONLY` is `UNIMPLEMENTED` |
+| CreateSnapshot, ListSnapshots, DeleteSnapshot | implemented (`size_bytes` is 0: no size API) |
+| ProvisionSessionLink | implemented |
+| InstallSession | implemented; `FAILED_PRECONDITION` while the host has no `hx-session` package for the distro |
+| RestartSession | implemented |
+| CheckUpdate, ApplyUpdate, RollbackUpdate | `UNIMPLEMENTED`: self-update is not in this release |
+| DestroyDesktop | implemented |
+| Uninstall | `UNIMPLEMENTED`: installer-level removal of units, credentials and the registry |
+| ResetLockout, EnrolOwnerKey | implemented |
+| UpgradeIncus, BeginSecretUpload, every Phase 2 command | `UNIMPLEMENTED` (reserved) |
+| PepperVerify, PepperEnrol, RecordEvent | implemented |
+
+## Unit hardening
+
+`hx-privd.service` runs as root because it drives Incus, loads nftables and writes sysctl drop-ins.
+`systemd-analyze security --offline` rates it 2.8 OK. What is set and why:
+
+* `ProtectSystem=strict` with `ReadWritePaths=/etc/hx /etc/sysctl.d` and `-/run/xtables.lock`: the only
+  host files it writes besides its own `StateDirectory` and `LogsDirectory`. `/etc/hx` and
+  `/run/xtables.lock` are created by tmpfiles so that the namespace setup cannot fail.
+* `CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE CAP_IPC_LOCK`: nft and iptables;
+  blkid on a block device and root-owned files; `mlockall` as a second line next to
+  `LimitMEMLOCK=infinity`. `NoNewPrivileges`, `RestrictSUIDSGID`, `LockPersonality`,
+  `MemoryDenyWriteExecute`, `RestrictRealtime`, `RestrictNamespaces`,
+  `RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6` (iptables-legacy needs inet),
+  `SystemCallFilter=@system-service`, `ProtectHome`, `PrivateTmp`, `ProtectKernelModules`,
+  `ProtectKernelLogs`, `ProtectControlGroups`, `ProtectClock`, `ProtectHostname`, `ProtectProc=invisible`.
+* **Not set, deliberately:** `ProtectKernelTunables` (`sysctl --system` writes `/proc/sys`),
+  `PrivateDevices` (blkid reads host block devices), `ProcSubset=pid` (the daemon reads
+  `/proc/meminfo` and `/proc/self/mountinfo`), `PrivateNetwork` (nft and iptables act on the host
+  network), `RuntimeDirectory` (it would delete `/run/hx` and the socket at stop).
+* `LimitCORE=0`, `UMask=0077`, `TimeoutStopSec=60s` (a cancel waits up to 30 s).
+
+## Deviations and follow-ups
+
+* The pepper is a root-only file in the state directory, not yet sealed with `systemd-creds`.
+* Host addresses are enumerated with `ip -j address show` (fixed argv, parsed with `serde_json`), not
+  with a netlink socket of our own.
+* Security-relevant budgets are written on every change (rarer than once a second by construction)
+  rather than once a second; in-memory rate buckets are not persisted.
+* `/etc/hx/privd.toml` (ipc.md section 2) is not read: the desktop cap is the compiled-in 1.
+* `CreateDesktop` warns instead of failing when the host has no `hx-session` package for the distro
+  (the packaging of `hx-session` and the signed artifact store are not in this release), so a desktop
+  still becomes `ready`; `InstallSession` installs it later. The current-password helper ships in that
+  package, so until then a current-password check outside the setup window fails closed (`INTERNAL`).
+* `hx-provision` has no instance listing, disk-usage or snapshot-size API; the registry, the
+  configured-size disk floor of `SetLimits` and `size_bytes: 0` follow from that.
+* The automatic re-run of steps 1 to 3 of `SetupHost` (at start and 30 s after a host address
+  changes) is implemented and uses what the last `SetupHost` recorded; it is covered by
+  `Daemon::refresh_host` but its timing loop is not exercised by a test.

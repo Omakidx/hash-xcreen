@@ -27,6 +27,7 @@ Every language, library, tool and external service hash-xcreen uses, and why. It
 | Async runtime | **tokio** (networking only) | Standard for quinn and HTTP; kept out of the media hot path |
 | Incus API client | Incus REST API over its unix socket (`hyper` 1.x with `hyper-util`, `http-body-util` and `bytes`; `serde` + `serde_json`; `tokio` for the socket and timeouts) | No CLI scraping; typed requests from `hx-privd` |
 | Recipe engine | `toml` 0.8 + `serde` (unknown keys rejected), `sha2` (file hashes in the equivalence manifest), `thiserror` (typed errors), `zeroize` (the desktop password in `hx_provision::Secret` is zeroized on drop and not `Clone`) | Pure, deterministic parsing and resolution in `hx-provision` |
+| Root daemon (`hx-privd`) | `rustix` (`mm`, `process`, `fs`, `net`: `mlockall`, `PR_SET_DUMPABLE`, `RLIMIT_CORE`, `statvfs`, socket-activation checks, with one audited `unsafe` block to adopt the `sd_listen_fds` descriptor), `hmac`, `hkdf`, `sha2`, `subtle`, `getrandom` (pepper verifiers, constant-time compare), `serde` + `serde_json` (state files, `ip -j` output), `prost` (recovering the request id of a rejected request), `bytes`, `zeroize`; fixed-argv `nft`, `sysctl`, `iptables`, `ip`, `blkid` through a closed `Tool` set with a cleared environment; units hardened with systemd sandboxing | Typed command set over a socket-activated unix socket, secrets in `Zeroizing` buffers read without an intermediate copy; no shell, no caller-supplied program, path or Incus parameter (docs/ipc.md Part 1) |
 
 ## Streaming
 
