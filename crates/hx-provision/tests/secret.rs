@@ -39,3 +39,19 @@ fn debug_never_shows_the_bytes() {
         .unwrap();
     assert!(!format!("{secrets:?}").contains("hunter2"));
 }
+
+#[test]
+fn equality_is_the_non_branching_fold_not_a_derive() {
+    let a = Secret::from_slice(b"correct horse");
+    assert!(a == Secret::from_slice(b"correct horse"));
+    assert!(a != Secret::from_slice(b"Correct horse"), "first byte");
+    assert!(a != Secret::from_slice(b"correct horsf"), "last byte");
+    assert!(a != Secret::from_slice(b"correct hors"), "length");
+    assert!(Secret::from_slice(b"") == Secret::from_slice(b""));
+    // No derived PartialEq (a derive would compare with an early exit).
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/exec.rs")).unwrap();
+    let at = src.find("pub struct Secret(").unwrap();
+    let before = &src[..at];
+    let attrs = before.rsplit("\n\n").next().unwrap();
+    assert!(!attrs.contains("PartialEq"), "{attrs}");
+}

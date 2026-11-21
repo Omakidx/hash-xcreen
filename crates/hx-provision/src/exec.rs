@@ -23,7 +23,6 @@ use crate::plan::{Plan, Stage, Step};
 ///
 /// There is deliberately no way to copy one: a secret that is handed over is moved. The types that
 /// hold secrets ([`Secrets`], [`ExecRequest`], [`Action`]) are therefore not `Clone` either.
-#[derive(PartialEq, Eq)]
 pub struct Secret(Zeroizing<Vec<u8>>);
 
 impl Secret {
@@ -50,6 +49,22 @@ impl std::fmt::Debug for Secret {
 }
 
 impl ZeroizeOnDrop for Secret {}
+
+/// Equality without an early exit: the comparison time does not depend on where two secrets of
+/// the same length first differ (only the length is visible). There is no derived `PartialEq`.
+impl PartialEq for Secret {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self
+                .0
+                .iter()
+                .zip(other.0.iter())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0
+    }
+}
+
+impl Eq for Secret {}
 
 /// Longest accepted password, in bytes.
 pub const MAX_PASSWORD_BYTES: usize = 1024;
