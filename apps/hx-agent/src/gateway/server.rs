@@ -185,6 +185,7 @@ impl Gateway {
             privd.clone(),
             clock.clone(),
             LoginConfig::default(),
+            devices.revoke_gate(),
         );
         let sessions = SessionManager::new(
             SessionSettings {

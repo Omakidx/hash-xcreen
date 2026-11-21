@@ -357,16 +357,19 @@ impl Session {
         let id = self.device.id;
         loop {
             let flow = tokio::select! {
+                // Closing and revocation are looked at before the next message: a request
+                // queued behind its sender's revocation must never be served.
+                biased;
                 _ = self.conn.closed() => return,
-                msg = self.conn.recv_control() => match msg {
-                    Ok(m) => self.handle(m).await,
-                    Err(_) => return,
-                },
                 r = revocations.recv() => match r {
                     Ok(rid) if rid == id => Flow::End(Some((CloseCode::Unauthorized, "device revoked"))),
                     Ok(_) => Flow::Continue,
                     Err(broadcast::error::RecvError::Lagged(_)) => self.registry_check().await,
                     Err(broadcast::error::RecvError::Closed) => return,
+                },
+                msg = self.conn.recv_control() => match msg {
+                    Ok(m) => self.handle(m).await,
+                    Err(_) => return,
                 },
                 n = notices.recv() => match n {
                     Ok(notice) => self.push_notice(&notice).await,
@@ -529,6 +532,7 @@ impl Session {
         if m.direction() != Some(MgmtDirection::ClientToServer) {
             return violation("a server-only DeviceMgmt body from a client");
         }
+        let mut requester_gone = false;
         let reply = match m.body {
             Some(B::List(_)) => match self.mgr.devices.device_list(Some(self.device.id)) {
                 Ok(list) => B::DeviceList(list),
@@ -560,6 +564,9 @@ impl Session {
                         None => pb::RevokeStatus::NotFound,
                     }
                 };
+                // FAILED because the asker itself was revoked meanwhile: answer, then close.
+                requester_gone = status == pb::RevokeStatus::Failed
+                    && !self.mgr.devices.is_active(&self.device.id);
                 B::RevokeResult(pb::RevokeResult {
                     status: status as i32,
                 })
@@ -571,6 +578,9 @@ impl Session {
             body: Some(reply),
         }));
         match self.send(out).await {
+            Ok(()) if requester_gone => {
+                Flow::End(Some((CloseCode::Unauthorized, "device revoked")))
+            }
             Ok(()) => Flow::Continue,
             Err(f) => f,
         }

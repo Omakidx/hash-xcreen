@@ -949,3 +949,86 @@ async fn names_with_control_characters_never_reach_a_client_unclean() {
     }
     drop(b);
 }
+
+// ------------------------------------------------------------------ review findings
+
+/// F2: a revoke request that was queued behind its sender's own revocation must not run, or
+/// two devices racing could revoke each other and leave nobody.
+#[tokio::test]
+async fn a_revoked_devices_queued_revoke_cannot_leave_the_server_without_devices() {
+    let env = Env::start().await;
+    let (a, b) = (new_key(), new_key());
+    env.pair(&a, "alice").await;
+    env.pair(&b, "bob").await;
+    env.set_pin(PIN).await;
+    let cb = env.login(&b, "bob", PIN).await;
+    // The operator revokes Bob first; then Bob's already-queued RevokeDevice(Alice) is served.
+    env.gw
+        .devices()
+        .revoke_by_operator(Env::id_of(&b))
+        .await
+        .unwrap();
+    let status = env
+        .gw
+        .devices()
+        .revoke_by_device(Env::id_of(&b), Env::id_of(&a))
+        .await;
+    assert_eq!(
+        status,
+        pb::RevokeStatus::Failed,
+        "a revoked requester is refused"
+    );
+    assert!(
+        env.gw.devices().is_active(&Env::id_of(&a)),
+        "Alice is still active"
+    );
+    assert_eq!(closed_with(&cb).await.code, CloseCode::Unauthorized);
+
+    // Also over the wire: Dave pipelines the request while being revoked; whichever order the
+    // gateway sees them in, a device stays active and Dave ends up closed as unauthorized.
+    let (c, d) = (new_key(), new_key());
+    env.pair(&c, "carol").await;
+    env.pair(&d, "dave").await;
+    let cd = env.login(&d, "dave", PIN).await;
+    cd.send_control(&mgmt(
+        1,
+        Mgmt::Revoke(pb::RevokeDevice {
+            device_id: Bytes::copy_from_slice(Env::id_of(&c).as_bytes()),
+        }),
+    ))
+    .await
+    .unwrap();
+    env.gw
+        .devices()
+        .revoke_by_operator(Env::id_of(&d))
+        .await
+        .unwrap();
+    assert_eq!(closed_with(&cd).await.code, CloseCode::Unauthorized);
+    assert!(
+        env.gw.devices().is_active(&Env::id_of(&a)) || env.gw.devices().is_active(&Env::id_of(&c)),
+        "at least one device stays active"
+    );
+}
+
+/// F2: a device-initiated revocation never leaves zero active devices, whoever the target is.
+#[tokio::test]
+async fn a_device_cannot_revoke_down_to_zero_active_devices() {
+    let env = Env::start().await;
+    let (a, b) = (new_key(), new_key());
+    env.pair(&a, "alice").await;
+    env.pair(&b, "bob").await;
+    env.set_pin(PIN).await;
+    // Bob revokes Alice: fine, Bob stays. Bob cannot then revoke himself.
+    let s = env
+        .gw
+        .devices()
+        .revoke_by_device(Env::id_of(&b), Env::id_of(&a))
+        .await;
+    assert_eq!(s, pb::RevokeStatus::Ok);
+    let s = env
+        .gw
+        .devices()
+        .revoke_by_device(Env::id_of(&b), Env::id_of(&b))
+        .await;
+    assert_eq!(s, pb::RevokeStatus::LastActiveDevice);
+}

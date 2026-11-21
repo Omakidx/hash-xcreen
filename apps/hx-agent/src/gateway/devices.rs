@@ -46,7 +46,10 @@ pub struct DeviceService {
     privd: PrivdClient,
     live: Arc<LiveSessions>,
     tx: broadcast::Sender<Arc<DeviceNotice>>,
-    revoke_lock: tokio::sync::Mutex<()>,
+    /// Serializes every revocation, whoever asks (a device, the operator, the PIN lockout):
+    /// the "keep one active device" and "requester still active" checks are only sound if
+    /// nothing else revokes between the check and the write.
+    revoke_lock: Arc<tokio::sync::Mutex<()>>,
     /// Which paired device asked for a pending revocation (consumed by the announcer).
     actors: Mutex<HashMap<DeviceId, DeviceId>>,
     version: AtomicU64,
@@ -91,7 +94,7 @@ impl DeviceService {
             privd,
             live,
             tx,
-            revoke_lock: tokio::sync::Mutex::new(()),
+            revoke_lock: Arc::new(tokio::sync::Mutex::new(())),
             actors: Mutex::new(HashMap::new()),
             version: AtomicU64::new(1),
         });
@@ -115,6 +118,16 @@ impl DeviceService {
             }
         });
         svc
+    }
+
+    /// The lock every revocation path takes ([`super::login::Login`] takes it for a lockout).
+    pub fn revoke_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.revoke_lock.clone()
+    }
+
+    /// True if `id` is in the registry and not revoked.
+    pub fn is_active(&self, id: &DeviceId) -> bool {
+        matches!(self.auth.registry().get(id), Ok(Some(r)) if !r.is_revoked())
     }
 
     /// Receives the notices pushed to clients.
@@ -249,14 +262,21 @@ impl DeviceService {
                 return S::Failed;
             }
         };
+        // The requester must still be a paired, non-revoked device *now*: a request queued
+        // behind its own revocation (an operator or a lockout got there first) must not run.
+        if !records.iter().any(|r| r.id == requester && !r.is_revoked()) {
+            return S::Failed;
+        }
         let Some(rec) = records.iter().find(|r| r.id == target) else {
             return S::NotFound;
         };
         if rec.is_revoked() {
             return S::AlreadyRevoked;
         }
+        // Whoever the target is, a device-initiated revocation never leaves the server
+        // without an active device.
         let active = records.iter().filter(|r| !r.is_revoked()).count();
-        if target == requester && active <= 1 {
+        if active <= 1 {
             return S::LastActiveDevice;
         }
         self.actors

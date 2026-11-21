@@ -124,6 +124,9 @@ struct Shared {
     not_before: Mutex<HashMap<DeviceId, Instant>>,
     /// One verification at a time per device, so parallel connections cannot multiply guesses.
     device_locks: Mutex<HashMap<DeviceId, Arc<tokio::sync::Mutex<()>>>>,
+    /// The device service's revocation lock: a lockout revocation is serialized with every
+    /// other one.
+    revoke_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// The PIN login of the gateway. Cheap to clone.
@@ -139,6 +142,7 @@ impl Login {
         privd: PrivdClient,
         clock: Arc<dyn Clock>,
         config: LoginConfig,
+        revoke_gate: Arc<tokio::sync::Mutex<()>>,
     ) -> Self {
         Self(Arc::new(Shared {
             registry,
@@ -149,6 +153,7 @@ impl Login {
             config,
             not_before: Mutex::new(HashMap::new()),
             device_locks: Mutex::new(HashMap::new()),
+            revoke_gate,
         }))
     }
 
