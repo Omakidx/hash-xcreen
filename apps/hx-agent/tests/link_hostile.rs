@@ -1574,3 +1574,88 @@ async fn a_media_flood_of_large_frames_is_throttled_to_the_budget_and_then_a_vio
         written / mib
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refusal_during_an_upload_does_not_end_the_link_and_the_abort_arrives() {
+    // Review L1: the bulk channel (16 slots) is full because the session does not read while an
+    // upload runs. A refusal used to `try_send` its abort into that channel and fail the link.
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let (res_tx, res_rx) = mpsc::channel::<(Vec<(u8, u32)>, u64)>();
+    let f = session(None, move |l| {
+        // Do not read bulk yet. Then open a clipboard transfer, which the gateway's policy
+        // refuses, while the upload is stuck.
+        go_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        l.bulk
+            .write_all(&open(2, pb::TransferChannel::Clipboard, "", 4))
+            .unwrap();
+        go_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        // Now read everything the gateway wrote on bulk: the abort must be in there, and the
+        // upload must still complete.
+        use hx_ipc::frame::Decoder;
+        use hx_ipc::link::frames::{LinkFrame, parse};
+        let policy = LinkPolicy::new(Role::Session, Lane::Bulk);
+        let mut d = Decoder::new(policy);
+        l.bulk
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let (mut frames, mut data) = (Vec::new(), 0u64);
+        loop {
+            let Ok(Some(raw)) = d.read_from(&mut NoCmsgReader(&l.bulk)) else {
+                break;
+            };
+            let kind = raw.kind;
+            match parse(&policy, raw, u64::MAX).unwrap() {
+                LinkFrame::TransferData { data: b, .. } => data += b.len() as u64,
+                LinkFrame::TransferAbort { id, code } => frames.push((kind, code)),
+                LinkFrame::TransferEnd { .. } => {
+                    frames.push((kind, 0));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        res_tx.send((frames, data)).unwrap();
+    });
+    let (link, _ev) = connect_with(&f, |c| c.liveness_timeout = Duration::from_secs(60)).await;
+    link.set_policy(false, true); // clipboard off, files on
+    let size = 8 * 1024 * 1024u64;
+    let mut up = link
+        .begin_transfer(
+            pb::TransferChannel::File,
+            TransferHeader {
+                mime: "application/octet-stream".into(),
+                name: "up.bin".into(),
+                size,
+            },
+        )
+        .await
+        .unwrap();
+    let uploader = tokio::spawn(async move {
+        let chunk = Bytes::from(vec![9u8; 64 * 1024]);
+        for _ in 0..size / (64 * 1024) {
+            up.write(chunk.clone()).await.unwrap();
+        }
+        up.finish().await.unwrap();
+    });
+    // The upload cannot finish while nobody reads: the channel and the socket are full.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(
+        !uploader.is_finished(),
+        "the upload is stuck behind the session"
+    );
+    go_tx.send(()).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!link.is_closed(), "a refusal during an upload ends nothing");
+    assert_eq!(link.counters().refused_transfers, 1);
+    go_tx.send(()).unwrap();
+    let (frames, data) = tokio::task::spawn_blocking(move || res_rx.recv().unwrap())
+        .await
+        .unwrap();
+    uploader.await.unwrap();
+    assert_eq!(data, size, "the whole upload arrived");
+    assert!(
+        frames.contains(&(hx_ipc::link::KIND_TRANSFER_ABORT, 0x101)),
+        "the refusal's abort was not lost: {frames:?}"
+    );
+    assert!(!link.is_closed());
+}

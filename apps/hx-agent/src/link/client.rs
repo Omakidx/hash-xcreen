@@ -377,7 +377,7 @@ impl LinkClient {
         if let Some(old) = replaced
             && let Ok(a) = encode_transfer_abort(old, RESET_TRANSFER_ERROR)
         {
-            let _ = self.sh.bulk_tx.send(BulkOut::Frame(a)).await;
+            self.sh.queue_abort(a);
         }
         if self.sh.bulk_tx.send(BulkOut::Frame(frame)).await.is_err() {
             return Err(TransferError::Closed);
@@ -480,7 +480,7 @@ impl TransferSender {
             x.out_aborted.remove(&self.id);
         }
         if let Ok(a) = encode_transfer_abort(self.id, code) {
-            let _ = self.sh.bulk_tx.try_send(BulkOut::Frame(a));
+            self.sh.queue_abort(a);
         }
     }
 }

@@ -535,6 +535,11 @@ pub(crate) struct Shared {
     pub clipboard_allowed: AtomicBool,
     pub files_allowed: AtomicBool,
     pub bulk_tx: mpsc::Sender<BulkOut>,
+    /// Transfer aborts, written ahead of queued bulk data. Separate from `bulk_tx` so that an
+    /// upload filling that channel can neither delay an abort behind its data nor make the abort
+    /// fail (review L1).
+    aborts: Mutex<VecDeque<Vec<u8>>>,
+    pub abort_wake: Notify,
     pub events_rl: Mutex<EventRates>,
     pub cursor_rl: Mutex<CursorRates>,
 }
@@ -609,6 +614,8 @@ impl Shared {
             clipboard_allowed: AtomicBool::new(cfg.clipboard_allowed),
             files_allowed: AtomicBool::new(cfg.files_allowed),
             bulk_tx,
+            aborts: Mutex::new(VecDeque::new()),
+            abort_wake: Notify::new(),
             events_rl: Mutex::new(EventRates {
                 stats: RateWindow::per_second(limits::STATS),
                 event: RateWindow::per_second(limits::EVENT),
@@ -653,6 +660,29 @@ impl Shared {
         self.inbox.wake.notify_waiters();
         self.inbox.wake.notify_one();
         self.out.wake.notify_one();
+    }
+
+    /// Queues an encoded `TransferAbort` for the `bulk` writer. Never fails because an upload
+    /// is in progress; a session that provokes more than 1 024 unwritten aborts is not reading
+    /// `bulk` at all, which ends the link as a fault.
+    pub(crate) fn queue_abort(&self, frame: Vec<u8>) {
+        {
+            let mut q = lock(&self.aborts);
+            if q.len() >= 1_024 {
+                drop(q);
+                self.fail(
+                    FailureClass::Fault,
+                    "bulk abort queue full: the session is not reading",
+                );
+                return;
+            }
+            q.push_back(frame);
+        }
+        self.abort_wake.notify_one();
+    }
+
+    pub(crate) fn pop_abort(&self) -> Option<Vec<u8>> {
+        lock(&self.aborts).pop_front()
     }
 
     pub(crate) fn count(&self, f: impl FnOnce(&mut Counters)) {

@@ -415,10 +415,8 @@ pub(crate) async fn bulk_reader(sh: Arc<Shared>, mut lane: LaneReader) {
 }
 
 fn abort_frame(sh: &Shared, id: u32, code: u32) {
-    if let Ok(f) = encode_transfer_abort(id, code)
-        && sh.bulk_tx.try_send(BulkOut::Frame(f)).is_err()
-    {
-        sh.fail(FailureClass::Fault, "bulk writer queue full");
+    if let Ok(f) = encode_transfer_abort(id, code) {
+        sh.queue_abort(f);
     }
 }
 
@@ -688,7 +686,24 @@ pub(crate) async fn bulk_writer(
 ) {
     let s = sh.clone();
     run(&sh, async move {
-        while let Some(out) = rx.recv().await {
+        loop {
+            // Aborts first, whatever the upload is doing.
+            let wake = s.abort_wake.notified();
+            tokio::pin!(wake);
+            wake.as_mut().enable();
+            while let Some(a) = s.pop_abort() {
+                if let Err(e) = write_all_stall(&stream, &a, s.cfg.bulk_write_stall).await {
+                    return write_fail("bulk", &e);
+                }
+            }
+            let out = tokio::select! {
+                biased;
+                () = &mut wake => continue,
+                out = rx.recv() => match out {
+                    Some(o) => o,
+                    None => break,
+                },
+            };
             let r = match out {
                 BulkOut::Frame(f) => write_all_stall(&stream, &f, s.cfg.bulk_write_stall).await,
                 BulkOut::Data { id, data } => {
