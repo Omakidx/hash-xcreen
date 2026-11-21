@@ -19,6 +19,21 @@
 //! order (`previous` first, then `current`) means that a crash between them leaves both pointing
 //! at the running version, which is harmless.
 //!
+//! **What "atomic" covers.** The guarantee is about the link itself: `readlink("current")` always
+//! succeeds and names a complete version. Resolving a path *through* the link at the very moment
+//! it is replaced is not fully atomic in the kernel. On ext4 (seen on Linux 6.8), when the
+//! replaced fast-symlink inode is freed, its inline target is cleared while a lockless path walk
+//! may still be reading it. That walk then sees an empty target and goes on from the parent
+//! directory, so `current/hx-gatewayd` briefly resolves as `/usr/lib/hx/hx-gatewayd`. This happens
+//! a few times per 100k switches under a tight loop, and never when the replaced inodes are kept
+//! alive or on tmpfs. It is harmless here for two reasons. First, nothing but version directories,
+//! the two links and dot-prefixed temporaries ever lives at the top of the release directory,
+//! which is private to privd ([`Layout::open`]), so such a lookup finds nothing and fails with
+//! `ENOENT`; it never runs something else. Second, privd restarts gatewayd and itself after the
+//! switch, not during it, so only an unrelated start that lands in that microsecond window can
+//! fail, and it fails as a missing file. Keep the first point true: never put a file named like a
+//! release member at the top of the release directory.
+//!
 //! A new release is unpacked into `.incoming-<version>-<rand>` and renamed to `<version>` only
 //! when complete and checked, so a half-extracted tree is never reachable under a version name.
 //! Everything is done relative to a descriptor of `/usr/lib/hx`, opened `O_NOFOLLOW`, which must be
@@ -405,13 +420,18 @@ mod tests {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reader = {
             let stop = stop.clone();
-            let cur = t.path().join("current");
+            let dir = t.path().to_path_buf();
             std::thread::spawn(move || {
                 let mut seen = std::collections::BTreeSet::new();
                 while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-                    let target = std::fs::read_link(&cur).expect("current always exists");
+                    let target =
+                        std::fs::read_link(dir.join("current")).expect("current always exists");
+                    // The target is a complete release. This is checked by joining the target,
+                    // not by resolving `current/hx-gatewayd`: during a rename over `current` the
+                    // kernel itself can resolve that path wrongly (see the module docs), which is
+                    // not something the switch can prevent or this test should measure.
+                    assert!(dir.join(&target).join("hx-gatewayd").is_file());
                     seen.insert(target.to_string_lossy().into_owned());
-                    assert!(std::fs::metadata(cur.join("hx-gatewayd")).is_ok());
                 }
                 seen
             })
