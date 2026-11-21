@@ -4,7 +4,9 @@
 //! ([`hx_agent::gateway::config`] documents the keys). Start-up order, which the seccomp
 //! allowlist depends on:
 //!
-//! 1. parse the configuration, load the identity key from the systemd credential, open the
+//! 0. in `main`, before any thread exists: parse the configuration and adopt the activated
+//!    sockets (this removes `LISTEN_*` from the environment);
+//! 1. load the identity key from the systemd credential, open the
 //!    state directory (device registry, verifiers) and bind the QUIC and WebSocket sockets and
 //!    the admin socket. Under systemd both come by socket activation, selected by descriptor
 //!    name (`admin`, `public`; [`hx_agent::gateway::activation`]): the public port must equal
@@ -82,15 +84,21 @@ fn notify_ready() {
     }
 }
 
-async fn run(args: Args) -> Result<(), String> {
+/// The configuration, with the debug-only override applied.
+fn load_config(args: &Args) -> Result<GatewayConfig, String> {
     let mut config = GatewayConfig::load(&args.config).map_err(|e| e.to_string())?;
     if let Some(path) = &args.link_socket {
         tracing::warn!(path = %path.display(), "DEBUG BUILD: dialling this link socket");
         config.link_socket = Some(path.clone());
     }
-    // Socket activation, by descriptor name: a start-up error when it does not match the
-    // configuration (the public port must equal `listen`).
-    let activated = activation::from_process(config.listen.port()).map_err(|e| e.to_string())?;
+    Ok(config)
+}
+
+async fn run(
+    args: Args,
+    config: GatewayConfig,
+    activated: activation::Activated,
+) -> Result<(), String> {
     let creds = std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from);
     let identity = load_identity(
         &config
@@ -171,6 +179,19 @@ fn main() -> ExitCode {
         println!("{} {}", env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
+    // Everything that touches the process environment (socket activation removes `LISTEN_*`)
+    // happens here, while the process is still single-threaded: `remove_var` is unsound once
+    // the runtime's worker threads exist.
+    let (config, activated) = match load_config(&args).and_then(|c| {
+        let a = activation::from_process(c.listen.port()).map_err(|e| e.to_string())?;
+        Ok((c, a))
+    }) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, "hx-gatewayd failed");
+            return ExitCode::FAILURE;
+        }
+    };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("hx-gatewayd")
@@ -182,7 +203,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(run(args)) {
+    match runtime.block_on(run(args, config, activated)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "hx-gatewayd failed");

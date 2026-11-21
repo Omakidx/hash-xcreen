@@ -180,15 +180,40 @@ pub fn read_shadow(path: &std::path::Path) -> Result<Zeroizing<Vec<u8>>, Failure
     Ok(buf)
 }
 
-/// Reads the candidate: all of `input`, but at most [`MAX_PASSWORD`] bytes are kept. `None`
-/// means "more than that" (the caller answers mismatch). Allocated once, wiped on drop.
-pub fn read_password(input: impl Read) -> Result<Option<Zeroizing<Vec<u8>>>, Failure> {
-    let mut buf = Zeroizing::new(Vec::with_capacity(MAX_PASSWORD + 1));
-    input
-        .take(MAX_PASSWORD as u64 + 1)
-        .read_to_end(&mut buf)
-        .map_err(|_| Failure::Unavailable("cannot read the password from standard input"))?;
-    Ok((buf.len() <= MAX_PASSWORD).then_some(buf))
+/// File descriptor 0, read directly with `read(2)`: no `std::io::Stdin` and therefore none of
+/// its 8 KiB buffer, which is never wiped.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RawStdin;
+
+impl Read for RawStdin {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        Ok(rustix::io::read(rustix::stdio::stdin(), buf)?)
+    }
+}
+
+/// Reads the candidate: at most [`MAX_PASSWORD`] bytes are kept. `None` means "more than that"
+/// (the caller answers mismatch). The bytes are read straight into one zeroed buffer of
+/// `MAX_PASSWORD + 1` bytes (no intermediate buffer, no regrowth) that is wiped on drop.
+pub fn read_password(mut input: impl Read) -> Result<Option<Zeroizing<Vec<u8>>>, Failure> {
+    let mut buf = Zeroizing::new(vec![0u8; MAX_PASSWORD + 1]);
+    let mut len = 0;
+    while len < buf.len() {
+        match input.read(&mut buf[len..]) {
+            Ok(0) => break,
+            Ok(n) => len += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => {
+                return Err(Failure::Unavailable(
+                    "cannot read the password from standard input",
+                ));
+            }
+        }
+    }
+    if len > MAX_PASSWORD {
+        return Ok(None);
+    }
+    buf.truncate(len);
+    Ok(Some(buf))
 }
 
 /// The whole check: validate the login, read the password and the shadow file, compare.

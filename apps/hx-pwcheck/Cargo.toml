@@ -25,7 +25,7 @@ name = "hx-pwcheck"
 path = "src/main.rs"
 
 [dependencies]
-rustix = { workspace = true, features = ["fs", "process"] }
+rustix = { workspace = true, features = ["fs", "process", "stdio"] }
 subtle = "2.6.1"
 zeroize.workspace = true
 

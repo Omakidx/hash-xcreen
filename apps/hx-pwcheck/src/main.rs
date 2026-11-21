@@ -14,5 +14,5 @@ fn main() -> ExitCode {
         eprintln!("hx-pwcheck: arguments must be UTF-8");
         return ExitCode::from(hx_pwcheck::EXIT_USAGE);
     };
-    ExitCode::from(hx_pwcheck::run(&args, std::io::stdin().lock()))
+    ExitCode::from(hx_pwcheck::run(&args, hx_pwcheck::RawStdin))
 }

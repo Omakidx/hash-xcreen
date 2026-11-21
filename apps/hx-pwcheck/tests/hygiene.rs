@@ -107,3 +107,60 @@ fn libcrypt_is_linked_dynamically_by_soname() {
         assert!(text.contains("libcrypt.so.1"), "{text}");
     }
 }
+
+/// The password is read from fd 0 straight into a wiped buffer, never through `std`'s stdin
+/// buffer (8 KiB, never wiped).
+#[test]
+fn the_password_does_not_pass_through_stds_stdin_buffer() {
+    let main = src("main.rs");
+    assert!(main.contains("RawStdin"));
+    for name in ["main.rs", "lib.rs", "crypt.rs"] {
+        let text = src(name);
+        assert!(
+            !code_lines(&text)
+                .iter()
+                .any(|l| l.contains("std::io::stdin(")),
+            "{name} uses std::io::stdin"
+        );
+    }
+}
+
+/// A reader that hands out one byte at a time and interrupts once: the password is still
+/// assembled, bounded, and an over-long one is a "too long" answer.
+#[test]
+fn read_password_handles_short_reads_and_the_bound() {
+    use std::io::{ErrorKind, Read};
+    struct Dribble<'a>(&'a [u8], bool);
+    impl Read for Dribble<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !std::mem::replace(&mut self.1, true) {
+                return Err(ErrorKind::Interrupted.into());
+            }
+            let n = self.0.len().min(1).min(buf.len());
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+    let p = hx_pwcheck::read_password(Dribble(b"abc", false))
+        .unwrap()
+        .unwrap();
+    assert_eq!(p.as_slice(), b"abc");
+    let max = vec![b'a'; hx_pwcheck::MAX_PASSWORD];
+    let p = hx_pwcheck::read_password(Dribble(&max, false))
+        .unwrap()
+        .unwrap();
+    assert_eq!(p.len(), hx_pwcheck::MAX_PASSWORD);
+    let over = vec![b'a'; hx_pwcheck::MAX_PASSWORD + 1];
+    assert!(
+        hx_pwcheck::read_password(Dribble(&over, false))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        hx_pwcheck::read_password(std::io::empty())
+            .unwrap()
+            .unwrap()
+            .is_empty()
+    );
+}
