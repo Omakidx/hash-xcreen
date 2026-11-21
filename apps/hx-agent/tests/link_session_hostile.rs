@@ -322,3 +322,90 @@ fn the_session_closes_the_link_for_a_hostile_gateway() {
         Some(pb::session_to_gateway::Message::Pong(p)) if p.nonce == 77
     ));
 }
+
+#[test]
+fn the_received_quota_refuses_a_file_that_does_not_fit() {
+    // Review (received files): an aggregate quota for the directory.
+    let Some(env) = Env::start(|cfg| cfg.received_quota_bytes = 2_000) else {
+        return;
+    };
+    let mut r = raw_link(&env.sock, [30; 16]);
+    start_stream(&mut r.ctl);
+    // 1 500 announced fits; a second file of 1 000 does not (1 500 in flight + 1 000 > 2 000).
+    let mut w = open(1, "first.bin", 1_500);
+    w.extend(open(3, "second.bin", 1_000));
+    r.bulk.write_all(&w).unwrap();
+    r.bulk
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut abort = [0u8; 13];
+    r.bulk.read_exact(&mut abort).unwrap();
+    assert_eq!(abort[4], hx_ipc::link::KIND_TRANSFER_ABORT);
+    assert_eq!(u32::from_le_bytes(abort[5..9].try_into().unwrap()), 3);
+    assert_eq!(u32::from_le_bytes(abort[9..13].try_into().unwrap()), 0x101);
+    assert!(!env.dir.join("received").join("second.bin").exists());
+    assert!(env.dir.join("received").join("first.bin").exists());
+    assert!(
+        !closes(&mut r.ctl, Duration::from_millis(500)),
+        "a refusal is not a violation"
+    );
+}
+
+#[test]
+fn a_hung_display_cannot_hold_the_handshake_slots() {
+    // Review: build_info connected to X with no timeout. A server that accepts and never
+    // answers used to park every handshake thread for ever.
+    let dir = std::env::temp_dir().join(format!("hx-link-hung-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let hung = dir.join("x.sock");
+    let hung_listener = std::os::unix::net::UnixListener::bind(&hung).unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let keep = std::thread::spawn(move || {
+        // Accept and say nothing; keep the connections open.
+        let mut held = Vec::new();
+        hung_listener.set_nonblocking(true).unwrap();
+        while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Ok((s, _)) = hung_listener.accept() {
+                held.push(s);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+    let sock = dir.join("link.sock");
+    let mut cfg = SessionConfig::new(Some(format!("{}:0", hung.display())));
+    cfg.display_probe_timeout = Duration::from_millis(400);
+    cfg.max_handshakes = 4;
+    cfg.clipboard = None;
+    let server = Server::bind(&sock, cfg).unwrap().spawn();
+    let t0 = Instant::now();
+    // Many more connections than handshake slots: each ctl lane is refused within the probe
+    // timeout (or at once, once two probes are parked), and the server keeps accepting.
+    let mut refused = 0;
+    for i in 0..12u8 {
+        let mut s = UnixStream::connect(&sock).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let offer = ClientPreamble {
+            preamble: Preamble::ours(Lane::Ctl),
+            link_id: [i + 1; 16],
+        }
+        .encode();
+        s.write_all(&offer).unwrap();
+        let mut answer = [0u8; 8];
+        s.read_exact(&mut answer).unwrap(); // the preamble is answered first
+        if closes(&mut s, Duration::from_secs(3)) {
+            refused += 1;
+        }
+    }
+    assert_eq!(refused, 12, "every link is refused, none hangs");
+    assert!(
+        t0.elapsed() < Duration::from_secs(10),
+        "{:?}: the probes are bounded",
+        t0.elapsed()
+    );
+    server.shutdown();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    keep.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

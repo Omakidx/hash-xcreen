@@ -24,6 +24,7 @@ pub mod activation;
 mod bulk;
 mod convert;
 mod io;
+mod received;
 mod runtime;
 
 use hx_capture::X11Input;
@@ -61,6 +62,12 @@ pub struct SessionConfig {
     pub max_frame_bytes: u32,
     /// Largest file accepted or sent (default 4 GiB).
     pub max_file_bytes: u64,
+    /// Aggregate limit for the received-files directory: bytes on disk plus the announced size
+    /// of every transfer in flight (default 8 GiB). A transfer that does not fit is refused.
+    pub received_quota_bytes: u64,
+    /// How long the display probe of a new link may take (2 s): a hung X server must not hold
+    /// handshake slots.
+    pub display_probe_timeout: Duration,
     /// Pipeline template; display, bitrate and frame rate are filled in per `start`.
     pub pipeline: PipelineConfig,
     /// Rate limits of the input gate.
@@ -95,6 +102,8 @@ impl SessionConfig {
             received_dir: PathBuf::from(DEFAULT_RECEIVED_DIR),
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             max_file_bytes: hx_proto::channel::MAX_FILE_SIZE,
+            received_quota_bytes: 8 * 1024 * 1024 * 1024,
+            display_probe_timeout: Duration::from_secs(2),
             pipeline: PipelineConfig::default(),
             input: InputLimits::default(),
             clipboard: Some(clipboard),
@@ -148,6 +157,9 @@ struct Hub {
     desktop: Mutex<()>,
     state: Mutex<HubState>,
     supervisors: Mutex<Vec<JoinHandle<()>>>,
+    received: Arc<received::ReceivedStore>,
+    /// A display probe is running (or hung): further links do not start another.
+    probing: Arc<AtomicUsize>,
 }
 
 fn log(msg: &str) {
@@ -155,9 +167,33 @@ fn log(msg: &str) {
 }
 
 impl Hub {
+    /// Asks the display for its size, bounded by `display_probe_timeout`. An X server that
+    /// accepts the connection and then never answers would otherwise hold a handshake thread (and
+    /// with enough connections every slot) for ever. The probe runs on its own thread; at most
+    /// two run at once, so a hung server costs two parked threads, not the daemon.
+    fn probe_display(&self) -> Option<hx_capture::Size> {
+        if self.probing.fetch_add(1, Relaxed) >= MAX_PROBES {
+            self.probing.fetch_sub(1, Relaxed);
+            return None;
+        }
+        let slot = ProbeSlot(self.probing.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let display = self.cfg.display.clone();
+        std::thread::Builder::new()
+            .name("hx-display-probe".into())
+            .spawn(move || {
+                let _slot = slot;
+                let size = X11Input::connect(display.as_deref())
+                    .ok()
+                    .map(|i| i.screen_size());
+                let _ = tx.send(size);
+            })
+            .ok()?;
+        rx.recv_timeout(self.cfg.display_probe_timeout).ok()?
+    }
+
     fn build_info(&self) -> Option<pb::Info> {
-        let input = X11Input::connect(self.cfg.display.as_deref()).ok()?;
-        let size = input.screen_size();
+        let size = self.probe_display()?;
         let mut features = FEATURE_INPUT | FEATURE_RESIZE | FEATURE_FILE_TRANSFER;
         if self.cfg.clipboard.is_some() {
             features |= FEATURE_CLIPBOARD;
@@ -256,7 +292,7 @@ impl Hub {
             media,
             bulk,
         };
-        let Ok((ctx, rx)) = LinkCtx::new(self.cfg.clone(), &lanes) else {
+        let Ok((ctx, rx)) = LinkCtx::new(self.cfg.clone(), self.received.clone(), &lanes) else {
             return;
         };
         lock(&self.state).live = Some(Live {
@@ -341,6 +377,18 @@ fn handshake(hub: &Arc<Hub>, stream: UnixStream) {
     match cp.preamble.lane {
         Lane::Ctl => hub.on_ctl(cp.link_id, stream),
         lane => hub.on_extra(lane, cp.link_id, stream),
+    }
+}
+
+/// Display probes that may run (or hang) at once.
+const MAX_PROBES: usize = 2;
+
+/// Frees a probe slot when the probe thread ends, however late.
+struct ProbeSlot(Arc<AtomicUsize>);
+
+impl Drop for ProbeSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Relaxed);
     }
 }
 
@@ -443,10 +491,15 @@ impl Server {
         Ok(Self {
             listener,
             hub: Arc::new(Hub {
-                cfg: Arc::new(cfg),
                 desktop: Mutex::new(()),
                 state: Mutex::new(HubState::default()),
                 supervisors: Mutex::new(Vec::new()),
+                received: Arc::new(received::ReceivedStore::new(
+                    cfg.received_dir.clone(),
+                    cfg.received_quota_bytes,
+                )),
+                probing: Arc::new(AtomicUsize::new(0)),
+                cfg: Arc::new(cfg),
             }),
             stop: Arc::new(AtomicBool::new(false)),
         })

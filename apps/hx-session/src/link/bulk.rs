@@ -15,6 +15,7 @@
 //! even; an id already in use is a violation.
 
 use super::io::{LaneError, LaneReader};
+use super::received::{ReceivedError, ReceivedFile};
 use super::runtime::LinkCtx;
 use hx_capture::clipboard::{ClipboardEvent, MIME_PNG, MIME_TEXT, MIME_URI_LIST, Selection};
 use hx_ipc::link::budget::{RateWindow, limits};
@@ -26,9 +27,7 @@ use hx_ipc::link::{MAX_TRANSFER_CHUNK, Role, pb};
 use hx_proto::channel::{MAX_CLIPBOARD_SIZE, RESET_TRANSFER_ERROR, STOP_TRANSFER_REJECTED};
 use hx_proto::pb::TransferHeader;
 use std::collections::{HashMap, VecDeque};
-use std::fs::File;
 use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
@@ -44,7 +43,7 @@ const MAX_PUSHED_FILES: usize = 16;
 
 enum Kind {
     Clipboard { mime: String, buf: Vec<u8> },
-    File { file: File, path: PathBuf },
+    File { file: ReceivedFile },
 }
 
 struct Incoming {
@@ -56,8 +55,9 @@ struct Incoming {
 impl Incoming {
     /// Drops what was written so far (a partial file is deleted).
     fn discard(self) {
-        if let Kind::File { path, .. } = self.kind {
-            let _ = std::fs::remove_file(path);
+        if let Kind::File { file } = self.kind {
+            // Through the directory descriptor, never by path.
+            file.discard();
         }
     }
 }
@@ -146,7 +146,7 @@ fn handle(
                         buf.extend_from_slice(&data);
                         false
                     }
-                    Kind::File { file, .. } => file.write_all(&data).is_err(),
+                    Kind::File { file } => file.file.write_all(&data).is_err(),
                 };
             if fail && let Some(t) = incoming.remove(&id) {
                 t.discard();
@@ -180,9 +180,7 @@ fn handle(
                 && let Ok(mut a) = ctx.aborted_out.lock()
             {
                 // One of the session's own outgoing transfers (even ids).
-                if a.len() < 16 {
-                    a.push(id);
-                }
+                note_aborted(&mut a, id);
             }
             Ok(())
         }
@@ -249,18 +247,27 @@ fn on_open(
                 remember(recent, open.id);
                 return Ok(());
             }
-            match create_received_file(&ctx.cfg.received_dir, &header.name) {
-                Ok((file, path)) => {
+            match ctx.received.create(&header.name, header.size) {
+                Ok(file) => {
                     incoming.insert(
                         open.id,
                         Incoming {
-                            kind: Kind::File { file, path },
+                            kind: Kind::File { file },
                             size: header.size,
                             got: 0,
                         },
                     );
                 }
-                Err(_) => {
+                // The directory's quota or the free space does not allow it: refused, not broken.
+                Err(ReceivedError::NoRoom) => {
+                    reject(STOP_TRANSFER_REJECTED);
+                    remember(recent, open.id);
+                }
+                Err(ReceivedError::Io(e)) => {
+                    ctx.event(
+                        pb::EventKind::ClipboardError,
+                        &format!("cannot store a received file: {e}"),
+                    );
                     reject(RESET_TRANSFER_ERROR);
                     remember(recent, open.id);
                 }
@@ -273,8 +280,12 @@ fn on_open(
 
 /// A completed transfer. A file is already on disk; a clipboard becomes the local selection.
 fn finish(ctx: &Arc<LinkCtx>, t: Incoming) {
-    let Kind::Clipboard { mime, buf } = t.kind else {
-        return;
+    let (mime, buf) = match t.kind {
+        Kind::Clipboard { mime, buf } => (mime, buf),
+        Kind::File { file } => {
+            file.finish();
+            return;
+        }
     };
     let canonical = match mime.split(';').next().unwrap_or("").trim() {
         m if m.eq_ignore_ascii_case("text/plain") => MIME_TEXT,
@@ -329,54 +340,6 @@ impl crate::clipboard::ClientSource for MemorySource {
     }
 }
 
-/// A file name this session will create: the announced name when it is a plain component, else
-/// `file`. Never a path.
-pub(crate) fn plain_name(hint: &str) -> String {
-    let ok = !hint.is_empty()
-        && hint.len() <= 255
-        && hint != "."
-        && hint != ".."
-        && !hint.contains(['/', '\\', '\0'])
-        && !hint.starts_with('-');
-    if ok {
-        hint.to_owned()
-    } else {
-        "file".to_owned()
-    }
-}
-
-/// Creates a new file in `dir` (created if missing, mode 0700) with `O_EXCL | O_NOFOLLOW` and
-/// mode 0600, picking `name`, `name.1`, `name.2`, ... so nothing is ever overwritten.
-pub(crate) fn create_received_file(dir: &Path, hint: &str) -> std::io::Result<(File, PathBuf)> {
-    use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)?;
-    let name = plain_name(hint);
-    let nofollow = rustix::fs::OFlags::NOFOLLOW.bits() as i32;
-    for n in 0..1000u32 {
-        let candidate = if n == 0 {
-            name.clone()
-        } else {
-            format!("{name}.{n}")
-        };
-        let path = dir.join(&candidate);
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(nofollow)
-            .open(&path)
-        {
-            Ok(f) => return Ok((f, path)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Err(std::io::Error::other("no free file name"))
-}
-
 // ----- session to gateway -----
 
 fn next_id(ctx: &LinkCtx) -> u32 {
@@ -392,14 +355,51 @@ fn next_id(ctx: &LinkCtx) -> u32 {
 fn aborted(ctx: &LinkCtx, id: u32) -> bool {
     ctx.aborted_out
         .lock()
-        .map(|mut a| match a.iter().position(|x| *x == id) {
-            Some(i) => {
-                a.swap_remove(i);
-                true
-            }
-            None => false,
-        })
+        .map(|mut a| take_aborted(&mut a, id))
         .unwrap_or(true)
+}
+
+/// Remembers that the gateway aborted outgoing transfer `id`. The oldest entry goes when the
+/// list is full, so a stale id (a transfer that already ended) can never make a later abort get
+/// lost.
+fn note_aborted(a: &mut VecDeque<u32>, id: u32) {
+    if a.len() >= 16 {
+        a.pop_front();
+    }
+    a.push_back(id);
+}
+
+fn take_aborted(a: &mut VecDeque<u32>, id: u32) -> bool {
+    match a.iter().position(|x| *x == id) {
+        Some(i) => {
+            a.remove(i);
+            true
+        }
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_aborted_ids_never_cause_a_later_abort_to_be_lost() {
+        // Review: the list used to stop accepting at 16 entries, none of which was ever
+        // removed for transfers that had already ended.
+        let mut a = VecDeque::new();
+        for id in (2..=400).step_by(2) {
+            note_aborted(&mut a, id);
+        }
+        assert!(a.len() <= 16);
+        note_aborted(&mut a, 1_000);
+        assert!(take_aborted(&mut a, 1_000), "the newest abort is found");
+        assert!(!take_aborted(&mut a, 1_000), "and consumed once");
+        assert!(
+            !take_aborted(&mut a, 2),
+            "an old one was evicted, not kept for ever"
+        );
+    }
 }
 
 /// Why an outgoing transfer did not complete.
@@ -583,47 +583,5 @@ fn push_local(ctx: &Arc<LinkCtx>, mgr: &crate::clipboard::ClipboardManager, form
         Ok(()) | Err(SendError::Aborted) => {}
         Err(SendError::Io(e)) => ctx.close(&format!("bulk write failed: {e}")),
         Err(SendError::Invalid(why)) => ctx.event(pb::EventKind::ClipboardError, &why),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn names_are_hints_and_never_paths() {
-        assert_eq!(plain_name("report.pdf"), "report.pdf");
-        for bad in ["", ".", "..", "a/b", "a\\b", "-rf", "nul\0byte"] {
-            assert_eq!(plain_name(bad), "file", "{bad:?}");
-        }
-        assert_eq!(plain_name(&"x".repeat(256)), "file");
-    }
-
-    #[test]
-    fn received_files_are_exclusive_private_and_do_not_follow_symlinks() {
-        let dir = std::env::temp_dir().join(format!("hx-bulk-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let (mut f1, p1) = create_received_file(&dir, "a.txt").unwrap();
-        let (_f2, p2) = create_received_file(&dir, "a.txt").unwrap();
-        let (_f3, p3) = create_received_file(&dir, "a.txt").unwrap();
-        assert_eq!(p1.file_name().unwrap(), "a.txt");
-        assert_eq!(p2.file_name().unwrap(), "a.txt.1");
-        assert_eq!(p3.file_name().unwrap(), "a.txt.2");
-        f1.write_all(b"x").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(&p1).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert_eq!(
-            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-        // A symlink planted at the target name is never followed: the next name is used.
-        std::os::unix::fs::symlink("/etc/passwd", dir.join("b.txt")).unwrap();
-        let (_f4, p4) = create_received_file(&dir, "b.txt").unwrap();
-        assert_eq!(p4.file_name().unwrap(), "b.txt.1");
-        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"x");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

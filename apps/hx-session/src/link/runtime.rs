@@ -39,6 +39,7 @@ use hx_ipc::text::sanitize_text;
 use hx_proto::datagram::MouseMove;
 use hx_proto::order::serial_gt;
 use hx_proto::pb as hx;
+use std::collections::VecDeque;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
@@ -101,7 +102,8 @@ pub(crate) struct LinkCtx {
     pub out: CtlOut,
     pub bulk_tx: Mutex<UnixStream>,
     pub next_tid: AtomicU32,
-    pub aborted_out: Mutex<Vec<u32>>,
+    pub aborted_out: Mutex<VecDeque<u32>>,
+    pub received: Arc<super::received::ReceivedStore>,
     pub manager: Option<Arc<ClipboardManager>>,
     pub clipboard_on: AtomicBool,
     pub files_on: AtomicBool,
@@ -136,6 +138,7 @@ impl LinkCtx {
     /// Builds the context of a link whose three lanes are connected.
     pub(crate) fn new(
         cfg: Arc<SessionConfig>,
+        received: Arc<super::received::ReceivedStore>,
         lanes: &Lanes,
     ) -> std::io::Result<(Arc<Self>, Receiver<Cmd>)> {
         let (cmd_tx, cmd_rx) = bounded(32);
@@ -155,7 +158,8 @@ impl LinkCtx {
             out: CtlOut::new(),
             bulk_tx: Mutex::new(lanes.bulk.try_clone()?),
             next_tid: AtomicU32::new(2),
-            aborted_out: Mutex::new(Vec::new()),
+            aborted_out: Mutex::new(VecDeque::new()),
+            received,
             manager,
             clipboard_on: AtomicBool::new(false),
             files_on: AtomicBool::new(false),
