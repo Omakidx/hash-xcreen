@@ -1510,3 +1510,67 @@ async fn sps_in_a_non_key_frame_is_compared_and_idr_outside_key_is_refused() {
     )
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_media_flood_of_large_frames_is_throttled_to_the_budget_and_then_a_violation() {
+    // Review M2: 4 MiB frames written as fast as the socket takes them. The media budget is
+    // 16 MiB/s with a 32 MiB burst; the debt of every frame is paid before the next is read,
+    // so the fake's writes block, and after three seconds of that the link is a violation.
+    let (tx, rx) = mpsc::channel::<(u64, Duration)>();
+    let f = session(None, move |l| {
+        std::thread::sleep(Duration::from_millis(300));
+        l.ctl.write_all(&stream_format(1, 0)).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        l.media
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let t0 = Instant::now();
+        let mut written = 0u64;
+        let first = video(0, 1 | 2, 1, &key_payload());
+        l.media.write_all(&first).unwrap();
+        let mut n = 1u32;
+        'flood: while t0.elapsed() < Duration::from_secs(12) {
+            let frame = video(n, 0, 1, &p_payload(4 * 1024 * 1024 - 64));
+            let mut off = 0;
+            while off < frame.len() {
+                match l.media.write(&frame[off..]) {
+                    Ok(0) => break 'flood,
+                    Ok(k) => {
+                        off += k;
+                        written += k as u64;
+                    }
+                    Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                        // A stalled write is the backpressure working; keep pushing.
+                        if t0.elapsed() > Duration::from_secs(12) {
+                            break 'flood;
+                        }
+                    }
+                    Err(_) => break 'flood, // the gateway closed the link
+                }
+            }
+            n += 1;
+        }
+        tx.send((written, t0.elapsed())).unwrap();
+    });
+    let (link, mut ev) = connect_with(&f, |c| c.liveness_timeout = Duration::from_secs(60)).await;
+    link.start(1, start_config()).unwrap();
+    closed(
+        &mut ev,
+        FailureClass::Violation,
+        "byte budget",
+        Duration::from_secs(12),
+    )
+    .await;
+    let (written, took) = tokio::task::spawn_blocking(move || rx.recv().unwrap())
+        .await
+        .unwrap();
+    let mib = 1024 * 1024u64;
+    // Burst (32 MiB) plus the rate over the time it took, plus what the kernel buffers hold and
+    // one frame of overshoot. Line speed would be gigabytes.
+    let bound = 32 * mib + 16 * mib * took.as_secs().max(1) + 24 * mib;
+    assert!(
+        written <= bound,
+        "wrote {} MiB in {took:?}: the budget did not throttle",
+        written / mib
+    );
+}

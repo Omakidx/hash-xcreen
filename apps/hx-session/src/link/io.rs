@@ -131,7 +131,9 @@ impl LaneReader {
                     std::thread::sleep(Duration::from_millis(10));
                     continue;
                 }
-                b.note_pending(false, now);
+                // Positive allowance: no verdict. Only an idle peer or a recovered bucket resets
+                // the starvation clock, not merely touching zero between two frames.
+                b.note_pending(true, now);
             }
             let want = self.decoder.wants().min(self.buf.len());
             let n = match NoCmsgReader(&self.stream).read(&mut self.buf[..want]) {
@@ -389,6 +391,60 @@ mod tests {
         b.write_all(&[0]).unwrap();
         let closed = AtomicBool::new(false);
         assert!(matches!(r.next(&closed), Err(LaneError::Violation(_))));
+    }
+
+    #[test]
+    fn a_flood_of_large_frames_is_throttled_to_the_budget_then_a_violation() {
+        // Review M2: 16 KiB frames at full speed against the 1 MiB/s ctl budget (2 MiB burst).
+        let (a, mut b) = pair();
+        let mut r = LaneReader::new(a, Lane::Ctl, session_policy(Lane::Ctl), None).unwrap();
+        let wire = encode_frame(KIND_GATEWAY_TO_SESSION, &vec![0u8; 16_383], 16_384).unwrap();
+        b.set_write_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let s2 = stop.clone();
+        let writer = std::thread::spawn(move || {
+            let mut written = 0usize;
+            let mut off = 0;
+            while !s2.load(Relaxed) {
+                match b.write(&wire[off..]) {
+                    Ok(0) | Err(_) if s2.load(Relaxed) => break,
+                    Ok(n) => {
+                        off = (off + n) % wire.len();
+                        written += n;
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(_) => break,
+                }
+            }
+            written
+        });
+        let closed = AtomicBool::new(false);
+        let t0 = Instant::now();
+        let mut frames = 0u64;
+        let err = loop {
+            match r.next(&closed) {
+                Ok(_) => frames += 1,
+                Err(e) => break e,
+            }
+            assert!(t0.elapsed() < Duration::from_secs(10), "never flagged");
+        };
+        let took = t0.elapsed();
+        stop.store(true, Relaxed);
+        let _ = writer.join();
+        assert!(
+            matches!(&err, LaneError::Violation(v) if v.contains("byte budget")),
+            "{err:?}"
+        );
+        // Burst (2 MiB) plus 1 MiB/s over the time taken, plus one frame: not line speed.
+        let consumed = frames * 16_388;
+        let bound = 2 * 1024 * 1024 + (took.as_secs() + 1) * 1024 * 1024 + 16_388;
+        assert!(consumed <= bound, "{consumed} bytes in {took:?}");
+        assert!(took >= Duration::from_secs(3), "{took:?}");
     }
 
     #[test]

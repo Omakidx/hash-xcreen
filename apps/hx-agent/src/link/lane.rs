@@ -189,7 +189,9 @@ impl LaneReader {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     continue;
                 }
-                b.note_pending(false, now.into_std());
+                // Positive allowance: no verdict. Only an idle peer or a recovered bucket resets
+                // the starvation clock, not merely touching zero between two frames.
+                b.note_pending(true, now.into_std());
             }
             let want = self.decoder.wants().min(self.buf.len());
             // How long this read may take: the frame deadline mid-frame, the idle limit between
