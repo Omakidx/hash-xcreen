@@ -33,7 +33,9 @@ pub mod session;
 pub mod user;
 
 pub use catalog::{Addon, Catalog, Desktop, Distro, Preset, RecipeId};
-pub use docker::{DockerOptions, DockerOutcome, enable_docker};
+pub use docker::{
+    DisableOutcome, DockerMode, DockerOptions, DockerOutcome, disable_docker, enable_docker,
+};
 pub use error::RecipeError;
 pub use exec::{
     Action, ApplyError, ExecError, ExecOutput, ExecRequest, Executor, FilePush, Progress, Secret,

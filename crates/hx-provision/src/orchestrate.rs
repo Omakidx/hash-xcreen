@@ -490,6 +490,9 @@ pub enum ProvisionError {
     /// Bad input.
     #[error("invalid request: {0}")]
     Invalid(String),
+    /// The requested mode or feature is named but not implemented (privd: `UNIMPLEMENTED`).
+    #[error("not implemented: {0}")]
+    Unimplemented(String),
     /// The operation needs a running desktop and it is not running (privd: `FAILED_PRECONDITION`).
     #[error("the desktop is not running")]
     NotRunning,
