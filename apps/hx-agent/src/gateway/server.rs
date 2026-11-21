@@ -76,6 +76,9 @@ pub struct StartOptions {
     pub link: Arc<dyn DesktopLink>,
     /// The admin socket, already bound (by systemd's socket activation or [`admin::bind`]).
     pub admin_listener: Option<UnixListener>,
+    /// The public sockets, already bound by systemd's socket activation (UDP for QUIC, TCP for
+    /// the WebSocket fallback). `None` binds `config.listen` itself.
+    pub public_listeners: Option<(std::net::UdpSocket, std::net::TcpListener)>,
     /// Who may use the admin socket.
     pub admin_policy: AdminPolicy,
     /// The clock (tests move time).
@@ -96,6 +99,7 @@ impl StartOptions {
             identity,
             link,
             admin_listener: None,
+            public_listeners: None,
             admin_policy: AdminPolicy::RootOnly,
             clock: Arc::new(SystemClock),
             server_options: ServerOptions::default(),
@@ -142,6 +146,7 @@ impl Gateway {
             identity,
             link,
             admin_listener,
+            public_listeners,
             admin_policy,
             clock,
             server_options,
@@ -197,14 +202,11 @@ impl Gateway {
             live.clone(),
             clock,
         );
-        let server = Arc::new(
-            Server::bind_paused(
-                config.listen,
-                tls::server_config(&identity)?,
-                server_options,
-            )
-            .await?,
-        );
+        let tls = tls::server_config(&identity)?;
+        let server = Arc::new(match public_listeners {
+            Some((udp, tcp)) => Server::from_listeners_paused(udp, tcp, tls, server_options)?,
+            None => Server::bind_paused(config.listen, tls, server_options).await?,
+        });
         let shared = Arc::new(Shared {
             auth: auth.clone(),
             verifiers: verifiers.clone(),
@@ -359,19 +361,61 @@ async fn handle_pending(sh: Arc<Shared>, pending: PendingSession) {
     }
 }
 
+/// Where systemd places the credentials of system services (`$CREDENTIALS_DIRECTORY` is
+/// `/run/credentials/<unit>`).
+const CREDENTIALS_ROOT: &str = "/run/credentials/";
+
+/// Is `path` lexically under systemd's credentials tree (no `..`)?
+fn in_credentials_dir(path: &Path) -> bool {
+    // `Path::starts_with` compares whole components, so `/run/credentialsX` does not match.
+    path.starts_with(CREDENTIALS_ROOT)
+        && path != Path::new(CREDENTIALS_ROOT)
+        && path
+            .components()
+            .all(|c| !matches!(c, std::path::Component::ParentDir))
+}
+
+/// Is `meta` an acceptable identity-key file?
+///
+/// Everywhere: a regular file with no group or other access (0600 or stricter).
+///
+/// Under `/run/credentials/` only, as systemd creates it: a unit with `User=` or
+/// `DynamicUser=` gets its credential as mode 0400 **owned by root with an ACL entry** for the
+/// service user (systemd falls back to `chown` to the user when the file system has no ACLs).
+/// `stat` then reports the ACL *mask* in the group bits, so the file looks like 0440. That is
+/// accepted: owner read, group read (the mask), nothing else, and the owner must be root or
+/// the process's own user. Write or execute bits, and any "other" access, are refused as
+/// everywhere else.
+fn identity_file_acceptable(meta: &std::fs::Metadata, credentials_dir: bool, euid: u32) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if !meta.is_file() {
+        return false;
+    }
+    let mode = meta.permissions().mode() & 0o7777;
+    if !credentials_dir {
+        return mode & 0o077 == 0;
+    }
+    mode & !0o440 == 0 && (meta.uid() == 0 || meta.uid() == euid)
+}
+
 /// Loads the identity key from a credential file: 32 raw bytes, or 64 hex characters.
-/// The file must be a private regular file (a systemd credential is 0400) and is opened
+/// The file must be a private regular file (see [`identity_file_acceptable`]: a systemd
+/// credential is 0400, or 0440 as `stat` shows it with the service user's ACL) and is opened
 /// without following symlinks.
 pub fn load_identity(path: &Path) -> Result<IdentityKey, String> {
     use std::io::Read;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
         .open(path)
         .map_err(|e| format!("cannot open the identity credential: {}", e.kind()))?;
     let meta = f.metadata().map_err(|e| e.kind().to_string())?;
-    if !meta.is_file() || meta.permissions().mode() & 0o077 != 0 {
+    if !identity_file_acceptable(
+        &meta,
+        in_credentials_dir(path),
+        rustix::process::geteuid().as_raw(),
+    ) {
         return Err("the identity credential must be a private regular file".into());
     }
     // Allocated once (the read is capped at 256 bytes): reading never regrows, so no copy of
@@ -394,4 +438,99 @@ pub fn load_identity(path: &Path) -> Result<IdentityKey, String> {
         seed.copy_from_slice(&raw);
     }
     IdentityKey::from_seed(&seed).map_err(|_| "the identity credential is not a valid key".into())
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn meta_with_mode(mode: u32) -> (tempfile::TempDir, std::fs::Metadata) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("identity");
+        std::fs::write(&p, [0u8; 32]).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+        let m = std::fs::metadata(&p).unwrap();
+        (dir, m)
+    }
+
+    #[test]
+    fn the_credentials_tree_is_recognised_lexically() {
+        assert!(in_credentials_dir(Path::new(
+            "/run/credentials/hx-gatewayd.service/identity"
+        )));
+        for p in [
+            "/run/credentials",
+            "/run/credentials/../etc/identity",
+            "/run/credentials/x/../../etc/identity",
+            "/tmp/run/credentials/x/identity",
+            "/var/run/credentials/x/identity",
+            "identity",
+        ] {
+            assert!(!in_credentials_dir(Path::new(p)), "{p}");
+        }
+    }
+
+    #[test]
+    fn strict_outside_the_credentials_tree() {
+        let me = rustix::process::geteuid().as_raw();
+        for (mode, ok) in [
+            (0o400, true),
+            (0o600, true),
+            (0o440, false),
+            (0o640, false),
+            (0o604, false),
+            (0o644, false),
+        ] {
+            let (_d, m) = meta_with_mode(mode);
+            assert_eq!(identity_file_acceptable(&m, false, me), ok, "{mode:o}");
+        }
+    }
+
+    #[test]
+    fn systemds_acl_mask_is_accepted_under_the_credentials_tree_only() {
+        let me = rustix::process::geteuid().as_raw();
+        for (mode, ok) in [
+            (0o400, true),
+            (0o440, true), // owner r, ACL mask r
+            (0o640, false),
+            (0o460, false),
+            (0o444, false),
+            (0o404, false),
+            (0o500, false),
+            (0o410, false),
+            (0o2440, false),
+        ] {
+            let (_d, m) = meta_with_mode(mode);
+            assert_eq!(identity_file_acceptable(&m, true, me), ok, "{mode:o}");
+        }
+        // The same 0440 is refused anywhere else.
+        let (_d, m) = meta_with_mode(0o440);
+        assert!(!identity_file_acceptable(&m, false, me));
+    }
+
+    #[test]
+    fn a_credential_owned_by_somebody_else_is_refused() {
+        let (_d, m) = meta_with_mode(0o400);
+        let owner = std::os::unix::fs::MetadataExt::uid(&m);
+        // Neither root nor the process's user (unless the test runs as root).
+        if owner != 0 {
+            assert!(!identity_file_acceptable(&m, true, owner + 1));
+        }
+        assert!(identity_file_acceptable(&m, true, owner));
+    }
+
+    #[test]
+    fn directories_and_symlinks_are_not_identity_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = std::fs::metadata(dir.path()).unwrap();
+        assert!(!identity_file_acceptable(&m, false, 0));
+        assert!(!identity_file_acceptable(&m, true, 0));
+        let target = dir.path().join("t");
+        std::fs::write(&target, [0u8; 32]).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let link = dir.path().join("l");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(load_identity(&link).is_err(), "NOFOLLOW");
+    }
 }

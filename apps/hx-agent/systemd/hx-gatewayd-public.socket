@@ -1,0 +1,35 @@
+# The public listeners of hx-gatewayd: QUIC (UDP) and the WebSocket fallback (TCP), one port.
+#
+# systemd binds them (as root) and hands both descriptors to hx-gatewayd.service under the name
+# "public" (socket activation, LISTEN_FDS / LISTEN_FDNAMES), because the gateway is unprivileged
+# with an empty capability bounding set and could not bind port 443 itself. The gateway tells
+# the TCP descriptor from the UDP one by SO_TYPE. The sockets stay bound while the service
+# restarts (for example in a self-update), so no connection attempt is refused in between.
+#
+# The installer writes a drop-in, hx-gatewayd-public.socket.d/50-port.conf, that resets both
+# lists and sets the chosen port:
+#
+#   [Socket]
+#   ListenStream=
+#   ListenStream=[::]:<port>
+#   ListenDatagram=
+#   ListenDatagram=[::]:<port>
+#
+# and writes the same port as `listen = "[::]:<port>"` in /etc/hx/gatewayd.toml. The gateway
+# refuses to start when the two disagree.
+
+[Unit]
+Description=hx-gatewayd public sockets (QUIC and WebSocket)
+Documentation=https://github.com/Omakidx/hash-xcreen
+
+[Socket]
+ListenStream=[::]:443
+ListenDatagram=[::]:443
+# One socket per transport serves IPv4 and IPv6 (IPv4-mapped addresses).
+BindIPv6Only=both
+Accept=no
+FileDescriptorName=public
+Service=hx-gatewayd.service
+
+[Install]
+WantedBy=sockets.target
