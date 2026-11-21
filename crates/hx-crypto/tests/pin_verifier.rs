@@ -25,6 +25,7 @@ use zeroize::Zeroizing;
 
 const PREF: TransportPreference = TransportPreference::Quic;
 const PIN: &str = "482913";
+const LOCKED: PinVerdict = PinVerdict::Locked { retry_after: None };
 const WAIT: Duration = Duration::from_secs(20);
 
 async fn within<T>(f: impl Future<Output = T>) -> T {
@@ -390,7 +391,7 @@ async fn unavailable_is_refunded_exactly_once_never_revokes_and_holds_the_device
 
 #[tokio::test]
 async fn locked_refuses_with_not_available_and_refunds() {
-    let v = Scripted::new(PinVerdict::Locked, Duration::from_millis(10));
+    let v = Scripted::new(LOCKED, Duration::from_millis(10));
     let e = env(AuthenticatorConfig::default(), &v).await;
     e.registry.begin_pin_attempt(&e.id()).expect("count");
     let mut c = e.open().await;
@@ -400,6 +401,115 @@ async fn locked_refuses_with_not_available_and_refunds() {
     assert_eq!(rec.failed_pins, 1, "back to the earlier count");
     assert!(!rec.is_revoked());
     assert_eq!(v.calls(), 1);
+}
+
+#[tokio::test]
+async fn locked_sets_the_verifiers_wait_and_attempts_during_it_are_not_counted() {
+    let v = Scripted::new(
+        PinVerdict::Locked {
+            retry_after: Some(Duration::from_secs(7)),
+        },
+        Duration::from_millis(10),
+    );
+    let e = env(AuthenticatorConfig::default(), &v).await;
+    e.registry.begin_pin_attempt(&e.id()).expect("count");
+    let r = within(e.open().await.submit(&pin("000000"))).await;
+    assert!(matches!(r, Err(Error::PinNotAvailable)), "{r:?}");
+    assert_eq!((v.calls(), e.failed()), (1, 1));
+
+    // Parallel attempts during the wait: BACKOFF with what is left, never verified, never
+    // counted, never revoking.
+    e.clock.advance(Duration::from_secs(2));
+    let mut conns = [e.open().await, e.open().await, e.open().await];
+    let replies = within(join_all(
+        conns
+            .iter_mut()
+            .map(|c| async move { c.submit(&pin("000000")).await })
+            .collect(),
+    ))
+    .await;
+    for r in replies {
+        assert_eq!(
+            r.expect("reply"),
+            PinReply::Backoff {
+                retry_after: Duration::from_secs(5)
+            }
+        );
+    }
+    assert_eq!((v.calls(), e.failed()), (1, 1));
+    assert!(
+        !e.registry
+            .get(&e.id())
+            .expect("reg")
+            .expect("dev")
+            .is_revoked()
+    );
+
+    // After the wait the verifier is asked again (and is still locked).
+    e.clock.advance(Duration::from_secs(5));
+    let r = within(e.open().await.submit(&pin("000000"))).await;
+    assert!(matches!(r, Err(Error::PinNotAvailable)), "{r:?}");
+    assert_eq!((v.calls(), e.failed()), (2, 1));
+}
+
+#[tokio::test]
+async fn is_backing_off_covers_wrong_pin_backoff_locked_and_unavailable_holds() {
+    // Wrong PIN: 1 s after the first failure.
+    let v = Scripted::new(PinVerdict::Wrong, Duration::ZERO);
+    let e = env(AuthenticatorConfig::default(), &v).await;
+    assert!(!e.auth.is_backing_off(&e.id()));
+    let r = within(e.open().await.submit(&pin("000000"))).await;
+    assert!(matches!(r, Ok(PinReply::Wrong { .. })), "{r:?}");
+    assert!(e.auth.is_backing_off(&e.id()));
+    assert_eq!(e.auth.backoff_remaining(&e.id()), Duration::from_secs(1));
+    e.clock.advance(Duration::from_millis(999));
+    assert!(e.auth.is_backing_off(&e.id()));
+    e.clock.advance(Duration::from_millis(1));
+    assert!(!e.auth.is_backing_off(&e.id()));
+    // Other devices are unaffected.
+    assert!(
+        !e.auth
+            .is_backing_off(&IdentityKey::generate().expect("k").public().device_id())
+    );
+
+    // Locked: the verifier's wait.
+    e.auth.set_pin_verifier(Scripted::new(
+        PinVerdict::Locked {
+            retry_after: Some(Duration::from_secs(9)),
+        },
+        Duration::ZERO,
+    ));
+    let r = within(e.open().await.submit(&pin("000000"))).await;
+    assert!(matches!(r, Err(Error::PinNotAvailable)), "{r:?}");
+    assert_eq!(e.auth.backoff_remaining(&e.id()), Duration::from_secs(9));
+    e.clock.advance(Duration::from_secs(9));
+    assert!(!e.auth.is_backing_off(&e.id()));
+
+    // Unavailable: the 2 s hold; an operator reset drops it.
+    e.auth
+        .set_pin_verifier(Scripted::new(PinVerdict::Unavailable, Duration::ZERO));
+    let r = within(e.open().await.submit(&pin("000000"))).await;
+    assert!(matches!(r, Ok(PinReply::Backoff { .. })), "{r:?}");
+    assert!(e.auth.is_backing_off(&e.id()));
+    e.auth.reset_lockout(&e.id()).await.expect("reset");
+    assert!(!e.auth.is_backing_off(&e.id()));
+}
+
+#[tokio::test]
+async fn locked_without_a_wait_holds_the_device_for_the_default() {
+    let v = Scripted::new(LOCKED, Duration::ZERO);
+    let e = env(AuthenticatorConfig::default(), &v).await;
+    let r = within(e.open().await.submit(&pin("000000"))).await;
+    assert!(matches!(r, Err(Error::PinNotAvailable)), "{r:?}");
+    let r = within(e.open().await.submit(&pin("000000"))).await;
+    assert_eq!(
+        r.expect("reply"),
+        PinReply::Backoff {
+            retry_after: hx_crypto::DEFAULT_LOCKED_WAIT
+        }
+    );
+    assert_eq!(v.calls(), 1);
+    assert_eq!(e.failed(), 0);
 }
 
 #[tokio::test]
@@ -432,6 +542,45 @@ async fn a_device_the_verifier_has_no_pin_for_is_refused_before_anything_is_aske
         Ok(Outcome::Refused(RefuseReason::Unauthorized))
     ));
     assert_eq!((v.calls(), e.failed()), (0, 0));
+}
+
+#[tokio::test]
+async fn unknown_revoked_and_no_pin_devices_get_the_same_refusal() {
+    let v = Scripted::without_pin();
+    let e = env(AuthenticatorConfig::default(), &v).await;
+    let refusal = |device: Arc<IdentityKey>| {
+        let (t, sk) = (e.target(), e.server_key.public());
+        async move {
+            let r = within(connect_with_pin(
+                &t,
+                &device,
+                sk,
+                &pin(PIN),
+                &SessionOptions {
+                    preference: PREF,
+                    ..Default::default()
+                },
+            ))
+            .await;
+            match r {
+                Err(Error::Refused { reason, message }) => (reason, message),
+                other => panic!("expected a refusal: {other:?}"),
+            }
+        }
+    };
+    let no_pin = refusal(e.device.clone()).await;
+    let unknown = refusal(new_key()).await;
+    e.auth
+        .set_pin_verifier(Scripted::new(PinVerdict::Right, Duration::ZERO));
+    e.auth
+        .revoke(&e.id(), RevokeReason::User)
+        .await
+        .expect("revoke");
+    let revoked = refusal(e.device.clone()).await;
+    assert_eq!(no_pin.0, RefuseReason::Unauthorized);
+    assert_eq!(no_pin, unknown);
+    assert_eq!(no_pin, revoked);
+    assert_eq!(no_pin.1, "not authorized");
 }
 
 #[tokio::test]
@@ -661,4 +810,155 @@ async fn a_cut_off_unavailable_attempt_is_still_refunded() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(e.failed(), 0, "refunded when the verifier gave up");
+}
+
+// ------------------------------------------------------------------ the revocation guard
+
+/// Takes a shared async mutex (the gateway's revocation lock) and counts its entries.
+struct LockGuard {
+    lock: Arc<tokio::sync::Mutex<()>>,
+    entered: AtomicUsize,
+    /// Whether the device was still active when the guard was entered.
+    active_on_entry: Mutex<Vec<bool>>,
+    registry: Arc<MemoryRegistry>,
+}
+
+impl hx_crypto::RevocationGuard for LockGuard {
+    fn enter<'a>(&'a self, device: &'a DeviceId) -> BoxFuture<'a, hx_crypto::RevocationPermit> {
+        Box::pin(async move {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            let active = self
+                .registry
+                .get(device)
+                .expect("reg")
+                .is_some_and(|d| !d.is_revoked());
+            self.active_on_entry.lock().expect("lock").push(active);
+            let permit = self.lock.clone().lock_owned().await;
+            Box::new(permit) as hx_crypto::RevocationPermit
+        })
+    }
+}
+
+fn lock_guard(e: &Env) -> Arc<LockGuard> {
+    Arc::new(LockGuard {
+        lock: Arc::new(tokio::sync::Mutex::new(())),
+        entered: AtomicUsize::new(0),
+        active_on_entry: Mutex::new(Vec::new()),
+        registry: e.registry.clone(),
+    })
+}
+
+#[tokio::test]
+async fn the_revocation_guard_is_entered_only_for_the_lockout_and_can_delay_it() {
+    let v = Scripted::new(PinVerdict::Wrong, Duration::ZERO);
+    let e = env(
+        AuthenticatorConfig {
+            max_pin_messages: 10,
+            ..Default::default()
+        },
+        &v,
+    )
+    .await;
+    let g = lock_guard(&e);
+    e.auth.set_revocation_guard(g.clone());
+    let mut revocations = e.auth.subscribe_revocations();
+    let mut c = e.open().await;
+
+    // Failures 1 to 4 are plain wrong PINs: the guard is not involved.
+    for _ in 0..4 {
+        e.clock.advance(Duration::from_secs(60));
+        let r = within(c.submit(&pin("000000"))).await;
+        assert!(matches!(r, Ok(PinReply::Wrong { .. })), "{r:?}");
+    }
+    assert_eq!(g.entered.load(Ordering::SeqCst), 0);
+
+    // The caller holds its revocation lock: the 5th wrong PIN waits for it.
+    let held = g.lock.clone().lock_owned().await;
+    e.clock.advance(Duration::from_secs(60));
+    let attempt = tokio::spawn(async move { c.submit(&pin("000000")).await });
+    for _ in 0..100 {
+        if g.entered.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(g.entered.load(Ordering::SeqCst), 1);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !e.registry
+            .get(&e.id())
+            .expect("reg")
+            .expect("dev")
+            .is_revoked(),
+        "delayed while the caller holds its lock"
+    );
+    assert!(revocations.try_recv().is_err());
+    assert!(!attempt.is_finished());
+
+    // Released: the lockout still revokes (the only device), announced and attributed.
+    drop(held);
+    let r = within(attempt).await.expect("join");
+    assert!(matches!(r, Err(Error::Revoked)), "{r:?}");
+    let rec = e.registry.get(&e.id()).expect("reg").expect("dev");
+    assert_eq!(
+        rec.revoked.expect("revoked").reason,
+        RevokeReason::TooManyPinFailures
+    );
+    assert_eq!(revocations.try_recv().expect("announced"), e.id());
+    assert_eq!(*g.active_on_entry.lock().expect("lock"), vec![true]);
+    // The permit was dropped after the revocation: the lock is free again.
+    assert!(g.lock.try_lock().is_ok());
+}
+
+#[tokio::test]
+async fn a_stuck_revocation_guard_only_delays_the_lockout() {
+    struct Stuck;
+    impl hx_crypto::RevocationGuard for Stuck {
+        fn enter<'a>(&'a self, _: &'a DeviceId) -> BoxFuture<'a, hx_crypto::RevocationPermit> {
+            Box::pin(std::future::pending())
+        }
+    }
+    let v = Scripted::new(PinVerdict::Wrong, Duration::ZERO);
+    let e = env(
+        AuthenticatorConfig {
+            revocation_guard_timeout: Duration::from_millis(150),
+            ..Default::default()
+        },
+        &v,
+    )
+    .await;
+    e.auth.set_revocation_guard(Arc::new(Stuck));
+    for _ in 0..4 {
+        e.registry.begin_pin_attempt(&e.id()).expect("count");
+    }
+    let r = within(e.open().await.submit(&pin("000000"))).await;
+    assert!(matches!(r, Err(Error::Revoked)), "{r:?}");
+    assert!(
+        e.registry
+            .get(&e.id())
+            .expect("reg")
+            .expect("dev")
+            .is_revoked()
+    );
+}
+
+#[tokio::test]
+async fn the_revocation_guard_is_not_entered_for_a_refunded_attempt() {
+    let v = Scripted::new(PinVerdict::Unavailable, Duration::ZERO);
+    let e = env(AuthenticatorConfig::default(), &v).await;
+    let g = lock_guard(&e);
+    e.auth.set_revocation_guard(g.clone());
+    for _ in 0..4 {
+        e.registry.begin_pin_attempt(&e.id()).expect("count");
+    }
+    let r = within(e.open().await.submit(&pin("000000"))).await;
+    assert!(matches!(r, Ok(PinReply::Backoff { .. })), "{r:?}");
+    assert_eq!(g.entered.load(Ordering::SeqCst), 0);
+    assert!(
+        !e.registry
+            .get(&e.id())
+            .expect("reg")
+            .expect("dev")
+            .is_revoked()
+    );
 }

@@ -151,7 +151,7 @@ flowchart LR
 ### 1C — Agent core
 - [x] `hx-privd` command set specified and reviewed before implementation ([ipc.md](ipc.md) v0.3; the session link too)
 - [x] `hx-gatewayd` unprivileged with systemd hardening and seccomp allowlist
-- [ ] Unix-socket IPC: gateway ↔ privd, gateway ↔ session
+- [x] Unix-socket IPC: gateway ↔ privd, gateway ↔ session
 - [ ] Device list and revocation; `hx-agent` CLI (status, devices, logs, uninstall)
 - [ ] Self-update with signature check and rollback
 
@@ -172,7 +172,7 @@ flowchart LR
 - [x] X11 capture backend (XDamage, XShm, XFixes cursor, RandR resize)
 - [x] Encode pipeline on dedicated threads with buffer pools; x264 settings from S2
 - [x] Source-side congestion control, intra refresh, stale-frame cancellation, bandwidth cap
-- [ ] Input injection (XTest, scancodes), cursor channel, clipboard (text, images, files) both ways
+- [x] Input injection (XTest, scancodes), cursor channel, clipboard (text, images, files) both ways
 
 ### 1G — Desktop client
 - [ ] S1 GPU run done (deferred from Phase 0, §0.4) and the rendering path confirmed or switched to the fallback

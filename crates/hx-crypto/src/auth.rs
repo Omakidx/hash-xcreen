@@ -35,7 +35,7 @@
 //!             // 1. Argon2id(pin) on a blocking thread.
 //!             // 2. `PepperVerify` to privd, bounded by a timeout.
 //!             //    yes -> Right, no -> Wrong, privd down or timed out -> Unavailable,
-//!             //    PIN purpose locked -> Locked.
+//!             //    PIN purpose locked -> Locked { retry_after: privd's wait }.
 //!             PinVerdict::Unavailable
 //!         })
 //!     }
@@ -110,6 +110,9 @@ pub struct AuthenticatorConfig {
     /// answer ([`PinVerdict::Unavailable`]); the device is also held that long server-side
     /// (default 2 s).
     pub unavailable_retry: Duration,
+    /// How long a lockout revocation waits for the [`RevocationGuard`] before it revokes
+    /// anyway (default 5 s). The lockout is never skipped: a slow or stuck hook only delays it.
+    pub revocation_guard_timeout: Duration,
 }
 
 impl Default for AuthenticatorConfig {
@@ -127,6 +130,7 @@ impl Default for AuthenticatorConfig {
             watch_interval: Duration::from_secs(5),
             min_hash_budget: Duration::from_secs(1),
             unavailable_retry: Duration::from_secs(2),
+            revocation_guard_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -148,8 +152,27 @@ pub enum PinVerdict {
     Unavailable,
     /// The verifier refuses to check PINs at all (for example `hx-privd` locked the PIN
     /// purpose after its global failure cap). Not a wrong PIN: the attempt is refunded, the
-    /// client gets `NOT_AVAILABLE` and the connection ends.
-    Locked,
+    /// client gets `NOT_AVAILABLE` (with the wait in `retry_after_ms`) and the connection
+    /// ends. The device is held for the wait before its guard is released: attempts that
+    /// arrive earlier get `BACKOFF`, are not verified and are not counted.
+    Locked {
+        /// How long to hold the device (for example privd's `retry_after`). `None` or zero
+        /// means [`DEFAULT_LOCKED_WAIT`]; anything above [`MAX_LOCKED_WAIT`] is capped.
+        retry_after: Option<Duration>,
+    },
+}
+
+/// The wait applied after [`PinVerdict::Locked`] when the verifier names none.
+pub const DEFAULT_LOCKED_WAIT: Duration = Duration::from_secs(60);
+
+/// The longest wait a verifier can impose with [`PinVerdict::Locked`].
+pub const MAX_LOCKED_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn locked_wait(retry_after: Option<Duration>) -> Duration {
+    retry_after
+        .filter(|d| !d.is_zero())
+        .unwrap_or(DEFAULT_LOCKED_WAIT)
+        .min(MAX_LOCKED_WAIT)
 }
 
 /// Decides whether a PIN is right. The authenticator calls it **inside** the per-device guard
@@ -166,7 +189,7 @@ pub enum PinVerdict {
 /// never reaches the verifier.
 pub trait PinVerifier: Send + Sync + 'static {
     /// True if a PIN can be checked for `device` at all. When false the client gets
-    /// `NOT_AVAILABLE` (and, before `HelloAck`, the uniform "not set up yet" refusal).
+    /// `NOT_AVAILABLE` (and, before `HelloAck`, the same uniform refusal as for an unknown or revoked device).
     fn has_pin(&self, _device: &DeviceId) -> bool {
         true
     }
@@ -177,6 +200,38 @@ pub trait PinVerifier: Send + Sync + 'static {
         device: &'a DeviceId,
         pin: Zeroizing<Vec<u8>>,
     ) -> BoxFuture<'a, PinVerdict>;
+}
+
+/// Proof that a [`RevocationGuard`] was entered. Dropping it leaves the guard.
+pub type RevocationPermit = Box<dyn Send + 'static>;
+
+/// Lets the caller serialize the revocations the authenticator makes by itself.
+///
+/// A PIN-lockout revocation (the 5th wrong PIN) happens inside the [`Authenticator`], so the
+/// application cannot wrap it in its own lock the way it wraps an operator's `revoke`. When a
+/// guard is installed ([`Authenticator::set_revocation_guard`]) the authenticator awaits
+/// [`enter`](Self::enter) right before it persists a lockout revocation and holds the returned
+/// permit until the revocation is persisted **and announced** on
+/// [`Authenticator::subscribe_revocations`], then drops it.
+///
+/// The guard only serializes and attributes; it cannot veto. The lockout always revokes, even
+/// the last active device, because a guesser must not get unlimited tries. If `enter` takes
+/// longer than [`AuthenticatorConfig::revocation_guard_timeout`] the revocation goes ahead
+/// without the permit.
+///
+/// How the gateway uses it: implement `enter` by taking the same async mutex that serializes
+/// its own revocations (the one under which it enforces "never zero active devices") and
+/// return the owned lock guard as the permit. Because the guard is entered while the
+/// authenticator holds the device's PIN guard, the gateway must never hold that revocation
+/// lock while it waits for a PIN check or for `reset_lockout` on the same device (they wait for
+/// the device guard): take the revocation lock last, and do not call back into the
+/// authenticator's PIN path from `enter`. Under the lock the gateway's "last device" check
+/// sees a consistent count: once the permit is held, a lockout revocation of another device
+/// is either fully visible or not started. A lockout revocation can still take the count to
+/// zero (that is intended); the gateway can notice it from the announcement.
+pub trait RevocationGuard: Send + Sync + 'static {
+    /// Wait until revoking `device` may proceed, and return the permit to hold meanwhile.
+    fn enter<'a>(&'a self, device: &'a DeviceId) -> BoxFuture<'a, RevocationPermit>;
 }
 
 /// The local check: constant-time Argon2id comparison on a blocking thread.
@@ -208,7 +263,10 @@ enum Judged {
     Unavailable {
         failed: u32,
     },
-    Locked,
+    /// Refunded and the device held for `wait`.
+    Locked {
+        wait: Duration,
+    },
 }
 
 /// What [`Authenticator::authenticate`] did with a session.
@@ -262,6 +320,7 @@ struct Inner {
     clock: Arc<dyn Clock>,
     window: PairingWindow,
     pin: RwLock<Option<Arc<dyn PinVerifier>>>,
+    revocation_guard: RwLock<Option<Arc<dyn RevocationGuard>>>,
     config: AuthenticatorConfig,
     revocations: broadcast::Sender<DeviceId>,
     /// Earliest time each device may try its PIN again (memory only).
@@ -303,6 +362,7 @@ impl Authenticator {
                 window: PairingWindow::new(clock.clone(), config.pairing.clone()),
                 clock,
                 pin: RwLock::new(None),
+                revocation_guard: RwLock::new(None),
                 config,
                 revocations,
                 not_before: Mutex::new(HashMap::new()),
@@ -340,6 +400,22 @@ impl Authenticator {
         if let Ok(mut p) = self.inner.pin.write() {
             *p = Some(verifier);
         }
+    }
+
+    /// Install the [`RevocationGuard`] the authenticator enters around a PIN-lockout
+    /// revocation. Takes effect for the next lockout.
+    pub fn set_revocation_guard(&self, guard: Arc<dyn RevocationGuard>) {
+        if let Ok(mut g) = self.inner.revocation_guard.write() {
+            *g = Some(guard);
+        }
+    }
+
+    fn revocation_guard(&self) -> Option<Arc<dyn RevocationGuard>> {
+        self.inner
+            .revocation_guard
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
     }
 
     fn pin_verifier(&self) -> Option<Arc<dyn PinVerifier>> {
@@ -414,6 +490,25 @@ impl Authenticator {
         Ok(done)
     }
 
+    /// How long the device must still wait before its PIN is tried again: the backoff after a
+    /// wrong PIN, the hold after [`PinVerdict::Unavailable`] or [`PinVerdict::Locked`].
+    /// Zero when no wait is running. Memory only, never blocks (a map lookup), so an admin
+    /// listing can call it for every device.
+    pub fn backoff_remaining(&self, id: &DeviceId) -> Duration {
+        let now = self.inner.clock.now();
+        self.inner
+            .not_before
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(id)
+            .map_or(Duration::ZERO, |t| t.saturating_duration_since(now))
+    }
+
+    /// True while [`backoff_remaining`](Self::backoff_remaining) is not zero.
+    pub fn is_backing_off(&self, id: &DeviceId) -> bool {
+        !self.backoff_remaining(id).is_zero()
+    }
+
     /// Run a registry change and its announcement as one blocking unit: once started it
     /// completes even if the awaiting future is cancelled, so a persisted revocation is
     /// never left unannounced.
@@ -470,7 +565,7 @@ impl Authenticator {
             Ok(k) => k,
             Err(_) => {
                 return self
-                    .refuse(pending, RefuseReason::Unauthorized, "not authorized")
+                    .refuse(pending, RefuseReason::Unauthorized, NOT_AUTHORIZED)
                     .await;
             }
         };
@@ -483,7 +578,7 @@ impl Authenticator {
             Err(e) => {
                 tracing::error!(error = %e, "registry lookup failed; refusing");
                 let _ = self
-                    .refuse(pending, RefuseReason::Unauthorized, "not authorized")
+                    .refuse(pending, RefuseReason::Unauthorized, NOT_AUTHORIZED)
                     .await;
                 return Err(e);
             }
@@ -494,7 +589,7 @@ impl Authenticator {
             Intent::Pair => self.pair(pending, key, known).await,
             Intent::Session => self.session(pending, known, rx).await,
             Intent::Unspecified => {
-                self.refuse(pending, RefuseReason::Unauthorized, "not authorized")
+                self.refuse(pending, RefuseReason::Unauthorized, NOT_AUTHORIZED)
                     .await
             }
         }
@@ -520,7 +615,7 @@ impl Authenticator {
     ) -> Result<Outcome> {
         if known.as_ref().is_some_and(DeviceRecord::is_revoked) {
             return self
-                .refuse(pending, RefuseReason::Unauthorized, "not authorized")
+                .refuse(pending, RefuseReason::Unauthorized, NOT_AUTHORIZED)
                 .await;
         }
         if !self.inner.window.is_open() {
@@ -578,21 +673,17 @@ impl Authenticator {
     ) -> Result<Outcome> {
         let Some(device) = known else {
             return self
-                .refuse(pending, RefuseReason::Unauthorized, "not authorized")
+                .refuse(pending, RefuseReason::Unauthorized, NOT_AUTHORIZED)
                 .await;
         };
         if device.is_revoked() {
             return self
-                .refuse(pending, RefuseReason::Unauthorized, "not authorized")
+                .refuse(pending, RefuseReason::Unauthorized, NOT_AUTHORIZED)
                 .await;
         }
         if self.pin_verifier().is_none_or(|v| !v.has_pin(&device.id)) {
             return self
-                .refuse(
-                    pending,
-                    RefuseReason::Unauthorized,
-                    "server is not set up yet",
-                )
+                .refuse(pending, RefuseReason::Unauthorized, NOT_AUTHORIZED)
                 .await;
         }
         let conn = pending
@@ -737,15 +828,7 @@ impl Authenticator {
                     .await;
                 return Err(Error::Revoked);
             }
-            let now = self.inner.clock.now();
-            let wait = self
-                .inner
-                .not_before
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .get(&device.id)
-                .map(|t| t.saturating_duration_since(now))
-                .unwrap_or(Duration::ZERO);
+            let wait = self.backoff_remaining(&device.id);
             let left = cfg.max_pin_failures.saturating_sub(current.failed_pins);
             if !wait.is_zero() {
                 self.send_result(conn, AuthStatus::Backoff, left, wait)
@@ -767,10 +850,10 @@ impl Authenticator {
 
             match self.check_pin(device.id, verifier, pin, guard).await? {
                 Judged::Right => return Ok(()),
-                Judged::Locked => {
-                    tracing::error!(device = %device.id, "the PIN verifier is locked; PIN logins are refused");
+                Judged::Locked { wait } => {
+                    tracing::error!(device = %device.id, ?wait, "the PIN verifier is locked; PIN logins are refused");
                     let _ = self
-                        .send_result(conn, AuthStatus::NotAvailable, left, Duration::ZERO)
+                        .send_result(conn, AuthStatus::NotAvailable, left, wait)
                         .await;
                     return Err(Error::PinNotAvailable);
                 }
@@ -841,7 +924,7 @@ impl Authenticator {
                     this.set_not_before(&id, None);
                     return Ok(Judged::Right);
                 }
-                PinVerdict::Unavailable | PinVerdict::Locked => {
+                PinVerdict::Unavailable | PinVerdict::Locked { .. } => {
                     // Not judged, so not a failure: give the attempt back. If that write
                     // fails the attempt stays counted, which errs on the safe side.
                     let failed = match this.reg(move |r| r.refund_pin_attempt(&id)).await {
@@ -851,8 +934,12 @@ impl Authenticator {
                             counted
                         }
                     };
-                    if verdict == PinVerdict::Locked {
-                        return Ok(Judged::Locked);
+                    if let PinVerdict::Locked { retry_after } = verdict {
+                        // Same unit, still under the device guard: the next connection to
+                        // take the lock sees the wait.
+                        let wait = locked_wait(retry_after);
+                        this.set_not_before(&id, Some(wait));
+                        return Ok(Judged::Locked { wait });
                     }
                     // Hold the device for the wait the client is told, before the guard is
                     // released, so retries do not hammer the verifier.
@@ -861,6 +948,24 @@ impl Authenticator {
                 }
                 PinVerdict::Wrong => {}
             }
+            // The attempt that reaches the limit revokes. Let the caller serialize that, and keep
+            // its permit until the revocation is persisted and announced.
+            let _permit = if counted >= max {
+                match this.revocation_guard() {
+                    Some(g) => tokio::time::timeout(
+                        this.inner.config.revocation_guard_timeout,
+                        g.enter(&id),
+                    )
+                    .await
+                    .map_err(|_| {
+                        tracing::error!(device = %id, "revocation guard timed out; revoking anyway");
+                    })
+                    .ok(),
+                    None => None,
+                }
+            } else {
+                None
+            };
             let revoked = this
                 .commit(move |r, tx, now| {
                     let revoked = r.revoke_if_failed(&id, max, now)?;
@@ -922,6 +1027,10 @@ impl Authenticator {
         });
     }
 }
+
+/// The one refusal text for an unknown device, a revoked device and a device with no PIN
+/// (protocol §11.6), so a refusal never tells which case applies.
+const NOT_AUTHORIZED: &str = "not authorized";
 
 /// How long to let the peer read our last message (a failure verdict) before closing. A QUIC
 /// close discards stream data the peer has not read yet, so closing at once would turn "wrong

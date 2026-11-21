@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 
 use hx_provision::incus::{SESSION_LINK_CONNECT, SessionLink};
 use hx_provision::session::{
-    SESSION_BINARY, SESSION_SERVICE_UNIT, SESSION_SOCKET, SESSION_SOCKET_DIR, SESSION_SOCKET_UNIT,
-    XSESSION_UNIT,
+    SESSION_BINARY, SESSION_CLIPBOARD_DIR, SESSION_RECEIVED_DIR, SESSION_SERVICE_UNIT,
+    SESSION_SOCKET, SESSION_SOCKET_DIR, SESSION_SOCKET_UNIT, XSESSION_UNIT,
 };
 use hx_provision::{Addon, Catalog, Plan, RecipeId, Step};
 
@@ -144,19 +144,14 @@ fn the_socket_unit_is_as_specified() {
                 == ["d", SESSION_SOCKET_DIR, "0755", "root", "root", "-"]),
             "{tmp}"
         );
-        // The writable received-files directory is owned by the desktop uid.
-        assert!(
-            tmp.lines().any(|l| l.split_whitespace().collect::<Vec<_>>()
-                == [
-                    "d",
-                    "/var/lib/hx-session/received",
-                    "0700",
-                    "1000",
-                    "-",
-                    "-"
-                ]),
-            "{tmp}"
-        );
+        // The writable directories are owned by the desktop uid.
+        for dir in [SESSION_RECEIVED_DIR, SESSION_CLIPBOARD_DIR] {
+            assert!(
+                tmp.lines().any(|l| l.split_whitespace().collect::<Vec<_>>()
+                    == ["d", dir, "0700", "1000", "-", "-"]),
+                "{dir}: {tmp}"
+            );
+        }
     });
 }
 
@@ -192,7 +187,11 @@ fn the_service_unit_is_as_specified() {
         assert_eq!(one("RestrictAddressFamilies"), ["AF_UNIX"]);
         assert_eq!(one("ProtectSystem"), ["strict"]);
         assert_eq!(one("ProtectHome"), ["read-only"]);
-        assert_eq!(one("ReadWritePaths"), ["/var/lib/hx-session/received"]);
+        assert_eq!(
+            one("ReadWritePaths"),
+            [SESSION_RECEIVED_DIR, SESSION_CLIPBOARD_DIR],
+            "the received files and the clipboard staging, nothing else"
+        );
         assert_eq!(one("LockPersonality"), ["yes"]);
         assert_eq!(one("SystemCallFilter"), ["@system-service"]);
         assert!(!one("TasksMax").is_empty() && !one("MemoryMax").is_empty());

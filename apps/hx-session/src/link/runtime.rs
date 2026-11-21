@@ -55,9 +55,37 @@ pub(crate) struct Lanes {
 /// Commands for the engine thread (everything that starts, stops or changes the pipeline runs
 /// there, so the control reader stays responsive).
 pub(crate) enum Cmd {
-    Start { cfg: pb::StreamConfig },
-    Stop { epoch: u32 },
-    Reconfigure(pb::StreamConfig),
+    Start {
+        cfg: pb::StreamConfig,
+    },
+    Stop {
+        epoch: u32,
+    },
+    /// Apply the pending reconfiguration ([`LinkCtx::take_reconfigure`]): reconfigures coalesce,
+    /// latest wins, so a flood of them never fills the command queue.
+    Reconfigure,
+}
+
+/// `newer` on top of `older`: a non-zero numeric field replaces the old value (zero keeps it, as
+/// in `Reconfigure`), the booleans and the codec when set are taken as given.
+pub(crate) fn merge_config(older: pb::StreamConfig, newer: pb::StreamConfig) -> pb::StreamConfig {
+    let pick = |o: u32, n: u32| if n != 0 { n } else { o };
+    let size_set = newer.width != 0 && newer.height != 0;
+    pb::StreamConfig {
+        codec: if newer.codec != 0 {
+            newer.codec
+        } else {
+            older.codec
+        },
+        max_fps: pick(older.max_fps, newer.max_fps),
+        bitrate_cap_kbps: pick(older.bitrate_cap_kbps, newer.bitrate_cap_kbps),
+        width: if size_set { newer.width } else { older.width },
+        height: if size_set { newer.height } else { older.height },
+        scale_percent: pick(older.scale_percent, newer.scale_percent),
+        audio_enabled: newer.audio_enabled,
+        clipboard_enabled: newer.clipboard_enabled,
+        file_transfer_enabled: newer.file_transfer_enabled,
+    }
 }
 
 /// State shared between the media writer, the control reader and the engine, behind one lock so
@@ -108,6 +136,10 @@ pub(crate) struct LinkCtx {
     pub clipboard_on: AtomicBool,
     pub files_on: AtomicBool,
     cmd_tx: Sender<Cmd>,
+    /// The reconfiguration waiting for the engine (latest wins) and whether a command for it is
+    /// queued.
+    pending_reconf: Mutex<Option<pb::StreamConfig>>,
+    reconf_queued: AtomicBool,
     pub epoch: AtomicU32,
     pub started: AtomicBool,
     pub state: Mutex<CcState>,
@@ -142,9 +174,18 @@ impl LinkCtx {
         lanes: &Lanes,
     ) -> std::io::Result<(Arc<Self>, Receiver<Cmd>)> {
         let (cmd_tx, cmd_rx) = bounded(32);
-        let manager = match &cfg.clipboard {
-            Some(settings) => ClipboardManager::start(settings.clone()).ok().map(Arc::new),
-            None => None,
+        // A clipboard that cannot start is loud: logged here and reported to the gateway as an
+        // event below, never silently off (ipc.md 14.2).
+        let (manager, clipboard_failure) = match &cfg.clipboard {
+            Some(settings) => match ClipboardManager::start(settings.clone()) {
+                Ok(m) => (Some(Arc::new(m)), None),
+                Err(e) => {
+                    let why = format!("the clipboard could not start: {e}");
+                    super::log(&why);
+                    (None, Some(why))
+                }
+            },
+            None => (None, None),
         };
         let now = mono_ns();
         let ctx = Arc::new(Self {
@@ -164,6 +205,8 @@ impl LinkCtx {
             clipboard_on: AtomicBool::new(false),
             files_on: AtomicBool::new(false),
             cmd_tx,
+            pending_reconf: Mutex::new(None),
+            reconf_queued: AtomicBool::new(false),
             epoch: AtomicU32::new(0),
             started: AtomicBool::new(false),
             state: Mutex::new(CcState {
@@ -180,6 +223,9 @@ impl LinkCtx {
             events_rl: Mutex::new(RateWindow::per_second(limits::EVENT)),
             cfg,
         });
+        if let Some(why) = clipboard_failure {
+            ctx.event(pb::EventKind::ClipboardError, &why);
+        }
         Ok((ctx, cmd_rx))
     }
 
@@ -245,6 +291,28 @@ impl LinkCtx {
         self.cmd_tx
             .try_send(c)
             .map_err(|_| "engine command queue overflow")
+    }
+
+    /// Queues a reconfiguration, merged with one that is still waiting: at most one command is
+    /// ever queued for any number of messages.
+    fn reconfigure(&self, cfg: pb::StreamConfig) -> Result<(), &'static str> {
+        {
+            let mut p = lock(&self.pending_reconf);
+            *p = Some(match p.take() {
+                Some(old) => merge_config(old, cfg),
+                None => cfg,
+            });
+        }
+        if self.reconf_queued.swap(true, Relaxed) {
+            return Ok(());
+        }
+        self.command(Cmd::Reconfigure)
+    }
+
+    /// The engine takes the waiting reconfiguration.
+    fn take_reconfigure(&self) -> Option<pb::StreamConfig> {
+        self.reconf_queued.store(false, Relaxed);
+        lock(&self.pending_reconf).take()
     }
 
     pub(crate) fn stream(&self) -> Option<Arc<StreamRt>> {
@@ -434,6 +502,8 @@ fn handle_ctl(
         M::Start(s) => {
             ctx.epoch.store(s.epoch, Relaxed);
             ctx.started.store(true, Relaxed);
+            // A start carries the whole configuration: an older waiting change is moot.
+            lock(&ctx.pending_reconf).take();
             ctx.command(Cmd::Start {
                 cfg: s.config.unwrap_or_default(),
             })?;
@@ -450,7 +520,7 @@ fn handle_ctl(
         }
         M::Reconfigure(r) => {
             if ctx.started.load(Relaxed) {
-                ctx.command(Cmd::Reconfigure(r.config.unwrap_or_default()))?;
+                ctx.reconfigure(r.config.unwrap_or_default())?;
             }
         }
         M::RequestIdr(r) => {
@@ -616,7 +686,11 @@ impl Engine {
                     self.pending_resize = None;
                 }
             }
-            Cmd::Reconfigure(cfg) => self.apply_config(ctx, &cfg, false),
+            Cmd::Reconfigure => {
+                if let Some(cfg) = ctx.take_reconfigure() {
+                    self.apply_config(ctx, &cfg, false);
+                }
+            }
         }
     }
 
@@ -992,5 +1066,47 @@ fn cursor_loop(ctx: &Arc<LinkCtx>) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod reconfigure_tests {
+    use super::*;
+
+    #[test]
+    fn waiting_reconfigures_merge_latest_wins_and_zero_keeps() {
+        let a = pb::StreamConfig {
+            max_fps: 30,
+            bitrate_cap_kbps: 1_000,
+            width: 800,
+            height: 600,
+            clipboard_enabled: true,
+            file_transfer_enabled: true,
+            ..Default::default()
+        };
+        let b = pb::StreamConfig {
+            bitrate_cap_kbps: 5_000,
+            clipboard_enabled: false,
+            file_transfer_enabled: true,
+            ..Default::default()
+        };
+        let m = merge_config(a, b);
+        assert_eq!((m.max_fps, m.bitrate_cap_kbps), (30, 5_000));
+        assert_eq!(
+            (m.width, m.height),
+            (800, 600),
+            "no size in the newer one keeps it"
+        );
+        assert!(
+            !m.clipboard_enabled && m.file_transfer_enabled,
+            "booleans as given"
+        );
+        let c = pb::StreamConfig {
+            width: 640,
+            height: 360,
+            ..Default::default()
+        };
+        let m = merge_config(m, c);
+        assert_eq!((m.width, m.height), (640, 360));
     }
 }

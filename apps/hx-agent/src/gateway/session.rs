@@ -267,6 +267,12 @@ impl SessionManager {
                 // Whatever the link does with a handle after it is detached, the gateway's
                 // wrapper ignores it.
                 let client: Arc<dyn LinkClient> = GuardedClient::new(client);
+                // Dialling the desktop can take seconds: look at the device once more, now,
+                // before it is given anything (a revocation in that window cuts it off here).
+                if conn.close_info().is_some() || !self.devices.is_active(&device.id) {
+                    client.detach(DetachReason::Left).await;
+                    return Claim::Revoked;
+                }
                 let token = self.next_token.fetch_add(1, Ordering::Relaxed);
                 *active = Some(Active {
                     token,
@@ -311,7 +317,7 @@ async fn bounded(f: impl std::future::Future<Output = ()>) {
 /// Sends `Goodbye`, waits (at most [`GOODBYE_FLUSH`]) until the peer's transport has read it,
 /// then closes. A `Ping` round trip proves delivery: the control stream is ordered, so the
 /// peer cannot answer the ping before it has read the `Goodbye` that precedes it.
-async fn goodbye(conn: &Connection, code: CloseCode, message: &str, reason: &str) {
+pub(super) async fn goodbye(conn: &Connection, code: CloseCode, message: &str, reason: &str) {
     let m = pb::ControlMessage::new(Ctl::Goodbye(pb::Goodbye {
         code: code.code(),
         message: message.to_owned(),

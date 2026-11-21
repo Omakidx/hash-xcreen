@@ -759,7 +759,7 @@ async fn run_one(c: &Client<UnixTransport>, recipe: &str, full: bool) {
         "NoNewPrivileges=yes",
         "ProtectSystem=strict",
         "ProtectHome=read-only",
-        "ReadWritePaths=/var/lib/hx-session/received",
+        "ReadWritePaths=/var/lib/hx-session/received /var/lib/hx-session/clipboard",
         "LockPersonality=yes",
         "PrivateNetwork=no",
         "PrivateTmp=no",
