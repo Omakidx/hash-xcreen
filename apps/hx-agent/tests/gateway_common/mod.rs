@@ -82,6 +82,11 @@ pub struct EnvOptions {
     pub manage_idle_s: u64,
     pub max_file_bytes: Option<u64>,
     pub link_unavailable: bool,
+    /// Builds a link of the test's own (the relay) from the fake privd, instead of the
+    /// recording fake.
+    #[allow(clippy::type_complexity)]
+    pub custom_link:
+        Option<Box<dyn FnOnce(&FakePrivd) -> Arc<dyn hx_agent::gateway::desktop::DesktopLink>>>,
 }
 
 impl Default for EnvOptions {
@@ -92,6 +97,7 @@ impl Default for EnvOptions {
             manage_idle_s: 300,
             max_file_bytes: None,
             link_unavailable: false,
+            custom_link: None,
         }
     }
 }
@@ -124,7 +130,11 @@ impl Env {
         let clock = Arc::new(ManualClock::new());
         let link = Arc::new(RecordingLink::default());
         *link.unavailable.lock().unwrap() = o.link_unavailable;
-        let mut opts = StartOptions::new(config, server_key.clone(), link.clone());
+        let desktop_link: Arc<dyn hx_agent::gateway::desktop::DesktopLink> = match o.custom_link {
+            Some(make) => make(&privd),
+            None => link.clone(),
+        };
+        let mut opts = StartOptions::new(config, server_key.clone(), desktop_link);
         opts.admin_listener = Some(admin::bind(&admin_path).expect("admin socket"));
         opts.admin_policy = o.admin_policy;
         opts.clock = clock.clone();

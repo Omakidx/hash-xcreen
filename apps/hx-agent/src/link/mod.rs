@@ -5,7 +5,7 @@
 //! container; malware there has the same uid). This module is the transport-agnostic client of
 //! the link: it knows nothing about QUIC, WebSocket or the gateway's authentication. The
 //! gateway core plugs a desktop in through [`LinkClient`] and [`LinkEvents`] (or
-//! [`DesktopLink`], which adds the redial policy and the 30 s keep).
+//! [`LinkKeeper`], which adds the redial policy and the 30 s keep).
 //!
 //! # Using it
 //!
@@ -51,7 +51,7 @@
 //! * Never forward a session-supplied string to a client ([`SessionEvent::message`],
 //!   [`SessionInfo::software`] are log-only). The only text that may reach a client is a file
 //!   name in a [`TransferEvent::Open`], which has passed the protocol.md validation.
-//! * Report [`LinkEvent::Closed`] to [`DesktopLink::on_closed`] and send the client
+//! * Report [`LinkEvent::Closed`] to [`LinkKeeper::on_closed`] and send the client
 //!   `Goodbye(INTERNAL_ERROR)` for any class except [`FailureClass::Closed`] (an owner's
 //!   own close).
 //!
@@ -80,7 +80,7 @@
 //!
 //! [`FailureClass`] separates "desktop unavailable" (refused, reset after accept, silent), an
 //! outdated or incompatible session, a protocol violation, other faults and a deliberate close.
-//! [`ReconnectPolicy`] turns that into the redial schedule of section 19.2 and [`DesktopLink`]
+//! [`ReconnectPolicy`] turns that into the redial schedule of section 19.2 and [`LinkKeeper`]
 //! adds the 30 s keep after the last client (section 18).
 
 pub mod annexb;
@@ -96,9 +96,10 @@ mod types;
 pub use client::{LinkClient, LinkEvents, TransferSender};
 pub use config::LinkConfig;
 pub use policy::{
-    Advice, Attached, BACKOFF_MAX, BACKOFF_MIN, DesktopLink, DesktopState, DialError, FAULT_WINDOW,
-    FAULTS_BEFORE_RESTART, IDLE_KEEP, INSTALLS_BEFORE_UNAVAILABLE, OUTDATED_GUESS_AFTER,
-    RESTART_WINDOW, RESTARTS_BEFORE_UNAVAILABLE, ReconnectPolicy, UNAVAILABLE_RETRY,
+    Advice, Attached, BACKOFF_MAX, BACKOFF_MIN, DesktopState, DialError, FAULT_WINDOW,
+    FAULTS_BEFORE_RESTART, IDLE_KEEP, INSTALLS_BEFORE_UNAVAILABLE, LinkKeeper,
+    OUTDATED_GUESS_AFTER, RESTART_WINDOW, RESTARTS_BEFORE_UNAVAILABLE, ReconnectPolicy,
+    UNAVAILABLE_RETRY,
 };
 pub use types::{
     ConnectError, Counters, CursorUpdate, FailureClass, Frame, LinkClosed, LinkEvent, SendError,

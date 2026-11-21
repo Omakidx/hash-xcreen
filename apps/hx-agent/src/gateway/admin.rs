@@ -13,11 +13,9 @@
 //! * Every reply is sanitized text or numbers; device names are cleaned again before they leave.
 //!
 //! The pairing token of decision 14 arrives as a kind-2 secret frame (never an environment
-//! variable or file). **Installing a caller-supplied token needs a method that hx-crypto's
-//! `PairingWindow` does not have yet** (it can only generate tokens): the secret is read,
-//! validated and wiped, and the command answers `UNIMPLEMENTED` until
-//! `PairingWindow::install_token` exists (exact diff in the round report). `CreatePairingCode`
-//! works today and is the documented fallback for the interactive install.
+//! variable or file): `CreatePairingToken` reads it, validates it, installs it with
+//! `PairingWindow::install_token` and wipes it. `CreatePairingCode` issues a short code
+//! instead, the interactive install's alternative.
 
 use std::collections::HashSet;
 use std::os::unix::fs::PermissionsExt;
@@ -446,9 +444,9 @@ async fn handle(
                     let info = device_info(r, false);
                     let state = if r.is_revoked() {
                         pb::DeviceState::Revoked
-                    } else if r.failed_pins > 0 {
-                        // "Locked": PIN failures that no success has cleared yet (the
-                        // authenticator's backoff clock is private to it).
+                    } else if st.auth.is_backing_off(&r.id) {
+                        // "Locked": the authenticator holds this device's PIN back right now
+                        // (a wrong-PIN backoff, an unavailable verifier or a locked purpose).
                         pb::DeviceState::Locked
                     } else {
                         pb::DeviceState::Active

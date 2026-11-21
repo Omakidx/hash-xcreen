@@ -95,6 +95,11 @@ impl LinkClient {
         self.sh.minor
     }
 
+    /// True if `other` is a handle of the same link (clones of one `connect`).
+    pub fn same_link(&self, other: &LinkClient) -> bool {
+        Arc::ptr_eq(&self.sh, &other.sh)
+    }
+
     /// True once the link has ended.
     pub fn is_closed(&self) -> bool {
         self.sh.is_closed()
@@ -164,7 +169,12 @@ impl LinkClient {
         self.sh.epoch_set.store(true, Relaxed);
         lock(&self.sh.video).gate_armed = true;
         let _stale = self.sh.inbox.drain_frames();
-        if self.sh.out.push_p1(f) {
+        // Motion queued for the previous client must not follow the new epoch's start.
+        self.sh.out.clear_mouse();
+        // `start` travels in the input queue (P0, FIFO): the new client's first input events can
+        // then never overtake the start they belong to, which strict priority would allow if
+        // it were queued with the P1 messages.
+        if self.sh.out.push_p0(f) {
             Ok(())
         } else {
             self.sh.fail(

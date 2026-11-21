@@ -370,7 +370,9 @@ pub const LOCKED_WAIT: Duration = Duration::from_secs(60);
 /// After `Locked` the verifier answers `Locked` itself, without asking privd, for privd's
 /// `retry_after` (else [`LOCKED_WAIT`]), which it also passes in `Locked { retry_after }` so the
 /// authenticator holds the device for the same time; this keeps reconnecting devices from
-/// hammering privd while the purpose is locked.
+/// hammering privd while the purpose is locked. The authenticator's wait is **per device**; the
+/// purpose is locked for **every** device, so this server-wide timer is not a duplicate: it is
+/// what saves privd a call for each other device that has not been held back yet.
 pub struct PrivdPinVerifier {
     store: Arc<VerifierStore>,
     privd: PrivdClient,
