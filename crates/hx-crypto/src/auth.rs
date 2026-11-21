@@ -398,6 +398,22 @@ impl Authenticator {
         Ok(done)
     }
 
+    /// An operator's lockout reset: zero the device's failure counter (without stamping
+    /// `last_seen`) and drop its backoff wait. It waits for any PIN check running for the
+    /// device, so it cannot interleave with an attempt. A revocation is not lifted (use
+    /// [`reinstate`](Self::reinstate)). Returns false if the device is unknown.
+    pub async fn reset_lockout(&self, id: &DeviceId) -> Result<bool> {
+        let id = *id;
+        let _guard = self.device_lock(&id).lock_owned().await;
+        let done = match self.reg(move |r| r.reset_pin_failures(&id)).await {
+            Ok(()) => true,
+            Err(Error::UnknownDevice) => false,
+            Err(e) => return Err(e),
+        };
+        self.set_not_before(&id, None);
+        Ok(done)
+    }
+
     /// Run a registry change and its announcement as one blocking unit: once started it
     /// completes even if the awaiting future is cancelled, so a persisted revocation is
     /// never left unannounced.

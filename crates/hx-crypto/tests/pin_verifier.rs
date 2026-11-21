@@ -220,16 +220,26 @@ impl Env {
         .expect("connect")
     }
 
-    /// Advances the clock by a minute every few milliseconds, so the backoff never decides
-    /// anything and only the per-device guard and the failure limit are under test.
-    fn tick_clock(&self, every: Duration) -> JoinHandle<()> {
-        let clock = self.clock.clone();
-        tokio::spawn(async move {
-            loop {
-                clock.advance(Duration::from_secs(60));
-                tokio::time::sleep(every).await;
-            }
-        })
+    /// Every connection keeps guessing (up to its message budget), moving the clock a minute
+    /// ahead before each attempt, so an attempt is held back only by the per-device guard and
+    /// the failure limit, never by the backoff of an attempt that finished earlier. Stops on
+    /// the first error (revoked, closed).
+    async fn hammer(&self, conns: &mut [AwaitingPin], guess: &Pin) {
+        let guess = &guess;
+        within(join_all(
+            conns
+                .iter_mut()
+                .map(|c| async move {
+                    for _ in 0..5 {
+                        self.clock.advance(Duration::from_secs(60));
+                        if c.submit(guess).await.is_err() {
+                            break;
+                        }
+                    }
+                })
+                .collect(),
+        ))
+        .await;
     }
 }
 
@@ -456,6 +466,38 @@ async fn a_local_pin_hash_is_a_verifier_and_set_pin_is_unchanged() {
     assert_eq!(v.calls(), 0);
 }
 
+#[tokio::test]
+async fn reset_lockout_clears_the_counter_and_the_wait_without_stamping_last_seen() {
+    let v = Scripted::new(PinVerdict::Wrong, Duration::ZERO);
+    let e = env(AuthenticatorConfig::default(), &v).await;
+    let mut c = e.open().await;
+    assert!(matches!(
+        within(c.submit(&pin("000000"))).await,
+        Ok(PinReply::Wrong { .. })
+    ));
+    assert!(matches!(
+        within(c.submit(&pin("000000"))).await,
+        Ok(PinReply::Backoff { .. })
+    ));
+    assert_eq!(e.failed(), 1);
+    assert!(e.auth.reset_lockout(&e.id()).await.expect("reset"));
+    assert_eq!(e.failed(), 0);
+    let rec = e.registry.get(&e.id()).expect("reg").expect("dev");
+    assert_eq!(rec.last_seen_unix, 0);
+    // The wait is gone: the next attempt is verified at once.
+    assert!(matches!(
+        within(c.submit(&pin("000000"))).await,
+        Ok(PinReply::Wrong { .. })
+    ));
+    assert_eq!(v.calls(), 2);
+    assert!(
+        !e.auth
+            .reset_lockout(&new_key().public().device_id())
+            .await
+            .expect("unknown")
+    );
+}
+
 // ------------------------------------------------------------------ races with a slow verifier
 
 #[tokio::test]
@@ -512,8 +554,8 @@ async fn parallel_attempts_during_a_pending_unavailable_get_no_extra_checks() {
 
 #[tokio::test]
 async fn parallel_connections_never_verify_two_pins_at_once() {
-    // The backoff is cleared continuously, so only the per-device guard is under test.
-    let v = Scripted::new(PinVerdict::Wrong, Duration::from_millis(150));
+    // The backoff never decides anything here, so only the per-device guard is under test.
+    let v = Scripted::new(PinVerdict::Wrong, Duration::from_millis(40));
     let e = env(
         AuthenticatorConfig {
             max_pin_failures: 50,
@@ -527,13 +569,8 @@ async fn parallel_connections_never_verify_two_pins_at_once() {
     for _ in 0..4 {
         conns.push(e.open().await);
     }
-    let ticker = e.tick_clock(Duration::from_millis(10));
-    let replies = within(join_all(
-        conns.iter_mut().map(|c| c.submit(&wrong)).collect(),
-    ))
-    .await;
-    ticker.abort();
-    assert!(replies.iter().all(Result::is_ok), "{replies:?}");
+    e.hammer(&mut conns, &wrong).await;
+    assert!(v.calls() >= 4, "the verifier was really exercised");
     assert_eq!(v.max_running(), 1, "one verification at a time per device");
     // Every check that ran was counted, none twice and none lost.
     assert_eq!(e.failed() as usize, v.calls());
@@ -557,12 +594,7 @@ async fn parallel_connections_cannot_beat_the_failure_limit_with_a_slow_verifier
     for _ in 0..4 {
         conns.push(e.open().await);
     }
-    let ticker = e.tick_clock(Duration::from_millis(5));
-    let _ = within(join_all(
-        conns.iter_mut().map(|c| c.submit(&wrong)).collect(),
-    ))
-    .await;
-    ticker.abort();
+    e.hammer(&mut conns, &wrong).await;
     assert_eq!(v.calls(), 2, "exactly the limit, never more");
     assert_eq!(v.max_running(), 1);
     assert!(
