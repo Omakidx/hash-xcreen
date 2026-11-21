@@ -142,9 +142,18 @@ impl LinkCtx {
         lanes: &Lanes,
     ) -> std::io::Result<(Arc<Self>, Receiver<Cmd>)> {
         let (cmd_tx, cmd_rx) = bounded(32);
-        let manager = match &cfg.clipboard {
-            Some(settings) => ClipboardManager::start(settings.clone()).ok().map(Arc::new),
-            None => None,
+        // A clipboard that cannot start is loud: logged here and reported to the gateway as an
+        // event below, never silently off (ipc.md 14.2).
+        let (manager, clipboard_failure) = match &cfg.clipboard {
+            Some(settings) => match ClipboardManager::start(settings.clone()) {
+                Ok(m) => (Some(Arc::new(m)), None),
+                Err(e) => {
+                    let why = format!("the clipboard could not start: {e}");
+                    super::log(&why);
+                    (None, Some(why))
+                }
+            },
+            None => (None, None),
         };
         let now = mono_ns();
         let ctx = Arc::new(Self {
@@ -180,6 +189,9 @@ impl LinkCtx {
             events_rl: Mutex::new(RateWindow::per_second(limits::EVENT)),
             cfg,
         });
+        if let Some(why) = clipboard_failure {
+            ctx.event(pb::EventKind::ClipboardError, &why);
+        }
         Ok((ctx, cmd_rx))
     }
 

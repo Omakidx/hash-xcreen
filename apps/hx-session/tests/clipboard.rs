@@ -22,9 +22,22 @@ use std::time::Duration;
 
 const SEL: Selection = Selection::Clipboard;
 
+/// A staging base of the test's own (the manager has no default location).
+fn staging_base() -> PathBuf {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let b = std::env::temp_dir().join(format!(
+        "hx-clip-it-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, SeqCst)
+    ));
+    std::fs::create_dir_all(&b).unwrap();
+    b
+}
+
 fn manager(x: &Xvfb) -> ClipboardManager {
     ClipboardManager::start(ClipboardSettings {
         display: Some(x.display.clone()),
+        staging_base: Some(staging_base()),
         step_timeout: Duration::from_secs(2),
         ..ClipboardSettings::default()
     })

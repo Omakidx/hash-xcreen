@@ -70,7 +70,10 @@ pub struct ClipboardSettings {
     /// Also share PRIMARY (select-to-copy). Off by default.
     pub primary: bool,
     pub display: Option<String>,
-    /// Where pasted client files are staged; `None` uses `$XDG_RUNTIME_DIR` or the temp dir.
+    /// The directory under which each manager makes a staging directory of its own for pasted
+    /// client files. It must exist, be owned by this user and not be a symlink; there is no
+    /// fallback (not `$XDG_RUNTIME_DIR`, which `ProtectSystem=strict` makes read-only, and not
+    /// the shared temp dir): `None` makes [`ClipboardManager::start`] fail.
     pub staging_base: Option<PathBuf>,
     pub step_timeout: Duration,
 }
@@ -141,14 +144,44 @@ pub struct StagingDir {
     next: AtomicU64,
 }
 
+/// Staging directories made by this process so far (the name of the next one).
+static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
+const STAGING_PREFIX: &str = "clip-";
+
+fn staging_err(why: &str) -> std::io::Error {
+    std::io::Error::other(why.to_owned())
+}
+
 impl StagingDir {
-    /// Create `<base>/hx-clipboard-<pid>` with mode 0700.
+    /// Creates a staging directory of its own under `base`: `<base>/clip-<pid>-<n>`, mode 0700,
+    /// created with `mkdir` (so an existing path, a symlink included, is refused, never reused)
+    /// and checked to be owned by this user. `base` must be an existing directory that is not a
+    /// symlink, owned by this user and not world-writable. Directories left by
+    /// processes that no longer run are removed; a live manager's directory is never touched
+    /// by another.
     pub fn create(base: &Path) -> std::io::Result<Self> {
-        let root = base.join(format!("hx-clipboard-{}", std::process::id()));
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&root)?;
+        let me = rustix::process::geteuid().as_raw();
+        let md = std::fs::symlink_metadata(base)?;
+        if md.file_type().is_symlink() || !md.is_dir() {
+            return Err(staging_err("the staging base is not a plain directory"));
+        }
+        if md.uid() != me || md.mode() & 0o002 != 0 {
+            return Err(staging_err(
+                "the staging base is not owned by this user or is world-writable",
+            ));
+        }
+        sweep_stale(base);
+        let root = base.join(format!(
+            "{STAGING_PREFIX}{}-{}",
+            std::process::id(),
+            STAGING_SEQ.fetch_add(1, Relaxed)
+        ));
+        DirBuilder::new().mode(0o700).create(&root)?;
+        let md = std::fs::symlink_metadata(&root)?;
+        if md.file_type().is_symlink() || md.uid() != me {
+            let _ = std::fs::remove_dir(&root);
+            return Err(staging_err("the staging directory is not ours"));
+        }
         Ok(Self {
             root,
             generation: AtomicU64::new(0),
@@ -188,6 +221,36 @@ impl StagingDir {
 impl Drop for StagingDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// Removes `clip-<pid>-<n>` directories of other processes that are gone (a crash leaves them).
+/// Only plain directories owned by this user are touched; the pid of a live process never is.
+fn sweep_stale(base: &Path) {
+    let me = rustix::process::geteuid().as_raw();
+    let Ok(rd) = std::fs::read_dir(base) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(STAGING_PREFIX))
+            .and_then(|n| n.split('-').next())
+            .and_then(|p| p.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == std::process::id() || Path::new("/proc").join(pid.to_string()).exists() {
+            continue;
+        }
+        let path = e.path();
+        if let Ok(md) = std::fs::symlink_metadata(&path)
+            && md.is_dir()
+            && md.uid() == me
+        {
+            let _ = std::fs::remove_dir_all(&path);
+        }
     }
 }
 
@@ -489,8 +552,7 @@ impl ClipboardManager {
         let base = settings
             .staging_base
             .clone()
-            .or_else(|| std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from))
-            .unwrap_or_else(std::env::temp_dir);
+            .ok_or_else(|| staging_err("no staging directory is configured"))?;
         let staging = Arc::new(StagingDir::create(&base)?);
         let engine = Clipboard::start(ClipboardConfig {
             display: settings.display,
@@ -728,6 +790,79 @@ mod tests {
             assert!(s.alloc("y").unwrap().starts_with(s.path()));
         }
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    fn base(tag: &str) -> PathBuf {
+        let b = std::env::temp_dir().join(format!("hx-stage-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&b);
+        std::fs::create_dir_all(&b).unwrap();
+        b
+    }
+
+    #[test]
+    fn every_manager_gets_a_staging_directory_of_its_own_and_never_removes_another() {
+        let b = base("own");
+        let one = StagingDir::create(&b).unwrap();
+        let two = StagingDir::create(&b).unwrap();
+        assert_ne!(one.path(), two.path());
+        assert!(one.path().starts_with(&b) && two.path().starts_with(&b));
+        let mode = std::fs::metadata(one.path()).unwrap().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        let staged = two.alloc("f.txt").unwrap();
+        std::fs::write(&staged, b"x").unwrap();
+        // An older manager going away (a superseded link) leaves the newer one's files alone.
+        drop(one);
+        assert!(staged.exists());
+        drop(two);
+        assert!(!staged.exists());
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    #[test]
+    fn the_staging_base_is_checked_and_there_is_no_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+        let b = base("sym");
+        // Missing.
+        assert!(StagingDir::create(&b.join("missing")).is_err());
+        // A symlink.
+        let link = b.join("link");
+        std::os::unix::fs::symlink(&b, &link).unwrap();
+        assert!(StagingDir::create(&link).is_err());
+        // Writable by others.
+        let open = b.join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(StagingDir::create(&open).is_err());
+        // Read-only (what ProtectSystem=strict makes of /run/user/<uid>): fails.
+        let ro = b.join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if rustix::process::geteuid().as_raw() != 0 {
+            assert!(StagingDir::create(&ro).is_err());
+        }
+        // No base configured: the manager does not start (nothing falls back to the temp dir).
+        let r = ClipboardManager::start(ClipboardSettings {
+            staging_base: None,
+            ..ClipboardSettings::default()
+        });
+        assert!(matches!(r, Err(ClipboardPolicyError::Staging(_))));
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    #[test]
+    fn directories_of_dead_processes_are_swept_and_live_ones_are_not() {
+        let b = base("sweep");
+        let dead = b.join("clip-4000000000-0");
+        let live = b.join("clip-1-0"); // pid 1 runs
+        let other = b.join("keep-me");
+        for d in [&dead, &live, &other] {
+            std::fs::create_dir(d).unwrap();
+        }
+        let _s = StagingDir::create(&b).unwrap();
+        assert!(!dead.exists(), "a dead process's directory goes");
+        assert!(live.exists() && other.exists());
+        let _ = std::fs::remove_dir_all(&b);
     }
 
     #[test]
