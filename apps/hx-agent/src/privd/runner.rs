@@ -20,6 +20,8 @@ use hx_ipc::text::sanitize_text;
 
 /// Output cap per stream (ipc.md 8).
 pub const OUTPUT_CAP: usize = 64 * 1024;
+/// Output cap of `ip` (4 MiB).
+pub const IP_OUTPUT_CAP: usize = 4 * 1024 * 1024;
 
 /// The closed set of host programs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -45,6 +47,15 @@ impl Tool {
             Tool::Iptables => &["/usr/sbin/iptables", "/sbin/iptables", "/usr/bin/iptables"],
             Tool::Ip => &["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"],
             Tool::Blkid => &["/usr/sbin/blkid", "/sbin/blkid", "/usr/bin/blkid"],
+        }
+    }
+
+    /// The most output kept from this tool. `ip -j address show` on a host with many veths is far
+    /// larger than 64 KiB, and a truncated list would silently shrink the ACL's host drops.
+    pub fn output_cap(self) -> usize {
+        match self {
+            Tool::Ip => IP_OUTPUT_CAP,
+            _ => OUTPUT_CAP,
         }
     }
 
@@ -153,7 +164,7 @@ impl CommandRunner for SystemRunner {
     }
 }
 
-fn read_capped(mut r: impl Read) -> Vec<u8> {
+fn read_capped(mut r: impl Read, cap: usize) -> Vec<u8> {
     let mut out = Vec::new();
     let mut buf = [0u8; 8192];
     loop {
@@ -162,7 +173,7 @@ fn read_capped(mut r: impl Read) -> Vec<u8> {
             Ok(n) => {
                 // Keep reading after the cap so the child never blocks on a full pipe, but keep
                 // only the first 64 KiB.
-                let room = OUTPUT_CAP.saturating_sub(out.len());
+                let room = cap.saturating_sub(out.len());
                 out.extend_from_slice(&buf[..n.min(room)]);
             }
         }
@@ -183,6 +194,7 @@ pub fn run_blocking(p: &Program) -> io::Result<RunOutput> {
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    let cap = p.tool.output_cap();
     let mut child = cmd.spawn()?;
     let stdin_thread = child.stdin.take().map(|mut si| {
         let data = p.stdin.clone().unwrap_or_default();
@@ -193,11 +205,11 @@ pub fn run_blocking(p: &Program) -> io::Result<RunOutput> {
     let out_thread = child
         .stdout
         .take()
-        .map(|o| std::thread::spawn(move || read_capped(o)));
+        .map(|o| std::thread::spawn(move || read_capped(o, cap)));
     let err_thread = child
         .stderr
         .take()
-        .map(|o| std::thread::spawn(move || read_capped(o)));
+        .map(|o| std::thread::spawn(move || read_capped(o, cap)));
     let started = Instant::now();
     let (status, timed_out) = loop {
         match child.try_wait()? {
@@ -215,7 +227,7 @@ pub fn run_blocking(p: &Program) -> io::Result<RunOutput> {
     }
     let text = |t: Option<std::thread::JoinHandle<Vec<u8>>>| {
         let bytes = t.and_then(|t| t.join().ok()).unwrap_or_default();
-        sanitize_text(&String::from_utf8_lossy(&bytes), OUTPUT_CAP)
+        sanitize_text(&String::from_utf8_lossy(&bytes), cap)
     };
     Ok(RunOutput {
         code: status.and_then(|s| s.code()),

@@ -186,7 +186,10 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
             return Err(CmdError::internal("cannot list the host's addresses")
                 .with_detail(ErrorDetail::Network));
         }
-        let mut v = parse_ip_addresses(&out.stdout, &self.cfg.naming.bridge);
+        let mut v = parse_ip_addresses(&out.stdout, &self.cfg.naming.bridge).map_err(|why| {
+            CmdError::internal(format!("cannot list the host's addresses: {why}"))
+                .with_detail(ErrorDetail::Network)
+        })?;
         for e in extra {
             if !v.contains(e) {
                 v.push(*e);

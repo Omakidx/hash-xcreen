@@ -217,7 +217,7 @@ async fn extending_the_window_is_admin_only_and_never_beyond_24_hours() {
 
 #[tokio::test]
 async fn an_expired_window_closes_and_setup_commands_are_refused() {
-    let h = Harness::start(GW);
+    let h = Harness::start_with(GW, FakeProbe::default(), FakeIncus::new(), host_runner());
     open_window(&h).await;
     let setup = Command::SetupHost(Default::default());
     // Inside the window the command passes authorization (the fake Incus can do the whole job).
@@ -2189,4 +2189,32 @@ async fn m3_when_the_budget_cannot_be_saved_pepper_commands_fail_closed() {
     let saved = std::fs::read_to_string(state.join("ratelimit")).unwrap();
     let v: serde_json::Value = serde_json::from_str(&saved).unwrap();
     assert_eq!(v["pin_failures"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn l3_setup_host_never_builds_the_acl_from_a_truncated_or_empty_address_list() {
+    for bad in [
+        "",
+        "[]",
+        "[{\"ifname\":\"eth0\",\"addr_info\":[{\"family\":\"inet\",\"lo",
+    ] {
+        let runner = FakeRunner::with(move |p| RunOutput {
+            code: Some(0),
+            stdout: if p.tool == Tool::Ip {
+                bad.to_string()
+            } else {
+                String::new()
+            },
+            ..Default::default()
+        });
+        let h = Harness::start_with(GW, FakeProbe::default(), FakeIncus::new(), runner);
+        let r = run(&h, Role::Admin, Command::SetupHost(Default::default())).await;
+        assert_eq!(err(&r).0, ErrorCode::Internal, "{bad:?}");
+        assert_eq!(err(&r).1, ErrorDetail::Network);
+        // ensure_host was never called: no ACL was written.
+        assert!(
+            h.incus
+                .with(|s| !s.objects.keys().any(|k| k.starts_with("network-acls/")))
+        );
+    }
 }

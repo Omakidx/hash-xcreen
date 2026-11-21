@@ -74,9 +74,13 @@ pub fn parse_os_release(text: &str) -> (String, String) {
 }
 
 /// Every address of every interface except `skip_iface`, from `ip -j address show` output.
-pub fn parse_ip_addresses(json: &str, skip_iface: &str) -> Vec<IpAddr> {
+///
+/// An error when the text is not a JSON array (truncated or garbled output) or lists no address at
+/// all (a host always has at least a loopback): the ACL's host drops must never be built from a
+/// partial or empty list.
+pub fn parse_ip_addresses(json: &str, skip_iface: &str) -> Result<Vec<IpAddr>, &'static str> {
     let Ok(serde_json::Value::Array(ifaces)) = serde_json::from_str(json) else {
-        return Vec::new();
+        return Err("the address list is not valid JSON (truncated?)");
     };
     let mut out: Vec<IpAddr> = Vec::new();
     for i in &ifaces {
@@ -99,7 +103,10 @@ pub fn parse_ip_addresses(json: &str, skip_iface: &str) -> Vec<IpAddr> {
             }
         }
     }
-    out
+    if out.is_empty() {
+        return Err("the address list is empty");
+    }
+    Ok(out)
 }
 
 impl HostProbe for SystemProbe {
@@ -165,6 +172,7 @@ mod tests {
           {"ifname":"dup","addr_info":[{"family":"inet","local":"203.0.113.5"},{"family":"inet","local":"not-an-ip"}]}
         ]"#;
         let ips: Vec<String> = parse_ip_addresses(j, "hx-br0")
+            .unwrap()
             .into_iter()
             .map(|i| i.to_string())
             .collect();
@@ -172,7 +180,25 @@ mod tests {
             ips,
             ["127.0.0.1", "::1", "203.0.113.5", "fe80::1", "172.17.0.1"]
         );
-        assert!(parse_ip_addresses("not json", "x").is_empty());
+        assert!(parse_ip_addresses("not json", "x").is_err());
+        assert!(parse_ip_addresses("[]", "x").is_err());
+        // Truncated output is an error, never a shorter list.
+        assert!(parse_ip_addresses(&j[..j.len() - 40], "hx-br0").is_err());
+        // A host with many interfaces: well over 64 KiB of JSON parses.
+        let mut big = String::from("[");
+        for n in 0..400 {
+            big.push_str(&format!(
+                "{{\"ifname\":\"veth{n}\",\"flags\":[\"BROADCAST\"],\"pad\":\"{}\",\"addr_info\":[{{\"family\":\"inet\",\"local\":\"10.{}.{}.1\"}}]}},",
+                "x".repeat(150),
+                n / 250,
+                n % 250
+            ));
+        }
+        big.push_str(
+            "{\"ifname\":\"lo\",\"addr_info\":[{\"family\":\"inet\",\"local\":\"127.0.0.1\"}]}]",
+        );
+        assert!(big.len() > 64 * 1024);
+        assert_eq!(parse_ip_addresses(&big, "none").unwrap().len(), 401);
     }
 
     #[test]
