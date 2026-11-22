@@ -73,6 +73,55 @@ async fn finish_prebuilt_restarts_and_waits_for_running_after_the_post_stage() {
 }
 
 #[tokio::test]
+async fn finish_prebuilt_holds_the_session_until_the_post_stage_is_done() {
+    let fake = Fake::start().await;
+    let p = plan();
+    let local = spec(&p).with_image(ImageSource::LocalFingerprint("a".repeat(64)));
+    let secrets = Secrets::none().with_user_password("Tr0ub4dor&3-x").unwrap();
+    finish_prebuilt(&fake.client(), &p, &local, &secrets, &mut |_| {})
+        .await
+        .unwrap();
+    let log = fake.log();
+    let hold = "/etc/systemd/user/hx-xsession.service.d/zz-hx-hold.conf";
+    // The drop-in is written into the stopped instance, before the first start...
+    let wrote = log
+        .iter()
+        .position(|r| {
+            r.method == "POST" && r.path.contains("/files?path=") && r.path.contains("zz-hx-hold")
+        })
+        .expect("the hold is pushed");
+    let start = log
+        .iter()
+        .position(|r| r.json()["action"] == "start")
+        .unwrap();
+    assert!(wrote < start, "written before the instance first boots");
+    let body = String::from_utf8(log[wrote].body.clone()).unwrap();
+    assert!(
+        body.contains(&format!("ConditionPathExists=!{hold}")),
+        "the unit is skipped while the drop-in exists: {body}"
+    );
+    // ...and removed after the last post step and before the restart.
+    let release = log
+        .iter()
+        .position(|r| {
+            r.path.ends_with("/exec")
+                && r.json()
+                    .to_string()
+                    .contains("rm -f /etc/systemd/user/hx-xsession.service.d/zz-hx-hold.conf")
+        })
+        .expect("the hold is released");
+    let restart = log
+        .iter()
+        .position(|r| r.json()["action"] == "restart")
+        .unwrap();
+    let last_step = log
+        .iter()
+        .rposition(|r| r.path.ends_with("/exec") && r.json().to_string().contains("chpasswd"))
+        .unwrap();
+    assert!(last_step < release && release < restart);
+}
+
+#[tokio::test]
 async fn build_image_builds_seals_stops_and_verifies_without_a_post_stage() {
     let fake = Fake::start().await;
     fake.with(|s| {
@@ -218,9 +267,20 @@ async fn the_seal_script_truncates_the_machine_id_and_clears_what_must_not_be_sh
         "$h/.bash_history",
         "$h/.cache",
         "/var/lib/apt/lists/*",
+        // Per-user XFCE session state is never baked into an image.
+        "$h/.config/user-dirs.dirs",
+        "$h/.config/user-dirs.locale",
+        "$h/.config/dconf",
+        "$h/.config/Thunar",
+        "$h/.ICEauthority",
+        "$h/.Xauthority",
+        "rmdir \"$h/$d\"",
     ] {
         assert!(script.contains(needle), "{needle}");
     }
+    // Empty folders only: a recipe's own files in them must survive.
+    assert!(!script.contains("rm -rf \"$h/$d\""));
+    assert!(!script.contains("rm -rf \"$h\""));
 }
 
 #[tokio::test]

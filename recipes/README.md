@@ -92,6 +92,12 @@ image CI, see the crate README):
 - Every file the build stage writes lives under `/etc` (the facts collect `/etc`, the apt
   sources and keyrings, the home tree, `/var/lib/hx-session` and the linger directory).
 - The post stage ends with a restart on both paths, so both end in a clean boot.
+- The XFCE session must first run after the post stage (the settings, above all the locale, decide
+  the language of the user's XDG folders, which the session creates at its first start). A server
+  build boots into the finished desktop, so this holds by itself. An image boots with its units
+  enabled, so `finish_prebuilt` writes a drop-in that keeps `hx-xsession.service` from starting
+  until the post stage is done and removes it before the final restart. A recipe must not start
+  the session in the build stage, and the seal removes session state in any case.
 
 Every apt invocation is bounded: apt's own HTTP timeouts and retries, a hard `timeout` per attempt
 and several attempts. In S3, `apt-get update` hung for over nine minutes twice.
