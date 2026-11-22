@@ -1,0 +1,8 @@
+# libFuzzer dictionary for the agent_update_sig target
+k0="untrusted comment: "
+k1="trusted comment: "
+k2="signature from minisign secret key"
+k3="RWQ"
+k4="RUQ"
+k5="timestamp:"
+k6="\x0a"

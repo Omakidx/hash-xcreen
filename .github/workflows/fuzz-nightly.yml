@@ -1,0 +1,242 @@
+name: Fuzz nightly
+
+# Runs every cargo-fuzz target of `fuzz/` for a fixed time budget each (docs/execution-phase.md,
+# 1H; Gate 1 needs seven clean nights in a row). A crash, a hang or an out-of-memory fails the
+# target's job and uploads the reproducer; the run's summary shows one row per target with
+# executions, speed and coverage, so a night is read from one page.
+#
+# Corpora live in the Actions cache (one entry per target and run, restored from the newest
+# one, so they keep growing) on top of the committed seeds in fuzz/seeds. Run it by hand with
+# "Run workflow"; `seconds` replaces every target's budget (a quick smoke run).
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Seconds per target (empty: the budget of each target)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-nightly
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # cargo-fuzz needs a nightly compiler for the sanitizers. A dated nightly keeps a night's
+  # result about our code and not about the compiler of the day: move the date forward
+  # deliberately (and re-run once by hand) when a newer one is wanted.
+  NIGHTLY: nightly-2026-11-21
+
+jobs:
+  fuzz:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Pre-authentication parsers and the session link (container-supplied): 15 minutes.
+          - { target: proto_control, seconds: 900, max_len: 4096 }
+          - { target: proto_messages, seconds: 900, max_len: 4096 }
+          - { target: proto_media, seconds: 900, max_len: 4096 }
+          - { target: transport_hello, seconds: 900, max_len: 4096 }
+          - { target: transport_ws_first, seconds: 900, max_len: 8192 }
+          - { target: transport_ws_session, seconds: 900, max_len: 16384 }
+          - { target: crypto_pairing, seconds: 900, max_len: 4096 }
+          - { target: crypto_secrets, seconds: 900, max_len: 1024 }
+          - { target: crypto_registry, seconds: 900, max_len: 4096 }
+          - { target: ipc_link, seconds: 900, max_len: 16384 }
+          - { target: agent_link_session, seconds: 900, max_len: 16384 }
+          - { target: agent_annexb, seconds: 900, max_len: 16384 }
+          # Everything else that takes bytes from outside a trust boundary: 5 minutes.
+          - { target: crypto_pin_record, seconds: 300, max_len: 512 }
+          - { target: ipc_frame, seconds: 300, max_len: 16384 }
+          - { target: ipc_privd_admin, seconds: 300, max_len: 8192 }
+          - { target: ipc_text, seconds: 300, max_len: 1024 }
+          - { target: agent_update_manifest, seconds: 300, max_len: 2048 }
+          - { target: agent_update_sig, seconds: 300, max_len: 2048 }
+          - { target: agent_update_extract, seconds: 300, max_len: 16384 }
+          - { target: agent_install_stdin, seconds: 300, max_len: 9000 }
+          - { target: agent_verifier_record, seconds: 300, max_len: 256 }
+          - { target: agent_fetcher_url, seconds: 300, max_len: 1024 }
+          - { target: pwcheck_shadow, seconds: 300, max_len: 4096 }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install the nightly toolchain
+        run: |
+          rustup toolchain install "$NIGHTLY" --profile minimal
+          echo "RUSTUP_TOOLCHAIN=$NIGHTLY" >> "$GITHUB_ENV"
+
+      - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2
+        with:
+          tool: cargo-fuzz
+
+      # The sanitizer build of the whole dependency tree is the slow part; reuse it.
+      - name: Cache the fuzz build
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            fuzz/target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: fuzz-build-${{ env.NIGHTLY }}-${{ hashFiles('fuzz/Cargo.lock', 'Cargo.lock') }}-${{ matrix.target }}
+          restore-keys: |
+            fuzz-build-${{ env.NIGHTLY }}-${{ hashFiles('fuzz/Cargo.lock', 'Cargo.lock') }}-
+            fuzz-build-${{ env.NIGHTLY }}-
+
+      # A new entry per run (the key ends in the run id), restored from the newest one.
+      - name: Restore the corpus
+        id: corpus
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      - name: Build the target
+        working-directory: fuzz
+        run: cargo fuzz build ${{ matrix.target }}
+
+      - name: Fuzz
+        id: run
+        working-directory: fuzz
+        env:
+          TARGET: ${{ matrix.target }}
+          BUDGET: ${{ matrix.seconds }}
+          OVERRIDE: ${{ inputs.seconds }}
+          MAX_LEN: ${{ matrix.max_len }}
+        run: |
+          set -uo pipefail
+          seconds="$BUDGET"
+          case "$OVERRIDE" in
+            '') ;;
+            *[!0-9]*) echo "seconds must be a number" >&2; exit 2 ;;
+            *) seconds="$OVERRIDE" ;;
+          esac
+          mkdir -p "corpus/$TARGET" "artifacts/$TARGET"
+          dict=()
+          if [ -f "dicts/$TARGET.dict" ]; then dict=("-dict=dicts/$TARGET.dict"); fi
+          start=$(date +%s)
+          set +e
+          cargo fuzz run "$TARGET" "corpus/$TARGET" "seeds/$TARGET" -- \
+            -max_total_time="$seconds" -max_len="$MAX_LEN" -timeout=20 -rss_limit_mb=2048 \
+            -print_final_stats=1 "${dict[@]}" 2>&1 | tee "../fuzz-$TARGET.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          end=$(date +%s)
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "elapsed=$((end - start))" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      # Runs whatever the outcome: a row for the night's table, from libFuzzer's final lines.
+      - name: Summarize
+        if: always()
+        env:
+          TARGET: ${{ matrix.target }}
+          STATUS: ${{ steps.run.outputs.status }}
+          ELAPSED: ${{ steps.run.outputs.elapsed }}
+        run: |
+          log="fuzz-$TARGET.log"
+          field() { grep -h "^stat::$1:" "$log" 2>/dev/null | tail -1 | awk '{print $2}'; }
+          execs=$(field number_of_executed_units); execs=${execs:-0}
+          speed=$(field average_exec_per_sec); speed=${speed:-0}
+          rss=$(field peak_rss_mb); rss=${rss:-0}
+          cov=$(grep -hE '^#[0-9]+.* (DONE|INITED|REDUCE|NEW) .*cov: ' "$log" 2>/dev/null | tail -1 | sed -E 's/.*cov: ([0-9]+).*/\1/'); cov=${cov:-0}
+          corpus=$(find "fuzz/corpus/$TARGET" -type f 2>/dev/null | wc -l)
+          crash=$(find "fuzz/artifacts/$TARGET" -type f 2>/dev/null | wc -l)
+          result=pass
+          if [ "${STATUS:-1}" != 0 ] || [ "$crash" != 0 ]; then result=FAIL; fi
+          mkdir -p result
+          printf '{"target":"%s","result":"%s","seconds":%s,"execs":%s,"execs_per_sec":%s,"cov":%s,"corpus":%s,"peak_rss_mb":%s,"crashes":%s}\n' \
+            "$TARGET" "$result" "${ELAPSED:-0}" "$execs" "$speed" "$cov" "$corpus" "$rss" "$crash" \
+            > "result/$TARGET.json"
+          {
+            echo "### $TARGET: $result"
+            echo
+            echo "| seconds | executions | exec/s | coverage | corpus files | peak RSS MB | crash files |"
+            echo "|---:|---:|---:|---:|---:|---:|---:|"
+            echo "| ${ELAPSED:-0} | $execs | $speed | $cov | $corpus | $rss | $crash |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: result-${{ matrix.target }}
+          path: result/${{ matrix.target }}.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # The reproducer of a crash, a hang or an out-of-memory: run it with
+      #   cargo fuzz run <target> <file>
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: failure()
+        with:
+          name: crash-${{ matrix.target }}
+          path: |
+            fuzz/artifacts/${{ matrix.target }}
+            fuzz-${{ matrix.target }}.log
+          if-no-files-found: warn
+          retention-days: 90
+
+      # Keep the cached corpus small: the smallest set with the same coverage.
+      - name: Minimize the corpus
+        if: success()
+        continue-on-error: true
+        working-directory: fuzz
+        env:
+          TARGET: ${{ matrix.target }}
+        run: timeout 300 cargo fuzz cmin "$TARGET" "corpus/$TARGET"
+
+  verdict:
+    name: Night verdict
+    needs: fuzz
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: result-*
+          path: results
+          merge-multiple: true
+      - name: One table for the night
+        env:
+          FUZZ_RESULT: ${{ needs.fuzz.result }}
+        run: |
+          total=23
+          shopt -s nullglob
+          files=(results/*.json)
+          failed=0
+          {
+            echo "## Fuzz night $(date -u +%F): ${FUZZ_RESULT}"
+            echo
+            echo "| target | result | seconds | executions | exec/s | coverage | corpus | crashes |"
+            echo "|---|---|---:|---:|---:|---:|---:|---:|"
+            for f in "${files[@]}"; do
+              t=$(sed -E 's/.*"target":"([^"]*)".*/\1/' "$f")
+              r=$(sed -E 's/.*"result":"([^"]*)".*/\1/' "$f")
+              s=$(sed -E 's/.*"seconds":([0-9]+).*/\1/' "$f")
+              e=$(sed -E 's/.*"execs":([0-9]+).*/\1/' "$f")
+              x=$(sed -E 's/.*"execs_per_sec":([0-9]+).*/\1/' "$f")
+              c=$(sed -E 's/.*"cov":([0-9]+).*/\1/' "$f")
+              k=$(sed -E 's/.*"corpus":([0-9]+).*/\1/' "$f")
+              z=$(sed -E 's/.*"crashes":([0-9]+).*/\1/' "$f")
+              [ "$r" = pass ] || failed=$((failed + 1))
+              echo "| $t | $r | $s | $e | $x | $c | $k | $z |"
+            done
+            echo
+            echo "${#files[@]} of $total targets reported, $failed failed."
+          } >> "$GITHUB_STEP_SUMMARY"
+          # A night counts only if every target reported and none failed.
+          if [ "${#files[@]}" -ne "$total" ] || [ "$failed" -ne 0 ] || [ "$FUZZ_RESULT" != success ]; then
+            echo "::error::not a clean night: ${#files[@]}/$total reported, $failed failed, fuzz job result $FUZZ_RESULT"
+            exit 1
+          fi

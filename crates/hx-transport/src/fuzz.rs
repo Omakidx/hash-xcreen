@@ -12,7 +12,6 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::Duration,
 };
 
 use futures_util::StreamExt;
@@ -156,7 +155,7 @@ fn inner_for(role: Role) -> Arc<Inner> {
         remote_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 1)),
         options: ConnectionOptions::default(),
         slot: None,
-        auth_timeout: Some(Duration::from_secs(60)),
+        auth_timeout: None,
     };
     Inner::new(parts, backend)
 }
@@ -174,11 +173,13 @@ pub fn ws_session(data: &[u8]) {
     };
     block_on(async {
         let inner = inner_for(role);
-        if role == Role::Server {
-            Connection::from_inner(inner.clone())
-                .authorize(Features::defined_up_to(2))
+        // Held until the input is consumed: dropping the last handle closes the connection.
+        let _conn = (role == Role::Server).then(|| {
+            let conn = Connection::from_inner(inner.clone());
+            conn.authorize(Features::defined_up_to(2))
                 .expect("authorize a fresh server connection");
-        }
+            conn
+        });
         let mut ws = ws_over(rest, role);
         // A client's video queue holds 16 frames and its reader would wait for the application;
         // stop short of that, as a closed connection would.
