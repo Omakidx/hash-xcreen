@@ -16,7 +16,7 @@ name: Installer VM
 #
 # Known limit: the Zabbly apt key (src/install/zabbly-key.asc) is still UNPROVISIONED, so a host
 # whose own Incus is too old cannot install it. Debian 12 has no Incus in its main archive, so its
-# build cell is allowed to fail until the key is provisioned (continue-on-error below); its prebuilt
+# build cell skips itself with a warning annotation until the key is provisioned (run-cell.sh); its prebuilt
 # cell still runs (the refusal comes before Incus). No cell uses --docker, which needs Incus 6.0.5
 # or newer: on the distros whose own Incus is 6.0.0 that means Zabbly as well.
 #
@@ -101,7 +101,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     # Debian 12 needs Zabbly for Incus, whose key is not provisioned yet (see the header).
-    continue-on-error: ${{ matrix.os == 'debian-12' && matrix.image == 'build' }}
     strategy:
       fail-fast: false
       matrix:

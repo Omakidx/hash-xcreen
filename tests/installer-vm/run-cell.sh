@@ -47,6 +47,15 @@ debian-13) image=debian/13 ;;
 *) die "unknown CELL_OS $CELL_OS" ;;
 esac
 
+# Debian 12 has no Incus in its main archive, so its build path needs the Zabbly repository, whose
+# pinned key ships UNPROVISIONED until the maintainer adds it. Skip the cell visibly rather than
+# fail it or hide a failure; it runs for real as soon as the key file holds a key.
+if [ "$CELL_OS" = debian-12 ] && [ "$CELL_IMAGE" = build ] &&
+    grep -q '^UNPROVISIONED' apps/hx-agent/src/install/zabbly-key.asc; then
+    echo "::warning title=debian-12 build skipped::the Zabbly apt key (apps/hx-agent/src/install/zabbly-key.asc) is UNPROVISIONED; this cell needs it"
+    exit 0
+fi
+
 vmx() { $INCUS exec "$vm" --force-noninteractive -- "$@"; }
 vmsh() { $INCUS exec "$vm" --force-noninteractive -- sh -c "$1"; }
 # The VM's address on its default-route interface. Not `incus list -c 4`: once the installer has
