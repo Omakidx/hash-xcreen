@@ -543,7 +543,7 @@ fn a_changed_port_moves_the_socket_and_the_rule() {
     assert_eq!(port_rules(&m), ["allow 8443/tcp", "allow 8443/udp"]);
     assert_eq!(
         bridge_rules(&m).len(),
-        5,
+        4,
         "the bridge rules stay when the port moves"
     );
     assert!(
@@ -2062,12 +2062,11 @@ fn a_password_longer_than_libxcrypt_reads_is_refused_before_any_change() {
 
 // ----- the bridge rules: ufw or a dropping nftables firewall must not stop the desktop ------------
 
-const BRIDGE_UFW: [&str; 5] = [
+const BRIDGE_UFW: [&str; 4] = [
     "allow in on hxbr0 to any port 67 proto udp",
     "allow in on hxbr0 to any port 53 proto udp",
     "allow in on hxbr0 to any port 53 proto tcp",
     "route allow in on hxbr0",
-    "route allow out on hxbr0",
 ];
 
 fn nft_comments(m: &Machine, chain: &str) -> Vec<String> {
@@ -2111,13 +2110,49 @@ fn ufw_also_lets_dhcp_dns_and_forwarding_through_on_the_bridge() {
     // Before the desktop is built (stage 11 of 13).
     let order: Vec<&str> = m.daemons.log.iter().map(String::as_str).collect();
     assert!(order.contains(&"create_desktop"));
+    // No out-on-bridge route rule: ufw's own before.rules accept related and established replies.
     assert!(
-        lines
-            .iter()
-            .position(|l| l.contains("route allow out"))
-            .unwrap()
-            < lines.len()
+        !lines.iter().any(|l| l.contains("route allow out")),
+        "{lines:#?}"
     );
+}
+
+#[test]
+fn an_out_route_rule_that_an_earlier_version_added_is_removed_but_an_adopted_one_stays() {
+    // Ours (recorded, comment hash-xcreen): removed on the next run.
+    let (mut m, dir) = fresh();
+    m.runner.ufw = Some(true);
+    assert_eq!(full_install(&mut m, &dir), 0);
+    m.runner.ufw_rules.push("route allow out on hxbr0".into());
+    m.runner.calls.clear();
+    assert_eq!(rerun(&mut m, &[], &[]), 0);
+    assert!(
+        states(&m, "done").contains(&"firewall-port".to_owned()),
+        "not skipped"
+    );
+    assert!(
+        !m.runner
+            .ufw_rules
+            .contains(&"route allow out on hxbr0".to_owned())
+    );
+    assert_eq!(bridge_rules(&m), BRIDGE_UFW);
+    // The administrator's own identical rule, adopted: never touched.
+    let (mut m, dir) = fresh();
+    m.runner.ufw = Some(true);
+    assert_eq!(full_install(&mut m, &dir), 0);
+    let theirs = "route allow out on hxbr0".to_owned();
+    m.runner.ufw_rules.push(theirs.clone());
+    m.runner.ufw_foreign.insert(theirs.clone());
+    let mut st = m.state().unwrap();
+    st.created
+        .port_rule
+        .as_mut()
+        .unwrap()
+        .adopted
+        .push("bridge:route-out".into());
+    hx_agent::install::state::save(&m.paths.at(paths::STATE_FILE), &st).unwrap();
+    assert_eq!(rerun(&mut m, &[], &[]), 0);
+    assert!(m.runner.ufw_rules.contains(&theirs));
 }
 
 #[test]
@@ -2136,7 +2171,7 @@ fn ufw_bridge_rules_converge_on_a_resume_and_a_second_run_changes_nothing() {
     // A rule was deleted by hand: the stage is not skipped and puts it back.
     m.runner
         .ufw_rules
-        .retain(|r| r != "route allow out on hxbr0");
+        .retain(|r| r != "route allow in on hxbr0");
     assert_eq!(rerun(&mut m, &[], &[]), 0);
     assert!(states(&m, "done").contains(&"firewall-port".to_owned()));
     assert_eq!(bridge_rules(&m), BRIDGE_UFW);
@@ -2154,14 +2189,14 @@ fn ufw_bridge_rules_converge_on_a_resume_and_a_second_run_changes_nothing() {
 fn a_partial_ufw_failure_is_recorded_and_the_next_run_finishes() {
     let (mut m, dir) = fresh();
     m.runner.ufw = Some(true);
-    m.runner.fail_on(Tool::Ufw, "route allow out", 1, Some(1));
+    m.runner.fail_on(Tool::Ufw, "route allow in", 1, Some(1));
     assert_eq!(full_install(&mut m, &dir), 1);
     assert_eq!(m.result()["stage"], "firewall-port");
     assert!(
         m.state().unwrap().created.port_rule.unwrap().bridge,
         "recorded before the rules"
     );
-    assert_eq!(bridge_rules(&m).len(), 4);
+    assert_eq!(bridge_rules(&m).len(), 3);
     let dir = release(&mut m, &Tamper::default());
     assert_eq!(full_install(&mut m, &dir), 0);
     assert_eq!(bridge_rules(&m), BRIDGE_UFW);

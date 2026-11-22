@@ -159,7 +159,7 @@ native nftables input chain drops, one rule `meta l4proto { tcp, udp } th dport 
 "hx-agent-port"` inserted at the **top** of that chain, before every other rule, so the chain's own
 drop rules cannot shadow it (it also comes ahead of anything the administrator put first on
 purpose, such as a fail2ban or geo-blocking rule: for this port, every source is accepted).
-With ufw or a dropping nftables firewall the stage also lets the desktop's bridge `hxbr0` through (input udp 67 and udp/tcp 53; forward in and out), because the build needs DHCP, DNS and forwarding: ufw `allow in on hxbr0 ...` and `route allow in|out on hxbr0`, nft rules with the comment `hx-agent-bridge:<kind>`. They are recorded, converged, adopted and removed like the port rule. `hx-agent-port.service` brings the nft rules back after a ruleset reload. The planned rule is recorded in the
+With ufw or a dropping nftables firewall the stage also lets the desktop's bridge `hxbr0` through (input udp 67 and udp/tcp 53; forward from the bridge, nft also related and established out), because the build needs DHCP, DNS and forwarding: ufw `allow in on hxbr0 ...` and `route allow in on hxbr0` (no out-on-bridge rule: ufw already accepts related and established replies), nft rules with the comment `hx-agent-bridge:<kind>`. They are recorded, converged, adopted and removed like the port rule. `hx-agent-port.service` brings the nft rules back after a ruleset reload. The planned rule is recorded in the
 state before it is inserted. Uninstall finds our comment in every input chain, falls back to
 searching by comment when the state is unreadable, and does not delete a ufw rule that already
 existed before the installer ran (recorded as `adopted`).

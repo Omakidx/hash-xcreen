@@ -26,13 +26,17 @@
 //!
 //! * input: udp 67 (DHCP), udp 53 and tcp 53 (DNS). The `inet hx` table already restricts input
 //!   from the bridge to exactly these;
-//! * forward: in on the bridge, and out on the bridge (nft: established and related only; ufw has
-//!   no such qualifier in a route rule). The `inet hx` forward chain still blocks private ranges and
-//!   DNAT, and a packet must pass **both** our table and the host's chains: allowing here does not
-//!   open anything that `inet hx` closes.
+//! * forward: traffic coming in on the bridge. nft also gets out on the bridge for established and
+//!   related traffic only. ufw gets **no** out-on-bridge rule: its stock `before.rules` already
+//!   accept `RELATED,ESTABLISHED` in `ufw-before-forward`, so replies to the desktop's own
+//!   connections pass, and `route allow out on hxbr0` would accept every forwarded packet heading
+//!   into the bridge, which `inet hx` (it filters only what enters FROM the bridge) would not
+//!   catch. The `inet hx` forward chain still blocks private ranges and DNAT, and a packet must
+//!   pass **both** our table and the host's chains: allowing here does not open anything that
+//!   `inet hx` closes.
 //!
 //! ufw: `ufw allow in on hxbr0 to any port 67 proto udp` (then 53 udp and tcp) and
-//! `ufw route allow in on hxbr0` / `ufw route allow out on hxbr0`, comment `hash-xcreen`. nft:
+//! `ufw route allow in on hxbr0`, comment `hash-xcreen`. nft:
 //! rules with the comments `hx-agent-bridge:<kind>` at the top of each dropping input chain
 //! (`iifname "hxbr0" udp dport { 53, 67 } accept`, `iifname "hxbr0" tcp dport 53 accept`) and
 //! forward chain (`iifname "hxbr0" accept`, `oifname "hxbr0" ct state established,related accept`),
@@ -411,11 +415,29 @@ fn ufw_bridge_rules(bridge: &str) -> Vec<(&'static str, Vec<String>)> {
             "bridge:route-in",
             w(vec!["route", "allow", "in", "on", bridge]),
         ),
-        (
-            "bridge:route-out",
-            w(vec!["route", "allow", "out", "on", bridge]),
-        ),
     ]
+}
+
+/// The out-on-bridge route rule that earlier versions added (too broad: see the module comment).
+/// It is never added now; a copy that we added is removed on the next run and at uninstall, and an
+/// adopted one (recorded as `bridge:route-out`) is never touched.
+fn ufw_legacy_rule(bridge: &str) -> (&'static str, Vec<String>) {
+    (
+        "bridge:route-out",
+        ["route", "allow", "out", "on", bridge]
+            .iter()
+            .map(|x| (*x).to_owned())
+            .collect(),
+    )
+}
+
+/// Removes our copy of the legacy rule, unless it was adopted. A failure (the rule is not there)
+/// is not an error.
+fn remove_ufw_legacy(r: &mut dyn Runner, adopted: &[String]) {
+    let (key, words) = ufw_legacy_rule(&bridge_name());
+    if !adopted.iter().any(|a| a == key) {
+        let _ = ufw_delete_words(r, &words);
+    }
 }
 
 /// `ufw ... comment hash-xcreen`. Returns true when the rule already existed ("Skipping adding
@@ -494,6 +516,7 @@ fn remove_ufw_bridge(r: &mut dyn Runner, rec: &PortRule) -> Result<()> {
             ufw_delete_words(r, &words)?;
         }
     }
+    remove_ufw_legacy(r, &rec.adopted);
     Ok(())
 }
 
@@ -520,6 +543,7 @@ pub fn remove_fallback(r: &mut dyn Runner) -> Result<()> {
     let known: Vec<Vec<String>> = ufw_bridge_rules(&bridge_name())
         .into_iter()
         .map(|(_, w)| w)
+        .chain(std::iter::once(ufw_legacy_rule(&bridge_name()).1))
         .collect();
     for line in o.out_text().lines() {
         let Some(rest) = line.trim().strip_prefix("ufw ") else {
@@ -647,6 +671,10 @@ pub fn execute(
     let bridge_known = previous.is_some_and(|p| p.backend == plan.backend() && p.bridge);
     match plan {
         Plan::Ufw => {
+            if bridge_known {
+                // An earlier version also added `route allow out on hxbr0`: drop our copy.
+                remove_ufw_legacy(r, &adopted);
+            }
             for proto in PROTOS {
                 let existed = ufw_add_words(r, &ufw_port_words(port, proto))?;
                 // First sight of a rule that was already there: the administrator's.
@@ -706,6 +734,11 @@ pub fn check(ctx: &mut Ctx<'_>) -> Result<bool> {
             }
             let added = ufw_added(ctx.runner);
             let has = |words: &[String]| added.iter().any(|a| *a == words.join(" "));
+            // Our copy of the legacy out-route rule is stale: not done until it is removed.
+            let (legacy_key, legacy) = ufw_legacy_rule(&bridge_name());
+            if has(&legacy) && !rec.adopted.iter().any(|a| a == legacy_key) {
+                return Ok(false);
+            }
             PROTOS.iter().all(|p| has(&ufw_port_words(rec.port, p)))
                 && ufw_bridge_rules(&bridge_name()).iter().all(|(_, w)| has(w))
         }

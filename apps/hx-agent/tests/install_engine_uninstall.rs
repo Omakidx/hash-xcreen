@@ -204,8 +204,8 @@ fn the_port_rule_is_removed_by_backend() {
     assert_eq!(full_install(&mut m, &dir), 0);
     assert_eq!(
         m.runner.ufw_rules.len(),
-        7,
-        "two port rules and five bridge rules"
+        6,
+        "two port rules and four bridge rules"
     );
     ok(uninstall(&mut m, true, 0).0);
     assert!(m.runner.ufw_rules.is_empty());
@@ -770,7 +770,7 @@ fn uninstall_removes_the_ufw_bridge_rules_except_an_adopted_one() {
     assert_eq!(full_install(&mut m, &dir), 0);
     let rec = m.state().unwrap().created.port_rule.unwrap();
     assert_eq!(rec.adopted, ["bridge:dns-udp"]);
-    assert_eq!(bridge_rules(&m).len(), 5);
+    assert_eq!(bridge_rules(&m).len(), 4);
     // A re-run keeps the adoption.
     assert_eq!(rerun_ssh(&mut m, &[]), 0);
     assert_eq!(
@@ -859,4 +859,46 @@ fn stale_nft_bridge_rules_are_cleaned_when_a_chain_stops_dropping() {
         3,
         "only the input chain keeps its rules"
     );
+}
+
+#[test]
+fn uninstall_removes_our_legacy_out_route_rule_but_never_an_adopted_one() {
+    for adopted in [false, true] {
+        let mut m = Machine::new();
+        m.runner.ufw = Some(true);
+        let dir = release(&mut m, &Tamper::default());
+        assert_eq!(full_install(&mut m, &dir), 0);
+        let legacy = "route allow out on hxbr0".to_owned();
+        m.runner.ufw_rules.push(legacy.clone());
+        if adopted {
+            m.runner.ufw_foreign.insert(legacy.clone());
+            let mut st = m.state().unwrap();
+            st.created
+                .port_rule
+                .as_mut()
+                .unwrap()
+                .adopted
+                .push("bridge:route-out".into());
+            hx_agent::install::state::save(&m.paths.at(paths::STATE_FILE), &st).unwrap();
+        }
+        ok(uninstall(&mut m, false, 0).0);
+        if adopted {
+            assert_eq!(
+                m.runner.ufw_rules,
+                [legacy],
+                "the administrator's rule stays"
+            );
+        } else {
+            assert!(m.runner.ufw_rules.is_empty(), "{:?}", m.runner.ufw_rules);
+        }
+    }
+    // An unreadable state: found by the comment, and only if it is ours.
+    let mut m = Machine::new();
+    m.runner.ufw = Some(true);
+    let dir = release(&mut m, &Tamper::default());
+    assert_eq!(full_install(&mut m, &dir), 0);
+    m.runner.ufw_rules.push("route allow out on hxbr0".into());
+    std::fs::write(path(&m, paths::STATE_FILE), b"{ no").unwrap();
+    ok(uninstall(&mut m, false, 0).0);
+    assert!(m.runner.ufw_rules.is_empty());
 }
