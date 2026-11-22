@@ -63,8 +63,11 @@ pub const PEPPER_KEY: &str = "/var/lib/hx/pepper.key";
 pub const VAR_LOG_HX: &str = "/var/log/hx";
 /// The runtime directory.
 pub const RUN_HX: &str = "/run/hx";
-/// The bootstrap hand-off directories live here.
-pub const BOOTSTRAP_PREFIX: &str = "/run/hx-bootstrap.";
+/// Where `install.sh` makes the bootstrap hand-off directory: on the root filesystem, because
+/// Ubuntu and Debian mount `/run` `noexec` and the agent is executed from that directory.
+pub const BOOTSTRAP_BASE: &str = "/var/lib";
+/// The bootstrap hand-off directories (`mktemp -d /var/lib/hx-bootstrap.XXXXXX`).
+pub const BOOTSTRAP_PREFIX: &str = "/var/lib/hx-bootstrap.";
 /// os-release.
 pub const OS_RELEASE: &str = "/etc/os-release";
 /// resolv.conf.

@@ -159,8 +159,9 @@ fn needs_secrets(prior: Option<&InstallState>) -> bool {
     prior.is_none_or(|s| !(s.finished("desktop") && s.finished("verifiers")))
 }
 
-/// The only directories the installer will delete as a bootstrap directory: `/run/hx-bootstrap.*`
-/// directly below `/run` (below the root of the host in tests), with no `..` in the path.
+/// The only directories the installer will delete as a bootstrap directory: `/var/lib/hx-bootstrap.*`
+/// directly below `/var/lib` (below the root of the host in tests), with no `..` in the path.
+/// Not `/run`: Ubuntu and Debian mount it `noexec`, and `install.sh` execs the agent from here.
 fn validate_bootstrap(paths: &Paths, dir: &Path) -> Result<(), InstallError> {
     let bad = |why: &str| {
         InstallError::verify(format!("the bootstrap directory is not acceptable: {why}"))
@@ -173,11 +174,14 @@ fn validate_bootstrap(paths: &Paths, dir: &Path) -> Result<(), InstallError> {
     }) {
         return Err(bad("it has a `.` or `..` component"));
     }
-    let run = paths.at("/run");
-    if dir.parent() != Some(run.as_path()) {
-        return Err(bad("it must be directly below /run"));
+    let base = paths.at(paths::BOOTSTRAP_BASE);
+    if dir.parent() != Some(base.as_path()) {
+        return Err(bad("it must be directly below /var/lib"));
     }
-    let prefix = paths::BOOTSTRAP_PREFIX.trim_start_matches("/run/");
+    let prefix = paths::BOOTSTRAP_PREFIX
+        .strip_prefix(paths::BOOTSTRAP_BASE)
+        .unwrap_or(paths::BOOTSTRAP_PREFIX)
+        .trim_start_matches('/');
     match dir.file_name().and_then(|n| n.to_str()) {
         Some(n) if n.starts_with(prefix) && n.len() > prefix.len() => Ok(()),
         _ => Err(bad("its name must start with hx-bootstrap.")),

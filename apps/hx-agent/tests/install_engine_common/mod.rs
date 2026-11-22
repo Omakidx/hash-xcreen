@@ -81,7 +81,7 @@ pub fn release(m: &mut Machine, tamper: &Tamper) -> PathBuf {
         let n = artifact.len() / 2;
         artifact[n] ^= 0xff;
     }
-    let dir = m.paths.at("/run/hx-bootstrap.test");
+    let dir = m.paths.at("/var/lib/hx-bootstrap.test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::set_permissions(

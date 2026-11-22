@@ -11,7 +11,8 @@
 #   2. takes /run/hx-install.lock (fd 9) so two installs cannot run at once;
 #   3. downloads the signed release manifest of the channel, verifies the minisign signature
 #      with openssl (below), then downloads the release tarball and checks its size and SHA-256;
-#   4. extracts ./hx-agent from it into a private directory under /run, and
+#   4. extracts ./hx-agent from it into a private directory under /var/lib (not /run: Ubuntu and
+#      Debian mount /run noexec, and the agent is executed from there), and
 #   5. execs `hx-agent install`, which verifies everything again with its compiled-in keys and
 #      does the real work. The lock stays held across the exec.
 #
@@ -70,7 +71,7 @@ KEY_NEXT='UNPROVISIONED'
 # imports every environment variable as a shell variable). Tests override them after sourcing.
 BASE_URL='https://github.com/Omakidx/hash-xcreen/releases/download'
 LOCK_FILE='/run/hx-install.lock'
-BOOT_BASE='/run'
+BOOT_BASE='/var/lib'
 AGENT_CURRENT='/usr/lib/hx/current/hx-agent'
 OS_RELEASE='/etc/os-release'
 SYSTEMD_DIR='/run/systemd/system'

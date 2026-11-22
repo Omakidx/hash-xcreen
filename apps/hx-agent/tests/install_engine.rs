@@ -135,7 +135,7 @@ fn the_files_the_install_writes_are_all_there() {
     );
     assert!(m.runner.enabled.contains("hx-docker-user.service"));
     // The bootstrap directory is gone; modes are private where they must be.
-    assert!(!exists(&m, "/run/hx-bootstrap.test"));
+    assert!(!exists(&m, "/var/lib/hx-bootstrap.test"));
     use std::os::unix::fs::PermissionsExt;
     let mode = |abs: &str| {
         std::fs::metadata(path(&m, abs))
@@ -690,7 +690,7 @@ fn preflight_fails(setup: impl FnOnce(&mut Machine), needle: &str) {
     );
     assert!(m.state().is_none(), "preflight records nothing");
     assert!(
-        !path(&m, "/run/hx-bootstrap.test").exists(),
+        !path(&m, "/var/lib/hx-bootstrap.test").exists(),
         "the bootstrap directory is removed"
     );
     assert_eq!(
@@ -1119,7 +1119,7 @@ fn a_bootstrap_directory_that_is_not_private_or_is_a_link_is_refused() {
     );
     let mut m = Machine::new();
     let dir = release(&mut m, &Tamper::default());
-    let link = m.paths.at("/run/hx-bootstrap.link");
+    let link = m.paths.at("/var/lib/hx-bootstrap.link");
     std::os::unix::fs::symlink(&dir, &link).unwrap();
     let mut a = ssh_args(&link, &[], &[]);
     a.bootstrap_dir = Some(link.to_string_lossy().into_owned());
@@ -1964,11 +1964,11 @@ fn a_bootstrap_directory_outside_run_or_with_dotdot_is_refused_and_nothing_is_de
     std::fs::create_dir_all(&elsewhere).unwrap();
     std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o700)).unwrap();
     for bad in [
-        path(&m, "/run/../victim"),
-        path(&m, "/run/hx-bootstrap.x/../../victim"),
-        path(&m, "/run/victim"),
-        path(&m, "/run/hx-bootstrap."),
-        path(&m, "/run/sub/hx-bootstrap.x"),
+        path(&m, "/var/lib/../victim"),
+        path(&m, "/var/lib/hx-bootstrap.x/../../victim"),
+        path(&m, "/var/lib/victim"),
+        path(&m, "/var/lib/hx-bootstrap."),
+        path(&m, "/var/lib/sub/hx-bootstrap.x"),
         elsewhere.clone(),
         path(&m, "/victim"),
     ] {
