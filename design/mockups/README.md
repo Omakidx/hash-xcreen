@@ -60,7 +60,16 @@ Calm and plain: flat surfaces in four steps (`bg`, `surface`, `surface-2`, `surf
 
 Slint feasibility: every element is a rectangle, row, column or text; controls map to `Button`, `LineEdit`, `Switch`, `ComboBox`, `Slider`, `ProgressIndicator` and a few custom components (`ServerCard`, `StageRow`, `NavItem`, the toolbar). Dialogs are a scrim plus a card. Where Slint's std-widgets differ in detail the app follows Slint and keeps the tokens.
 
-## Open questions for the maintainer
+## Maintainer decisions (2026-11-22)
+
+The mockups are **approved as they are**, including every behaviour tagged `Proposed` below (takeover notice, open-link dialog, server-identity-changed screen, pair again after revoke, SSH lost during an install, agent unreachable after the one-liner, reconnect give-up, desktop not available). Decisions on the open questions:
+
+- **Theme default:** follow the system theme (userflow 1.3); dark remains the designed-first look.
+- **Phase 2 and 3 items** (Backups, web access, passkeys, alerts): **hidden** in the Phase 1 app until their phase is built; the mockups keep them for later.
+- **Pair a new device from Server details, Security:** added to the protocol (an already-paired, PIN-logged-in device may request a short-lived pairing code, rate-limited and audited), instead of telling the user to run `hx-agent pairing code`.
+- The remaining open questions (window size, stage grouping, password strength rule, title bar, device name, remove server, retention, SSH-lost retry) are settled by what the mockups show, with these specifics for 1G: system title bar; 900 x 600 minimum; the ten grouped stage rows; a password needs at least 8 characters and matching confirmation, the meter is advisory only; retention follows architecture 9.7 when backups arrive (Phase 2).
+
+## Open questions for the maintainer (as asked)
 
 Design decisions needed for approval:
 
