@@ -673,7 +673,7 @@ Receiver validation (all before allocating the payload): stream's first byte is 
 
 ### 6.1 Ordering and the reorder window
 
-Streams are independent, so frames can complete in a different order than they were sent. The client keeps a small reorder window (default 4 frames, held for at most 10 ms) with these rules:
+Streams are independent, so frames can complete in a different order than they were sent. The client keeps a reorder window (default 32 frames, held for at most 250 ms: frame streams are reliable, so a frame that is late is late by a loss recovery of one to three round trips, and releasing past it costs a key frame; both numbers are client policy, not wire format) with these rules:
 
 1. Track `last_released`, the frame number last handed to the decoder.
 2. A frame whose number is **not newer** than `last_released` (equal or older in serial order) is dropped as stale and counted.
@@ -683,6 +683,8 @@ Streams are independent, so frames can complete in a different order than they w
 6. The very first frame is released immediately.
 
 `hx_proto::ReorderWindow` implements these rules as a pure state machine; `hx_transport::Connection::recv_video_frame` applies them.
+
+A gap that remains (a cancelled frame, a frame later than the hold) leaves the decoder without a frame: the client drops frames until a key frame arrives and sends `request_keyframe`. A request, or its answer, can be lost or late, and the server sends nothing while its display is still, so the client **repeats the request** (about every 500 ms) until the key frame arrives; the server coalesces repeats. A key frame is a complete picture but not always a good one: its quality is whatever the server's rate control could afford, and the server keeps sending refinement frames of the unchanged screen until the picture is back at the normal quality (architecture §6.2). The client needs nothing special for this; they are ordinary P frames.
 
 ### 6.2 Congestion control hooks
 

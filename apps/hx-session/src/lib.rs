@@ -17,4 +17,5 @@ pub mod input;
 pub mod link;
 pub mod pacing;
 pub mod pipeline;
+pub mod refine;
 pub mod stats;

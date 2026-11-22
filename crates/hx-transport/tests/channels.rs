@@ -63,6 +63,7 @@ scenarios!(
     transfers_both_directions,
     video_frames_are_acked,
     video_reorder_drops_older,
+    video_late_frame_is_waited_for,
     role_and_feature_errors,
     close_code_is_reported,
 );
@@ -502,6 +503,46 @@ async fn video_reorder_drops_older(pref: TransportPreference) {
         .await
         .expect("resync frame");
     assert!(f.header.is_resync() && f.header.is_key());
+}
+
+/// The lossy-link defect (testing.md 2.8): a frame that is late by a loss recovery (about one to
+/// three round trips, 100 ms here) is waited for, not skipped. Skipping it makes the decoder
+/// lose a frame, which costs a key frame, and the key frame is itself overtaken by the frames
+/// behind it: the loop that left the lossy end-to-end run with a corrupt picture.
+async fn video_late_frame_is_waited_for(pref: TransportPreference) {
+    let p = pair(pref).await;
+    let client = p.client.clone();
+    let reader = tokio::spawn(async move {
+        let mut got = Vec::new();
+        for _ in 0..4 {
+            got.push(
+                within(client.recv_video_frame())
+                    .await
+                    .expect("frame")
+                    .header
+                    .frame_number,
+            );
+        }
+        got
+    });
+    // 1 is released at once; 3 and 4 complete while 2 is still on its way.
+    for n in [1u32, 3, 4] {
+        let t = p
+            .srv
+            .send_video_frame(header(n, 0, 4), Bytes::from_static(b"data"))
+            .await
+            .expect("send");
+        assert_eq!(within(t.ack()).await.outcome, AckOutcome::Delivered);
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let t = p
+        .srv
+        .send_video_frame(header(2, 0, 4), Bytes::from_static(b"data"))
+        .await
+        .expect("send");
+    assert_eq!(within(t.ack()).await.outcome, AckOutcome::Delivered);
+    assert_eq!(within(reader).await.expect("reader"), vec![1, 2, 3, 4]);
+    assert_eq!(p.client.stats().frames_dropped_stale, 0);
 }
 
 async fn role_and_feature_errors(pref: TransportPreference) {

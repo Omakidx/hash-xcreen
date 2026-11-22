@@ -421,8 +421,7 @@ pub async fn run_profile(p: &Profile, o: &Opts) -> RunResult {
         rep.errors.push("the client ran into the watchdog".into());
     }
     // The netem counters after the whole flow: the drops netem made while the stack ran.
-    result.control.tc_after = net.tc_server();
-    result.control.netem_dropped = super::net::parse_dropped(&result.control.tc_after);
+    net.read_drops(&mut result.control);
 
     // CPU over each phase window, from the ticks the reader took at its boundaries.
     {

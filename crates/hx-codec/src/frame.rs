@@ -35,6 +35,10 @@ pub struct EncodedFrame {
     pub idr: bool,
     pub width: u32,
     pub height: u32,
+    /// Average quantiser (H.264 QP, 0 to 51) the rate control chose for the frame, when the
+    /// encoder reports it. A key frame far above the `crf` target was starved by the VBV: its
+    /// picture is coarse until later frames refine it.
+    pub qp: Option<u8>,
     pub timing: FrameTiming,
     /// The bitstream; returned to the encoder's pool when dropped.
     pub data: PooledBuf,

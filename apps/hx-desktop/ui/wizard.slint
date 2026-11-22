@@ -1,0 +1,998 @@
+import { Tokens } from "tokens.slint";
+import { ScrollView } from "std-widgets.slint";
+import { Btn, Badge, Banner, Card, Check, Dialog, ButtonRow, Field, Heading, KeyValue, Label, Mono, Muted, RadioRow, SliderField, Segmented, Spinner, Toggle } from "widgets.slint";
+import { AppBar } from "home.slint";
+import { WizardVm, CheckData, Kv } from "state.slint";
+
+component StepList inherits Rectangle {
+    width: 200px;
+    background: Tokens.surface;
+    Rectangle {
+        x: parent.width - 1px;
+        width: 1px;
+        background: Tokens.border;
+    }
+
+    VerticalLayout {
+        padding: Tokens.sp-4;
+        spacing: Tokens.sp-1;
+        alignment: start;
+        accessible-role: AccessibleRole.list;
+        accessible-label: "Steps";
+        for s in WizardVm.steps: Rectangle {
+            height: 36px;
+            border-radius: Tokens.r-md;
+            background: s.current ? Tokens.accent-soft : transparent;
+            accessible-role: AccessibleRole.list-item;
+            accessible-label: s.number + " " + s.title + (s.current ? ", current step" : s.done ? ", done" : "");
+            HorizontalLayout {
+                padding-left: Tokens.sp-3;
+                spacing: Tokens.sp-3;
+                Rectangle {
+                    width: 22px;
+                    height: 22px;
+                    y: 7px;
+                    border-radius: 11px;
+                    background: s.current ? Tokens.accent : s.done ? Tokens.success-bg : Tokens.surface-3;
+                    Text {
+                        text: s.done && !s.current ? "✓" : s.number;
+                        color: s.current ? Tokens.on-accent : s.done ? Tokens.success : Tokens.text-2;
+                        font-size: Tokens.fs-xs;
+                        font-weight: Tokens.fw-medium;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                Text {
+                    text: s.title;
+                    color: s.current ? Tokens.accent-text : Tokens.text-2;
+                    font-size: Tokens.fs-md;
+                    font-weight: s.current ? Tokens.fw-medium : Tokens.fw-regular;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}
+
+component CheckRowView inherits HorizontalLayout {
+    in property <CheckData> c;
+    spacing: Tokens.sp-3;
+    padding-top: 6px;
+    padding-bottom: 6px;
+    accessible-role: AccessibleRole.list-item;
+    accessible-label: (c.status == 0 ? "Passed: " : c.status == 1 ? "Not met: " : "Unknown: ") + c.title + ". " + c.detail;
+    Rectangle {
+        width: 22px;
+        height: 22px;
+        border-radius: 11px;
+        background: c.status == 0 ? Tokens.success-bg : c.status == 1 ? Tokens.danger-bg : Tokens.neutral-bg;
+        Text {
+            text: c.status == 0 ? "✓" : c.status == 1 ? "✕" : "?";
+            color: c.status == 0 ? Tokens.success : c.status == 1 ? Tokens.danger : Tokens.text-2;
+            font-weight: Tokens.fw-medium;
+            font-size: Tokens.fs-sm;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+
+    VerticalLayout {
+        spacing: 1px;
+        Text {
+            text: c.title;
+            color: Tokens.text;
+            font-size: Tokens.fs-md;
+            wrap: word-wrap;
+        }
+
+        Text {
+            text: c.detail;
+            visible: c.detail != "";
+            height: c.detail != "" ? self.preferred-height : 0px;
+            color: c.status == 1 ? Tokens.danger : Tokens.text-2;
+            font-size: Tokens.fs-sm;
+            wrap: word-wrap;
+        }
+    }
+}
+
+component ReviewBlock inherits Card {
+    in property <string> title;
+    in property <[Kv]> rows;
+    in property <string> edit-step;
+    height: col.preferred-height + 2 * Tokens.sp-4;
+    col := VerticalLayout {
+        padding: Tokens.sp-4;
+        spacing: Tokens.sp-2;
+        HorizontalLayout {
+            Text {
+                text: root.title;
+                color: Tokens.text;
+                font-size: Tokens.fs-lg;
+                font-weight: Tokens.fw-medium;
+                horizontal-stretch: 1;
+            }
+
+            if root.edit-step != "": Btn {
+                text: "Edit";
+                kind: "ghost";
+                clicked => {
+                    WizardVm.edit(root.edit-step);
+                }
+            }
+        }
+
+        for r in root.rows: KeyValue {
+            key: r.key;
+            value: r.value;
+        }
+    }
+}
+
+component CopyBlock inherits Card {
+    in property <string> title;
+    in property <string> text;
+    in property <string> button;
+    in property <string> note;
+    callback copy();
+    height: col.preferred-height + 2 * Tokens.sp-4;
+    col := VerticalLayout {
+        padding: Tokens.sp-4;
+        spacing: Tokens.sp-2;
+        Text {
+            text: root.title;
+            color: Tokens.text;
+            font-size: Tokens.fs-md;
+            font-weight: Tokens.fw-medium;
+            wrap: word-wrap;
+        }
+
+        Rectangle {
+            background: Tokens.surface-2;
+            border-radius: Tokens.r-md;
+            border-width: 1px;
+            border-color: Tokens.border;
+            height: t.preferred-height + 2 * Tokens.sp-3;
+            t := Mono {
+                x: Tokens.sp-3;
+                y: Tokens.sp-3;
+                width: parent.width - 2 * Tokens.sp-3;
+                text: root.text;
+            }
+        }
+
+        HorizontalLayout {
+            spacing: Tokens.sp-3;
+            alignment: start;
+            Btn {
+                text: root.button;
+                clicked => {
+                    root.copy();
+                }
+            }
+
+            Muted {
+                text: root.note;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
+export component WizardScreen inherits Rectangle {
+    background: Tokens.bg;
+    FocusScope {
+        key-pressed(e) => {
+            if (e.text == Key.Escape) {
+                WizardVm.back();
+                return accept;
+            }
+            reject
+        }
+    VerticalLayout {
+        AppBar {
+            title: "hash-xcreen";
+            crumb: "Add server";
+        }
+
+        HorizontalLayout {
+            vertical-stretch: 1;
+            if WizardVm.steps.length > 0: StepList { }
+            VerticalLayout {
+                horizontal-stretch: 1;
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        padding: Tokens.sp-6;
+                max-width: 680px;
+                        padding-bottom: Tokens.sp-4;
+                        spacing: Tokens.sp-4;
+                        alignment: start;
+                        Heading {
+                            text: WizardVm.heading;
+                            level: 1;
+                            accessible-role: AccessibleRole.text;
+                        }
+
+                        Muted {
+                            text: WizardVm.subheading;
+                            font-size: Tokens.fs-md;
+                        }
+
+                        if WizardVm.banner-title != "": Banner {
+                            title: WizardVm.banner-title;
+                            text: WizardVm.banner-text;
+                            tone: 3;
+                        }
+
+                        // ----------------------------------------------------------------- method
+                        if WizardVm.step == "method": VerticalLayout {
+                            spacing: Tokens.sp-3;
+                            RadioRow {
+                                title: "Over SSH";
+                                description: "The app connects to your server and installs everything. Fastest. Needs SSH access once.";
+                                selected: WizardVm.method == 0;
+                                activated => {
+                                    WizardVm.set-method(0);
+                                }
+                            }
+
+                            RadioRow {
+                                title: "Copy a one-liner";
+                                description: "You paste one command into a root shell on the server. No SSH access from this app.";
+                                selected: WizardVm.method == 1;
+                                activated => {
+                                    WizardVm.set-method(1);
+                                }
+                            }
+
+                            RadioRow {
+                                title: "Enter a pairing code";
+                                description: "The server was installed with install.sh --interactive and printed a code.";
+                                selected: WizardVm.method == 2;
+                                activated => {
+                                    WizardVm.set-method(2);
+                                }
+                            }
+                        }
+
+                        // ----------------------------------------------------------------- ssh connection
+                        if WizardVm.step == "connection" && WizardVm.conn-phase != 4 && WizardVm.conn-phase != 5: VerticalLayout {
+                            spacing: Tokens.sp-3;
+                            Field {
+                                label: "Server address";
+                                text <=> WizardVm.address;
+                                hint: "Use the public address of the VPS.";
+                                error: WizardVm.err-address;
+                                enabled: WizardVm.conn-phase == 0 || WizardVm.conn-phase == 6;
+                                edited(_) => {
+                                    WizardVm.changed();
+                                }
+                                accepted => {
+                                    WizardVm.next();
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: Tokens.sp-3;
+                                Field {
+                                    label: "SSH port";
+                                    text <=> WizardVm.ssh-port;
+                                    error: WizardVm.err-ssh-port;
+                                    width: 140px;
+                                    enabled: WizardVm.conn-phase == 0 || WizardVm.conn-phase == 6;
+                                    edited(_) => {
+                                        WizardVm.changed();
+                                    }
+                                }
+
+                                Field {
+                                    label: "Username";
+                                    text <=> WizardVm.ssh-user;
+                                    error: WizardVm.err-ssh-user;
+                                    enabled: WizardVm.conn-phase == 0 || WizardVm.conn-phase == 6;
+                                    edited(_) => {
+                                        WizardVm.changed();
+                                    }
+                                }
+                            }
+
+                            VerticalLayout {
+                                spacing: Tokens.sp-1;
+                                Text {
+                                    text: "Authentication";
+                                    color: Tokens.text;
+                                    font-size: Tokens.fs-sm;
+                                    font-weight: Tokens.fw-medium;
+                                }
+
+                                Segmented {
+                                    options: ["SSH key", "Password"];
+                                    label: "Authentication";
+                                    current <=> WizardVm.auth-mode;
+                                    changed(_) => {
+                                        WizardVm.changed();
+                                    }
+                                    max-width: 280px;
+                                }
+                            }
+
+                            if WizardVm.auth-mode == 0: VerticalLayout {
+                                spacing: Tokens.sp-1;
+                                Text {
+                                    text: "SSH key";
+                                    color: Tokens.text;
+                                    font-size: Tokens.fs-sm;
+                                    font-weight: Tokens.fw-medium;
+                                }
+
+                                for k[i] in WizardVm.keys: RadioRow {
+                                    title: k;
+                                    selected: WizardVm.key-index == i;
+                                    height: 44px;
+                                    activated => {
+                                        WizardVm.key-index = i;
+                                    }
+                                }
+
+                                Muted {
+                                    text: "Default: the keys the app finds in your .ssh folder. The key is read, never copied.";
+                                }
+                            }
+                            if WizardVm.auth-mode == 1: VerticalLayout {
+                                spacing: Tokens.sp-3;
+                                Field {
+                                    label: "SSH password";
+                                    password: true;
+                                    text <=> WizardVm.ssh-password;
+                                    error: WizardVm.err-ssh-password;
+                                    hint: "Used for this install only and never stored. It is wiped from memory when the install ends.";
+                                    enabled: WizardVm.conn-phase == 0 || WizardVm.conn-phase == 6;
+                                    edited(_) => {
+                                        WizardVm.changed();
+                                    }
+                                    accepted => {
+                                        WizardVm.next();
+                                    }
+                                }
+
+                                Banner {
+                                    title: "Prefer a key";
+                                    text: "A key is safer than a password and lets a failed install resume without asking again.";
+                                    tone: 4;
+                                }
+                            }
+                            if WizardVm.conn-phase == 1 || WizardVm.conn-phase == 3: HorizontalLayout {
+                                spacing: Tokens.sp-2;
+                                alignment: start;
+                                Spinner { }
+
+                                Muted {
+                                    text: WizardVm.conn-phase == 1 ? "Connecting to read the host key…" : "Checking the server…";
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+
+                        // ----------------------------------------------------------------- ssh checks
+                        if WizardVm.step == "connection" && (WizardVm.conn-phase == 4 || WizardVm.conn-phase == 5): VerticalLayout {
+                            spacing: Tokens.sp-1;
+                            accessible-role: AccessibleRole.list;
+                            accessible-label: "Server checks";
+                            Rectangle {
+                                height: 0px;
+                            }
+
+                            CheckRowView {
+                                c: { title: WizardVm.connected-as, detail: "Host key trusted", status: 0 };
+                            }
+
+                            for c in WizardVm.checks: CheckRowView {
+                                c: c;
+                            }
+                        }
+
+                        // ----------------------------------------------------------------- one-liner server
+                        if WizardVm.step == "server" || WizardVm.step == "code": VerticalLayout {
+                            spacing: Tokens.sp-3;
+                            Field {
+                                label: "Server address";
+                                text <=> WizardVm.address;
+                                hint: WizardVm.step == "code" ? "One of the addresses the installer printed." : "The public IP address or hostname the app will connect to.";
+                                error: WizardVm.err-address;
+                                edited(_) => {
+                                    WizardVm.changed();
+                                }
+                            }
+
+                            Field {
+                                label: "Agent port";
+                                text <=> WizardVm.agent-port;
+                                hint: "TCP and UDP. Not 22 or 80.";
+                                error: WizardVm.err-agent-port;
+                                width: 160px;
+                                edited(_) => {
+                                    WizardVm.changed();
+                                }
+                            }
+
+                            if WizardVm.step == "code": Field {
+                                label: "Pairing code";
+                                text <=> WizardVm.code;
+                                mono: true;
+                                hint: "Eight characters, valid for 15 minutes. Case and the dash do not matter.";
+                                error: WizardVm.err-code;
+                                width: 260px;
+                                edited(_) => {
+                                    WizardVm.changed();
+                                }
+                                accepted => {
+                                    WizardVm.next();
+                                }
+                            }
+                            if WizardVm.step == "server": Banner {
+                                title: "The next steps are the same as over SSH";
+                                text: "Desktop, Account, Backups, Resources and Review. The command you copy at the end holds only non-secret options. The password and PIN you choose stay in this app until the server is paired, then go over the encrypted connection.";
+                                tone: 4;
+                            }
+                            if WizardVm.step == "code": Muted {
+                                text: "After pairing, the server appears on Home and you connect with your PIN.";
+                            }
+                            if WizardVm.pairing: HorizontalLayout {
+                                spacing: Tokens.sp-2;
+                                alignment: start;
+                                Spinner { }
+
+                                Muted {
+                                    text: "Pairing…";
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+
+                        // ----------------------------------------------------------------- desktop
+                        if WizardVm.step == "desktop": VerticalLayout {
+                            spacing: Tokens.sp-3;
+                            Text {
+                                text: "Distribution";
+                                color: Tokens.text;
+                                font-size: Tokens.fs-sm;
+                                font-weight: Tokens.fw-medium;
+                            }
+
+                            RadioRow {
+                                title: "Ubuntu 24.04 LTS";
+                                tag: "Recommended";
+                                selected: WizardVm.distro == 0;
+                                height: 48px;
+                                activated => {
+                                    WizardVm.distro = 0;
+                                }
+                            }
+
+                            RadioRow {
+                                title: "Ubuntu 26.04";
+                                tag: "Newest";
+                                selected: WizardVm.distro == 1;
+                                height: 48px;
+                                activated => {
+                                    WizardVm.distro = 1;
+                                }
+                            }
+
+                            RadioRow {
+                                title: "Debian 12";
+                                tag: "Stable";
+                                selected: WizardVm.distro == 2;
+                                height: 48px;
+                                activated => {
+                                    WizardVm.distro = 2;
+                                }
+                            }
+
+                            RadioRow {
+                                title: "Debian 13";
+                                tag: "Current stable";
+                                selected: WizardVm.distro == 3;
+                                height: 48px;
+                                activated => {
+                                    WizardVm.distro = 3;
+                                }
+                            }
+
+                            Text {
+                                text: "Desktop";
+                                color: Tokens.text;
+                                font-size: Tokens.fs-sm;
+                                font-weight: Tokens.fw-medium;
+                            }
+
+                            Card {
+                                height: 48px;
+                                HorizontalLayout {
+                                    padding: Tokens.sp-3;
+                                    spacing: Tokens.sp-3;
+                                    Text {
+                                        text: "XFCE";
+                                        color: Tokens.text;
+                                        font-weight: Tokens.fw-medium;
+                                        vertical-alignment: center;
+                                    }
+
+                                    Muted {
+                                        text: "XFCE is the only desktop in this version.";
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+
+                            Text {
+                                text: "Apps preset";
+                                color: Tokens.text;
+                                font-size: Tokens.fs-sm;
+                                font-weight: Tokens.fw-medium;
+                            }
+
+                            Segmented {
+                                options: ["Basic", "Developer"];
+                                label: "Apps preset";
+                                current: WizardVm.developer ? 1 : 0;
+                                changed(i) => {
+                                    WizardVm.developer = i == 1;
+                                }
+                                max-width: 280px;
+                            }
+
+                            Muted {
+                                text: WizardVm.developer ? "Developer: basic + git, build tools, Docker-ready" : "Basic: browser, files, terminal, editor";
+                            }
+
+                            Toggle {
+                                title: "Install Docker in the desktop";
+                                description: "Off by default. Lets you run containers inside your desktop.";
+                                checked <=> WizardVm.docker;
+                                toggled(on) => {
+                                    if (!on) {
+                                        WizardVm.docker-ack = false;
+                                    }
+                                    WizardVm.changed();
+                                }
+                            }
+
+                            if WizardVm.docker: VerticalLayout {
+                                spacing: Tokens.sp-3;
+                                Banner {
+                                    title: "Docker weakens isolation";
+                                    text: "Anything that can run Docker commands in the desktop can reach more of the server than a normal desktop user. Turn it on only if you need containers. You can turn it off again under Server details, Desktop.";
+                                    tone: 2;
+                                }
+
+                                Check {
+                                    title: "I understand that Docker weakens the isolation of this desktop.";
+                                    checked <=> WizardVm.docker-ack;
+                                    error: WizardVm.err-docker-ack;
+                                    toggled(_) => {
+                                        WizardVm.changed();
+                                    }
+                                }
+
+                                if WizardVm.err-docker-ack != "": Text {
+                                    text: WizardVm.err-docker-ack;
+                                    color: Tokens.danger;
+                                    font-size: Tokens.fs-sm;
+                                }
+                            }
+                        }
+
+                        // ----------------------------------------------------------------- account
+                        if WizardVm.step == "account": VerticalLayout {
+                            spacing: Tokens.sp-3;
+                            Field {
+                                label: "Username";
+                                text <=> WizardVm.username;
+                                hint: "Lowercase letters, digits, dash and underscore; must start with a letter.";
+                                error: WizardVm.err-username;
+                                edited(_) => {
+                                    WizardVm.changed();
+                                }
+                                blurred => {
+                                    WizardVm.changed();
+                                }
+                            }
+
+                            Field {
+                                label: "Password";
+                                password: true;
+                                text <=> WizardVm.password;
+                                error: WizardVm.err-password;
+                                edited(_) => {
+                                    WizardVm.changed();
+                                }
+                            }
+
+                            if WizardVm.password != "": HorizontalLayout {
+                                spacing: Tokens.sp-1;
+                                accessible-role: AccessibleRole.text;
+                                accessible-label: "Strength: " + WizardVm.strength-word;
+                                for i in 4: Rectangle {
+                                    height: 4px;
+                                    border-radius: 2px;
+                                    background: i < WizardVm.strength ? (WizardVm.strength <= 1 ? Tokens.danger : WizardVm.strength == 2 ? Tokens.warning : Tokens.success) : Tokens.surface-3;
+                                    width: 40px;
+                                }
+
+                                Muted {
+                                    text: "  Strength: " + WizardVm.strength-word + " (advice only)";
+                                }
+                            }
+
+                            Field {
+                                label: "Confirm password";
+                                password: true;
+                                text <=> WizardVm.password2;
+                                error: WizardVm.err-password2;
+                                edited(_) => {
+                                    WizardVm.changed();
+                                }
+                            }
+
+                            Field {
+                                label: "PIN";
+                                password: true;
+                                text <=> WizardVm.pin;
+                                hint: "6 or more digits. Required every time you connect. Five wrong tries remove the device.";
+                                error: WizardVm.err-pin;
+                                edited(_) => {
+                                    WizardVm.changed();
+                                }
+                            }
+
+                            Field {
+                                label: "Confirm PIN";
+                                password: true;
+                                text <=> WizardVm.pin2;
+                                error: WizardVm.err-pin2;
+                                edited(_) => {
+                                    WizardVm.changed();
+                                }
+                                accepted => {
+                                    WizardVm.next();
+                                }
+                            }
+
+                            Banner {
+                                title: "Sent once, never stored here";
+                                text: "The password and PIN travel over the encrypted install channel and are kept by the server only as hashes. This app does not save them.";
+                                tone: 4;
+                            }
+                        }
+
+                        // ----------------------------------------------------------------- backups (Phase 1)
+                        if WizardVm.step == "backups": VerticalLayout {
+                            spacing: Tokens.sp-3;
+                            Banner {
+                                title: "Backups are not available yet";
+                                text: "This version records \"off\". You can turn on backups from Server details once they ship, without reinstalling.";
+                                tone: 4;
+                            }
+
+                            Text {
+                                text: "Schedule";
+                                color: Tokens.text;
+                                font-size: Tokens.fs-sm;
+                                font-weight: Tokens.fw-medium;
+                            }
+
+                            Segmented {
+                                options: ["Off"];
+                                label: "Schedule";
+                                current: 0;
+                                max-width: 160px;
+                            }
+                        }
+
+                        // ----------------------------------------------------------------- resources
+                        if WizardVm.step == "resources": VerticalLayout {
+                            spacing: Tokens.sp-3;
+                            SliderField {
+                                label: "CPU";
+                                unit: "cores";
+                                minimum: 1;
+                                maximum: WizardVm.cpu-max;
+                                value <=> WizardVm.cpu;
+                                hint: WizardVm.cpu-hint;
+                                changed(_) => {
+                                    WizardVm.changed();
+                                }
+                            }
+
+                            SliderField {
+                                label: "Memory";
+                                unit: "GB";
+                                minimum: 1;
+                                maximum: WizardVm.memory-max;
+                                value <=> WizardVm.memory;
+                                hint: WizardVm.memory-hint;
+                                changed(_) => {
+                                    WizardVm.changed();
+                                }
+                            }
+
+                            SliderField {
+                                label: "Disk";
+                                unit: "GB";
+                                minimum: 8;
+                                maximum: WizardVm.disk-max;
+                                value <=> WizardVm.disk;
+                                hint: WizardVm.disk-hint;
+                                changed(_) => {
+                                    WizardVm.changed();
+                                }
+                            }
+
+                            Text {
+                                text: "Advanced";
+                                color: Tokens.text;
+                                font-size: Tokens.fs-lg;
+                                font-weight: Tokens.fw-medium;
+                            }
+
+                            Field {
+                                label: "Agent port";
+                                text <=> WizardVm.agent-port;
+                                hint: "TCP and UDP. Not 22 or 80.";
+                                error: WizardVm.err-agent-port;
+                                width: 160px;
+                                edited(_) => {
+                                    WizardVm.changed();
+                                }
+                            }
+
+                            Field {
+                                label: "Domain (optional)";
+                                text <=> WizardVm.domain;
+                                hint: "Recorded now; used by web access later.";
+                                error: WizardVm.err-domain;
+                                edited(_) => {
+                                    WizardVm.changed();
+                                }
+                            }
+                        }
+
+                        // ----------------------------------------------------------------- review
+                        if WizardVm.step == "review": VerticalLayout {
+                            spacing: Tokens.sp-3;
+                            ReviewBlock {
+                                title: "Server";
+                                rows: WizardVm.review-server;
+                                edit-step: WizardVm.method == 0 ? "connection" : "server";
+                            }
+
+                            ReviewBlock {
+                                title: "Desktop";
+                                rows: WizardVm.review-desktop;
+                                edit-step: "desktop";
+                            }
+
+                            ReviewBlock {
+                                title: "Account";
+                                rows: WizardVm.review-account;
+                                edit-step: "account";
+                            }
+
+                            ReviewBlock {
+                                title: "Backups";
+                                rows: WizardVm.review-backups;
+                                edit-step: "backups";
+                            }
+
+                            ReviewBlock {
+                                title: "Resources";
+                                rows: WizardVm.review-resources;
+                                edit-step: "resources";
+                            }
+                        }
+
+                        // ----------------------------------------------------------------- run on the server
+                        if WizardVm.step == "run": VerticalLayout {
+                            spacing: Tokens.sp-3;
+                            CopyBlock {
+                                title: "1. Run this command on the server, in a root shell";
+                                text: WizardVm.command;
+                                button: "Copy command";
+                                note: "Holds no token and no secret, so it is safe in shell history and server logs.";
+                                copy => {
+                                    WizardVm.copy-command();
+                                }
+                            }
+
+                            CopyBlock {
+                                title: "2. Paste this token when the installer asks for it";
+                                text: WizardVm.token;
+                                button: "Copy token";
+                                note: "One-time. Works once and expires 15 minutes after the installer takes it. Nothing is shown while you paste it.";
+                                copy => {
+                                    WizardVm.copy-token();
+                                }
+                            }
+
+                            if WizardVm.run-phase == 0 || WizardVm.run-phase == 4: HorizontalLayout {
+                                spacing: Tokens.sp-3;
+                                alignment: start;
+                                Spinner { }
+
+                                VerticalLayout {
+                                    Text {
+                                        text: WizardVm.run-status;
+                                        color: Tokens.text;
+                                        font-size: Tokens.fs-md;
+                                        font-weight: Tokens.fw-medium;
+                                        wrap: word-wrap;
+                                        accessible-role: AccessibleRole.text;
+                                    }
+                                }
+                            }
+                            if WizardVm.run-phase == 1: VerticalLayout {
+                                spacing: Tokens.sp-2;
+                                Banner {
+                                    title: "This token expired";
+                                    text: "It was valid for 15 minutes after the installer took it.";
+                                    tone: 2;
+                                }
+
+                                HorizontalLayout {
+                                    alignment: start;
+                                    Btn {
+                                        text: "Generate a new token";
+                                        kind: "primary";
+                                        clicked => {
+                                            WizardVm.new-token();
+                                        }
+                                    }
+                                }
+                            }
+                            if WizardVm.run-phase == 2: VerticalLayout {
+                                spacing: Tokens.sp-2;
+                                Banner {
+                                    title: "Cannot reach " + WizardVm.address + ":" + WizardVm.agent-port;
+                                    text: "The agent should be listening, but nothing answers. Check that your provider's firewall or security group allows TCP and UDP on port " + WizardVm.agent-port + ", then try again.";
+                                    tone: 3;
+                                }
+
+                                HorizontalLayout {
+                                    alignment: start;
+                                    Btn {
+                                        text: "Try again";
+                                        kind: "primary";
+                                        clicked => {
+                                            WizardVm.try-again();
+                                        }
+                                    }
+                                }
+                            }
+                            if WizardVm.run-phase == 3: VerticalLayout {
+                                spacing: Tokens.sp-2;
+                                Banner {
+                                    title: "Paired";
+                                    text: "This app and the server now trust each other. " + WizardVm.run-status;
+                                    tone: 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ------------------------------------------------------------------ button bar
+                Rectangle {
+                    height: 64px;
+                    background: Tokens.surface;
+                    Rectangle {
+                        height: 1px;
+                        background: Tokens.border;
+                    }
+
+                    HorizontalLayout {
+                        padding-left: Tokens.sp-6;
+                        padding-right: Tokens.sp-6;
+                        padding-top: 14px;
+                        padding-bottom: 14px;
+                        spacing: Tokens.sp-2;
+                        Btn {
+                            text: "Cancel";
+                            kind: "ghost";
+                            clicked => {
+                                WizardVm.cancel();
+                            }
+                        }
+
+                        Rectangle {
+                            horizontal-stretch: 1;
+                        }
+
+                        if WizardVm.show-back: Btn {
+                            text: "Back";
+                            clicked => {
+                                WizardVm.back();
+                            }
+                        }
+                        if WizardVm.step == "run" && WizardVm.run-phase == 3: Btn {
+                            text: "Continue to progress";
+                            kind: "primary";
+                            clicked => {
+                                WizardVm.continue-to-progress();
+                            }
+                        }
+                        if WizardVm.step != "run" || WizardVm.run-phase != 3: Btn {
+                            text: WizardVm.next-label;
+                            kind: "primary";
+                            enabled: WizardVm.next-enabled;
+                            clicked => {
+                                WizardVm.next();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ host key dialog
+    if WizardVm.conn-phase == 2 && WizardVm.step == "connection": Dialog {
+        open: true;
+        title: "Confirm this server's identity";
+        danger: false;
+        dismissed => {
+            WizardVm.cancel-host-key();
+        }
+        Label {
+            text: "This is the first time this app connects to " + WizardVm.address + ". Compare the fingerprint with the one your provider shows (or run ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub on the server).";
+        }
+
+        Text {
+            text: "Host key (" + WizardVm.host-algo + ")";
+            color: Tokens.text-2;
+            font-size: Tokens.fs-sm;
+        }
+
+        Rectangle {
+            background: Tokens.surface-2;
+            border-radius: Tokens.r-md;
+            border-width: 1px;
+            border-color: Tokens.border;
+            height: fp.preferred-height + 2 * Tokens.sp-3;
+            fp := Mono {
+                x: Tokens.sp-3;
+                y: Tokens.sp-3;
+                width: parent.width - 2 * Tokens.sp-3;
+                text: WizardVm.host-fp;
+                accessible-role: AccessibleRole.text;
+                accessible-label: "Host key fingerprint " + WizardVm.host-fp;
+            }
+        }
+
+        Muted {
+            text: "If you cannot check it, only continue on a network you trust. The app remembers this key and warns you if it ever changes.";
+        }
+
+        ButtonRow {
+            Btn {
+                text: "Cancel";
+                autofocus: true;
+                clicked => {
+                    WizardVm.cancel-host-key();
+                }
+            }
+
+            Btn {
+                text: "Trust and continue";
+                kind: "primary";
+                clicked => {
+                    WizardVm.trust-host-key();
+                }
+            }
+        }
+    }
+    }
+}

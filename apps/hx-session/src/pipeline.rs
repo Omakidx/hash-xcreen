@@ -20,6 +20,7 @@
 //! a cheap clone that any thread may hold.
 
 use crate::pacing::{Decision, IDLE_POLL, Pacer};
+use crate::refine;
 use crate::stats::{QueueId, Stats, StatsSnapshot};
 use crossbeam_channel::{Receiver, RecvTimeoutError, SendTimeoutError, Sender, bounded};
 use hx_capture::{Capture, CaptureError, CursorEvent, Frame, Size, X11Capture, X11Config, mono_ns};
@@ -98,6 +99,11 @@ struct Shared {
     max_fps: AtomicU32,
     /// Bumped by every IDR request; each thread compares with the value it last acted on.
     idr_epoch: AtomicU64,
+    /// Refinement captures still wanted (see [`crate::refine`]); set by the encode thread,
+    /// spent by the capture thread.
+    refine_left: AtomicU32,
+    /// Refinement captures taken so far; the encode thread tells their frames from damage.
+    refine_taken: AtomicU64,
     /// Pending resize as `width << 32 | height`; 0 for none.
     resize: AtomicU64,
     fatal: Mutex<Option<String>>,
@@ -251,6 +257,8 @@ impl Pipeline {
             bitrate_kbps: AtomicU32::new(enc_cfg.bitrate_kbps),
             max_fps: AtomicU32::new(cfg.max_fps),
             idr_epoch: AtomicU64::new(0),
+            refine_left: AtomicU32::new(0),
+            refine_taken: AtomicU64::new(0),
             resize: AtomicU64::new(0),
             fatal: Mutex::new(None),
             last_error: Mutex::new(None),
@@ -427,6 +435,7 @@ fn capture_loop(
     };
     let mut pacer = Pacer::new(max_fps);
     let (mut idr_seen, mut fps_seen) = (0u64, max_fps);
+    let mut last_capture = std::time::Instant::now();
     // The first frame, so a consumer always starts from a full picture.
     cap.force_full_frame();
     while !sh.stopped() {
@@ -437,6 +446,14 @@ fn capture_loop(
             if let Err(e) = cap.refresh_cursor() {
                 soft(e)?;
             }
+        }
+        // A key frame or a budget-bound frame may have left the client with a coarse picture
+        // of a screen that has stopped changing: take the same screen again (refine.rs).
+        let left = sh.refine_left.load(Relaxed);
+        if refine::due(left, cap.damage_pending(), last_capture.elapsed()) {
+            sh.refine_left.fetch_sub(1, Relaxed);
+            sh.refine_taken.fetch_add(1, Relaxed);
+            cap.force_full_frame();
         }
         let fps = sh.max_fps.load(Relaxed);
         if fps != fps_seen {
@@ -460,6 +477,7 @@ fn capture_loop(
                 let t0 = mono_ns();
                 match cap.grab(GRAB_BUFFER_WAIT) {
                     Ok(Some(frame)) => {
+                        last_capture = std::time::Instant::now();
                         let t1 = frame.t_capture_ns();
                         pacer.on_capture(t1);
                         sh.stats.record_capture(
@@ -486,7 +504,13 @@ fn capture_loop(
                 }
             }
             Decision::Idle => {
-                if let Err(e) = cap.wait(Some(IDLE_POLL)) {
+                // Wake for the next refinement pass instead of the idle poll.
+                let nap = if sh.refine_left.load(Relaxed) > 0 {
+                    refine::QUIET
+                } else {
+                    IDLE_POLL
+                };
+                if let Err(e) = cap.wait(Some(nap)) {
                     soft(e)?;
                 }
             }
@@ -552,6 +576,7 @@ fn encode_loop(
 ) -> Result<(), PipelineError> {
     let mut idr_seen = 0u64;
     let mut failures = 0u32;
+    let mut refine_seen = 0u64;
     while let Some(job) = recv(rx, sh) {
         let mut step = || -> Result<Option<EncodedFrame>, EncodeError> {
             let epoch = sh.idr_epoch.load(Relaxed);
@@ -578,6 +603,22 @@ fn encode_loop(
         match result {
             Ok(Some(frame)) => {
                 failures = 0;
+                let taken = sh.refine_taken.load(Relaxed);
+                let refinement = taken != refine_seen;
+                refine_seen = taken;
+                let left = sh.refine_left.load(Relaxed);
+                let next = refine::next_left(
+                    left,
+                    refine::FrameInfo {
+                        idr: frame.idr,
+                        refinement,
+                        bytes: frame.bytes().len(),
+                        qp: frame.qp,
+                    },
+                );
+                if next != left {
+                    sh.refine_left.store(next, Relaxed);
+                }
                 let t = frame.timing;
                 sh.stats.record_frame(
                     t.t_encode_end_ns.saturating_sub(t.t_encode_start_ns),
