@@ -47,6 +47,8 @@ impl fmt::Debug for pb::PairingCodeIssued {
         f.debug_struct("PairingCodeIssued")
             .field("code", &Redacted)
             .field("expires_at_unix", &self.expires_at_unix)
+            .field("status", &self.status())
+            .field("retry_after_s", &self.retry_after_s)
             .finish()
     }
 }
