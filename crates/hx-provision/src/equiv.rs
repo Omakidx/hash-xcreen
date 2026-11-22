@@ -144,6 +144,24 @@ pub fn tree_roots(user: &str) -> Vec<String> {
 const COLLECT_SCRIPT: &str = r#"d=$1; u=$2
 export LC_ALL=C
 umask 077
+# `running` is reported before the XFCE session has started, and the session writes per-user state
+# as it starts (XDG folders in the locale's language, ~/Desktop, .cache and .local/share when they
+# do not exist yet). Wait, at most 2 minutes, until xfdesktop runs (a /proc scan: procps may not
+# be installed), so both desktops are read in the same state. Not finding it is not an error:
+# the trees then show what is there.
+xfdesktop_up() { grep -qx xfdesktop /proc/[0-9]*/comm 2>/dev/null; }
+for i in $(seq 240); do xfdesktop_up && break; sleep 0.5; done
+# Then wait until the top of the home tree has stopped changing (five equal samples a second
+# apart, at most 90 s): xfdesktop makes ~/Desktop, and other session programs their folders, a
+# few seconds after they start, at a pace that differs between two boots.
+home_sig() { find "/home/$u" -xdev -maxdepth 2 -printf '%p %m %u\n' 2>/dev/null | sort | cksum; }
+last=; same=0
+for i in $(seq 90); do
+  cur=$(home_sig)
+  if [ "$cur" = "$last" ]; then same=$((same + 1)); else same=0; last=$cur; fi
+  [ "$same" -ge 5 ] && break
+  sleep 1
+done
 rm -rf -- "$d"; mkdir -p -- "$d"
 dpkg-query -W -f '${Package}\t${Architecture}\t${db:Status-Abbrev}\t${Version}\n' > "$d/packages"
 apt-mark showauto 2>/dev/null | sort > "$d/auto"
@@ -165,11 +183,15 @@ sort /etc/subgid > "$d/subgid" 2>/dev/null
 awk -F: 'BEGIN{OFS=":"} {$2=""; $3=""; print}' /etc/shadow | sort > "$d/shadow"
 id -nG "$u" 2>/dev/null | tr ' ' '\n' | sort > "$d/usergroups"
 # Home and state trees: structure only. Caches, per-application state and what the XFCE session
-# generates at its own pace (.config/xfce4: panel, desktop and xfconf files appear when the session
-# first runs) are not compared.
-find "/home/$u" -xdev \( \( -path '*/.cache' -o -path '*/.config/xfce4' \) -printf "$fmt" -prune \) -o \( -path '*/.local/share/*/*' -prune \) -o -printf "$fmt" > "$d/tree0" 2>/dev/null
-find /var/lib/hx-session -xdev -printf "$fmt" > "$d/tree1" 2>/dev/null
-find /var/lib/systemd/linger -xdev -printf "$fmt" > "$d/tree2" 2>/dev/null
+# generates at its own pace are not compared: .config/xfce4 (panel, desktop and xfconf files),
+# .config/dconf (written by whichever GTK program settles first) and .config/Thunar (uca.xml, from
+# Thunar's daemon). The XDG folders and user-dirs.* are compared: they decide the language of the
+# user's folders and are made at the session's first start.
+# Also not compared: sockets (they exist only while a process runs, e.g. ~/.ssh/agent/s.*), and
+# what is below ~/.claude/backups (a vendor installer's state; the file names carry a timestamp).
+find "/home/$u" -xdev \( \( -path '*/.cache' -o -path '*/.config/xfce4' \) -printf "$fmt" -prune \) -o \( \( -path '*/.config/dconf' -o -path '*/.config/Thunar' \) -prune \) -o \( -path '*/.local/share/*/*' -prune \) -o \( -path '*/.claude/backups/*' -prune \) -o \( -type s -prune \) -o -printf "$fmt" > "$d/tree0" 2>/dev/null
+find /var/lib/hx-session -xdev \( -type s -prune \) -o -printf "$fmt" > "$d/tree1" 2>/dev/null
+find /var/lib/systemd/linger -xdev \( -type s -prune \) -o -printf "$fmt" > "$d/tree2" 2>/dev/null
 systemctl list-unit-files --state=enabled --no-legend --no-pager > "$d/svc_enabled" 2>/dev/null
 systemctl --global list-unit-files --state=enabled --no-legend --no-pager > "$d/svc_user_enabled" 2>/dev/null
 systemctl list-units --type=service --state=running --no-legend --plain --no-pager > "$d/svc_running" 2>/dev/null
@@ -531,10 +553,25 @@ fn etc_index(f: &Facts) -> BTreeMap<String, &FileFact> {
     f.etc.iter().map(|e| (e.path.clone(), e)).collect()
 }
 
+/// Whether a home or state tree entry is runtime or vendor noise that `compare` ignores even
+/// when a facts file carries it (the collection script already leaves these out):
+///
+/// - a socket (type `s`) exists only while some process runs (`~/.ssh/agent/s.*`);
+/// - anything below `.claude/backups` is a vendor installer's state, and its file names carry a
+///   timestamp (`.claude.json.backup.<epoch-ms>`), so no two builds can agree.
+fn tree_noise(e: &FileFact) -> bool {
+    e.kind == "s" || e.path.contains("/.claude/backups/")
+}
+
 fn tree_index<'a>(f: &'a Facts, root: &str) -> BTreeMap<String, &'a FileFact> {
     f.trees
         .get(root)
-        .map(|v| v.iter().map(|e| (e.path.clone(), e)).collect())
+        .map(|v| {
+            v.iter()
+                .filter(|e| !tree_noise(e))
+                .map(|e| (e.path.clone(), e))
+                .collect()
+        })
         .unwrap_or_default()
 }
 

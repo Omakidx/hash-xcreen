@@ -2600,6 +2600,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hx-imagectl"
+version = "0.1.0"
+dependencies = [
+ "hx-provision",
+ "minisign",
+ "minisign-verify",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "hx-ipc"
 version = "0.1.0"
 dependencies = [

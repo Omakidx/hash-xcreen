@@ -352,6 +352,53 @@ fn trees_compare_structure_not_content() {
     ));
 }
 
+fn tree_entry(path: &str, kind: &str) -> FileFact {
+    FileFact {
+        path: path.into(),
+        kind: kind.into(),
+        mode: 0o755,
+        owner: "alice:alice".into(),
+        sha256: None,
+        target: None,
+    }
+}
+
+#[test]
+fn runtime_sockets_and_vendor_backups_are_not_drift() {
+    // Noise: a socket that exists only on A, and timestamped vendor backups that differ by name.
+    let mut a = repo_facts();
+    let mut b = repo_facts();
+    fn home(f: &mut Facts) -> &mut Vec<FileFact> {
+        f.trees.get_mut("/home/alice").unwrap()
+    }
+    home(&mut a).push(tree_entry("/home/alice/.ssh/agent/s.AbC.agent.Xyz", "s"));
+    home(&mut a).push(tree_entry(
+        "/home/alice/.claude/backups/.claude.json.backup.1795356020853",
+        "f",
+    ));
+    home(&mut b).push(tree_entry(
+        "/home/alice/.claude/backups/.claude.json.backup.1795356105548",
+        "f",
+    ));
+    let d = compare(&a, &b, &manifest());
+    assert!(errors(&d).is_empty(), "{d:?}");
+    // The directories themselves are still compared, and so is a socket's neighbour.
+    let mut b = repo_facts();
+    home(&mut b).push(tree_entry("/home/alice/.claude/backups", "d"));
+    assert!(has(
+        &compare(&repo_facts(), &b, &manifest()),
+        Area::Trees,
+        "only on B"
+    ));
+    let mut b = repo_facts();
+    home(&mut b).push(tree_entry("/home/alice/.ssh/agent/other", "f"));
+    assert!(has(
+        &compare(&repo_facts(), &b, &manifest()),
+        Area::Trees,
+        "only on B"
+    ));
+}
+
 #[test]
 fn services_and_boot_state() {
     let mut b = repo_facts();
