@@ -75,6 +75,9 @@ pub struct UpdateConfig {
     pub versions_dir: PathBuf,
     /// Where the fetcher writes (`/var/lib/hx/updates`, bind-mounted into its unit).
     pub fetch_dir: PathBuf,
+    /// Upper bound of the size of the fetch directory's tmpfs; the directory must be a tmpfs of
+    /// at most this size (`var-lib-hx-updates.mount`: 300 MiB). `None` skips the check (tests).
+    pub fetch_tmpfs_cap: Option<u64>,
     /// privd's verified copies (`/var/lib/hx/staging`), root-only.
     pub staging_dir: PathBuf,
     /// The version of the running binary.
@@ -98,6 +101,7 @@ impl UpdateConfig {
         Self {
             versions_dir: VERSIONS_DIR.into(),
             fetch_dir: state_dir.join("updates"),
+            fetch_tmpfs_cap: Some(300 * 1024 * 1024),
             staging_dir: state_dir.join("staging"),
             running_version: env!("CARGO_PKG_VERSION").to_string(),
             arch: std::env::consts::ARCH.to_string(),
@@ -114,6 +118,7 @@ impl UpdateConfig {
         Self {
             versions_dir: dir.join("lib-hx"),
             fetch_dir: dir.join("state").join("updates"),
+            fetch_tmpfs_cap: None,
             staging_dir: dir.join("state").join("staging"),
             running_version: "1.0.0".into(),
             arch: std::env::consts::ARCH.to_string(),

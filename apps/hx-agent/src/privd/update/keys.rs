@@ -26,6 +26,7 @@
 
 use minisign_verify::{PublicKey, Signature};
 
+use super::manifest::Manifest;
 use super::verify::VerifyError;
 
 const CURRENT: &str = include_str!("../../../release-keys/current.pub");
@@ -149,17 +150,42 @@ impl UpdateKeys {
     /// Verifies `sig_text` (a `.minisig` file) over exactly `data` against each embedded key.
     /// Only prehashed signatures (`ED`, what minisign writes by default) are accepted; the
     /// legacy form is refused. The trusted comment's global signature is checked too.
+    ///
+    /// This checks the signature only. A release manifest goes through
+    /// [`verify_manifest`](Self::verify_manifest), which also binds the signed trusted comment to
+    /// the manifest.
     pub fn verify(&self, data: &[u8], sig_text: &str) -> Result<(), VerifyError> {
+        self.verify_signed(data, sig_text).map(|_| ())
+    }
+
+    /// [`verify`](Self::verify), returning the signed trusted comment.
+    pub fn verify_signed(&self, data: &[u8], sig_text: &str) -> Result<String, VerifyError> {
         if self.keys.is_empty() {
             return Err(VerifyError::NoKeys);
         }
         let sig = Signature::decode(sig_text).map_err(|_| VerifyError::BadSignatureFile)?;
         for k in &self.keys {
             if k.verify(data, &sig, false).is_ok() {
-                return Ok(());
+                return Ok(sig.trusted_comment().to_string());
             }
         }
         Err(VerifyError::SignatureMismatch)
+    }
+
+    /// Verifies the signature of release manifest bytes **and** that its signed trusted comment is
+    /// exactly the one the release workflow writes for that manifest
+    /// (`hx-manifest v<version> channel=<channel> arch=<arch>`, see
+    /// [`Manifest::trusted_comment`]): a signature made over these bytes for another purpose (the
+    /// installer script's `hx-install.sh v<V>`, an image manifest, a test) is not a release
+    /// signature. Returns the parsed manifest, whose fields still need
+    /// [`Manifest::check`].
+    pub fn verify_manifest(&self, data: &[u8], sig_text: &str) -> Result<Manifest, VerifyError> {
+        let comment = self.verify_signed(data, sig_text)?;
+        let m = Manifest::parse(data).map_err(|_| VerifyError::BadManifest)?;
+        if comment != m.trusted_comment() {
+            return Err(VerifyError::BadComment);
+        }
+        Ok(m)
     }
 }
 

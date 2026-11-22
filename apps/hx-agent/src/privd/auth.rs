@@ -75,7 +75,6 @@ pub struct RateRule {
 
 const MIN: u64 = 60_000;
 const HOUR: u64 = 3_600_000;
-const DAY: u64 = 86_400_000;
 
 /// The command-specific limit of ipc.md 6 and 8, if the command has one. `PepperEnrol` and the
 /// failure caps of `PepperVerify` are not here: they are persisted budgets (`limiter`).
@@ -92,7 +91,9 @@ pub fn rate_rule(cmd: &Command) -> Option<RateRule> {
         Command::EnableDocker(_) => r(HOUR, 3, false),
         Command::SetUserPassword(_) => r(HOUR, 10, false),
         Command::CreateSnapshot(_) => r(HOUR, 6, false),
-        Command::ApplyUpdate(_) => r(DAY, 2, false),
+        // `ApplyUpdate` has no in-memory rule: its limits are persisted in `updates-state`
+        // and count only Gateway (a started update: 2 a day; a refused one: 10 an hour), so
+        // refused requests can never use up an allowance the Admin needs.
         Command::StartDesktop(_) | Command::StopDesktop(_) | Command::RestartDesktop(_) => {
             r(MIN, 6, true)
         }

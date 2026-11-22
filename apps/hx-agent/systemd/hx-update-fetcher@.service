@@ -72,7 +72,7 @@ RestrictNamespaces=yes
 # sit behind a CDN with no stable addresses, so the public ranges are not listed. The binary also
 # connects only to the release host names and to global unicast addresses (src/fetcher).
 RestrictAddressFamilies=AF_INET AF_INET6
-IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
+IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7 64:ff9b::/96 64:ff9b:1::/48
 IPAddressAllow=127.0.0.53/32 127.0.0.54/32
 
 # System calls: the common service set without anything privileged or resource-changing.

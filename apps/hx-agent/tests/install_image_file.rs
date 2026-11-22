@@ -66,7 +66,11 @@ impl Signer {
     }
 }
 
-const COMMENT: &str = "hx-images-manifest schema=1 arch=x86_64 timestamp=1799990000";
+/// The exact trusted comment hx-imagectl writes, bound to the manifest's own timestamp (privd
+/// refuses a comment whose arch or timestamp differs from the manifest's).
+fn comment_for(timestamp: u64) -> String {
+    format!("hx-images-manifest schema=1 arch=x86_64 timestamp={timestamp}")
+}
 
 /// An image, its signed manifest and the signature, in a directory of their own.
 struct Fixture {
@@ -123,7 +127,7 @@ impl Fixture {
         .unwrap()
         .into_bytes();
         let signer = Signer::new();
-        let sig = signer.sign(&manifest, COMMENT);
+        let sig = signer.sign(&manifest, &comment_for(NOW - 3600));
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
         let mut f = Self {
@@ -526,7 +530,7 @@ fn an_old_entry_is_accepted_with_a_warning_and_a_future_manifest_is_refused() {
     parsed.timestamp = NOW + 3 * 86_400;
     parsed.images[0].created = NOW - 1000;
     f.manifest = parsed.to_json().unwrap().into_bytes();
-    f.sig = f.signer.sign(&f.manifest, COMMENT);
+    f.sig = f.signer.sign(&f.manifest, &comment_for(parsed.timestamp));
     f.write();
     let (mut m, dir) = machine();
     f.trust(&mut m);

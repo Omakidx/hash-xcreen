@@ -79,14 +79,55 @@ impl Pepper {
     /// is the source. Without it (a development run, or a host still migrating) the root-only
     /// state file `pepper.key` is used, created on first use. A credential that is present but
     /// wrong (length, owner, mode) is an error, never a silent fallback.
+    ///
+    /// A **release build** (feature `release-build`) never falls back: without
+    /// `$CREDENTIALS_DIRECTORY/pepper` it refuses to start, so a missing or broken
+    /// `LoadCredentialEncrypted=` can never silently put a self-generated plaintext pepper on disk.
     pub fn load(credentials_dir: Option<&Path>, state_file: &Path) -> io::Result<Self> {
+        Self::load_with(
+            credentials_dir,
+            state_file,
+            !cfg!(feature = "release-build"),
+        )
+    }
+
+    /// [`load`](Self::load) with the fallback decision explicit (so both builds are testable).
+    pub fn load_with(
+        credentials_dir: Option<&Path>,
+        state_file: &Path,
+        allow_state_file: bool,
+    ) -> io::Result<Self> {
         if let Some(dir) = credentials_dir {
             let cred = dir.join(CREDENTIAL_NAME);
             match std::fs::symlink_metadata(&cred) {
-                Ok(_) => return Ok(Self(read_key_file(&cred)?)),
+                Ok(_) => {
+                    let key = Self(read_key_file(&cred)?);
+                    if state_file.exists() {
+                        crate::privd::log::warn(&format!(
+                            "{} exists but the sealed pepper credential is in use; it is a stale \
+                             plaintext copy: shred -u it",
+                            state_file.display()
+                        ));
+                    }
+                    return Ok(key);
+                }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
             }
+        }
+        if !allow_state_file {
+            if state_file.exists() {
+                crate::privd::log::warn(&format!(
+                    "{} exists but is ignored in a release build; seal it into \
+                     /etc/hx/creds/pepper.cred",
+                    state_file.display()
+                ));
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no sealed pepper credential ($CREDENTIALS_DIRECTORY/pepper); a release build does \
+                 not fall back to a plaintext pepper file",
+            ));
         }
         Self::load_or_create(state_file)
     }
@@ -285,5 +326,23 @@ mod tests {
         let p = Pepper::from_bytes([0x41; LEN]);
         let s = format!("{p:?}");
         assert!(!s.contains("41") && !s.contains("65"));
+    }
+
+    #[test]
+    fn a_release_build_refuses_to_start_without_the_credential() {
+        let d = tempfile::tempdir().unwrap();
+        let creds = d.path().join("creds");
+        std::fs::create_dir(&creds).unwrap();
+        let state = d.path().join("pepper.key");
+        for dir in [Some(creds.as_path()), None] {
+            let Err(e) = Pepper::load_with(dir, &state, false) else {
+                panic!("a release build must refuse");
+            };
+            assert_eq!(e.kind(), io::ErrorKind::NotFound);
+            assert!(!state.exists(), "no plaintext pepper was created");
+        }
+        // The development fallback still works, and a credential is used when present.
+        assert!(Pepper::load_with(Some(&creds), &state, true).is_ok());
+        assert!(state.exists());
     }
 }

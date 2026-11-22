@@ -43,13 +43,22 @@ impl Signer {
         self.kp.pk.to_base64()
     }
 
-    /// A prehashed minisign signature file over `data`.
+    /// A prehashed minisign signature file over `data`, with the trusted comment the release
+    /// workflow writes for a manifest (`hx-manifest v<version> channel=<c> arch=<a>`, taken from
+    /// the manifest itself when `data` is one).
     pub fn sign(&self, data: &[u8]) -> String {
+        let comment = serde_json::from_slice::<hx_agent::privd::update::manifest::Manifest>(data)
+            .map_or_else(|_| "hx-manifest test".to_string(), |m| m.trusted_comment());
+        self.sign_with_comment(data, &comment)
+    }
+
+    /// A prehashed minisign signature file over `data` with an explicit trusted comment.
+    pub fn sign_with_comment(&self, data: &[u8], comment: &str) -> String {
         minisign::sign(
             Some(&self.kp.pk),
             &self.kp.sk,
             Cursor::new(data),
-            Some("hx test release"),
+            Some(comment),
             None,
         )
         .expect("sign")

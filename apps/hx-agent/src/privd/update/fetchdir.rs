@@ -65,6 +65,9 @@ pub struct FetchDir {
     owner: Option<u32>,
 }
 
+/// `statfs.f_type` of a tmpfs (`TMPFS_MAGIC`).
+const TMPFS_MAGIC: u64 = 0x0102_1994;
+
 fn dir_flags() -> OFlags {
     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
 }
@@ -98,6 +101,34 @@ impl FetchDir {
     pub fn open(path: &Path) -> io::Result<Self> {
         let fd = rustix::fs::open(path, dir_flags(), Mode::empty())?;
         Ok(Self { fd, owner: None })
+    }
+
+    /// Requires the opened directory to be a tmpfs of at most `cap` bytes (`fstatfs` of the open
+    /// descriptor, so a mount swapped in after the check is not a concern). The fetcher units'
+    /// directories are size-capped tmpfs mounts (`var-lib-hx-updates.mount`,
+    /// `var-lib-hx-imagein.mount`); if one is inactive the directory is a plain directory of the
+    /// root file system, and a compromised fetcher could fill it. `None` skips the check (tests,
+    /// which run on temporary directories).
+    pub fn require_tmpfs(&self, cap: Option<u64>) -> io::Result<()> {
+        let Some(cap) = cap else { return Ok(()) };
+        let st = rustix::fs::fstatfs(&self.fd)?;
+        #[allow(clippy::unnecessary_cast, clippy::cast_sign_loss)]
+        let (kind, blocks, bsize) = (
+            (st.f_type as u64) & 0xffff_ffff,
+            st.f_blocks as u64,
+            st.f_bsize as u64,
+        );
+        if kind != TMPFS_MAGIC {
+            return Err(io::Error::other(
+                "the fetch directory is not a tmpfs (is its .mount unit active?)",
+            ));
+        }
+        if blocks.saturating_mul(bsize) > cap {
+            return Err(io::Error::other(
+                "the fetch directory's tmpfs is larger than its size cap",
+            ));
+        }
+        Ok(())
     }
 
     /// Requires every file read through this handle to be owned by `uid`.
@@ -340,6 +371,24 @@ mod tests {
         ensure_dir(&fetch, 0o700).unwrap();
         ensure_dir(&staging, 0o700).unwrap();
         (t, FetchDir::open(&fetch).unwrap(), fetch, staging)
+    }
+
+    #[test]
+    fn the_tmpfs_check_refuses_other_file_systems_and_oversized_tmpfs() {
+        // Skipped (None) in tests that use temporary directories.
+        let (_t, d, ..) = setup();
+        d.require_tmpfs(None).unwrap();
+        // /proc is a file system, but not a tmpfs.
+        let proc = FetchDir::open(Path::new("/proc")).unwrap();
+        let e = proc.require_tmpfs(Some(u64::MAX)).unwrap_err();
+        assert!(e.to_string().contains("not a tmpfs"), "{e}");
+        // /dev/shm is a tmpfs on every systemd host; where it is not, the test has nothing to say.
+        if let Ok(shm) = FetchDir::open(Path::new("/dev/shm"))
+            && shm.require_tmpfs(Some(u64::MAX)).is_ok()
+        {
+            let e = shm.require_tmpfs(Some(1)).unwrap_err();
+            assert!(e.to_string().contains("larger than"), "{e}");
+        }
     }
 
     #[test]

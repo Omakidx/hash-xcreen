@@ -4,7 +4,8 @@
 //! | Field | Meaning |
 //! |---|---|
 //! | `highest_by_channel` | Per channel, the highest manifest timestamp accepted so far; an older manifest of that channel is refused (replay). Never lowered. Per channel so that switching `beta` to `stable` does not make valid stable manifests look like replays. |
-//! | `apply_log` | When `ApplyUpdate` was last admitted (a day's worth): the 2-a-day limit survives a restart of privd. |
+//! | `apply_log` | When a Gateway `ApplyUpdate` actually started an update (a day's worth): the 2-a-day limit survives a restart of privd. Refused attempts and Admin applies are not counted. |
+//! | `refused_log` | When a Gateway `ApplyUpdate` was refused or failed (an hour's worth): the separate 10-an-hour limit on refused attempts. |
 //! | `manual_rollback` | The last release an Admin rolled back; re-applying it is Admin-only for 24 h, like a release that failed its health check. |
 //! | `verified_version` | The version whose manifest and signature privd holds in `staging/` after a successful `CheckUpdate`. |
 //! | `pending` | An update that was switched in and has not yet passed its health check. Present across the re-exec; the **new** privd reads it at start and finishes the check (or rolls back). |
@@ -58,9 +59,13 @@ pub struct UpdateState {
     /// Highest accepted manifest timestamp, per channel.
     #[serde(default)]
     pub highest_by_channel: BTreeMap<String, u64>,
-    /// When `ApplyUpdate` was admitted, Unix seconds (entries older than a day are dropped).
+    /// When a Gateway `ApplyUpdate` started an update, Unix seconds (entries older than a day are dropped).
     #[serde(default)]
     pub apply_log: Vec<u64>,
+    /// When a Gateway `ApplyUpdate` was refused or failed, Unix seconds (entries older than an
+    /// hour are dropped).
+    #[serde(default)]
+    pub refused_log: Vec<u64>,
     /// The last release an Admin rolled back.
     #[serde(default)]
     pub manual_rollback: Option<RolledBack>,

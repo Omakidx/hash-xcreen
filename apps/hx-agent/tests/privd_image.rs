@@ -10,7 +10,7 @@ mod privd_image_common;
 
 use std::sync::atomic::Ordering;
 
-use hx_agent::privd::image::keys::{ImageKeys, ImageVerifyError};
+use hx_agent::privd::image::keys::{ImageKeys, ImageVerifyError, SignedComment};
 use hx_agent::privd::probe::ImageSpace;
 use hx_agent::privd::testing::{ExecRule, FakeIncus, FakeProbe};
 use hx_ipc::privd::pb::{self, ErrorCode, ErrorDetail, ImageMode, ImageReason, PathTaken, Role};
@@ -911,7 +911,13 @@ fn the_trusted_comment_rule_and_the_key_rule_of_the_manifest_signature() {
     let other = Signer::new();
     let keys = ImageKeys::from_public_keys(&[&signer.public()]).unwrap();
     let m = b"{\"schema\":1}";
-    assert_eq!(keys.verify_manifest(m, &signer.sign_manifest(m, 5)), Ok(()));
+    assert_eq!(
+        keys.verify_manifest(m, &signer.sign_manifest(m, 5)),
+        Ok(SignedComment {
+            arch: arch(),
+            timestamp: 5
+        })
+    );
     assert_eq!(
         keys.verify_manifest(m, &signer.sign_with_comment(m, "hx-release-manifest x")),
         Err(ImageVerifyError::BadComment)
@@ -934,12 +940,50 @@ fn the_trusted_comment_rule_and_the_key_rule_of_the_manifest_signature() {
         keys.verify_manifest(m, "junk"),
         Err(ImageVerifyError::BadSignatureFile)
     );
+    // The comment is the exact form hx-imagectl writes, not just a prefix (I3).
+    for bad in [
+        "hx-images-manifest schema=1 arch=x86_64 timestamp=5 extra",
+        "hx-images-manifest schema=2 arch=x86_64 timestamp=5",
+        "hx-images-manifest schema=1 arch=x86_64 timestamp=05",
+        "hx-images-manifest schema=1 arch=x86_64 timestamp=-5",
+        "hx-images-manifest schema=1 arch=x86_64  timestamp=5",
+        "hx-images-manifest schema=1 arch= timestamp=5",
+        "hx-images-manifest schema=1 timestamp=5 arch=x86_64",
+        "hx-images-manifest anything",
+    ] {
+        assert_eq!(
+            keys.verify_manifest(m, &signer.sign_with_comment(m, bad)),
+            Err(ImageVerifyError::BadComment),
+            "{bad:?}"
+        );
+    }
     // Either of two embedded keys (current and next) verifies.
     let both = ImageKeys::from_public_keys(&[&other.public(), &signer.public()]).unwrap();
     assert_eq!(both.len(), 2);
-    assert_eq!(both.verify_manifest(m, &signer.sign_manifest(m, 5)), Ok(()));
+    assert!(both.verify_manifest(m, &signer.sign_manifest(m, 5)).is_ok());
     assert_eq!(
         ImageKeys::none().verify_manifest(m, &signer.sign_manifest(m, 5)),
         Err(ImageVerifyError::NoKeys)
     );
+}
+
+#[test]
+fn the_signed_comment_is_bound_to_the_manifests_own_timestamp_and_arch() {
+    use hx_agent::privd::image::choose::verify_manifest;
+    let signer = Signer::new();
+    let keys = ImageKeys::from_public_keys(&[&signer.public()]).unwrap();
+    let m = manifest_json(vec![], NOW);
+    let ok = signer.sign_manifest(&m, NOW);
+    assert!(verify_manifest(&keys, &m, &ok, &arch(), NOW).is_ok());
+    // A signature (valid, right form) carrying another timestamp is not this manifest's.
+    let other_ts = signer.sign_manifest(&m, NOW - 1);
+    let e = verify_manifest(&keys, &m, &other_ts, &arch(), NOW).unwrap_err();
+    assert!(e.contains("does not match"), "{e}");
+    // Nor one carrying another arch.
+    let other_arch = signer.sign_with_comment(
+        &m,
+        &format!("hx-images-manifest schema=1 arch=aarch64 timestamp={NOW}"),
+    );
+    let e = verify_manifest(&keys, &m, &other_arch, "x86_64", NOW).unwrap_err();
+    assert!(e.contains("does not match"), "{e}");
 }

@@ -340,7 +340,9 @@ async fn privd_installs_from_an_image_served_over_https_by_the_real_fetcher() {
         ok_route(sig.as_bytes()),
     );
     publish_parts(&srv, &d, 2);
-    srv.route("/mirror/Packages.xz", ok_route(&vec![1u8; 100_000]));
+    // A one-byte mirror body: the probe still asks the mirror, but its rate cannot beat the
+    // release host's (both are loopback, so with equal bodies the choice was a coin toss under load).
+    srv.route("/mirror/Packages.xz", ok_route(b"x"));
     let cfg = srv.fetch_config(&env.fetch_dir());
     env.script(|s| s.hook = Some(https_hook(cfg)));
     // The first part is the same bytes as the unsplit file's start: the probe uses `.p0`.
@@ -384,7 +386,9 @@ async fn a_server_that_serves_a_tampered_image_makes_auto_build() {
     let mut bad = d.clone();
     bad[4000] ^= 1;
     publish_parts(&srv, &bad, 1);
-    srv.route("/mirror/Packages.xz", ok_route(&vec![1u8; 100_000]));
+    // A one-byte mirror body: the probe still asks the mirror, but its rate cannot beat the
+    // release host's (both are loopback, so with equal bodies the choice was a coin toss under load).
+    srv.route("/mirror/Packages.xz", ok_route(b"x"));
     let cfg = srv.fetch_config(&env.fetch_dir());
     env.script(|s| s.hook = Some(https_hook(cfg)));
     let c = created(env.create(env.request(ImageMode::Auto)).await);

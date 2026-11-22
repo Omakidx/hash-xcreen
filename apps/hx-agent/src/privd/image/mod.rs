@@ -56,6 +56,9 @@ pub struct ImageConfig {
     /// Where the image fetcher writes (`/var/lib/hx/imagein`, an 80 MiB tmpfs, bind-mounted into
     /// its unit).
     pub fetch_dir: PathBuf,
+    /// Upper bound of the size of the fetch directory's tmpfs; the directory must be a tmpfs of
+    /// at most this size (`var-lib-hx-imagein.mount`: 80 MiB). `None` skips the check (tests).
+    pub fetch_tmpfs_cap: Option<u64>,
     /// The offline import directory (`/var/lib/hx/import`, root 0700).
     pub import_dir: PathBuf,
     /// privd's verified copies (`/var/lib/hx/staging`).
@@ -94,6 +97,7 @@ impl ImageConfig {
     pub fn production(state_dir: &Path, incus_dir: &Path) -> Self {
         Self {
             fetch_dir: state_dir.join("imagein"),
+            fetch_tmpfs_cap: Some(80 * 1024 * 1024),
             import_dir: state_dir.join("import"),
             staging_dir: state_dir.join("staging"),
             state_dir: state_dir.to_path_buf(),
@@ -118,6 +122,7 @@ impl ImageConfig {
         let state = dir.join("state");
         Self {
             fetch_dir: state.join("imagein"),
+            fetch_tmpfs_cap: None,
             import_dir: state.join("import"),
             staging_dir: state.join("staging"),
             state_dir: state,

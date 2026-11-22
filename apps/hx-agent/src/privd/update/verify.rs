@@ -15,6 +15,13 @@ pub enum VerifyError {
     /// No embedded key validates the signature (wrong key, altered data, legacy signature).
     #[error("no embedded release key validates the signature")]
     SignatureMismatch,
+    /// The signature is valid but the signed bytes are not a release manifest.
+    #[error("the signed bytes are not a release manifest")]
+    BadManifest,
+    /// The signature is valid but its signed trusted comment is not
+    /// `hx-manifest v<version> channel=<channel> arch=<arch>` of the manifest it signs.
+    #[error("the signed trusted comment does not match the release manifest")]
+    BadComment,
     /// A key could not be parsed (tests).
     #[error("malformed public key")]
     BadKey,
