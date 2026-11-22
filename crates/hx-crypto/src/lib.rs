@@ -22,6 +22,8 @@ pub mod auth;
 pub mod clock;
 mod encoding;
 pub mod error;
+#[cfg(feature = "fuzzing")]
+pub mod fuzz;
 pub mod keys;
 pub mod pairing;
 pub mod pin;
