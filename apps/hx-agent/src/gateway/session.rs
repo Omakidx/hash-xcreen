@@ -59,6 +59,7 @@ use super::desktop::{
 use super::devices::{DeviceNotice, DeviceService};
 use super::live::LiveSessions;
 use super::privd_client::PrivdClient;
+use super::server_mgmt::ServerMgmtService;
 use super::takeover::{Refusal, TakeoverLimiter, TakeoverPolicy};
 use super::util::{device_id, log_text, short_id};
 
@@ -123,6 +124,7 @@ pub struct SessionManager {
     active: Mutex<Option<Active>>,
     live: Arc<LiveSessions>,
     devices: Arc<DeviceService>,
+    server_mgmt: Arc<ServerMgmtService>,
     privd: PrivdClient,
     next_token: AtomicU64,
 }
@@ -134,6 +136,7 @@ impl SessionManager {
         link: Arc<dyn DesktopLink>,
         privd: PrivdClient,
         devices: Arc<DeviceService>,
+        server_mgmt: Arc<ServerMgmtService>,
         live: Arc<LiveSessions>,
         clock: Arc<dyn Clock>,
     ) -> Arc<Self> {
@@ -145,6 +148,7 @@ impl SessionManager {
             active: Mutex::new(None),
             live,
             devices,
+            server_mgmt,
             privd,
             next_token: AtomicU64::new(1),
         })
@@ -501,6 +505,7 @@ impl Session {
             }
             Some(Ctl::Goodbye(_)) => Flow::End(Some((CloseCode::NoError, "goodbye"))),
             Some(Ctl::DeviceMgmt(d)) => self.device_mgmt(d).await,
+            Some(Ctl::ServerMgmt(s)) => self.server_mgmt(s).await,
             // Only the server sends these (protocol 5.8, 5.2, 10): a client that does is broken.
             Some(Ctl::ServerStats(_)) => violation("ServerStats from a client"),
             Some(Ctl::StreamInfo(_)) => violation("StreamInfo from a client"),
@@ -588,6 +593,54 @@ impl Session {
                 let _ = ticket.commit().await;
                 Self::ANSWERED
             }
+        }
+    }
+
+    /// `ServerMgmt` (protocol 5.11): only on this authorized session of an active device, with
+    /// the feature negotiated; the request is served by [`ServerMgmtService`].
+    async fn server_mgmt(&mut self, m: pb::ServerMgmt) -> Flow {
+        let violation = |why: &'static str| Flow::End(Some((CloseCode::ProtocolError, why)));
+        if !self.features.contains(Features::SERVER_MANAGEMENT) {
+            return violation("server management was not negotiated");
+        }
+        if m.direction() != Some(MgmtDirection::ClientToServer) {
+            return violation("a server-only ServerMgmt body from a client");
+        }
+        let request_id = m.request_id;
+        let Some(body) = m.body else {
+            return violation("ServerMgmt without a body");
+        };
+        // A device revoked while the request queued must not be served.
+        if !self.mgr.devices.is_active(&self.device.id) {
+            return Flow::End(Some((CloseCode::Unauthorized, "device revoked")));
+        }
+        let session_active = self.mgr.has_active_client().await;
+        let answer = self
+            .mgr
+            .server_mgmt
+            .handle(self.device.id, body, session_active)
+            .await;
+        let lockout = answer.lockout;
+        let out = pb::ControlMessage::new(Ctl::ServerMgmt(pb::ServerMgmt {
+            request_id,
+            body: Some(answer.body),
+        }));
+        let sent = self.send(out).await;
+        if lockout {
+            // The 5th wrong PIN: the answer is delivered, then the device is revoked and ends.
+            if sent.is_ok() {
+                let _ = self.conn.ping(GOODBYE_FLUSH).await;
+            }
+            self.mgr.server_mgmt.lockout(self.device.id).await;
+            return Flow::End(Some((CloseCode::Unauthorized, "device revoked")));
+        }
+        match sent {
+            // A 5th wrong PIN revokes the asker: answer first, then end.
+            Ok(()) if !self.mgr.devices.is_active(&self.device.id) => {
+                Flow::End(Some((CloseCode::Unauthorized, "device revoked")))
+            }
+            Ok(()) => Flow::Continue,
+            Err(f) => f,
         }
     }
 

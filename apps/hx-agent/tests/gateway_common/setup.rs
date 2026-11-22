@@ -103,6 +103,10 @@ impl SetupEnv {
             s.params = CHEAP;
             s.finish_retry_wait = Duration::from_millis(20);
             opts.setup = Some(s);
+            opts.server_mgmt = Some(hx_agent::gateway::server_mgmt::ServerMgmtSettings {
+                desktop_id: "main".into(),
+                params: CHEAP,
+            });
             match Gateway::start(opts).await {
                 Ok(gw) => {
                     self.gw = Some(gw);

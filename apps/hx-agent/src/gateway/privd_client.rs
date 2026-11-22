@@ -750,6 +750,72 @@ impl PrivdClient {
         }
     }
 
+    /// `RestartDesktop` (section 6.7).
+    pub async fn restart_desktop(
+        &self,
+        desktop_id: &str,
+        force: bool,
+    ) -> Result<pb::PowerResult, PrivdError> {
+        let command = Command::RestartDesktop(pb::RestartDesktopRequest {
+            desktop_id: desktop_id.to_owned(),
+            force,
+        });
+        match self.call(command, &[], None).await? {
+            pb::response::Result::RestartDesktop(r) => Ok(r),
+            _ => Err(PrivdError::Protocol("unexpected result variant".into())),
+        }
+    }
+
+    /// `SetLimits` (section 6.8). privd checks the bounds.
+    pub async fn set_limits(
+        &self,
+        desktop_id: &str,
+        limits: pb::Limits,
+    ) -> Result<pb::SetLimitsResult, PrivdError> {
+        let command = Command::SetLimits(pb::SetLimitsRequest {
+            desktop_id: desktop_id.to_owned(),
+            limits: Some(limits),
+        });
+        match self.call(command, &[], None).await? {
+            pb::response::Result::SetLimits(r) => Ok(r),
+            _ => Err(PrivdError::Protocol("unexpected result variant".into())),
+        }
+    }
+
+    /// `DisableDocker` (section 6.9): always allowed to the gateway, it only reduces exposure.
+    pub async fn disable_docker(
+        &self,
+        desktop_id: &str,
+    ) -> Result<pb::DisableDockerResult, PrivdError> {
+        let command = Command::DisableDocker(pb::DisableDockerRequest {
+            desktop_id: desktop_id.to_owned(),
+        });
+        match self.call(command, &[], None).await? {
+            pb::response::Result::DisableDocker(r) => Ok(r),
+            _ => Err(PrivdError::Protocol("unexpected result variant".into())),
+        }
+    }
+
+    /// `CheckUpdate` (section 6.12).
+    pub async fn check_update(&self) -> Result<pb::CheckUpdateResult, PrivdError> {
+        let command = Command::CheckUpdate(pb::CheckUpdateRequest {});
+        match self.call(command, &[], None).await? {
+            pb::response::Result::CheckUpdate(r) => Ok(r),
+            _ => Err(PrivdError::Protocol("unexpected result variant".into())),
+        }
+    }
+
+    /// `ApplyUpdate` (section 6.12): privd answers first, then restarts the agent.
+    pub async fn apply_update(&self, version: &str) -> Result<pb::ApplyUpdateResult, PrivdError> {
+        let command = Command::ApplyUpdate(pb::ApplyUpdateRequest {
+            version: version.to_owned(),
+        });
+        match self.call(command, &[], None).await? {
+            pb::response::Result::ApplyUpdate(r) => Ok(r),
+            _ => Err(PrivdError::Protocol("unexpected result variant".into())),
+        }
+    }
+
     /// `ProvisionSessionLink` (section 6.11): ensures the proxy device exists and returns the
     /// host path of the link socket.
     pub async fn provision_session_link(&self, desktop_id: &str) -> Result<String, PrivdError> {
