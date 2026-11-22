@@ -153,6 +153,10 @@ if id -u "$from" >/dev/null 2>&1 && ! id -u "$to" >/dev/null 2>&1; then
   done
   if [ "$ok" != 1 ]; then echo "could not rename $from to $to" >&2; exit 1; fi
   if getent group "$from" >/dev/null && ! getent group "$to" >/dev/null; then groupmod -n "$to" "$from"; fi
+  # usermod -l leaves the subordinate id ranges under the old name.
+  for f in /etc/subuid /etc/subgid; do
+    if [ -f "$f" ]; then sed -i "s/^$from:/$to:/" "$f"; fi
+  done
   loginctl enable-linger "$to"
 fi
 "#,

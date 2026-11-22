@@ -115,6 +115,12 @@ pub struct State {
     pub refuse_cancel: bool,
     /// Answer this many `/wait` calls with Incus 6.0.0's `500 context deadline exceeded`.
     pub wait_timeouts: u32,
+    /// Local image store: fingerprint to (aliases, size).
+    pub images: BTreeMap<String, (Vec<String>, u64)>,
+    /// Report this fingerprint from an image import instead of the real one.
+    pub import_reports: Option<String>,
+    /// `POST /1.0/images` requests received (accepted or not).
+    pub import_requests: u32,
 }
 
 impl State {
@@ -157,6 +163,9 @@ impl State {
             forgotten_ops: Default::default(),
             refuse_cancel: false,
             wait_timeouts: 0,
+            images: BTreeMap::new(),
+            import_reports: None,
+            import_requests: 0,
         }
     }
 }
@@ -191,6 +200,16 @@ mod tempdir {
 
 fn sync(meta: Value) -> (u16, String) {
     (200, json!({"type":"sync","status":"Success","status_code":200,"operation":"","error_code":0,"error":"","metadata":meta}).to_string())
+}
+
+fn image_json(fp: &str, aliases: &[String], size: u64) -> Value {
+    json!({
+        "fingerprint": fp,
+        "size": size,
+        "created_at": "2026-11-20T10:00:00Z",
+        "properties": {"os": "test"},
+        "aliases": aliases.iter().map(|a| json!({"name": a, "description": ""})).collect::<Vec<_>>(),
+    })
 }
 
 fn not_found(what: &str) -> (u16, String) {
@@ -482,6 +501,64 @@ impl State {
                     .collect();
                 sync(Value::Array(items))
             }
+            ("POST", ["1.0", "images"]) => {
+                use sha2::{Digest, Sha256};
+                let fp = Sha256::digest(&r.body)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>();
+                self.import_requests += 1;
+                if let Some(want) = r.headers.get("x-incus-fingerprint")
+                    && *want != fp
+                {
+                    return (
+                        400,
+                        json!({"type":"error","error_code":400,"error":format!("Image fingerprint doesn't match. Got {fp} expected {want}")}).to_string(),
+                    );
+                }
+                if self.images.contains_key(&fp) {
+                    return (
+                        409,
+                        json!({"type":"error","error_code":409,"error":"Image with same fingerprint already exists"}).to_string(),
+                    );
+                }
+                self.images
+                    .insert(fp.clone(), (Vec::new(), r.body.len() as u64));
+                let reported = self.import_reports.clone().unwrap_or(fp);
+                self.new_op(json!({ "fingerprint": reported }), 1)
+            }
+            ("GET", ["1.0", "images"]) => sync(Value::Array(
+                self.images
+                    .iter()
+                    .map(|(fp, (al, sz))| image_json(fp, al, *sz))
+                    .collect(),
+            )),
+            ("GET", ["1.0", "images", fp]) => match self.images.get(*fp) {
+                Some((al, sz)) => sync(image_json(fp, al, *sz)),
+                None => not_found("image"),
+            },
+            ("DELETE", ["1.0", "images", fp]) => match self.images.remove(*fp) {
+                Some(_) => self.new_op(Value::Null, 0),
+                None => not_found("image"),
+            },
+            ("POST", ["1.0", "images", "aliases"]) => {
+                let name = body["name"].as_str().unwrap_or_default().to_string();
+                if self.images.values().any(|(al, _)| al.contains(&name)) {
+                    return (
+                        409,
+                        json!({"type":"error","error_code":409,"error":"Alias already exists"})
+                            .to_string(),
+                    );
+                }
+                let target = body["target"].as_str().unwrap_or_default();
+                match self.images.get_mut(target) {
+                    Some((al, _)) => {
+                        al.push(name);
+                        sync(Value::Null)
+                    }
+                    None => not_found("image"),
+                }
+            }
             ("GET", ["1.0", "operations", id, "wait"]) => {
                 if self.wait_timeouts > 0 {
                     self.wait_timeouts -= 1;
@@ -551,23 +628,24 @@ impl State {
             cmd.clone()
         };
         let joined = inner.join(" ");
-        let (exit, out, err) = if joined.contains("systemctl is-system-running") {
-            let s = if self.running_states.len() > 1 {
-                self.running_states.pop_front().unwrap()
+        let (exit, out, err) =
+            if joined.contains("systemctl is-system-running") && !joined.contains("dpkg-query") {
+                let s = if self.running_states.len() > 1 {
+                    self.running_states.pop_front().unwrap()
+                } else {
+                    self.running_states[0].clone()
+                };
+                (
+                    if s == "running" { 0 } else { 1 },
+                    format!("{s}\n"),
+                    String::new(),
+                )
             } else {
-                self.running_states[0].clone()
+                match self.exec_rules.iter().find(|r| joined.contains(&r.needle)) {
+                    Some(r) => (r.exit, r.stdout.clone(), r.stderr.clone()),
+                    None => (0, String::new(), String::new()),
+                }
             };
-            (
-                if s == "running" { 0 } else { 1 },
-                format!("{s}\n"),
-                String::new(),
-            )
-        } else {
-            match self.exec_rules.iter().find(|r| joined.contains(&r.needle)) {
-                Some(r) => (r.exit, r.stdout.clone(), r.stderr.clone()),
-                None => (0, String::new(), String::new()),
-            }
-        };
         if wrapped {
             let base = &cmd[4];
             self.files.insert(format!("{base}.out"), out.into_bytes());
