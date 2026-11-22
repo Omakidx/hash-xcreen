@@ -81,7 +81,7 @@ Every language, library, tool and external service hash-xcreen uses, and why. It
 | Web login | **WebAuthn passkeys** (`webauthn-rs`) | Phishing-resistant browser login |
 | Client key storage | Secret Service / libsecret via `keyring` | System keyring on Linux |
 | Syscall filtering | seccomp allowlist (`seccompiler`) plus systemd hardening | Contain `hx-gatewayd` if exploited |
-| Fuzzing | `cargo-fuzz` (libFuzzer); OSS-Fuzz later | Pre-auth and container-supplied parsers |
+| Fuzzing | `cargo-fuzz` (libFuzzer, via `libfuzzer-sys`) on a dated nightly toolchain, in the `fuzz/` crate that is excluded from the product workspace; AddressSanitizer; nightly GitHub workflow; OSS-Fuzz later. The crates expose their entry points behind a `fuzzing` Cargo feature that no product build enables. Seed generation reuses `spake2` and `tar` (already approved) | Pre-auth and container-supplied parsers; the toolchain, sanitizer flags and `libfuzzer-sys` stay out of the product build and its `Cargo.lock` |
 
 ## Backups
 
@@ -108,7 +108,7 @@ Every language, library, tool and external service hash-xcreen uses, and why. It
 | Area | Choice |
 |---|---|
 | Workspace | One Cargo workspace; `--locked` builds; one semver version for all components |
-| Test runner | `cargo nextest`; `proptest` for property tests; `criterion` for microbenchmarks |
+| Test runner | `cargo nextest`; `proptest` for property tests; `criterion` for microbenchmarks; `cargo-fuzz` for the fuzz targets (`fuzz/README.md`) |
 | Gateway test support | `tempfile`, `hmac` + `sha2` (a fake `hx-privd` that derives its own pepper), `quinn` + `rustls` (a raw QUIC client that can announce protocol 1.0, for the takeover fallback), `strace` as an optional development aid for deriving the seccomp allowlist | Tests of `hx-gatewayd` against a privd written from `docs/ipc.md` alone |
 | UI tests | Slint testing backend; screenshot comparison; **Playwright** for the web client |
 | Network simulation | `tc netem` profiles in CI |

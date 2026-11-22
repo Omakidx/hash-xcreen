@@ -1,0 +1,13 @@
+# libFuzzer dictionary for the agent_fetcher_url target
+k0="https://"
+k1="http://"
+k2="github.com"
+k3="objects.githubusercontent.com"
+k4="release-assets.githubusercontent.com"
+k5=":443"
+k6="/Omakidx/hash-xcreen/releases/download/"
+k7="?"
+k8="#"
+k9="@"
+k10="[::1]"
+k11="%2f"

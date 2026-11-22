@@ -206,7 +206,7 @@ Notes (design approved 2026-11-22, written before the code):
 - **App decisions** (mockups README, architecture §11.1): the theme follows the system; Backups, web access, passkeys and alerts are hidden in the Phase 1 app; system title bar; 900 x 600 minimum; ten grouped stage rows; password of at least 8 characters with a matching confirmation; video on the CPU-upload path first.
 
 ### 1H — Hardening
-- [ ] Fuzz targets for every pre-auth and container-supplied parser, running nightly
+- [x] Fuzz targets for every pre-auth and container-supplied parser, running nightly
 - [ ] Performance suite on the dedicated runner with regression thresholds
 - [ ] End-to-end tests: install → pair → connect → type and scroll → disconnect, under netem profiles
 - [ ] Independent security review of 1B, 1C and 1E; findings fixed
