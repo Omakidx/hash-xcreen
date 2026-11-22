@@ -10,11 +10,12 @@ Scripts behind `.github/workflows/release.yml` (design D7 of the 1E installer). 
 | `make-test-release.sh` | A TEST-keyed release directory for local and CI tests (never a real release). |
 | `openssl-minisign.sh` | minisign-compatible test keys and signatures with openssl only (test use). |
 | `verify-with-installer.sh` | Verifies a signature with a shipped `install.sh`'s own function. |
+| `tests/gate-pinning.sh` | Test of the SHA-pinning check of `gate.sh` over every workflow file (`sh release/tests/gate-pinning.sh`). |
 | `tests/gate-image-keys.sh` | Test of the image-key check of `gate.sh` on a synthetic tree with per-run test keys (`sh release/tests/gate-image-keys.sh`). |
 
-## Supply-chain rules of `release.yml` (enforced by `gate.sh`)
+## Supply-chain rules (enforced by `gate.sh`)
 
-- Every `uses:` is pinned to a full 40-hex commit SHA, with the tag as a trailing comment. To bump
+- Every `uses:` of EVERY workflow in `.github/workflows` is pinned to a full 40-hex commit SHA (a `docker://` image to its `sha256` digest), with the tag as a trailing comment. To bump
   one: `gh api repos/<owner>/<repo>/commits/<tag> --jq .sha`, review the diff of that action, and
   replace both the SHA and the comment.
 - No build cache (`Swatinem/rust-cache`, `actions/cache`) anywhere in the workflow: a release build
@@ -70,7 +71,10 @@ sudo sh install.sh --pair ...
   manifest, the manifest's size for the tarball), because curl before 8.4 does not enforce
   `--max-filesize` without a Content-Length;
 - with `--release-dir`, refuses a directory or file that is group- or other-writable or not owned by
-  root, and copies only regular files, bounded by those caps (a FIFO or a huge file is refused).
+  root, **and every parent directory of it that is not root-owned or is group-/other-writable** (a
+  sticky directory such as `/tmp` is tolerated), and copies only regular files, bounded by those
+  caps (a FIFO or a huge file is refused);
+- ignores `TMPDIR` (`unset` in `main`; the self-test makes its scratch directory under `/tmp`).
 
 ## Desktop images (`images.yml`)
 
@@ -117,7 +121,12 @@ Once, before the first publish:
       and `crates/hx-provision/` to CODEOWNERS (or a ruleset with the same effect).
 - [ ] **Do not enable repository-wide "immutable releases"**: `images` (and `channel-*`) are moving
       releases whose assets are replaced. The `images-<build_id>` releases are immutable by
-      convention (the workflow only adds to them).
+      convention: the workflow only adds to them, and refuses (fails) when an asset of that name
+      already exists; it never uses `--clobber` on them.
+- [ ] **`image-signing` and tags**: `images.yml` only builds `v*` tags whose commit is an ancestor of
+      `main` (others are skipped with a warning), and `release.yml` fails its gate for a tag that is
+      not on `main`; also restrict `v*` tag creation with a tag ruleset (above) so that tags cannot
+      be pushed from arbitrary branches at all.
 - [ ] **Actions permissions**: the default `GITHUB_TOKEN` stays read-only (each job asks for what it
       needs; `contents: write` is in `publish` only).
 - [ ] **Rehearse** on a pull request first: the `image` cells and `rehearse` run with test keys and

@@ -73,7 +73,7 @@ jobs:
     outputs:
       run: ${{ steps.g.outputs.run }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
       - id: g
@@ -102,7 +102,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned toolchain
         run: rustup toolchain install
       - name: Install system libraries
@@ -111,7 +111,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang libclang-dev pkg-config libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libx264-dev dpkg-dev jq
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Self-test of the pty driver of the interactive cell
         run: tests/installer-vm/test-tty-driver.sh
       - name: Install and prepare Incus (containers only, no KVM) for the test image
@@ -141,7 +141,7 @@ jobs:
           df -h /mnt /var/lib/incus/disks
       - name: Build the test-keyed release directory, the client and the test-signed image
         run: tests/installer-vm/build-artifacts.sh "$RUNNER_TEMP/artifacts"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: installer-vm-artifacts
           # The image is a separate artifact: only the prebuilt cells download it.
@@ -150,7 +150,7 @@ jobs:
             !${{ runner.temp }}/artifacts/img
           retention-days: 3
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: installer-vm-image
           path: ${{ runner.temp }}/artifacts/img
@@ -202,12 +202,12 @@ jobs:
             image: build
             variant: auto
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: installer-vm-artifacts
           path: ${{ runner.temp }}/artifacts
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         if: matrix.image == 'prebuilt'
         with:
           name: installer-vm-image
@@ -261,7 +261,7 @@ jobs:
               awk -F'\t' '{print "| " $1 " | " $2 " |"}' "$f"
             } >> "$GITHUB_STEP_SUMMARY"
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: cell-${{ matrix.os }}-${{ matrix.image }}-${{ matrix.variant }}
