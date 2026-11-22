@@ -506,6 +506,8 @@ impl Session {
             Some(Ctl::Pairing(_) | Ctl::Auth(_)) => {
                 violation("pairing or auth after authorization")
             }
+            // Setup messages belong to INTENT_SETUP connections only (protocol 1.3, 5.10).
+            Some(Ctl::Setup(_)) => violation("setup message on a session"),
             // Ping and Pong never surface; a message with no variant never validates.
             Some(Ctl::Ping(_) | Ctl::Pong(_)) | None => Flow::Continue,
         }

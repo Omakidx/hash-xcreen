@@ -343,7 +343,9 @@ async fn handle_pending(sh: Arc<Shared>, pending: PendingSession) {
     // Pairing and the PIN login are both `Authenticator::authenticate`: the current registry
     // is read for every session, the PIN is checked by `PrivdPinVerifier`.
     match sh.auth.authenticate(pending).await {
-        Ok(Outcome::Paired { connection, device }) => {
+        Ok(Outcome::Paired {
+            connection, device, ..
+        }) => {
             tracing::info!(device = %device.id, "device paired");
             sh.devices.announce_added(&device);
             // Post-pairing setup messages (password, PIN) are specified by 1G; until then the
@@ -355,6 +357,13 @@ async fn handle_pending(sh: Arc<Shared>, pending: PendingSession) {
         Ok(Outcome::Authorized { connection, device }) => {
             tracing::info!(device = %device.id, "session authorized");
             sh.sessions.serve(connection, device, revocations).await;
+        }
+        // No `SetupGate` is installed until the setup coordinator exists, so the authenticator
+        // refuses `INTENT_SETUP` before this can happen; close defensively if it ever does.
+        Ok(Outcome::Setup { connection, .. }) => {
+            connection
+                .close(CloseCode::SetupClosed, "setup is not available")
+                .await;
         }
         Ok(Outcome::Refused(_)) => {}
         Err(e) => tracing::debug!(error = %e, "authentication ended without success"),
