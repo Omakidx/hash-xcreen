@@ -55,6 +55,9 @@ pub enum AuthStatus {
     Revoked = 4,
     /// The server cannot verify PINs.
     NotAvailable = 5,
+    /// Protocol 1.3, sent only on an `INTENT_SETUP` connection whose device already has a PIN:
+    /// the setup connection needs the PIN first (the exchange is then exactly §11.4).
+    PinRequired = 6,
 }
 
 /// Envelope body of `ControlMessage.pairing`.

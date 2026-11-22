@@ -171,6 +171,7 @@ async fn pairing_with_a_long_token_pins_both_keys_and_is_single_use() {
         let Outcome::Paired {
             connection,
             device: rec,
+            ..
         } = e.next().await.expect("outcome")
         else {
             panic!("expected Paired");

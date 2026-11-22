@@ -12,6 +12,7 @@
 //!   device or an authorized session.
 //! * [`session`]: the client side of a session ([`connect_session`], PIN submission).
 //! * [`wire`]: the messages inside the pairing and auth envelopes.
+//! * [`setup`]: the client side of the post-pairing setup connection (protocol 1.3).
 //!
 //! Everything that can be driven by a peer returns an error instead of panicking, and no
 //! secret ever reaches `Debug`, logs or error text.
@@ -28,18 +29,22 @@ pub mod pin;
 pub mod registry;
 pub mod secrets;
 pub mod session;
+pub mod setup;
 pub mod text;
 pub mod tls;
 pub mod wire;
 
 pub use auth::{
     Authenticator, AuthenticatorConfig, BoxFuture, DEFAULT_LOCKED_WAIT, MAX_LOCKED_WAIT, Outcome,
-    PinVerdict, PinVerifier, RegistryView, RevocationGuard, RevocationPermit,
+    PinVerdict, PinVerifier, RegistryView, RevocationGuard, RevocationPermit, SetupAdmission,
+    SetupGate,
 };
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use error::{Error, Result};
 pub use keys::{DeviceId, Fingerprint, IdentityKey, PublicKey};
-pub use pairing::{PairClientOptions, PairedServer, PairingLimits, PairingWindow, pair_device};
+pub use pairing::{
+    PairClientOptions, PairedServer, PairedWith, PairingLimits, PairingWindow, pair_device,
+};
 pub use pin::{MAX_PIN_FAILURES, PinHash, PinParams};
 pub use registry::{
     DeviceRecord, DeviceRegistry, FileRegistry, MemoryRegistry, Revocation, RevokeReason,
