@@ -7,6 +7,50 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
+build = "build.rs"
 
 [lints]
 workspace = true
+
+[lib]
+name = "hx_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hx-desktop"
+path = "src/main.rs"
+
+[dependencies]
+bytes.workspace = true
+ffmpeg-next.workspace = true # software H.264 decode (hx-codec has no decode side yet)
+hx-crypto.workspace = true
+hx-proto.workspace = true
+hx-transport.workspace = true
+keyring = "4" # Secret Service (zbus, no C library) for the device key
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] } # ServerName for hx_transport::Target
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+slint = { version = "=1.19.0", default-features = false, features = ["std", "backend-winit", "backend-winit-x11", "backend-winit-wayland", "renderer-femtovg", "renderer-software", "compat-1-2", "unstable-winit-030"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "net", "fs", "io-util"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std", "env-filter"] }
+yuvutils-rs.workspace = true
+zeroize.workspace = true
+
+[build-dependencies]
+slint-build = "=1.19.0"
+
+[dev-dependencies]
+# The ignored end-to-end test (tests/session_e2e.rs) reuses the relay harness of hx-agent.
+hmac = "0.12"
+hx-agent = { path = "../hx-agent", features = ["test-support", "gateway-test-hooks", "install-test-hooks"] }
+hx-capture.workspace = true
+hx-ipc = { workspace = true, features = ["privd", "link"] }
+hx-session.workspace = true
+rustix = { workspace = true, features = ["fs", "process", "net", "event", "rand", "termios"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+sha2 = "0.10"
+tempfile = "3.27.0"
+x11rb = { workspace = true, features = ["xtest"] }
+i-slint-backend-testing = { version = "=1.19.0", features = ["renderer-software"] }

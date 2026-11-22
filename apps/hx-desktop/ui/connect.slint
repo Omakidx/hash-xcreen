@@ -1,0 +1,320 @@
+import { Tokens } from "tokens.slint";
+import { ScrollView } from "std-widgets.slint";
+import { Btn, Banner, ButtonRow, Card, Check, Field, Heading, Label, Mono, Muted, Spinner } from "widgets.slint";
+import { AppBar } from "home.slint";
+import { ConnectVm } from "state.slint";
+
+export component ConnectScreen inherits Rectangle {
+    background: Tokens.bg;
+    VerticalLayout {
+        AppBar {
+            crumb: "Servers  /  " + ConnectVm.server-name + "  /  Connect";
+        }
+
+        Rectangle {
+            vertical-stretch: 1;
+            ScrollView {
+                VerticalLayout {
+                    padding: Tokens.sp-6;
+                    alignment: center;
+                    VerticalLayout {
+                        max-width: 520px;
+                        spacing: Tokens.sp-4;
+                        alignment: start;
+                        Heading {
+                            text: ConnectVm.server-name;
+                            level: 1;
+                        }
+
+                        Mono {
+                            text: ConnectVm.address;
+                            color: Tokens.text-2;
+                        }
+
+                        // ----------------------------------------------------- PIN form
+                        if ConnectVm.phase == 0 || ConnectVm.phase == 1 || ConnectVm.phase == 2 || ConnectVm.phase == 3: VerticalLayout {
+                            spacing: Tokens.sp-3;
+                            if ConnectVm.phase == 0 && ConnectVm.notice-title == "": Label {
+                                text: "Enter the PIN you chose when you set up this desktop.";
+                            }
+                            if ConnectVm.takeover-hint != "": Banner {
+                                title: "Another device will be disconnected";
+                                text: ConnectVm.takeover-hint;
+                                tone: 2;
+                            }
+                            if ConnectVm.notice-title != "": Banner {
+                                title: ConnectVm.notice-title;
+                                text: ConnectVm.notice-text;
+                                tone: ConnectVm.notice-tone;
+                            }
+                            if ConnectVm.phase == 1 || ConnectVm.phase == 2: HorizontalLayout {
+                                spacing: Tokens.sp-3;
+                                alignment: start;
+                                Spinner { }
+
+                                VerticalLayout {
+                                    Text {
+                                        text: ConnectVm.phase == 1 ? "Connecting…" : "Checking your PIN…";
+                                        color: Tokens.text;
+                                        font-weight: Tokens.fw-medium;
+                                        accessible-role: AccessibleRole.text;
+                                    }
+
+                                    Muted {
+                                        text: ConnectVm.phase == 2 ? "Connected securely. The server verifies the PIN." : "Opening a secure connection.";
+                                    }
+                                }
+                            }
+                            Field {
+                                label: "PIN";
+                                password: true;
+                                reveal: ConnectVm.show-pin;
+                                text <=> ConnectVm.pin;
+                                placeholder: "6 or more digits";
+                                autofocus: true;
+                                focus-request: ConnectVm.focus-tick;
+                                enabled: ConnectVm.phase == 0;
+                                accepted => {
+                                    ConnectVm.submit();
+                                }
+                            }
+
+                            Check {
+                                title: "Show PIN";
+                                checked <=> ConnectVm.show-pin;
+                            }
+
+                            ButtonRow {
+                                Btn {
+                                    text: "Cancel";
+                                    clicked => {
+                                        ConnectVm.cancel();
+                                    }
+                                }
+
+                                Btn {
+                                    text: ConnectVm.phase == 3 ? "Connect in " + ConnectVm.wait-secs + " s" : "Connect";
+                                    kind: "primary";
+                                    enabled: ConnectVm.phase == 0 && ConnectVm.pin != "";
+                                    clicked => {
+                                        ConnectVm.submit();
+                                    }
+                                }
+                            }
+                        }
+
+                        // ----------------------------------------------------- revoked
+                        if ConnectVm.phase == 4: VerticalLayout {
+                            spacing: Tokens.sp-3;
+                            Banner {
+                                title: "This device was removed from the server";
+                                text: "The server no longer trusts this device, so the PIN cannot be tried again here.";
+                                tone: 3;
+                            }
+
+                            Label {
+                                text: "To use this server from this device again, pair it again. You will need the account password you chose during setup, then your PIN.";
+                            }
+
+                            ButtonRow {
+                                Btn {
+                                    text: "Back to Home";
+                                    clicked => {
+                                        ConnectVm.back();
+                                    }
+                                }
+
+                                Btn {
+                                    text: "Pair again";
+                                    kind: "primary";
+                                    autofocus: true;
+                                    clicked => {
+                                        ConnectVm.pair-again();
+                                    }
+                                }
+                            }
+                        }
+
+                        // ----------------------------------------------------- pair again
+                        if ConnectVm.phase == 5: VerticalLayout {
+                            spacing: Tokens.sp-3;
+                            Label {
+                                text: "Enter the Linux account password of the desktop. It is sent once over an encrypted connection and not kept.";
+                            }
+
+                            Field {
+                                label: "Account password";
+                                password: true;
+                                text <=> ConnectVm.password;
+                                error: ConnectVm.err-password;
+                                enabled: !ConnectVm.pairing;
+                                accepted => {
+                                    ConnectVm.submit-password();
+                                }
+                            }
+
+                            if ConnectVm.pairing: HorizontalLayout {
+                                spacing: Tokens.sp-2;
+                                alignment: start;
+                                Spinner { }
+
+                                Muted {
+                                    text: "Pairing…";
+                                    vertical-alignment: center;
+                                }
+                            }
+                            ButtonRow {
+                                Btn {
+                                    text: "Cancel";
+                                    clicked => {
+                                        ConnectVm.back();
+                                    }
+                                }
+
+                                Btn {
+                                    text: "Pair and continue";
+                                    kind: "primary";
+                                    enabled: ConnectVm.password != "" && !ConnectVm.pairing;
+                                    clicked => {
+                                        ConnectVm.submit-password();
+                                    }
+                                }
+                            }
+                        }
+
+                        // ----------------------------------------------------- not available
+                        if ConnectVm.phase == 6: VerticalLayout {
+                            spacing: Tokens.sp-3;
+                            Banner {
+                                title: "The server cannot check PINs right now";
+                                text: "This is not a wrong PIN and nothing was counted. Try again in about a minute. If it keeps happening, check the server in Server details.";
+                                tone: 2;
+                            }
+
+                            ButtonRow {
+                                Btn {
+                                    text: "Back to Home";
+                                    clicked => {
+                                        ConnectVm.back();
+                                    }
+                                }
+
+                                Btn {
+                                    text: ConnectVm.wait-secs > 0 ? "Try again in " + ConnectVm.wait-secs + " s" : "Try again";
+                                    kind: "primary";
+                                    enabled: ConnectVm.wait-secs == 0;
+                                    clicked => {
+                                        ConnectVm.retry();
+                                    }
+                                }
+                            }
+                        }
+
+                        // ----------------------------------------------------- unreachable
+                        if ConnectVm.phase == 7: VerticalLayout {
+                            spacing: Tokens.sp-3;
+                            Banner {
+                                title: "Cannot reach " + ConnectVm.address;
+                                text: "No answer. The server may be off, the address may have changed, or a firewall may block the port.";
+                                tone: 3;
+                            }
+
+                            ButtonRow {
+                                Btn {
+                                    text: "Back to Home";
+                                    clicked => {
+                                        ConnectVm.back();
+                                    }
+                                }
+
+                                Btn {
+                                    text: "Server details";
+                                    clicked => {
+                                        ConnectVm.open-details();
+                                    }
+                                }
+
+                                Btn {
+                                    text: "Try again";
+                                    kind: "primary";
+                                    autofocus: true;
+                                    clicked => {
+                                        ConnectVm.retry();
+                                    }
+                                }
+                            }
+                        }
+
+                        // ----------------------------------------------------- identity changed
+                        if ConnectVm.phase == 8: VerticalLayout {
+                            spacing: Tokens.sp-3;
+                            Banner {
+                                title: "This server's identity changed";
+                                text: "The server at " + ConnectVm.address + " presented a different key than the one this app pinned when it was paired. This can mean the server was reinstalled, or that someone is intercepting the connection. No PIN was sent.";
+                                tone: 3;
+                            }
+
+                            Card {
+                                height: keys.preferred-height + 2 * Tokens.sp-3;
+                                keys := VerticalLayout {
+                                    padding: Tokens.sp-3;
+                                    spacing: Tokens.sp-1;
+                                    HorizontalLayout {
+                                        spacing: Tokens.sp-3;
+                                        Text {
+                                            text: "Pinned";
+                                            color: Tokens.text-2;
+                                            font-size: Tokens.fs-sm;
+                                            width: 80px;
+                                        }
+
+                                        Mono {
+                                            text: ConnectVm.pinned-fp;
+                                        }
+                                    }
+
+                                    HorizontalLayout {
+                                        spacing: Tokens.sp-3;
+                                        Text {
+                                            text: "Presented";
+                                            color: Tokens.danger;
+                                            font-size: Tokens.fs-sm;
+                                            width: 80px;
+                                        }
+
+                                        Mono {
+                                            text: ConnectVm.presented-fp;
+                                            color: Tokens.danger;
+                                        }
+                                    }
+                                }
+                            }
+
+                            Muted {
+                                text: "If you reinstalled the server yourself, remove it from the app and pair it again.";
+                            }
+
+                            ButtonRow {
+                                Btn {
+                                    text: "Back to Home";
+                                    autofocus: true;
+                                    clicked => {
+                                        ConnectVm.back();
+                                    }
+                                }
+
+                                Btn {
+                                    text: "Remove server from this app";
+                                    kind: "danger";
+                                    clicked => {
+                                        ConnectVm.remove-server();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

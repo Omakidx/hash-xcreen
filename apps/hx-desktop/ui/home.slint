@@ -1,0 +1,259 @@
+import { Tokens } from "tokens.slint";
+import { ScrollView } from "std-widgets.slint";
+import { Btn, Badge, Card, Heading, Label, Muted, Mono, Spinner } from "widgets.slint";
+import { HomeVm, ServerCardData } from "state.slint";
+
+export component AppBar inherits Rectangle {
+    in property <string> title: "hash-xcreen";
+    in property <string> crumb;
+    height: Tokens.appbar-h;
+    background: Tokens.surface;
+    Rectangle {
+        y: parent.height - 1px;
+        height: 1px;
+        background: Tokens.border;
+    }
+
+    HorizontalLayout {
+        padding-left: Tokens.sp-5;
+        padding-right: Tokens.sp-5;
+        spacing: Tokens.sp-3;
+        alignment: stretch;
+        Text {
+            text: root.title;
+            color: Tokens.text;
+            font-size: Tokens.fs-lg;
+            font-weight: Tokens.fw-medium;
+            vertical-alignment: center;
+            accessible-role: AccessibleRole.text;
+        }
+
+        if root.crumb != "": Text {
+            text: "/  " + root.crumb;
+            color: Tokens.text-2;
+            font-size: Tokens.fs-md;
+            vertical-alignment: center;
+        }
+        Rectangle {
+            horizontal-stretch: 1;
+        }
+
+        HorizontalLayout {
+            spacing: Tokens.sp-2;
+            padding-top: (Tokens.appbar-h - Tokens.control-h) / 2;
+            padding-bottom: (Tokens.appbar-h - Tokens.control-h) / 2;
+            @children
+        }
+    }
+}
+
+component ServerCard inherits Card {
+    in property <ServerCardData> d;
+    height: 168px;
+    accessible-role: AccessibleRole.groupbox;
+    accessible-label: d.name + ", " + d.address + ", " + d.status;
+    VerticalLayout {
+        padding: Tokens.sp-4;
+        spacing: Tokens.sp-2;
+        HorizontalLayout {
+            spacing: Tokens.sp-2;
+            Text {
+                text: d.name;
+                color: Tokens.text;
+                font-size: Tokens.fs-lg;
+                font-weight: Tokens.fw-medium;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+        }
+
+        Mono {
+            text: d.address;
+            color: Tokens.text-2;
+            wrap: no-wrap;
+            overflow: elide;
+        }
+
+        HorizontalLayout {
+            spacing: Tokens.sp-2;
+            alignment: start;
+            Badge {
+                text: d.status;
+                tone: d.tone;
+            }
+
+            if d.extra-badge != "": Badge {
+                text: d.extra-badge;
+                tone: 4;
+                dot: false;
+            }
+        }
+
+        Text {
+            text: d.note;
+            color: Tokens.text-2;
+            font-size: Tokens.fs-sm;
+            wrap: word-wrap;
+            overflow: elide;
+            vertical-stretch: 1;
+        }
+
+        HorizontalLayout {
+            spacing: Tokens.sp-2;
+            if d.action != "none": Btn {
+                text: d.action-label;
+                kind: "primary";
+                enabled: d.action-enabled;
+                clicked => {
+                    HomeVm.primary(d.id, d.action);
+                }
+            }
+            Btn {
+                text: "Details";
+                clicked => {
+                    HomeVm.details(d.id);
+                }
+            }
+        }
+    }
+}
+
+component Welcome inherits Rectangle {
+    ScrollView {
+        VerticalLayout {
+            padding: Tokens.sp-6;
+            spacing: Tokens.sp-5;
+            alignment: center;
+            VerticalLayout {
+                spacing: Tokens.sp-4;
+                alignment: center;
+                max-width: 720px;
+                Heading {
+                    text: "Welcome to hash-xcreen";
+                    level: 1;
+                }
+
+                Label {
+                    text: "Your own remote desktop, on a server you control. hash-xcreen sets up a desktop on your server, streams it to this app, and keeps it protected by a PIN. Nothing runs in anyone else's cloud.";
+                    color: Tokens.text-2;
+                    font-size: Tokens.fs-lg;
+                }
+
+                for item in [
+                    { t: "Set up over SSH", d: "Give the app SSH access once; it does the rest." },
+                    { t: "Or paste one command", d: "Run it on the server yourself, no SSH from here." },
+                    { t: "Locked by a PIN", d: "Each device is paired, and the PIN protects the desktop." },
+                ]: Card {
+                    height: 68px;
+                    VerticalLayout {
+                        padding: Tokens.sp-3;
+                        padding-left: Tokens.sp-4;
+                        spacing: 2px;
+                        alignment: center;
+                        Text {
+                            text: item.t;
+                            color: Tokens.text;
+                            font-size: Tokens.fs-md;
+                            font-weight: Tokens.fw-medium;
+                        }
+
+                        Text {
+                            text: item.d;
+                            color: Tokens.text-2;
+                            font-size: Tokens.fs-sm;
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: Tokens.sp-3;
+                    alignment: start;
+                    Btn {
+                        text: "Add server";
+                        kind: "primary";
+                        autofocus: true;
+                        clicked => {
+                            HomeVm.add-server();
+                        }
+                    }
+
+                    Btn {
+                        text: "I already installed it: enter a pairing code";
+                        kind: "ghost";
+                        clicked => {
+                            HomeVm.enter-code();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component HomeScreen inherits Rectangle {
+    background: Tokens.bg;
+    VerticalLayout {
+        AppBar {
+            Btn {
+                text: "Settings";
+                kind: "ghost";
+                clicked => {
+                    HomeVm.open-settings();
+                }
+            }
+
+            if HomeVm.servers.length > 0 || HomeVm.loading: Btn {
+                text: "Add server";
+                kind: "primary";
+                clicked => {
+                    HomeVm.add-server();
+                }
+            }
+        }
+
+        if HomeVm.servers.length == 0 && !HomeVm.loading: Welcome {
+            vertical-stretch: 1;
+        }
+        if HomeVm.servers.length > 0 || HomeVm.loading: Rectangle {
+            vertical-stretch: 1;
+            fl := Flickable {
+                content-height: max(self.height, hdr.preferred-height + grid.height + 2 * Tokens.sp-5);
+                hdr := VerticalLayout {
+                    x: Tokens.sp-5;
+                    y: Tokens.sp-5;
+                    width: parent.width - 2 * Tokens.sp-5;
+                    spacing: 2px;
+                    Heading {
+                        text: "Servers";
+                        level: 2;
+                    }
+
+                    Muted {
+                        text: HomeVm.loading ? "Checking each server…" : "Your remote desktops. Connect asks for your PIN.";
+                    }
+                }
+
+                property <int> cols: max(1, floor((self.width - 2 * Tokens.sp-5 + Tokens.sp-4) / (340px + Tokens.sp-4)));
+                property <length> cw: (self.width - 2 * Tokens.sp-5 - (cols - 1) * Tokens.sp-4) / cols;
+                grid := Rectangle {
+                    x: 0px;
+                    y: hdr.y + hdr.preferred-height + Tokens.sp-4;
+                    width: parent.width;
+                    height: ceil(HomeVm.servers.length / fl.cols) * (168px + Tokens.sp-4);
+                    for s[i] in HomeVm.servers: ServerCard {
+                        d: s;
+                        x: Tokens.sp-5 + mod(i, fl.cols) * (fl.cw + Tokens.sp-4);
+                        y: floor(i / fl.cols) * (168px + Tokens.sp-4);
+                        width: fl.cw;
+                    }
+                }
+            }
+        }
+    }
+
+    if HomeVm.loading: Rectangle {
+        x: parent.width - 60px;
+        y: 18px;
+        Spinner { }
+    }
+}

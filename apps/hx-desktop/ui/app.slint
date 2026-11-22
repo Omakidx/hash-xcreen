@@ -1,0 +1,105 @@
+import { Tokens, ThemeMode } from "tokens.slint";
+import { Btn, Banner, Heading, Label } from "widgets.slint";
+import { Nav, Screen, HomeVm, WizardVm, ProgressVm, ConnectVm, DesktopVm, DetailsVm, SettingsVm } from "state.slint";
+import { HomeScreen } from "home.slint";
+import { WizardScreen } from "wizard.slint";
+import { ProgressScreen } from "progress.slint";
+import { ConnectScreen } from "connect.slint";
+import { DesktopScreen } from "desktop.slint";
+import { DetailsScreen } from "details.slint";
+import { SettingsScreen } from "settings.slint";
+
+export { Tokens, ThemeMode }
+export * from "state.slint";
+
+component FatalScreen inherits Rectangle {
+    background: Tokens.bg;
+    VerticalLayout {
+        padding: Tokens.sp-6;
+        alignment: center;
+        VerticalLayout {
+            max-width: 560px;
+            spacing: Tokens.sp-4;
+            Heading {
+                text: Nav.fatal-title;
+                level: 1;
+            }
+
+            Banner {
+                title: Nav.fatal-title;
+                text: Nav.fatal-text;
+                tone: 3;
+            }
+
+            HorizontalLayout {
+                alignment: start;
+                Btn {
+                    text: "Quit";
+                    kind: "primary";
+                    autofocus: true;
+                    clicked => {
+                        Nav.quit();
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: Nav.title;
+    min-width: 900px;
+    min-height: 600px;
+    preferred-width: 1100px;
+    preferred-height: 720px;
+    background: Tokens.bg;
+    default-font-size: Tokens.fs-md;
+    no-frame: DesktopVm.fullscreen && Nav.screen == Screen.desktop;
+    full-screen: DesktopVm.fullscreen && Nav.screen == Screen.desktop;
+
+    // The local clipboard, reached through the window system by a hidden text input.
+    public function clipboard-write(t: string) {
+        cb.text = t;
+        cb.select-all();
+        cb.copy();
+    }
+    public function clipboard-read() -> string {
+        cb.text = "";
+        cb.paste();
+        return cb.text;
+    }
+    cb := TextInput {
+        x: -20px;
+        y: -20px;
+        width: 1px;
+        height: 1px;
+        opacity: 0;
+        accessible-role: AccessibleRole.none;
+    }
+
+    if Nav.screen == Screen.home: HomeScreen { }
+    if Nav.screen == Screen.wizard: WizardScreen { }
+    if Nav.screen == Screen.progress: ProgressScreen { }
+    if Nav.screen == Screen.connect: ConnectScreen { }
+    if Nav.screen == Screen.desktop: DesktopScreen { }
+    if Nav.screen == Screen.details: DetailsScreen { }
+    if Nav.screen == Screen.settings: SettingsScreen { }
+    if Nav.screen == Screen.fatal: FatalScreen { }
+
+    if Nav.demo: Rectangle {
+        x: parent.width - self.width - 8px;
+        y: parent.height - self.height - 8px;
+        width: 200px;
+        height: 26px;
+        background: Tokens.warning-bg;
+        border-radius: Tokens.r-sm;
+        Text {
+            text: "Demo mode: no real server";
+            color: Tokens.warning;
+            font-size: Tokens.fs-xs;
+            font-weight: Tokens.fw-medium;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}

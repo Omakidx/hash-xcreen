@@ -1,0 +1,283 @@
+import { Tokens } from "tokens.slint";
+import { ScrollView } from "std-widgets.slint";
+import { Btn, Badge, Banner, Card, Heading, KeyValue, Label, Mono, Muted, ProgressBar, Spinner } from "widgets.slint";
+import { AppBar } from "home.slint";
+import { ProgressVm, StageRowData } from "state.slint";
+
+component StageRow inherits Rectangle {
+    in property <StageRowData> r;
+    height: col.preferred-height + 2 * Tokens.sp-3;
+    background: r.state == 1 ? Tokens.accent-soft : transparent;
+    accessible-role: AccessibleRole.list-item;
+    accessible-label: r.title + ", " + (r.state == 0 ? "waiting" : r.state == 1 ? "running" : r.state == 2 ? "done" : r.state == 3 ? "failed" : "set up later") + (r.duration != "" ? ", " + r.duration : "");
+    HorizontalLayout {
+        padding-left: Tokens.sp-4;
+        padding-right: Tokens.sp-4;
+        padding-top: Tokens.sp-3;
+        padding-bottom: Tokens.sp-3;
+        spacing: Tokens.sp-3;
+        Rectangle {
+            width: 22px;
+            height: 22px;
+            if r.state == 1: Spinner {
+                size: 20px;
+            }
+            if r.state != 1: Rectangle {
+                border-radius: 11px;
+                background: r.state == 2 ? Tokens.success-bg : r.state == 3 ? Tokens.danger-bg : Tokens.neutral-bg;
+                Text {
+                    text: r.state == 2 ? "✓" : r.state == 3 ? "✕" : r.state == 4 ? "–" : "";
+                    color: r.state == 2 ? Tokens.success : r.state == 3 ? Tokens.danger : Tokens.text-2;
+                    font-weight: Tokens.fw-medium;
+                    font-size: Tokens.fs-sm;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        col := VerticalLayout {
+            spacing: 2px;
+            horizontal-stretch: 1;
+            HorizontalLayout {
+                spacing: Tokens.sp-2;
+                Text {
+                    text: r.title;
+                    color: r.state == 0 ? Tokens.text-2 : Tokens.text;
+                    font-size: Tokens.fs-md;
+                    font-weight: r.state == 1 ? Tokens.fw-medium : Tokens.fw-regular;
+                    wrap: word-wrap;
+                    horizontal-stretch: 1;
+                }
+
+                Text {
+                    text: r.duration;
+                    color: Tokens.text-3;
+                    font-size: Tokens.fs-sm;
+                    vertical-alignment: center;
+                }
+            }
+
+            Text {
+                text: r.ids;
+                color: Tokens.text-3;
+                font-size: Tokens.fs-xs;
+                font-family: Tokens.font-mono;
+                wrap: word-wrap;
+            }
+
+            if r.detail != "": Text {
+                text: r.detail;
+                color: Tokens.text-2;
+                font-size: Tokens.fs-sm;
+                wrap: word-wrap;
+            }
+            if r.state == 1 && r.percent != -2: ProgressBar {
+                percent: r.percent;
+            }
+        }
+    }
+}
+
+export component ProgressScreen inherits Rectangle {
+    background: Tokens.bg;
+    VerticalLayout {
+        AppBar {
+            crumb: ProgressVm.server-name + "  /  Install";
+            Btn {
+                text: "Back to Home";
+                kind: "ghost";
+                clicked => {
+                    ProgressVm.back();
+                }
+            }
+        }
+
+        ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                padding: Tokens.sp-6;
+                spacing: Tokens.sp-4;
+                alignment: start;
+                HorizontalLayout {
+                    spacing: Tokens.sp-3;
+                    Heading {
+                        text: ProgressVm.headline;
+                        level: 1;
+                    }
+
+                    Badge {
+                        text: ProgressVm.badge;
+                        tone: ProgressVm.badge-tone;
+                        y: 8px;
+                    }
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                    }
+                }
+
+                Muted {
+                    text: ProgressVm.subline;
+                    font-size: Tokens.fs-md;
+                }
+
+                if ProgressVm.state == 1: Banner {
+                    title: ProgressVm.fail-title;
+                    text: ProgressVm.fail-text;
+                    tone: 3;
+                }
+                if ProgressVm.state == 2: Banner {
+                    title: ProgressVm.fail-title;
+                    text: ProgressVm.fail-text;
+                    tone: 2;
+                }
+                if ProgressVm.state == 1 && ProgressVm.retryable: HorizontalLayout {
+                    alignment: start;
+                    Btn {
+                        text: "Retry from this stage";
+                        kind: "primary";
+                        autofocus: true;
+                        clicked => {
+                            ProgressVm.retry();
+                        }
+                    }
+                }
+                if ProgressVm.state == 1 && !ProgressVm.retryable: HorizontalLayout {
+                    alignment: start;
+                    Btn {
+                        text: "Copy log";
+                        kind: "primary";
+                        autofocus: true;
+                        clicked => {
+                            ProgressVm.copy-log();
+                        }
+                    }
+                }
+                if ProgressVm.state == 2: HorizontalLayout {
+                    alignment: start;
+                    Btn {
+                        text: "Reconnect and resume";
+                        kind: "primary";
+                        autofocus: true;
+                        clicked => {
+                            ProgressVm.reconnect();
+                        }
+                    }
+                }
+                if ProgressVm.state == 3: HorizontalLayout {
+                    alignment: start;
+                    spacing: Tokens.sp-2;
+                    Btn {
+                        text: "Open desktop";
+                        kind: "primary";
+                        autofocus: true;
+                        clicked => {
+                            ProgressVm.open-desktop();
+                        }
+                    }
+
+                    Btn {
+                        text: "Server details";
+                        clicked => {
+                            ProgressVm.details();
+                        }
+                    }
+                }
+
+                Card {
+                    height: rows-col.preferred-height;
+                    rows-col := VerticalLayout {
+                        accessible-role: AccessibleRole.list;
+                        accessible-label: "Install stages";
+                        for r in ProgressVm.rows: StageRow {
+                            r: r;
+                        }
+                    }
+                }
+
+                if ProgressVm.image-title != "": Banner {
+                    title: ProgressVm.image-title;
+                    text: ProgressVm.image-text;
+                    tone: 4;
+                }
+                if ProgressVm.state == 3: Card {
+                    height: sum.preferred-height + 2 * Tokens.sp-4;
+                    sum := VerticalLayout {
+                        padding: Tokens.sp-4;
+                        spacing: Tokens.sp-2;
+                        Text {
+                            text: "Summary";
+                            color: Tokens.text;
+                            font-size: Tokens.fs-lg;
+                            font-weight: Tokens.fw-medium;
+                        }
+
+                        for kv in ProgressVm.summary: KeyValue {
+                            key: kv.key;
+                            value: kv.value;
+                        }
+                    }
+                }
+                if ProgressVm.state == 3: Banner {
+                    title: "Good to know";
+                    text: ProgressVm.good-to-know;
+                    tone: 4;
+                }
+                Card {
+                    height: logcol.preferred-height + 2 * Tokens.sp-3;
+                    logcol := VerticalLayout {
+                        padding: Tokens.sp-3;
+                        spacing: Tokens.sp-2;
+                        HorizontalLayout {
+                            spacing: Tokens.sp-2;
+                            Text {
+                                text: "Log";
+                                color: Tokens.text;
+                                font-size: Tokens.fs-md;
+                                font-weight: Tokens.fw-medium;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+
+                            Btn {
+                                text: ProgressVm.log-open ? "Hide" : "Show";
+                                kind: "ghost";
+                                clicked => {
+                                    ProgressVm.log-open = !ProgressVm.log-open;
+                                }
+                            }
+
+                            Btn {
+                                text: "Copy";
+                                kind: "ghost";
+                                clicked => {
+                                    ProgressVm.copy-log();
+                                }
+                            }
+                        }
+
+                        if ProgressVm.log-open: Rectangle {
+                            height: 180px;
+                            background: Tokens.surface-2;
+                            border-radius: Tokens.r-md;
+                            clip: true;
+                            ScrollView {
+                                Mono {
+                                    x: Tokens.sp-3;
+                                    y: Tokens.sp-2;
+                                    width: parent.visible-width - 2 * Tokens.sp-3;
+                                    text: ProgressVm.log;
+                                    color: Tokens.text-2;
+                                    font-size: Tokens.fs-xs;
+                                    accessible-role: AccessibleRole.text;
+                                    accessible-label: "Install log";
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

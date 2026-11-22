@@ -1,0 +1,208 @@
+import { Tokens } from "tokens.slint";
+import { ScrollView } from "std-widgets.slint";
+import { Btn, Card, Field, Heading, Muted, Segmented, Toggle } from "widgets.slint";
+import { AppBar } from "home.slint";
+import { SettingsVm } from "state.slint";
+
+component Group inherits Card {
+    in property <string> title;
+    height: col.preferred-height + 2 * Tokens.sp-4;
+    col := VerticalLayout {
+        padding: Tokens.sp-4;
+        spacing: Tokens.sp-3;
+        Text {
+            text: root.title;
+            color: Tokens.text;
+            font-size: Tokens.fs-lg;
+            font-weight: Tokens.fw-medium;
+        }
+
+        @children
+    }
+}
+
+component Row inherits HorizontalLayout {
+    in property <string> title;
+    in property <string> description;
+    spacing: Tokens.sp-4;
+    VerticalLayout {
+        horizontal-stretch: 1;
+        alignment: center;
+        Text {
+            text: root.title;
+            color: Tokens.text;
+            font-size: Tokens.fs-md;
+            font-weight: Tokens.fw-medium;
+            wrap: word-wrap;
+        }
+
+        Muted {
+            text: root.description;
+        }
+    }
+
+    @children
+}
+
+export component SettingsScreen inherits Rectangle {
+    background: Tokens.bg;
+    VerticalLayout {
+        AppBar {
+            crumb: "Settings";
+            Btn {
+                text: "Done";
+                kind: "primary";
+                autofocus: true;
+                clicked => {
+                    SettingsVm.done();
+                }
+            }
+        }
+
+        ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                padding: Tokens.sp-6;
+                spacing: Tokens.sp-4;
+                alignment: start;
+                Heading {
+                    text: "App settings";
+                    level: 1;
+                }
+
+                Muted {
+                    text: "Settings for this device only. They are not shared with your servers.";
+                    font-size: Tokens.fs-md;
+                }
+
+                Group {
+                    title: "Appearance";
+                    Row {
+                        title: "Theme";
+                        description: SettingsVm.theme == 0 ? "System follows your desktop." : SettingsVm.theme == 1 ? "Dark." : "Light.";
+                        Segmented {
+                            options: ["System", "Dark", "Light"];
+                            label: "Theme";
+                            current <=> SettingsVm.theme;
+                            changed(_) => {
+                                SettingsVm.changed();
+                            }
+                            width: 260px;
+                            y: 0px;
+                        }
+                    }
+                }
+
+                Group {
+                    title: "Desktop view";
+                    Row {
+                        title: "Default quality";
+                        description: "Used when a desktop opens. You can change it per session in the toolbar.";
+                        Segmented {
+                            options: ["Auto", "Sharp", "Smooth"];
+                            label: "Default quality";
+                            current <=> SettingsVm.quality;
+                            changed(_) => {
+                                SettingsVm.changed();
+                            }
+                            width: 260px;
+                        }
+                    }
+
+                    Row {
+                        title: "Bandwidth cap";
+                        description: "The most this app asks the server to send. Auto adapts to the connection.";
+                        Segmented {
+                            options: ["Auto", "5", "10", "25", "50 Mbps"];
+                            label: "Bandwidth cap";
+                            current <=> SettingsVm.bandwidth;
+                            changed(_) => {
+                                SettingsVm.changed();
+                            }
+                            width: 340px;
+                        }
+                    }
+
+                    Row {
+                        title: "Keyboard shortcut";
+                        description: "Shows the toolbar in a desktop. The only key combination the app keeps for itself.";
+                        Text {
+                            text: SettingsVm.chord;
+                            color: Tokens.text;
+                            font-family: Tokens.font-mono;
+                            font-size: Tokens.fs-sm;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Toggle {
+                        title: "Capture all keys";
+                        description: "Send every key, including system shortcuts, to the desktop while it has focus.";
+                        checked <=> SettingsVm.capture-keys;
+                        toggled(_) => {
+                            SettingsVm.changed();
+                        }
+                    }
+                }
+
+                Group {
+                    title: "Clipboard on this device";
+                    Toggle {
+                        title: "Send my clipboard to the desktop";
+                        description: "Text you copy here can be pasted there.";
+                        checked <=> SettingsVm.clip-send;
+                        toggled(_) => {
+                            SettingsVm.changed();
+                        }
+                    }
+
+                    Toggle {
+                        title: "Receive the desktop's clipboard";
+                        description: "What you copy in the desktop can be pasted here.";
+                        checked <=> SettingsVm.clip-receive;
+                        toggled(_) => {
+                            SettingsVm.changed();
+                        }
+                    }
+
+                    Toggle {
+                        title: "Include files";
+                        description: "Files can be moved between the two. Each file is limited to 4 GiB.";
+                        checked <=> SettingsVm.clip-files;
+                        toggled(_) => {
+                            SettingsVm.changed();
+                        }
+                    }
+                }
+
+                Group {
+                    title: "General";
+                    Toggle {
+                        title: "Start at login";
+                        description: "Open hash-xcreen when you sign in to this computer.";
+                        checked <=> SettingsVm.start-at-login;
+                        toggled(_) => {
+                            SettingsVm.changed();
+                        }
+                    }
+                }
+
+                Group {
+                    title: "This device";
+                    Field {
+                        label: "Device name";
+                        text <=> SettingsVm.device-name;
+                        hint: "Shown in the paired devices list on every server, next to Last seen.";
+                        edited(_) => {
+                            SettingsVm.changed();
+                        }
+                    }
+
+                    Muted {
+                        text: "Device key: stored in the system keyring (Secret Service). Never written to a file.   Version " + SettingsVm.version + " · licensed AGPL-3.0-or-later";
+                    }
+                }
+            }
+        }
+    }
+}
