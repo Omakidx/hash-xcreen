@@ -136,6 +136,25 @@ message StatusResult {
   LinkState session_link = 7;
   uint32 link_faults_10min = 8;
   uint64 registry_version = 9;
+  // 1G (additive): the setup binding and the setup job (docs/ipc.md 5.5, 9).
+  // True while a device is bound as the setup device and the window is open.
+  bool setup_device_bound = 10;
+  // The bound device's id (16 bytes) when setup_device_bound, else empty.
+  bytes setup_device_id = 11;
+  // The installer's token was recorded while the window is open and nobody paired with it yet.
+  bool setup_token_pending = 12;
+  SetupJobState setup_job = 13;
+  // The job's id, 0 before the first job.
+  uint32 setup_job_id = 14;
+}
+
+enum SetupJobState {
+  SETUP_JOB_STATE_UNSPECIFIED = 0;
+  SETUP_JOB_STATE_IDLE = 1;
+  SETUP_JOB_STATE_RUNNING = 2;
+  SETUP_JOB_STATE_SUCCEEDED = 3;
+  SETUP_JOB_STATE_FAILED = 4;
+  SETUP_JOB_STATE_CANCELLED = 5;
 }
 
 enum DeviceState {

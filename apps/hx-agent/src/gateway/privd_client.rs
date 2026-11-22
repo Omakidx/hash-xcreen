@@ -33,8 +33,9 @@ use hx_ipc::privd::{self, Incoming, PrivdPolicy, Side, pb, pb::request::Command}
 use hx_ipc::text::sanitize_text;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio::time::Instant;
+use zeroize::Zeroizing;
 
 use super::ipc_io::read_frame;
 
@@ -76,6 +77,8 @@ pub struct RemoteError {
     pub retryable: bool,
     /// Suggested wait before the retry.
     pub retry_after: Duration,
+    /// The failing stage (`ProgressStage` number), set by long commands such as `CreateDesktop`.
+    pub stage: Option<i32>,
 }
 
 /// Why a privd call failed.
@@ -319,6 +322,111 @@ impl Conn {
         }
     }
 
+    /// Like [`Conn::run`] for the dedicated lane: the secrets are **owned** and each is wiped
+    /// right after its frame has been written (docs/ipc.md 5.2 rule 4), `Progress` frames are
+    /// forwarded, and `cancel` makes the call send a privd `Cancel` frame and then keep waiting
+    /// for privd's answer (`CANCELLED`).
+    async fn run_streaming(
+        &mut self,
+        request_id: u64,
+        deadline_ms: u32,
+        command: &Command,
+        secrets: Vec<(pb::SecretKind, Zeroizing<Vec<u8>>)>,
+        progress: &mpsc::Sender<pb::Progress>,
+        cancel: &Notify,
+    ) -> Result<pb::response::Result, PrivdError> {
+        let slots = secrets
+            .iter()
+            .enumerate()
+            .map(|(i, (kind, bytes))| pb::SecretSlot {
+                slot: i as u32,
+                kind: *kind as i32,
+                sealed: false,
+                length: bytes.len() as u32,
+                upload_nonce: Bytes::new(),
+                signer_key_id: 0,
+            })
+            .collect();
+        let frame = pb::Frame {
+            frame: Some(pb::frame::Frame::Request(pb::Request {
+                request_id,
+                deadline_ms,
+                secret_slots: slots,
+                command: Some(command.clone()),
+            })),
+        };
+        let bytes = privd::encode_message(&frame, Side::Server)
+            .map_err(|e| PrivdError::InvalidRequest(e.to_string()))?;
+        self.write(&bytes)
+            .await
+            .map_err(|e| PrivdError::Unavailable(format!("{REQUEST_WRITE}: {}", e.kind())))?;
+        for (i, (_, bytes)) in secrets.into_iter().enumerate() {
+            // The framed copy is `Zeroizing`; `bytes` is wiped at the end of this iteration,
+            // as soon as the frame is on the socket.
+            let framed = privd::encode_secret(request_id, i as u8, &bytes)
+                .map_err(|e| PrivdError::InvalidRequest(e.to_string()))?;
+            self.write(&framed)
+                .await
+                .map_err(|e| PrivdError::Unavailable(format!("send: {}", e.kind())))?;
+        }
+        let mut cancelled = false;
+        loop {
+            let incoming = tokio::select! {
+                () = cancel.notified(), if !cancelled => {
+                    cancelled = true;
+                    let f = pb::Frame {
+                        frame: Some(pb::frame::Frame::Cancel(pb::Cancel { request_id })),
+                    };
+                    let b = privd::encode_message(&f, Side::Server)
+                        .map_err(|e| PrivdError::InvalidRequest(e.to_string()))?;
+                    self.write(&b)
+                        .await
+                        .map_err(|e| PrivdError::Unavailable(format!("send: {}", e.kind())))?;
+                    continue;
+                }
+                r = self.recv() => r?,
+            };
+            match incoming {
+                Incoming::Message(pb::Frame {
+                    frame: Some(pb::frame::Frame::Response(r)),
+                }) => {
+                    if r.request_id != request_id {
+                        return Err(PrivdError::Protocol("response for another request".into()));
+                    }
+                    return match r.result {
+                        Some(pb::response::Result::Error(e)) => Err(remote(e)),
+                        Some(ok) => Ok(ok),
+                        None => Err(PrivdError::Protocol("response without a result".into())),
+                    };
+                }
+                Incoming::Message(pb::Frame {
+                    frame: Some(pb::frame::Frame::Progress(p)),
+                }) => {
+                    if p.request_id == request_id {
+                        // A slow consumer loses intermediate steps, never blocks the call.
+                        let _ = progress.try_send(p);
+                    }
+                }
+                Incoming::Message(pb::Frame {
+                    frame: Some(pb::frame::Frame::Ping(p)),
+                }) => {
+                    let pong = pb::Frame {
+                        frame: Some(pb::frame::Frame::Pong(pb::Pong { nonce: p.nonce })),
+                    };
+                    let bytes = privd::encode_message(&pong, Side::Server)
+                        .map_err(|e| PrivdError::InvalidRequest(e.to_string()))?;
+                    self.write(&bytes)
+                        .await
+                        .map_err(|e| PrivdError::Unavailable(format!("send: {}", e.kind())))?;
+                }
+                Incoming::Message(pb::Frame {
+                    frame: Some(pb::frame::Frame::Pong(_)),
+                }) => {}
+                _ => return Err(PrivdError::Protocol("unexpected frame".into())),
+            }
+        }
+    }
+
     /// A connection-level `Ping`: proves privd is alive and reading on this connection.
     async fn ping(&mut self, nonce: u64) -> Result<(), PrivdError> {
         let frame = pb::Frame {
@@ -361,6 +469,7 @@ fn remote(e: pb::Error) -> PrivdError {
         message: sanitize_text(&e.message, privd::MAX_ERROR_MESSAGE_LEN),
         retryable: e.retryable,
         retry_after: Duration::from_millis(u64::from(e.retry_after_ms)),
+        stage: e.stage,
     })
 }
 
@@ -612,6 +721,35 @@ impl PrivdClient {
         }
     }
 
+    /// `SetUserPassword` (section 6.9) without `CURRENT_PASSWORD`, which privd allows only
+    /// while the setup window is open. The caller keeps `password` in its own zeroizing buffer.
+    pub async fn set_user_password(
+        &self,
+        desktop_id: &str,
+        password: &[u8],
+    ) -> Result<(), PrivdError> {
+        let command = Command::SetUserPassword(pb::SetUserPasswordRequest {
+            desktop_id: desktop_id.to_owned(),
+        });
+        let secret = OutSecret {
+            kind: pb::SecretKind::UserPassword,
+            bytes: password,
+        };
+        match self.call(command, &[secret], None).await? {
+            pb::response::Result::SetUserPassword(_) => Ok(()),
+            _ => Err(PrivdError::Protocol("unexpected result variant".into())),
+        }
+    }
+
+    /// `FinishSetup` (section 6.3) without `force`: closes the setup window.
+    pub async fn finish_setup(&self) -> Result<(), PrivdError> {
+        let command = Command::FinishSetup(pb::FinishSetupRequest { force: None });
+        match self.call(command, &[], None).await? {
+            pb::response::Result::FinishSetup(_) => Ok(()),
+            _ => Err(PrivdError::Protocol("unexpected result variant".into())),
+        }
+    }
+
     /// `ProvisionSessionLink` (section 6.11): ensures the proxy device exists and returns the
     /// host path of the link socket.
     pub async fn provision_session_link(&self, desktop_id: &str) -> Result<String, PrivdError> {
@@ -645,6 +783,143 @@ impl PrivdClient {
         match self.call(command, &[], None).await? {
             pb::response::Result::InstallSession(_) => Ok(()),
             _ => Err(PrivdError::Protocol("unexpected result variant".into())),
+        }
+    }
+}
+
+// ------------------------------------------------------------------ the dedicated lane
+
+/// One privd call on the dedicated lane, running in its own task so that a caller that is
+/// busy elsewhere (the setup job, forwarding progress) is never what holds the connection.
+/// Dropping it closes the connection, which privd treats as a cancel.
+pub struct LaneCall {
+    /// The request id, for [`PrivdLane::cancel`].
+    pub request_id: u64,
+    lane: Arc<LaneInner>,
+    task: Option<tokio::task::JoinHandle<Result<pb::response::Result, PrivdError>>>,
+}
+
+impl LaneCall {
+    /// Waits for privd's answer.
+    pub async fn wait(mut self) -> Result<pb::response::Result, PrivdError> {
+        let task = self.task.take().expect("waited once");
+        task.await
+            .unwrap_or_else(|_| Err(PrivdError::Unavailable("the call was aborted".into())))
+    }
+}
+
+impl Drop for LaneCall {
+    fn drop(&mut self) {
+        if let Some(t) = &self.task {
+            t.abort();
+            self.lane
+                .cancels
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&self.request_id);
+        }
+    }
+}
+
+struct LaneInner {
+    client: PrivdClient,
+    /// One call at a time on the lane.
+    gate: Arc<Semaphore>,
+    cancels: Mutex<std::collections::HashMap<u64, Arc<Notify>>>,
+}
+
+/// A privd connection outside the pool (`docs/ipc.md` 5.5): the setup job's `CreateDesktop`
+/// runs here so that the pool stays free for logins, and so that progress frames can be
+/// forwarded. Pool (2) plus the lane (1) stay within privd's 4 connections for the gateway.
+/// Cheap to clone; calls are serialized.
+#[derive(Clone)]
+pub struct PrivdLane(Arc<LaneInner>);
+
+impl PrivdClient {
+    /// The dedicated lane of this client.
+    pub fn dedicated(&self) -> PrivdLane {
+        PrivdLane(Arc::new(LaneInner {
+            client: self.clone(),
+            gate: Arc::new(Semaphore::new(1)),
+            cancels: Mutex::new(std::collections::HashMap::new()),
+        }))
+    }
+}
+
+impl PrivdLane {
+    /// Starts `command` on its own fresh connection. `secrets` are owned and each is wiped as
+    /// soon as its frame is written. `Progress` frames go to `progress` (a full channel drops
+    /// the frame). `deadline` may only shorten the command's maximum.
+    pub fn call_streaming(
+        &self,
+        command: Command,
+        secrets: Vec<(pb::SecretKind, Zeroizing<Vec<u8>>)>,
+        deadline: Option<Duration>,
+        progress: mpsc::Sender<pb::Progress>,
+    ) -> LaneCall {
+        let inner = self.0.clone();
+        let request_id = inner.client.0.next_id.fetch_add(1, Ordering::Relaxed);
+        let cancel = Arc::new(Notify::new());
+        // Registered before the task starts, so a cancel that races the start is not lost: the
+        // stored permit is consumed as soon as the request has been written.
+        inner
+            .cancels
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(request_id, cancel.clone());
+        let info = privd::command_info(&command);
+        let requested_ms = deadline
+            .map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX))
+            .unwrap_or(0);
+        let deadline_ms = info.effective_deadline_ms(requested_ms);
+        let task = tokio::spawn(async move {
+            let _slot = inner
+                .gate
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| PrivdError::Unavailable("lane closed".into()))?;
+            let opts = &inner.client.0.opts;
+            let until =
+                Instant::now() + Duration::from_millis(u64::from(deadline_ms)) + opts.margin;
+            let result = async {
+                let mut conn = connect_until(&inner.client.0, until).await?;
+                tokio::time::timeout_at(
+                    until,
+                    conn.run_streaming(
+                        request_id,
+                        deadline_ms,
+                        &command,
+                        secrets,
+                        &progress,
+                        &cancel,
+                    ),
+                )
+                .await
+                .map_err(|_| PrivdError::Timeout)?
+            }
+            .await;
+            inner
+                .cancels
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&request_id);
+            result
+        });
+        LaneCall {
+            request_id,
+            lane: self.0.clone(),
+            task: Some(task),
+        }
+    }
+
+    /// Asks privd to cancel `request_id` (a `Cancel` frame on the call's own connection). The
+    /// call's [`LaneCall::wait`] then resolves with privd's `CANCELLED` answer once privd has
+    /// destroyed what it had built. A request that is not in flight is ignored.
+    pub fn cancel(&self, request_id: u64) {
+        let cancels = self.0.cancels.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = cancels.get(&request_id) {
+            n.notify_one();
         }
     }
 }
