@@ -119,9 +119,12 @@ impl App {
             Some(d) => ServerStore::open(d.join("servers.json")),
             None => Ok(ServerStore::in_memory(cfg.seed.clone())),
         };
-        let hosts = known_hosts::KnownHosts::open(
+        let (hosts, hosts_err) = match known_hosts::KnownHosts::open(
             cfg.config_dir.as_ref().map(|d| d.join("known_hosts.json")),
-        );
+        ) {
+            Ok(h) => (h, None),
+            Err(e) => (known_hosts::KnownHosts::default(), Some(e)),
+        };
         let (key, store, fatal) = match (key, store) {
             (Ok(k), Ok(s)) => (Some(k), Some(s), None),
             (Err(e), _) => (
@@ -145,6 +148,15 @@ impl App {
                 )),
             ),
         };
+        // A damaged known_hosts.json must not silently reset trust: block like a damaged server list.
+        let fatal = fatal.or(hosts_err.map(|e| {
+            (
+                "The trusted SSH keys could not be read".to_owned(),
+                format!(
+                    "{e}. The file was left as it is. Fix or move known_hosts.json in the app's config folder, then open the app again."
+                ),
+            )
+        }));
         let app = Rc::new(App {
             ui: ui.clone_strong(),
             rt,

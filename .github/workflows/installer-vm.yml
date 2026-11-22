@@ -7,24 +7,40 @@ name: Installer VM
 # under real systemd, pairing and PIN login from the runner, the first frame of the desktop built
 # inside the VM, the secrets canary, the hx-provision host-ruleset checklist, failure injection and
 # resume, idempotence, a pending update whose privd fails, a VM reboot, and uninstall in both modes
-# with an empty-leftovers check. The `prebuilt` cells assert the clean refusal of `--image prebuilt`
-# (exit 6, nothing changed): the prebuilt path is not in this release (privd answers
-# UNIMPLEMENTED). The box "installer CI: both image paths" stays open until 1D's prebuilt CI lands.
+# with an empty-leftovers check.
+#
+# Both image paths (design 1D, docs/architecture.md 12). The `artifacts` job builds the agent with
+# a per-run TEST image key (feature `test-image-key`) and a real prebuilt image
+# (`hx-imagectl build-image --recipe ubuntu-24.04-xfce-basic`, on a runner with the same Incus setup
+# as images.yml), and signs its manifest with that key:
+#   build cells     pass `--image build` and assert reason_code=build_requested.
+#   prebuilt cells  install from the test-signed image with `--image-file /root/img/<file>` (the
+#                   offline path; the recipe is chosen by --distro, not by the host OS, so every host
+#                   OS installs the same image). A manifest with one flipped byte must give exit 10
+#                   and change nothing; the real install must give path_taken=PREBUILT and
+#                   reason_code=image_file, the first frame, an empty /var/lib/hx/import, no hx-img-*
+#                   image, and a clean uninstall.
+#   auto variant    (ubuntu-24.04) no --image option: this test agent cannot use the published
+#                   manifest, so it must build with list_unavailable, list_unverified or
+#                   no_matching_image.
+# The ONLINE prebuilt path is covered by privd's integration tests (a local HTTPS server and a fake
+# Incus); a nightly `prebuilt-online` canary cell comes once the real image keys exist.
 #
 # Triggers: nightly, workflow_dispatch, and pull requests that carry the `installer-vm` label or
 # touch the installer (see the gate job).
 #
 # Debian 12 has no Incus in its main archive, so its build cell installs Incus from the Zabbly
 # repository with the pinned key in src/install/zabbly-key.asc; the cell skips itself with a warning
-# annotation if that file ever reads UNPROVISIONED again (run-cell.sh); its prebuilt
-# cell still runs (the refusal comes before Incus).
+# annotation if that file ever reads UNPROVISIONED again (run-cell.sh); the same holds for its
+# prebuilt cell, which also needs Incus.
 #
-# Two variants exercise the installer paths the other cells do not:
+# Variants exercise the installer paths the other cells do not:
 #   docker       `--docker` needs Incus 6.0.5 or newer, which the distro archives of ubuntu-24.04
 #                (6.0.0) and debian-13 (6.0.4) do not have, so the incus stage must take Zabbly.
 #                Checks: the Zabbly source and version, nesting and the mknod and setxattr
 #                intercepts, the user in the docker group, `docker run --rm hello-world` inside
 #                the desktop (before and after a reboot), and the rest of the full cell.
+#   auto         the default `--image auto` (see above); a shorter cell.
 #   interactive  `--interactive` answered on a pseudo-terminal by tests/installer-vm/tty-driver.py:
 #                the prompts, a refused answer, hidden secrets asked twice, the printed pairing
 #                code, QUIC pairing with that code and the typed PIN, the canary, the checklist,
@@ -80,10 +96,11 @@ jobs:
           echo "installer-vm cells will run: $run"
 
   artifacts:
-    name: Test-keyed release and client
+    name: Test-keyed release, client and test image
     needs: gate
     if: needs.gate.outputs.run == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain
@@ -97,12 +114,48 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Self-test of the pty driver of the interactive cell
         run: tests/installer-vm/test-tty-driver.sh
-      - name: Build the test-keyed release directory and the client
+      - name: Install and prepare Incus (containers only, no KVM) for the test image
+        # The same steps as the `image` job of images.yml: the image is built by `hx-imagectl
+        # build-image` in a container on a btrfs pool (a loop file on /mnt, the big disk).
+        run: |
+          set -eu
+          # With recommends: incus only recommends dnsmasq-base (its managed bridge needs it).
+          # This is the CI runner, not a host under test.
+          sudo apt-get update -q
+          sudo apt-get install -y incus incus-client dnsmasq-base btrfs-progs zstd
+          sudo incus admin init --minimal
+          sudo mkdir -p /mnt/incus-disks /var/lib/incus/disks
+          sudo mount --bind /mnt/incus-disks /var/lib/incus/disks
+          sudo modprobe btrfs || true
+          grep -qw btrfs /proc/filesystems || { echo "::error::this runner kernel has no btrfs"; exit 1; }
+          # Docker on the runner drops forwarded traffic of an Incus bridge (hxci-br0 is the
+          # builder's, incusbr0 the default one).
+          for br in hxci-br0 incusbr0; do
+            sudo iptables -I DOCKER-USER -i "$br" -j ACCEPT || true
+            sudo iptables -I DOCKER-USER -o "$br" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT || true
+          done
+          # Ubuntu 24.04 restricts unprivileged user namespaces with AppArmor, which can stop
+          # containers from starting. Runner only; this is not the host the product installs on.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo incus version
+          df -h /mnt /var/lib/incus/disks
+      - name: Build the test-keyed release directory, the client and the test-signed image
         run: tests/installer-vm/build-artifacts.sh "$RUNNER_TEMP/artifacts"
       - uses: actions/upload-artifact@v4
         with:
           name: installer-vm-artifacts
-          path: ${{ runner.temp }}/artifacts
+          # The image is a separate artifact: only the prebuilt cells download it.
+          path: |
+            ${{ runner.temp }}/artifacts
+            !${{ runner.temp }}/artifacts/img
+          retention-days: 3
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-vm-image
+          path: ${{ runner.temp }}/artifacts/img
+          # the image is already zstd-compressed
+          compression-level: 0
           retention-days: 3
           if-no-files-found: error
 
@@ -143,12 +196,22 @@ jobs:
           - os: ubuntu-24.04
             image: build
             variant: interactive
+          # No --image option (auto): this test agent cannot use the published manifest, so it builds
+          # (list_unavailable, list_unverified or no_matching_image).
+          - os: ubuntu-24.04
+            image: build
+            variant: auto
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: installer-vm-artifacts
           path: ${{ runner.temp }}/artifacts
+      - uses: actions/download-artifact@v4
+        if: matrix.image == 'prebuilt'
+        with:
+          name: installer-vm-image
+          path: ${{ runner.temp }}/artifacts/img
       - name: Runtime libraries of the client
         run: |
           sudo apt-get update

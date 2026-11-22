@@ -5,9 +5,14 @@
 #       [CELL_VARIANT=none|ufw|docker-host|private|docker|interactive] tests/installer-vm/run-cell.sh
 #
 #   CELL_OS       ubuntu-24.04 | ubuntu-26.04 | debian-12 | debian-13 (the VM's OS)
-#   CELL_IMAGE    build    : the full install, every check below
-#                 prebuilt : `--image prebuilt` must be refused cleanly (exit 6, nothing changed):
-#                            privd answers UNIMPLEMENTED for the prebuilt path in this release
+#   CELL_IMAGE    build    : the full install with `--image build` (asserts reason_code=build_requested),
+#                            every check below
+#                 prebuilt : install from the TEST-SIGNED image of $ART/img through `--image-file`
+#                            (the offline path): first a manifest with one flipped byte must give
+#                            exit 10 and change nothing; then the install must end with
+#                            path_taken=PREBUILT and reason_code=image_file, the first frame, an
+#                            empty /var/lib/hx/import, no hx-img-* image left, the secrets canary,
+#                            the host-ruleset checklist, and a clean `uninstall --destroy-desktop`
 #   CELL_VARIANT  none         plain host
 #                 docker       install with --docker: the incus stage must take Zabbly (6.0.5 or newer),
 #                              the desktop gets nesting and the syscall intercepts, and Docker
@@ -18,9 +23,14 @@
 #                 ufw          ufw is active on the VM before the install (the port rule must open 443)
 #                 docker-host  Docker runs on the VM, with a published port (DOCKER-USER, DNAT drop)
 #                 private      install with --allow-private-networks (checklist item 5)
+#                 auto         ubuntu-24.04 only: no --image option (the default, `auto`); the
+#                              online manifest cannot serve this PR's test agent, so the install
+#                              must build (path_taken=BUILD with reason_code list_unavailable,
+#                              list_unverified or no_matching_image); a shorter cell
 #   ART           holds `release/` (a test-keyed release directory made by
-#                 tests/installer-vm/build-artifacts.sh) and `client` (the compiled
-#                 installer_vm_client test binary)
+#                 tests/installer-vm/build-artifacts.sh), `client` (the compiled
+#                 installer_vm_client test binary) and, for the prebuilt cells, `img/` (the
+#                 test-signed image, its manifest and signature)
 #   OUT           receives the evidence: JSON Lines of every run, stage timings, logs
 #
 # Needs on the runner: Incus with KVM (see the workflow), jq, sudo. Nothing here is run on a
@@ -58,9 +68,9 @@ esac
 # Debian 12 has no Incus in its main archive, so its build path needs the Zabbly repository, whose
 # pinned key ships UNPROVISIONED until the maintainer adds it. Skip the cell visibly rather than
 # fail it or hide a failure; it runs for real as soon as the key file holds a key.
-if [ "$CELL_OS" = debian-12 ] && [ "$CELL_IMAGE" = build ] &&
+if [ "$CELL_OS" = debian-12 ] &&
     grep -q '^UNPROVISIONED' apps/hx-agent/src/install/zabbly-key.asc; then
-    echo "::warning title=debian-12 build skipped::the Zabbly apt key (apps/hx-agent/src/install/zabbly-key.asc) is UNPROVISIONED; this cell needs it"
+    echo "::warning title=debian-12 $CELL_IMAGE skipped::the Zabbly apt key (apps/hx-agent/src/install/zabbly-key.asc) is UNPROVISIONED; this cell needs it"
     exit 0
 fi
 
@@ -104,23 +114,6 @@ for f in vm-cell.sh checklist.sh; do $INCUS file push --uid 0 --gid 0 --mode 075
 
 install_args=(sh /root/release/install.sh --release-dir /root/release --progress json)
 
-# ---- the prebuilt cell: a clean refusal ----
-if [ "$CELL_IMAGE" = prebuilt ]; then
-    step "--image prebuilt must be refused with exit 6 and change nothing"
-    mkdir -p "$OUT/secrets"
-    HX1E_VM_DIR="$OUT/secrets" "$CLIENT" --ignored --exact vm_secrets >/dev/null 2>&1
-    set +e
-    $INCUS exec "$vm" --force-noninteractive -- "${install_args[@]}" --ssh --user alice --image prebuilt \
-        <"$OUT/secrets/frames.bin" >"$OUT/prebuilt.jsonl" 2>"$OUT/prebuilt.err"
-    rc=$?
-    set -e
-    [ "$rc" = 6 ] || die "--image prebuilt exited $rc, want 6: $(cat "$OUT/prebuilt.err")"
-    vmsh 'test ! -e /var/lib/hx/install-state.json && test ! -e /usr/lib/hx && ! dpkg -s incus >/dev/null 2>&1' ||
-        die "a refused install changed the host"
-    echo "PASS: --image prebuilt refused with exit 6, no state, no /usr/lib/hx, no incus package"
-    exit 0
-fi
-
 # ---- variants that prepare the host ----
 case $variant in
 ufw)
@@ -133,6 +126,12 @@ docker-host)
     ;;
 esac
 extra=()
+# Build cells ask for the build explicitly (reason_code build_requested); the `auto` variant and the
+# interactive cell leave the option out, so privd chooses.
+case $variant in
+auto | interactive) ;;
+*) [ "$CELL_IMAGE" = build ] && extra+=(--image build) ;;
+esac
 [ "$variant" = private ] && extra+=(--allow-private-networks)
 [ "$variant" = docker ] && extra+=(--docker)
 chk=()
@@ -168,6 +167,78 @@ run_install() { # run_install <tag> [extra installer args...]
     return "$rc"
 }
 result_of() { jq -c 'select(.t=="result")' "$OUT/$1.jsonl" | tail -n 1; }
+# The reasons an `auto` install builds for in CI: the published manifest is not there (or not one
+# this test agent can verify) or lists nothing for this PR's recipes.
+AUTO_BUILD_REASONS='["list_unavailable","list_unverified","no_matching_image"]'
+assert_auto_build() { # assert_auto_build <result json>
+    echo "$1" | jq -e --argjson ok "$AUTO_BUILD_REASONS" '.desktop.path_taken == "BUILD" and (.desktop.reason_code as $c | $ok | index($c) != null)' >/dev/null ||
+        die "an auto install must build with one of $AUTO_BUILD_REASONS, got: $(echo "$1" | jq -c .desktop)"
+    echo "PASS: auto built on the server: reason_code $(echo "$1" | jq -r .desktop.reason_code), \"$(echo "$1" | jq -r .desktop.reason)\""
+}
+
+# ---- the prebuilt cell: install from the test-signed image through --image-file ----
+if [ "$CELL_IMAGE" = prebuilt ]; then
+    imgdir=$ART/img
+    imgfile=$(basename "$(ls "$imgdir"/hx-image-*.img | head -n 1)")
+    [ -n "$imgfile" ] && [ -s "$imgdir/images-manifest-x86_64.json" ] && [ -s "$imgdir/images-manifest-x86_64.json.minisig" ] ||
+        die "$imgdir has no test image, manifest and signature (build-artifacts.sh without HX_SKIP_IMAGE)"
+    sha=$(jq -r '.images[0].sha256' "$imgdir/images-manifest-x86_64.json")
+
+    step "push the test image, its manifest and its signature into the VM (/root/img)"
+    vmsh 'mkdir -p /root/img && chmod 0700 /root/img'
+    for f in "$imgdir"/*; do
+        $INCUS file push --uid 0 --gid 0 --mode 0600 "$f" "$vm/root/img/$(basename "$f")" >/dev/null
+    done
+    vmsh "ls -l /root/img && df -h /root /var/lib | tail -n 2"
+
+    step "a manifest with one flipped byte: exit 10, nothing changed"
+    # Same image (a hard link, no second copy), manifest with one byte changed, the original signature.
+    vmsh "mkdir -p /root/img-bad && ln -f /root/img/$imgfile /root/img-bad/$imgfile && sed 's/xfce/xfcf/' /root/img/images-manifest-x86_64.json >/root/img-bad/images-manifest-x86_64.json && cp /root/img/images-manifest-x86_64.json.minisig /root/img-bad/"
+    vmsh 'cmp -s /root/img/images-manifest-x86_64.json /root/img-bad/images-manifest-x86_64.json && exit 1; test "$(stat -c %s /root/img/images-manifest-x86_64.json)" = "$(stat -c %s /root/img-bad/images-manifest-x86_64.json)"' ||
+        die "the tampered manifest is not a one-byte change"
+    rc=0
+    run_install bad-manifest --image-file "/root/img-bad/$imgfile" || rc=$?
+    [ "$rc" = 10 ] || die "a tampered manifest exited $rc, want 10: $(cat "$OUT/bad-manifest.err") $(jq -c 'select(.t=="result")' "$OUT/bad-manifest.jsonl" | tail -n 1)"
+    [ "$(jq -r 'select(.t=="result") | .code' "$OUT/bad-manifest.jsonl" | tail -n 1)" = VERIFY ] || die "the tampered manifest was not a VERIFY failure"
+    vmx sh /root/vm-cell.sh untouched
+    echo "PASS: a manifest with one flipped byte gave exit 10 (VERIFY) and changed nothing"
+
+    step "install from the image file"
+    rc=0
+    run_install install --image-file "/root/img/$imgfile" || rc=$?
+    [ "$rc" = 0 ] || die "install exited $rc: $(cat "$OUT/install.err") $(jq -c 'select(.t=="result")' "$OUT/install.jsonl" | tail -n 1)"
+    res=$(jq -c 'select(.t=="result")' "$OUT/install.jsonl" | tail -n 1)
+    echo "$res" | jq -e '.ok == true and (.server_public_key | length == 64) and .port == 443' >/dev/null || die "bad result: $res"
+    echo "$res" | jq -e '.desktop.path_taken == "PREBUILT" and .desktop.reason_code == "image_file" and (.desktop.image.build_id | length > 0) and .desktop.image.size > 0' >/dev/null ||
+        die "the desktop was not made from the image file: $(echo "$res" | jq -c .desktop)"
+    server_key=$(echo "$res" | jq -r .server_public_key)
+    jq -r 'select(.t=="stage" and .state=="done") | [.id, .ms] | @tsv' "$OUT/install.jsonl" >"$OUT/stages.tsv"
+    echo "PASS: exit 0, path_taken=PREBUILT, reason_code=image_file, image $(echo "$res" | jq -r .desktop.image.build_id)"
+    vmx sh /root/vm-cell.sh image-clean "$sha"
+
+    step "units and credentials"
+    vmx sh /root/vm-cell.sh units
+
+    step "pairing and PIN login from the runner, and the first frame of the prebuilt desktop"
+    vm_ip=$(vm_addr)
+    HX1E_VM_DIR="$S" HX1E_VM_ADDR="$vm_ip:443" HX1E_VM_SERVER_KEY="$server_key" HX1E_VM_STREAM=1 \
+        HX1E_VM_CREDS="quic:$(cat "$S/token")" \
+        "$CLIENT" --ignored --exact vm_login --nocapture 2>&1 | tee "$OUT/client.log" | grep -E '^(PASS|thread)' || die "client failed: see client.log"
+    grep -q 'first frame' "$OUT/client.log" || die "no first frame"
+
+    step "secrets canary"
+    vmx sh /root/vm-cell.sh canary-check
+
+    step "host-ruleset checklist (the prebuilt desktop is isolated like a built one)"
+    vmx bash /root/checklist.sh
+
+    step "uninstall --destroy-desktop"
+    vmsh "$AGENT uninstall --destroy-desktop --yes" || die "uninstall --destroy-desktop failed"
+    vmx sh /root/vm-cell.sh leftovers destroy
+    echo
+    echo "CELL PASSED: $CELL_OS / $CELL_IMAGE / $variant"
+    exit 0
+fi
 
 # ---- the interactive cell: --interactive on a pseudo-terminal ----
 if [ "$variant" = interactive ]; then
@@ -202,6 +273,7 @@ if [ "$variant" = interactive ]; then
     grep -E '^\{' "$out" >"$OUT/interactive.jsonl" || true
     res=$(jq -c 'select(.t=="result")' "$OUT/interactive.jsonl" | tail -n 1)
     echo "$res" | jq -e '.ok == true and .exit == 0 and (.server_public_key | length == 64) and .port == 443 and .pairing.kind == "code" and .pairing.expires_at_unix_s > 0' >/dev/null || die "bad result: $res"
+    assert_auto_build "$res"
     server_key=$(echo "$res" | jq -r .server_public_key)
     pair_code=$(grep -Eo 'pairing code: [0-9A-Z]{4}-[0-9A-Z]{4}' "$out" | head -n 1 | sed 's/^pairing code: //')
     [ -n "$pair_code" ] || die "no 'pairing code: XXXX-XXXX' in the output"
@@ -271,6 +343,13 @@ echo "$res" | jq -e '.ok == true and (.server_public_key | length == 64) and .po
 server_key=$(echo "$res" | jq -r .server_public_key)
 jq -r 'select(.t=="stage" and .state=="done") | [.id, .ms] | @tsv' "$OUT"/fail-incus.jsonl "$OUT"/fail-host.jsonl "$OUT"/install.jsonl >"$OUT/stages.tsv"
 echo "PASS: install exit 0, server key ${server_key:0:12}..., port rule $(echo "$res" | jq -r .port_rule)"
+if [ "$variant" = auto ]; then
+    assert_auto_build "$res"
+else
+    echo "$res" | jq -e '.desktop.path_taken == "BUILD" and .desktop.reason_code == "build_requested"' >/dev/null ||
+        die "--image build must give path_taken=BUILD and reason_code=build_requested: $(echo "$res" | jq -c .desktop)"
+    echo "PASS: --image build gave path_taken=BUILD, reason_code=build_requested"
+fi
 
 step "units and credentials"
 vmx sh /root/vm-cell.sh units
@@ -288,6 +367,18 @@ if [ "$variant" = docker ]; then
     echo "$res" | jq -e '[.desktop.warnings[] | select(test("docker"; "i"))] | length == 0' >/dev/null || die "the result carries a Docker warning: $res"
     vmx sh /root/vm-cell.sh docker alice
     echo "PASS: $n DOCKER progress steps, no Docker warning in the result"
+fi
+
+# ---- the auto variant stops here: the path chosen is what it checks ----
+if [ "$variant" = auto ]; then
+    step "secrets canary"
+    vmx sh /root/vm-cell.sh canary-check
+    step "uninstall --destroy-desktop"
+    vmsh "$AGENT uninstall --destroy-desktop --yes" || die "uninstall --destroy-desktop failed"
+    vmx sh /root/vm-cell.sh leftovers destroy
+    echo
+    echo "CELL PASSED: $CELL_OS / $CELL_IMAGE / $variant"
+    exit 0
 fi
 
 # ---- pairing and PIN login from the runner ----

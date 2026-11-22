@@ -420,6 +420,8 @@ export global DetailsVm {
     callback cancel-restart();
     callback uninstall();
     callback danger-continue();
+    // The SSH username or port was edited: the host key check no longer applies.
+    callback ssh-changed();
     callback danger-cancel();
     callback danger-confirm();
     callback copy-commands();

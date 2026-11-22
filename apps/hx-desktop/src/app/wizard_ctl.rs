@@ -103,6 +103,21 @@ fn key_choices() -> Vec<slint::SharedString> {
     v
 }
 
+/// Empties the secret text fields of the form, so no copy stays in the UI after the wizard has
+/// taken (and wiped) its own.
+fn clear_secret_fields(app: &Rc<App>) {
+    let vm = app.ui().global::<WizardVm>();
+    for set in [
+        WizardVm::set_ssh_password,
+        WizardVm::set_password,
+        WizardVm::set_password2,
+        WizardVm::set_pin,
+        WizardVm::set_pin2,
+    ] {
+        set(&vm, ss(""));
+    }
+}
+
 fn pull(app: &Rc<App>) {
     let ui = app.ui();
     let vm = ui.global::<WizardVm>();
@@ -610,7 +625,13 @@ fn trust_host_key(app: &Rc<App>) {
         let t = target_of(&c.w);
         (t.host, t.port, algorithm.clone(), fingerprint.clone())
     };
-    app.hosts.borrow_mut().trust(&host, port, &fp);
+    let saved = app.hosts.borrow_mut().trust(&host, port, &fp);
+    if let Err(e) = saved {
+        app.wiz.borrow_mut().w.conn =
+            ConnPhase::Error(format!("The host key could not be saved: {e}"));
+        push_all(app);
+        return;
+    }
     app.wiz.borrow_mut().w.trusted = Some((algo, fp));
     start_checks(app);
 }
@@ -733,6 +754,7 @@ fn start_code_pairing(app: &Rc<App>) {
                     };
                     let _ = a.store.borrow_mut().upsert(s);
                     a.wiz.borrow_mut().w.wipe_secrets();
+                    clear_secret_fields(a);
                     a.show_home();
                 }
                 Err(e) => {
@@ -820,6 +842,7 @@ fn start_install(app: &Rc<App>) {
         // Keep the non-secret choices for a "Reconnect and resume" later; the secrets go now.
         c.w.wipe_secrets();
     }
+    clear_secret_fields(app);
     super::progress_ctl::start_ssh(app, id, req);
 }
 
@@ -955,6 +978,7 @@ fn begin_setup(app: &Rc<App>, id: String, addr: ServerAddr, p: crate::backend::P
         c.w.wipe_secrets();
         (r, c.epoch)
     };
+    clear_secret_fields(app);
     let vm = app.ui().global::<WizardVm>();
     vm.set_run_phase(4);
     vm.set_run_status(ss(format!(
@@ -1037,6 +1061,7 @@ fn cancel(app: &Rc<App>) {
         c.w.wipe_secrets();
         c.token = None;
     }
+    clear_secret_fields(app);
     app.show_home();
 }
 

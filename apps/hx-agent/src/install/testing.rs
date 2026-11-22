@@ -637,6 +637,9 @@ pub struct FakeDaemons {
     pub desktop_password: Option<Vec<u8>>,
     /// Requests of `CreateDesktop`.
     pub create_requests: Vec<pb::CreateDesktopRequest>,
+    /// What `CreateDesktop` answers instead of the default (a build on the server): tests of the
+    /// prebuilt path set the path, `reason_code` and `image`.
+    pub create_result: Option<pb::CreateDesktopResult>,
     /// Requests of `SetupHost`.
     pub host_requests: Vec<pb::SetupHostRequest>,
     /// Limits applied by `SetLimits`.
@@ -673,6 +676,7 @@ impl FakeDaemons {
             codes: 0,
             desktop_password: None,
             create_requests: Vec::new(),
+            create_result: None,
             host_requests: Vec::new(),
             limit_calls: Vec::new(),
             owner_key: None,
@@ -811,11 +815,21 @@ impl Daemons for FakeDaemons {
             ..Default::default()
         });
         let id = req.desktop_id.clone();
+        let code = if req.image_mode == pb::ImageMode::Build as i32 {
+            pb::ImageReason::BuildRequested
+        } else {
+            pb::ImageReason::NoImageKey
+        };
         self.create_requests.push(req);
+        if let Some(mut r) = self.create_result.clone() {
+            r.desktop_id = id;
+            return Ok(r);
+        }
         Ok(pb::CreateDesktopResult {
             desktop_id: id,
             path_taken: pb::PathTaken::Build as i32,
             reason: "built on the server".into(),
+            reason_code: code as i32,
             warnings: vec!["hx-session package missing".into()],
             ..Default::default()
         })
@@ -1021,6 +1035,8 @@ pub struct Machine {
     pub err: Vec<u8>,
     /// The release keys.
     pub keys: crate::privd::update::keys::UpdateKeys,
+    /// The image signing keys (`--image-file`); tests replace them with a test key.
+    pub image_keys: crate::privd::image::ImageKeys,
     /// `--json`.
     pub json: bool,
 }
@@ -1061,6 +1077,7 @@ impl Machine {
             out: Vec::new(),
             err: Vec::new(),
             keys: crate::privd::update::keys::UpdateKeys::embedded(),
+            image_keys: crate::privd::image::ImageKeys::embedded(),
             json: true,
             paths,
             dir,
@@ -1086,6 +1103,7 @@ impl Machine {
             json: self.json,
             now: fixed_now,
             keys: self.keys.clone(),
+            image_keys: self.image_keys.clone(),
             verifier_params: hx_crypto::PinParams {
                 memory_kib: 64,
                 iterations: 1,

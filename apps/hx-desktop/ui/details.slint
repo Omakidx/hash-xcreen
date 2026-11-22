@@ -1010,11 +1010,17 @@ export component DetailsScreen inherits Rectangle {
             Field {
                 label: "Username";
                 text <=> DetailsVm.ssh-user;
+                edited(_) => {
+                    DetailsVm.ssh-changed();
+                }
             }
 
             Field {
                 label: "Port";
                 text <=> DetailsVm.ssh-port;
+                edited(_) => {
+                    DetailsVm.ssh-changed();
+                }
                 width: 100px;
             }
         }
