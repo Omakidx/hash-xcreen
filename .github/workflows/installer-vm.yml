@@ -140,9 +140,11 @@ jobs:
           ls -l /dev/kvm
       - name: Install and initialise Incus
         run: |
-          # dnsmasq-base is only recommended by incus, but its managed bridge (incusbr0) needs it.
+          # With recommends: incus only recommends dnsmasq-base (its managed bridge needs it), and
+          # Ubuntu's qemu-system-x86 only recommends the SPICE module that Incus VMs need. This is
+          # the CI runner, not a host under test: the installer installs its own minimal set.
           sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends incus incus-client dnsmasq-base qemu-system-x86 ovmf qemu-utils
+          sudo apt-get install -y incus incus-client dnsmasq-base qemu-system-x86 qemu-system-modules-spice ovmf qemu-utils
           sudo incus admin init --minimal
           # VM disks (40 GiB each) live on /mnt, the big disk of the runner.
           sudo mkdir -p /mnt/incus
