@@ -2526,3 +2526,121 @@ async fn n9_any_admitted_desktop_command_enforces_it_and_a_docker_desktop_is_lef
     );
     assert!(h.daemon.flags_for("main").is_empty());
 }
+
+// ----- a desktop kept by `uninstall --keep-desktop` is adopted on reinstall ----------------------
+
+fn create_cmd(user: &str) -> Command {
+    Command::CreateDesktop(pb::CreateDesktopRequest {
+        desktop_id: "main".into(),
+        distro: pb::Distro::Ubuntu2404 as i32,
+        desktop: pb::DesktopKind::Xfce as i32,
+        preset: pb::Preset::Basic as i32,
+        username: user.into(),
+        ..Default::default()
+    })
+}
+
+fn chpasswd_count(h: &Harness) -> usize {
+    h.incus
+        .with(|s| s.execs.iter().filter(|e| e.contains("chpasswd")).count())
+}
+
+#[tokio::test]
+async fn create_desktop_adopts_a_ready_desktop_that_privd_forgot() {
+    let h = Harness::start(GW);
+    // The instance survived an `uninstall --keep-desktop`; privd's registry and the link did not.
+    h.incus
+        .add_desktop("hx-main", "ubuntu-24.04-xfce-basic", "alice", true);
+    assert!(!h.daemon.read_state(|s| s.desktops.contains_key("main")));
+    open_window(&h).await;
+    // Without adoption FinishSetup finds no ready desktop.
+    let r = run(
+        &h,
+        Role::Admin,
+        Command::FinishSetup(pb::FinishSetupRequest::default()),
+    )
+    .await;
+    assert_eq!(
+        err(&r),
+        (ErrorCode::FailedPrecondition, ErrorDetail::DesktopNotReady)
+    );
+    let kinds = [pb::SecretKind::UserPassword];
+    let pw: &[&[u8]] = &[b"New-Password-For-The-Kept-One-3"];
+    let before = chpasswd_count(&h);
+    let R::CreateDesktop(c) =
+        ok(run_with(&h.daemon, Role::Admin, create_cmd("alice"), &kinds, pw).await)
+    else {
+        panic!()
+    };
+    assert_eq!(c.reason, "adopted the existing desktop");
+    assert!(
+        h.daemon.read_state(|s| s.desktops.contains_key("main")),
+        "registered again"
+    );
+    // The password of this request was set in the kept desktop (and never in an argv).
+    assert_eq!(chpasswd_count(&h), before + 1);
+    assert!(
+        h.incus
+            .with(|s| s.execs.iter().all(|e| !e.contains("New-Password-For")))
+    );
+    // The session link is provisioned again; a missing package is a warning, not a failure.
+    assert!(
+        h.incus
+            .with(|s| s.instances["hx-main"].devices.contains_key("hx-link"))
+    );
+    assert!(
+        c.warnings.iter().any(|w| w.contains("hx-session package")),
+        "{:?}",
+        c.warnings
+    );
+    // FinishSetup now succeeds.
+    ok(run(
+        &h,
+        Role::Admin,
+        Command::FinishSetup(pb::FinishSetupRequest::default()),
+    )
+    .await);
+    // A resume (already registered) changes nothing and sets no second password.
+    let R::CreateDesktop(c2) =
+        ok(run_with(&h.daemon, Role::Admin, create_cmd("alice"), &kinds, pw).await)
+    else {
+        panic!()
+    };
+    assert!(c2.reason.contains("already exists"));
+    assert_eq!(chpasswd_count(&h), before + 1);
+}
+
+#[tokio::test]
+async fn adoption_needs_the_same_arguments_and_is_undone_when_it_fails() {
+    let h = Harness::start(GW);
+    h.incus
+        .add_desktop("hx-main", "ubuntu-24.04-xfce-basic", "alice", true);
+    open_window(&h).await;
+    let kinds = [pb::SecretKind::UserPassword];
+    let pw: &[&[u8]] = &[b"Some-Password-1234"];
+    // Other arguments: still a refusal, and nothing is registered.
+    let r = run_with(&h.daemon, Role::Admin, create_cmd("bob"), &kinds, pw).await;
+    assert_eq!(
+        err(&r),
+        (ErrorCode::FailedPrecondition, ErrorDetail::DesktopExists)
+    );
+    assert!(!h.daemon.read_state(|s| s.desktops.contains_key("main")));
+    // The password cannot be set: the adoption fails and the desktop is unregistered again.
+    h.incus.with(|s| {
+        s.exec_rules.push(ExecRule {
+            needle: "chpasswd".into(),
+            exit: 1,
+            stdout: "boom".into(),
+            delay: Some(std::time::Duration::ZERO),
+        });
+    });
+    let r = run_with(&h.daemon, Role::Admin, create_cmd("alice"), &kinds, pw).await;
+    assert!(
+        matches!(
+            r.result,
+            Some(hx_ipc::privd::pb::response::Result::Error(_))
+        ),
+        "{r:?}"
+    );
+    assert!(!h.daemon.read_state(|s| s.desktops.contains_key("main")));
+}
