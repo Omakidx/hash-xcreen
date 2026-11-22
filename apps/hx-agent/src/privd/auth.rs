@@ -75,7 +75,6 @@ pub struct RateRule {
 
 const MIN: u64 = 60_000;
 const HOUR: u64 = 3_600_000;
-const DAY: u64 = 86_400_000;
 
 /// The command-specific limit of ipc.md 6 and 8, if the command has one. `PepperEnrol` and the
 /// failure caps of `PepperVerify` are not here: they are persisted budgets (`limiter`).

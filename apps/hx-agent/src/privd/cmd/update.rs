@@ -111,6 +111,13 @@ fn ensure_dirs<T: Transport + Clone + 'static>(d: &Daemon<T>) -> Result<FetchDir
         log::error(&format!("fetch directory: {e}"));
         CmdError::internal("the fetch directory cannot be opened")
     })?;
+    dir.require_tmpfs(u.fetch_tmpfs_cap).map_err(|e| {
+        log::error(&format!("fetch directory: {e}"));
+        d.audit_notice("update fetch directory is not the expected tmpfs; update refused");
+        refused(
+            "the fetch directory is not its size-capped tmpfs (is var-lib-hx-updates.mount active?)",
+        )
+    })?;
     dir.sweep(&[MANIFEST_FILE, MANIFEST_SIG_FILE, ARTIFACT_FILE])
         .map_err(|e| {
             log::error(&format!("fetch directory: {e}"));

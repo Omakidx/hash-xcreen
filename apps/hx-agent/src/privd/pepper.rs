@@ -335,7 +335,9 @@ mod tests {
         std::fs::create_dir(&creds).unwrap();
         let state = d.path().join("pepper.key");
         for dir in [Some(creds.as_path()), None] {
-            let e = Pepper::load_with(dir, &state, false).err().expect("refused");
+            let Err(e) = Pepper::load_with(dir, &state, false) else {
+                panic!("a release build must refuse");
+            };
             assert_eq!(e.kind(), io::ErrorKind::NotFound);
             assert!(!state.exists(), "no plaintext pepper was created");
         }
