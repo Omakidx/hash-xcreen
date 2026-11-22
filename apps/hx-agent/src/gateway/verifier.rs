@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use argon2::{Algorithm, Argon2, Params, Version};
-use hx_crypto::auth::{BoxFuture, PinVerdict, PinVerifier};
+use hx_crypto::auth::{BoxFuture, PasswordVerdict, PinVerdict, PinVerifier, ReinstateGate};
 use hx_crypto::{DeviceId, PinParams};
 use hx_ipc::privd::pb::LockoutPurpose;
 use zeroize::Zeroizing;
@@ -471,6 +471,91 @@ impl PinVerifier for PrivdPinVerifier {
                 }
                 Err(_) => {
                     tracing::warn!("PepperVerify timed out");
+                    PinVerdict::Unavailable
+                }
+            }
+        })
+    }
+}
+
+/// The gateway's [`ReinstateGate`] (protocol 1.3, section 11.7): the account password of a
+/// device that was locked out by the PIN. Argon2id runs here with the **stored password
+/// verifier's own parameters**, then privd's `PepperVerify(PASSWORD)` answers yes or no, bounded
+/// by a timeout. The authenticator owns who may ask and the attempt limits; privd keeps the
+/// global PASSWORD failure budget.
+///
+/// | privd | verdict |
+/// |---|---|
+/// | yes | `Right` |
+/// | no | `Wrong` (counted by the authenticator and by privd) |
+/// | down, timeout, any failure | `Unavailable` (refunded) |
+/// | PASSWORD purpose locked | `Locked { retry_after }` (refunded) |
+pub struct PrivdReinstateGate {
+    store: Arc<VerifierStore>,
+    privd: PrivdClient,
+    timeout: Duration,
+}
+
+impl PrivdReinstateGate {
+    /// A gate over `store` that asks `privd`.
+    pub fn new(store: Arc<VerifierStore>, privd: PrivdClient) -> Self {
+        Self {
+            store,
+            privd,
+            timeout: PRIVD_TIMEOUT,
+        }
+    }
+}
+
+impl ReinstateGate for PrivdReinstateGate {
+    fn has_password(&self, _device: &DeviceId) -> bool {
+        self.store.password().is_some()
+    }
+
+    fn verify<'a>(
+        &'a self,
+        _device: &'a DeviceId,
+        password: Zeroizing<Vec<u8>>,
+    ) -> BoxFuture<'a, PasswordVerdict> {
+        Box::pin(async move {
+            let Some(record) = self.store.password() else {
+                return PinVerdict::Unavailable;
+            };
+            // A malformed password is a wrong one, without a hash.
+            if hx_proto::message::password_problem(&password).is_some() {
+                return PinVerdict::Wrong;
+            }
+            let expected = *record.expected_mac();
+            let output = tokio::task::spawn_blocking(move || record.derive(&password)).await;
+            let output = match output {
+                Ok(Ok(o)) => o,
+                _ => return PinVerdict::Unavailable,
+            };
+            let answer = tokio::time::timeout(
+                self.timeout,
+                self.privd
+                    .pepper_verify(LockoutPurpose::Password, &expected, &*output),
+            )
+            .await;
+            match answer {
+                Ok(Ok(true)) => PinVerdict::Right,
+                Ok(Ok(false)) => PinVerdict::Wrong,
+                Ok(Err(e)) if e.is_locked() => {
+                    let wait = match &e {
+                        PrivdError::Remote(r) if !r.retry_after.is_zero() => r.retry_after,
+                        _ => LOCKED_WAIT,
+                    };
+                    tracing::error!("privd reports the PASSWORD purpose locked");
+                    PinVerdict::Locked {
+                        retry_after: Some(wait),
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "PepperVerify (password) failed");
+                    PinVerdict::Unavailable
+                }
+                Err(_) => {
+                    tracing::warn!("PepperVerify (password) timed out");
                     PinVerdict::Unavailable
                 }
             }

@@ -74,7 +74,8 @@ pub fn extend<T: Transport + Clone + 'static>(
 }
 
 /// `FinishSetup` (class A: Gateway or Admin): `SETUP_OPEN` to `READY`. Needs at least one desktop
-/// in state `ready` unless Admin passes `force`. In `READY` it is a no-op (converge).
+/// in state `ready` unless Admin passes `force`. In `READY` it is a no-op (converge). Admin in
+/// `UNINITIALIZED` moves to `READY` when a desktop is ready (ipc.md 5.1, the expiry trap).
 pub async fn finish<T: Transport + Clone + 'static>(
     d: &Daemon<T>,
     ctx: &Ctx,
@@ -83,6 +84,19 @@ pub async fn finish<T: Transport + Clone + 'static>(
     match d.phase() {
         PhaseKind::Ready => return Ok(response::Result::FinishSetup(pb::FinishSetupResult {})),
         PhaseKind::Uninitialized => {
+            // The expiry trap (ipc.md 5.1): a window that expired before `FinishSetup` returned
+            // to `UNINITIALIZED`, where PIN logins are refused. Admin (never Gateway) may
+            // finish from there when a desktop is ready; without one it stays refused.
+            if ctx.role == Role::Admin && d.any_desktop_ready().await? {
+                d.mutate_state(|s| {
+                    s.phase.phase = PhaseKind::Ready;
+                    s.phase.return_to = PhaseKind::Ready;
+                    s.phase.window_started = 0;
+                    s.phase.window_expires = 0;
+                })?;
+                d.audit_notice("FinishSetup by Admin from UNINITIALIZED: a desktop is ready");
+                return Ok(response::Result::FinishSetup(pb::FinishSetupResult {}));
+            }
             return Err(CmdError::precondition(
                 ErrorDetail::SetupWindowClosed,
                 "the setup window is not open",
