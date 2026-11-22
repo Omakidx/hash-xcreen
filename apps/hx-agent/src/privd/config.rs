@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use hx_provision::host::Naming;
 
 use super::identity::{FileMeta, GatewayIdentity, IdentityError, resolve_gateway_from};
+use super::image::ImageConfig;
 use super::update::UpdateConfig;
 
 /// The privd socket (ipc.md 3).
@@ -83,6 +84,8 @@ pub struct PrivdConfig {
     pub max_desktops: usize,
     /// Paths and policy of self-update (ipc.md 6.12).
     pub update: UpdateConfig,
+    /// Paths and timings of the prebuilt-image path (ipc.md 6.5, 6.12).
+    pub image: ImageConfig,
 }
 
 impl PrivdConfig {
@@ -119,6 +122,10 @@ impl PrivdConfig {
             gateway,
             max_desktops: 1,
             update: UpdateConfig::production(std::path::Path::new(STATE_DIR)),
+            image: ImageConfig::production(
+                std::path::Path::new(STATE_DIR),
+                std::path::Path::new("/var/lib/incus"),
+            ),
         })
     }
 
@@ -152,6 +159,7 @@ impl PrivdConfig {
             gateway,
             max_desktops: 1,
             update: UpdateConfig::for_tests(dir),
+            image: ImageConfig::for_tests(dir),
         }
     }
 

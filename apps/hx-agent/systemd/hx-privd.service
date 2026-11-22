@@ -12,8 +12,9 @@ Description=hash-xcreen privileged helper (hx-privd)
 Documentation=https://github.com/Omakidx/hash-xcreen/blob/main/docs/ipc.md
 Requires=hx-privd.socket
 After=hx-privd.socket incus.service systemd-tmpfiles-setup.service
-# The fetcher's directory is its own size-capped tmpfs (var-lib-hx-updates.mount).
-RequiresMountsFor=/var/lib/hx/updates
+# The fetchers' directories are their own size-capped tmpfs mounts (var-lib-hx-updates.mount,
+# var-lib-hx-imagein.mount).
+RequiresMountsFor=/var/lib/hx/updates /var/lib/hx/imagein
 # Incus being down is not a reason to refuse to start: commands answer UNAVAILABLE and retry.
 #
 # Safety net of self-update (docs/ipc.md 6.12). A new privd that cannot start at all never reaches

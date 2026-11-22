@@ -36,6 +36,24 @@ impl fmt::Debug for pb::SetupStart {
     }
 }
 
+impl fmt::Debug for pb::ServerChangePin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServerChangePin")
+            .field("current", &Redacted)
+            .field("new", &Redacted)
+            .finish()
+    }
+}
+
+impl fmt::Debug for pb::ServerChangePassword {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServerChangePassword")
+            .field("current", &Redacted)
+            .field("new", &Redacted)
+            .finish()
+    }
+}
+
 impl fmt::Debug for pb::Opaque {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Opaque").field("data", &Redacted).finish()

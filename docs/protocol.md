@@ -157,7 +157,7 @@ A receiver that sees a value above its limit treats it as a protocol error (reli
 
 Capabilities advertised in `HelloAck` are an *offer*: negotiated features take effect only when the server authorizes the connection (§2.1). For an `INTENT_PAIR` hello the server advertises no features and no codecs, so a pairing connection can never carry anything but control messages.
 
-`features` is a bitmask. Both sides compute `negotiated = client.features & server.features & mask(negotiated_minor)` (bits 0 to 2 exist from 1.0, bit 3 from 1.1, bit 4 from 1.2, bit 5 from 1.3) and `codecs = client.video_codecs ∩ server.video_codecs`, in the server's order of preference. Bits unknown to a side are ignored by that side.
+`features` is a bitmask. Both sides compute `negotiated = client.features & server.features & mask(negotiated_minor)` (bits 0 to 2 exist from 1.0, bit 3 from 1.1, bit 4 from 1.2, bits 5 and 6 from 1.3) and `codecs = client.video_codecs ∩ server.video_codecs`, in the server's order of preference. Bits unknown to a side are ignored by that side.
 
 | Bit | Name | Introduced | Enables |
 |---|---|---|---|
@@ -167,6 +167,7 @@ Capabilities advertised in `HelloAck` are an *offer*: negotiated features take e
 | 3 | `SERVER_STATS` | 1.1 | `ServerStats` control messages (§5.8), sent only while the client has asked for them (`ViewConfig.stats_enabled`) |
 | 4 | `DEVICE_MANAGEMENT` | 1.2 | `DeviceMgmt` control messages (§5.9): list paired devices, revoke one, the server's change notices and (1.3) a request for a pairing code |
 | 5 | `SETUP` | 1.3 | `SetupMessage` control messages (§5.10). Offered **only** in the `HelloAck` of an `INTENT_SETUP` connection; a normal session offers `defined_up_to(3)` without it, so a `setup` message on a session is a `PROTOCOL_ERROR` at the application level (the same pattern as `DeviceMgmt`) |
+| 6 | `SERVER_MANAGEMENT` | 1.3 | `ServerMgmt` control messages (§5.11): server overview, change PIN and password, restart the desktop, turn Docker off, limits, agent update. Offered on normal sessions only (never on a pairing or setup connection) |
 
 An empty `codecs` intersection is not a handshake error; the server then answers `StreamInfo` only after a `ViewConfig` with a codec that is in the intersection, and rejects other codecs with `Goodbye` (code `PROTOCOL_ERROR`). Video, cursor, input, mouse and control are always available (not feature-gated).
 
@@ -208,6 +209,7 @@ Decision: **a minor bump to 1.3, with a new feature bit**, for two things the ap
 | `SetupMessage` (`ControlMessage.setup` = 13) and its messages | §5.2, §5.10 | Negotiated minor at least 3 **and** feature `SETUP`, on `INTENT_SETUP` connections only |
 | `AuthStatus` `PIN_REQUIRED` (6) | §11.4 | Sent only on `INTENT_SETUP` connections |
 | `DeviceMgmt` bodies `create_pairing_code` (15) and `pairing_code_issued` (16) | §5.9 | Negotiated minor at least 3 **and** feature `DEVICE_MANAGEMENT`, on an authorized `INTENT_SESSION` connection |
+| Feature bit 6 `SERVER_MANAGEMENT` and `ServerMgmt` (`ControlMessage.server_mgmt` = 14) | §4.3, §5.11 | Negotiated minor at least 3 **and** feature `SERVER_MANAGEMENT`, on an authorized `INTENT_SESSION` connection of an active device |
 | `INTENT_REINSTATE` (`Intent` 4), `AuthStatus` `PASSWORD_REQUIRED` (7) and `WRONG_PASSWORD` (8), and `AuthMessage.password` (`PasswordAttempt`, field 3) | §11.7 | A client sends it **only** to a server whose confirmed version has minor at least 3 (the version it saw on its last successful session or pairing), and only after a session was refused with `REVOKED` |
 | Redacting `Debug` for `SetupSetPin`, `SetupStart`, `PairingCodeIssued`, `PasswordAttempt` and `Opaque` (`skip_debug` plus hand-written impls; this also fixes today's `Opaque` PIN leak through `Debug`) | §14 | n/a (implementation rule) |
 
@@ -248,6 +250,7 @@ A `oneof` envelope. Exactly one variant MUST be set, else the message is invalid
 | `server_stats` | 11 | S → C | **1.1.** Numeric statistics for the stats overlay, §5.8 |
 | `device_mgmt` | 12 | both | **1.2.** Device management: list and revoke paired devices, change notices, §5.9; **1.3:** request a pairing code |
 | `setup` | 13 | both | **1.3.** Post-pairing setup on an `INTENT_SETUP` connection, §5.10 |
+| `server_mgmt` | 14 | both | **1.3.** Server management on an authorized session: overview, change PIN and password, restart, Docker off, limits, agent update, §5.11 |
 | `pairing` | 100 | both | **Owned by 1B.** Opaque pairing envelope, §11 |
 | `auth` | 101 | both | **Owned by 1B.** Opaque PIN/auth envelope, §11 |
 
@@ -584,6 +587,64 @@ pub fn server_supports_setup(v: &pb::Version) -> bool;        // minor >= 3, use
 **Server-side contracts** that this section relies on (code, not wire): `hx_transport::Connection::authorize_control_only(allowed: Features)` (server only; satisfies the deadline, releases the pre-authentication slot, lets the control variants through, keeps the QUIC unidirectional credit at 0, still drops input and mouse and refuses media sends; `Hello` validation accepts `Intent::Setup`; `RefuseReason::SetupClosed` maps to close code 10; `Features::SETUP`, `defined_up_to(3)` and a `Features::without` helper; `PROTOCOL_MINOR = 3`), and in `hx-crypto` a `SetupGate` (`admit(device)` returns `Closed`, `KeyOnly` or `NeedsPin`, bounds its own calls, and without it `INTENT_SETUP` is refused `UNAUTHORIZED`), the additive `Outcome::Paired { …, with: PairedWith::{Token{id}, Code} }` and `Outcome::Setup { connection, device, pin_verified }`. The gate and the registry are checked again immediately before `authorize_control_only`; on a NeedsPin connection the PIN exchange reuses the session's `pin_exchange` unchanged, and the revocation watcher closes the connection.
 
 **Threats this section answers** (the full table is in the 1G design record): a token thief who wins the pairing race gets the desktop setup, which is inherent to bearer tokens; the legitimate app then fails to pair ("wrong or expired, or intercepted", §11.3) and the user reruns the one-liner, and the device is visible in `hx-agent devices` and the audit log. A stolen setup-device key before a PIN exists equals the owner for the few minutes before `set_pin`; afterwards every setup connection needs the PIN, with lockout after 5. A malicious paired client during setup has no field for Admin-only options (the server builds the privd request from typed, validated values: no `image_file`, no pool device, no private networks, `desktop_id` from configuration). A protocol downgrade is impossible inside pinned TLS: `INTENT_SETUP` needs a client minor of at least 3 and `SETUP`, and an old server is never sent the intent.
+
+### 5.11 Server management (1.3)
+
+Lets an app manage the server it is connected to from the "Server details" screens: an overview, changing the PIN and the account password, restarting the desktop, turning Docker off, changing the resource limits and updating the agent. One control variant, `ControlMessage.server_mgmt` (field 14, `ServerMgmt`), used in both directions, negotiated by the feature `SERVER_MANAGEMENT` (bit 6, §4.3, §4.7). The server side is [ipc.md](ipc.md) §5.6; the decision is ipc.md §22 decision 24.
+
+`ServerMgmt` = `request_id` (1, uint32) and one body (`oneof`). Every request is answered by exactly one response with the same non-zero `request_id`; a client may have several outstanding, the server handles one connection's requests in arrival order.
+
+| Body | # | Direction | Fields |
+|---|---|---|---|
+| `get_overview` | 10 | C → S | none |
+| `overview` | 11 | S → C | `ServerOverview` (below) |
+| `change_pin` | 12 | C → S | `current` (1, bytes), `new` (2, bytes): 6 to 16 ASCII digits each. **Secret** |
+| `change_password` | 13 | C → S | `current` (1, bytes), `new` (2, bytes): 1 to 511 bytes of UTF-8 without NUL, CR or LF (`hx_proto::message::password_problem`). **Secret** |
+| `restart_desktop` | 14 | C → S | `force` (1, bool) |
+| `set_docker` | 15 | C → S | `enable` (1, bool) |
+| `set_limits` | 16 | C → S | `limits` (1, `SetupLimits`: `cpu`, `memory_mib`, `disk_gib`; each non-zero and within the static caps of §5.10) |
+| `check_update` | 17 | C → S | none |
+| `apply_update` | 18 | C → S | `version` (1, string, at most 32 bytes) |
+| `result` | 19 | S → C | `ServerResult` (below): the answer to every request except `get_overview` |
+
+`ServerResult`: `status` (1, `ServerStatus`), `retry_after_s` (2, uint32), `attempts_left` (3, uint32, set with `WRONG_PIN`), `message` (4, string, at most 256 bytes: a fixed or sanitised text, **never** a value that was sent), `restart_required` (5, bool, `set_limits`), `update` (6, `ServerUpdateInfo`, `check_update`), `version` (7, string, `apply_update`: the version being installed). `ServerStatus`: `OK` 1, `INVALID_ARGUMENT` 2 (a semantic check failed; nothing was changed), `WRONG_PIN` 3, `WRONG_PASSWORD` 4, `BACKOFF` 5 (too soon after a wrong secret: not checked, not counted; `retry_after_s`), `LOCKED` 6 (the check is locked: a purpose that privd locked after its failure cap, or the device was revoked by the lockout; only the operator lifts it), `RATE_LIMITED` 7 (`retry_after_s`), `ADMIN_ONLY` 8 (not allowed to the server's gateway after setup, for example turning Docker **on**; the app shows the command in `message`), `UNAVAILABLE` 9 (the privileged daemon cannot be reached now; retry), `DESKTOP_NOT_READY` 10, `FAILED` 11 (a server fault), `UPDATE_REFUSED` 12 (privd refuses the update: not newer, not the fetched release, or a rolled-back release that only an operator may re-apply within 24 hours), `UNSUPPORTED` 13. `UNSPECIFIED` (0) is invalid.
+
+`ServerOverview` (everything is optional data; a field the server cannot know is left unset or `UNKNOWN`, never invented): `agent_version` (1, string ≤ 64), `privd_version` (2, string ≤ 64), `server_time_unix` (3), `agent_uptime_s` (4), `update` (5, `ServerUpdateInfo`, the **cached** result of the last `check_update`, unset if there was none since the agent started; `get_overview` never touches the network), `desktop` (6, `ServerDesktop`), `host` (7, `SetupHostFacts`, §5.10), `host_attention` (8, repeated `ServerAttention`, at most 8), `session_active` (9, bool: some client holds the desktop now). `ServerDesktop`: `state` (1, `ServerDesktopState`: `NONE` 1, `CREATING` 2, `READY` 3, `FAILED` 4, `STOPPED` 5, `RUNNING` 6, `STARTING` 7, `UNKNOWN` 8 when privd could not be asked), `username` (2, ≤ 32), `distro` (3, `SetupDistro`), `preset` (4, `SetupPreset`), `limits` (5, `SetupLimits`), `docker` (6, `ServerDockerState`: `OFF` 1, `ON` 2, `DEGRADED` 3), `needs_attention` (7, repeated `ServerAttention`, at most 8), `created_unix` (8). `ServerAttention` mirrors privd's `NeedsAttention`: `HOST_ACCOUNT_POLICY` 1, `STUCK_OPERATION` 2, `ISOLATION_NOT_RESTORED` 3, `PIN_LOCKED` 4, `PASSWORD_LOCKED` 5, `UPDATE_ROLLED_BACK` 6, `HOST_DOCKER_FORWARDING` 7. `ServerUpdateInfo`: `current` (1, ≤ 32), `available` (2, ≤ 32, empty = none), `channel` (3, `ServerUpdateChannel`: `STABLE` 1, `BETA` 2), `verified` (4), `rolled_back_version` (5, ≤ 32), `rolled_back_reason` (6, ≤ 256), `checked_unix` (7, 0 = never).
+
+**Authorization.** Only on a connection that is **authorized** (§2.1: the pinned key checked and the PIN passed), of an **active** device, that negotiated `SERVER_MANAGEMENT`. A restricted, pairing or setup connection never processes it (the transport already treats the variant as a protocol error there). A body that only the server may send, a request with `request_id` 0, or the variant without the negotiated feature is a protocol error (`PROTOCOL_ERROR`); `hx_proto::pb::ServerMgmt::direction` tells a receiver which way a body may travel. Authority comes from the authenticated session alone; any authenticated paired device may manage the server, as for devices (§5.9), and it rests on the PIN. Hard size caps and the request-id rules are checked by `hx-proto` (a violation is `PROTOCOL_ERROR`); **semantic** checks (PIN digits, password rules, limits non-zero, the version syntax) are answered `INVALID_ARGUMENT`.
+
+**What each request does.**
+
+- **`get_overview`**: the server's version, the cached update status, the desktop (`GetDesktop`: state, limits, Docker, `needs_attention`), the host facts (`GetHostInfo`: CPU, memory, pool, Incus) and the server time. Bounded: if privd does not answer in time the desktop is `UNKNOWN` and the host facts are left unset.
+- **`change_pin`**: the **current PIN is checked like a login**: the attempt is counted before it is checked on the device's own failure counter (the same one a PIN login uses), a wrong one answers `WRONG_PIN` with `attempts_left` and a short backoff (`BACKOFF`, not counted again), the 5th consecutive wrong PIN **revokes the device** and closes its sessions (§11.4), a right one resets the counter. An unavailable verifier is never a wrong PIN (the attempt is refunded). Then the new PIN is enrolled (Argon2id here, privd's `PepperEnrol(PIN)`, at most 5 a day for the gateway after setup: `RATE_LIMITED` past it) and stored for **all** devices; other devices keep their sessions and use the new PIN at their next login. Audited (`PIN_CHANGED` with the requesting device).
+- **`change_password`**: the account password. privd's `SetUserPassword` with `CURRENT_PASSWORD` verifies the current password against the desktop user's shadow hash and charges a failure to privd's global PASSWORD budget (`WRONG_PASSWORD`; `LOCKED` when that budget is spent), then the server refreshes its password verifier. The desktop must be running (`DESKTOP_NOT_READY`). If the verifier cannot be refreshed after privd accepted the change (for example `PepperEnrol`'s daily allowance is used up) the answer is still `OK` but with a non-empty `message` naming `sudo hx-agent desktop password --verifier-only`: the password did change, and only reinstating a locked-out device by password is affected. Audited (`PASSWORD_CHANGED`, then `PASSWORD_VERIFIER_CHANGED` once the verifier is refreshed).
+- **`restart_desktop`**: privd's `RestartDesktop`. Open apps in the desktop close; the stream ends and the client reconnects. Audited (`DESKTOP_RESTARTED`).
+- **`set_docker`**: `enable = false` is privd's `DisableDocker` (always allowed: it only reduces exposure; the desktop restarts). `enable = true` after setup is **Admin only** (ipc.md §5.1: it lowers container isolation): the server does not call privd and answers `ADMIN_ONLY` with `message` = `sudo hx-agent docker enable`. Audited (`DOCKER_DISABLED`).
+- **`set_limits`**: privd's `SetLimits` (bounds are privd's: ipc.md §6.8, an out-of-bounds value is `INVALID_ARGUMENT`); `restart_required` says the CPU count changed on a running desktop. Audited (`LIMITS_CHANGED`).
+- **`check_update`**: privd's `CheckUpdate` (the sandboxed fetcher, verified manifest); the answer is also cached for `get_overview`. At most 6 an hour (privd's own limit).
+- **`apply_update`**: privd's `ApplyUpdate` for `version`, which must equal the release privd fetched and verified; `OK` means privd accepted it and is restarting the agent. **The session ends when the gateway restarts**: the client reconnects and reads the new version from `get_overview`. privd's rules apply unchanged: no downgrade, at most 2 a day, and a release that was rolled back cannot be re-applied by the gateway for 24 hours (`UPDATE_REFUSED`). Audited (`UPDATE_APPLIED`).
+
+**Limits.** Every request is rate limited per device over all its connections (overview 30 a minute, other requests 10 a minute, `RATE_LIMITED` with `retry_after_s`), on top of the privd limits quoted above. Control writes are bounded to 5 s as in §5.9. A request that is waiting on privd is not cancelled by the client dropping the connection (the effect of a mutation that was admitted is applied and audited).
+
+**Secrecy.** `ServerChangePin` and `ServerChangePassword` have a redacting `Debug` (`skip_debug`, §14); the server copies each secret into zeroizing memory at once and drops the message, never logs a secret and never puts one in a `ServerResult.message` or an error; the client wipes its copies after sending (`hx_crypto::server_admin`).
+
+**Client library** (`hx_crypto::server_admin::ServerAdmin`, over an authorized session connection, like `DeviceAdmin`):
+
+```rust
+impl ServerAdmin {
+  pub fn new(connection: Connection) -> Result<Self>;             // needs SERVER_MANAGEMENT negotiated
+  pub async fn overview(&mut self) -> Result<pb::ServerOverview>;
+  pub async fn change_pin(&mut self, current: &Pin, new: &Pin) -> Result<ServerReply>;
+  pub async fn change_password(&mut self, current: &Password, new: &Password) -> Result<ServerReply>;
+  pub async fn restart_desktop(&mut self, force: bool) -> Result<ServerReply>;
+  pub async fn set_docker(&mut self, enable: bool) -> Result<ServerReply>;
+  pub async fn set_limits(&mut self, limits: pb::SetupLimits) -> Result<ServerReply>;
+  pub async fn check_update(&mut self) -> Result<ServerReply>;
+  pub async fn apply_update(&mut self, version: &str) -> Result<ServerReply>;
+}
+```
+
+`ServerReply` is the decoded `ServerResult` (its `status` is never turned into an `Err`: only transport and protocol failures are errors).
 
 ## 6. Media (video) channel
 

@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 pub mod fake_privd;
+pub mod setup;
 
 use std::future::Future;
 use std::path::PathBuf;

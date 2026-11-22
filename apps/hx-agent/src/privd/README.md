@@ -210,6 +210,32 @@ ipc.md 6.12 is the contract; this is how it is built (code in `update/`, `cmd/up
 * **Safety net.** `hx-privd.service` carries `OnFailure=hx-privd-rescue.service`, `StartLimitIntervalSec=300` and `StartLimitBurst=5` (more than `MAX_ATTEMPTS`, which a test enforces). The installer must put the `hx-privd-rescue` binary at `/usr/lib/hx-rescue/hx-privd-rescue` (root, 0755, **outside** `/usr/lib/hx`, so pruning never removes it) and install `hx-privd-rescue.service`. See "The rescue helper".
 * **Release hosting.** `channel-<stable|beta>/manifest-<arch>.json` and `.minisig`, and `v<version>/hx-<version>-<arch>.tar.gz`, under the repository's releases.
 
+## Prebuilt images (1D)
+
+`CreateDesktop` can install from a signed prebuilt image (`src/privd/image/`, ipc.md 6.5 and 6.12).
+
+- **`choose`** (`image/choose.rs`) is the algorithm of ipc.md 6.5 step 3; every outcome carries an
+  `ImageReason` and a fixed-template reason string. `auto` builds with a reason where `prebuilt`
+  fails (`FAILED_PRECONDITION` detail `IMAGE` or `POOL`, `UNAVAILABLE` for an unavailable list).
+- **Keys** (`image/keys.rs`): `image-keys/{current,next}.pub`, a pair separate from the release keys,
+  `UNPROVISIONED` until the maintainer supplies them. `release-build` fails to compile while either
+  is unprovisioned, and with `test-image-key`; `test-image-key` adds the key of
+  `HX_TEST_IMAGE_PUBKEY` for the installer VM tests and image CI. The trusted comment must start with
+  `hx-images-manifest ` (CI signs `hx-images-manifest schema=1 arch=<arch> timestamp=<T>`).
+- **Fetch** (`image/fetch.rs`): jobs of `hx-image-fetcher@.service` through the `Systemd` trait
+  (`start_image_job`, `image_job_state`, `stop_image_job`); chunks read through the directory
+  descriptor with `openat2`, exactly the signed size, copied once into one `O_TMPFILE` in staging
+  while hashing; the directory is swept before and after every job.
+- **Offline** (`image/offline.rs`): `image_file` is a file name in `/var/lib/hx/import/` (root 0700)
+  with the signed manifest beside it; no replay counter; the three files are unlinked after import.
+- **State** (`image/state.rs`, `images-state`): highest online manifest timestamp and the imported
+  `hx-img-*` images; the record is written before the import. The image is kept until `ready`, then
+  deleted; `Uninstall` deletes every recorded image in both modes (step `images`).
+- **Fall back** (`cmd/create.rs`): in `auto`, a failure before the post stage destroys the instance
+  and the imported image and builds on the server (`FELL_BACK`) if 25 of the 45 minutes remain.
+- Tests: `tests/privd_image*.rs` (online, hostile directory, offline, HTTPS with the real fetcher,
+  units, uninstall). Nothing in them needs root or a real Incus.
+
 ## The rescue helper
 
 `hx-privd-rescue` (`src/bin/hx-privd-rescue.rs`, logic in `privd::rescue`) is what

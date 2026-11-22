@@ -14,6 +14,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         ".hx.v1.SetupStart",
         ".hx.v1.Opaque",
         ".hx.v1.PairingCodeIssued",
+        ".hx.v1.ServerChangePin",
+        ".hx.v1.ServerChangePassword",
     ]);
     config.compile_fds(fds)?;
     Ok(())
