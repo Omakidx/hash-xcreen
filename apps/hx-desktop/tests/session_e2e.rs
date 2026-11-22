@@ -53,8 +53,8 @@ async fn pair_pin_first_frame_type_and_disconnect() {
         Err(Outcome::Wrong { attempts_left, .. }) => assert_eq!(attempts_left, 4),
         other => panic!("expected a wrong PIN, got {:?}", other.err()),
     }
-    // The right one needs no new pairing; wait out the backoff of the failure first.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // The gateway runs on a manual clock: let the one-second wait after a wrong PIN pass.
+    rig.env.clock.advance(Duration::from_secs(5));
     let conn = login(&link, gateway_common::PIN).await.expect("PIN login");
 
     // Video: the app's decoder thread, the CPU presenter's trait.
@@ -72,7 +72,13 @@ async fn pair_pin_first_frame_type_and_disconnect() {
         }),
     )
     .expect("decoder");
-    let (session, mut events) = Session::start(conn, Some(tx), std::env::temp_dir(), stats.clone(), tokio::runtime::Handle::current());
+    let (session, mut events) = Session::start(
+        conn,
+        Some(tx),
+        std::env::temp_dir(),
+        stats.clone(),
+        tokio::runtime::Handle::current(),
+    );
     let session = Arc::new(session);
     *slot.lock().unwrap() = Some(session.clone());
     session.view(build_view(0, 0, 0, (0, 0), true, true));
@@ -80,12 +86,20 @@ async fn pair_pin_first_frame_type_and_disconnect() {
     let mut got_stream = false;
     let end = tokio::time::Instant::now() + Duration::from_secs(40);
     while tokio::time::Instant::now() < end && pictures.0.lock().unwrap().is_empty() {
-        if let Ok(Some(Event::Stream(s))) = tokio::time::timeout(Duration::from_millis(200), events.recv()).await {
+        if let Ok(Some(Event::Stream(s))) =
+            tokio::time::timeout(Duration::from_millis(200), events.recv()).await
+        {
             assert_eq!((s.width, s.height), (relay_common::W, relay_common::H));
             got_stream = true;
         }
     }
-    let first = pictures.0.lock().unwrap().first().copied().expect("a decoded frame");
+    let first = pictures
+        .0
+        .lock()
+        .unwrap()
+        .first()
+        .copied()
+        .expect("a decoded frame");
     assert_eq!(first, (relay_common::W, relay_common::H));
     assert!(got_stream || stats.take_interval().decoded > 0);
 
@@ -99,12 +113,18 @@ async fn pair_pin_first_frame_type_and_disconnect() {
     session.send_clipboard_text("hello from hx-desktop");
     let before = pictures.0.lock().unwrap().len();
     tokio::time::sleep(Duration::from_secs(2)).await;
-    assert!(session.connection().close_info().is_none(), "still connected");
+    assert!(
+        session.connection().close_info().is_none(),
+        "still connected"
+    );
     let _ = before;
 
     // Device management over the 1.2 messages: this device is listed and current.
     let list = session.list_devices().await.expect("device list");
-    assert!(list.iter().any(|d| d.current && d.name.contains("hx-desktop")));
+    assert!(
+        list.iter()
+            .any(|d| d.current && d.name.contains("hx-desktop"))
+    );
 
     // Disconnect: the app closes; the close is ours, so no reconnect.
     session.close().await;

@@ -87,7 +87,8 @@ pub async fn pair(
     credential: &str,
     device_name: &str,
 ) -> Result<PairedInfo, SetupError> {
-    let cred = PairingCredential::parse(credential.trim()).map_err(|_| SetupError::PairingFailed)?;
+    let cred =
+        PairingCredential::parse(credential.trim()).map_err(|_| SetupError::PairingFailed)?;
     let t = target(host, port)
         .await
         .map_err(|_| SetupError::Unreachable)?;
@@ -337,9 +338,10 @@ impl Session {
                         st.dropped();
                         asked += 1;
                         if asked == 1 {
-                            let _ = o.send(Out::Control(Ctl::RequestKeyframe(
-                                pb::RequestKeyframe { last_decoded_frame: 0 },
-                            )));
+                            let _ =
+                                o.send(Out::Control(Ctl::RequestKeyframe(pb::RequestKeyframe {
+                                    last_decoded_frame: 0,
+                                })));
                         }
                     } else {
                         asked = 0;
@@ -349,7 +351,12 @@ impl Session {
         }
 
         // Control in.
-        let (c, tx, pend, gb) = (conn.clone(), ev_tx.clone(), pending.clone(), goodbye.clone());
+        let (c, tx, pend, gb) = (
+            conn.clone(),
+            ev_tx.clone(),
+            pending.clone(),
+            goodbye.clone(),
+        );
         handle.spawn(async move {
             while let Ok(m) = c.recv_control().await {
                 match m.message {
@@ -392,7 +399,11 @@ impl Session {
         });
 
         // Transfers in.
-        let (c, tx, ids) = (conn.clone(), ev_tx.clone(), Arc::new(AtomicU32::new(1 << 20)));
+        let (c, tx, ids) = (
+            conn.clone(),
+            ev_tx.clone(),
+            Arc::new(AtomicU32::new(1 << 20)),
+        );
         let limit = negotiated.max_file_bytes;
         let dl = downloads.clone();
         handle.spawn(async move {
@@ -409,7 +420,8 @@ impl Session {
             loop {
                 tick.tick().await;
                 if let Ok(rtt) = c.ping(Duration::from_secs(5)).await {
-                    st.rtt_us.store(rtt.as_micros().min(u128::from(u32::MAX)) as u32, Relaxed);
+                    st.rtt_us
+                        .store(rtt.as_micros().min(u128::from(u32::MAX)) as u32, Relaxed);
                 }
                 let i = st.take_interval();
                 let m = ControlMessage::new(Ctl::Stats(pb::ClientStats {
@@ -564,7 +576,9 @@ impl Session {
             };
             let result: Result<(), String> = async {
                 use tokio::io::AsyncReadExt;
-                let mut f = tokio::fs::File::open(&path).await.map_err(|e| e.to_string())?;
+                let mut f = tokio::fs::File::open(&path)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 let md = f.metadata().await.map_err(|e| e.to_string())?;
                 if !md.is_file() {
                     return Err("not a regular file".into());
@@ -648,7 +662,9 @@ impl Session {
             device_id: Bytes::copy_from_slice(&id),
         });
         match self.request(b).await? {
-            Body::RevokeResult(r) => Ok(RevokeStatus::try_from(r.status).unwrap_or(RevokeStatus::Failed)),
+            Body::RevokeResult(r) => {
+                Ok(RevokeStatus::try_from(r.status).unwrap_or(RevokeStatus::Failed))
+            }
             _ => Err(MgmtError::Closed),
         }
     }
@@ -679,7 +695,12 @@ async fn receive_transfer(
             let Ok(body) = t.read_to_end(hx_proto::channel::MAX_CLIPBOARD_SIZE).await else {
                 return;
             };
-            let m = mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+            let m = mime
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
             let ev = match m.as_str() {
                 "text/plain" => Event::ClipboardText(String::from_utf8_lossy(&body).into_owned()),
                 "text/uri-list" => Event::LinkRequest(body.to_vec()),
@@ -700,7 +721,10 @@ async fn receive_transfer(
                 t.reject();
                 let _ = tx.send(Event::Transfer {
                     id,
-                    activity: act(0, TransferState::Failed(crate::files::refusal_text(&name, limit))),
+                    activity: act(
+                        0,
+                        TransferState::Failed(crate::files::refusal_text(&name, limit)),
+                    ),
                     saved: None,
                 });
                 return;
@@ -717,13 +741,21 @@ async fn receive_transfer(
                     .map_err(|e| e.to_string())?;
                 let mut done = 0u64;
                 let mut last = std::time::Instant::now();
-                let _ = tx.send(Event::Transfer { id, activity: act(0, TransferState::Running), saved: None });
+                let _ = tx.send(Event::Transfer {
+                    id,
+                    activity: act(0, TransferState::Running),
+                    saved: None,
+                });
                 while let Some(chunk) = t.next_chunk().await.map_err(|e| e.to_string())? {
                     f.write_all(&chunk).await.map_err(|e| e.to_string())?;
                     done += chunk.len() as u64;
                     if last.elapsed() > Duration::from_millis(200) {
                         last = std::time::Instant::now();
-                        let _ = tx.send(Event::Transfer { id, activity: act(done, TransferState::Running), saved: None });
+                        let _ = tx.send(Event::Transfer {
+                            id,
+                            activity: act(done, TransferState::Running),
+                            saved: None,
+                        });
                     }
                 }
                 f.flush().await.map_err(|e| e.to_string())?;

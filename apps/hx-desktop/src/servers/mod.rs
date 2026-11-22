@@ -75,7 +75,11 @@ pub fn format_address(host: &str, port: u16) -> String {
 
 /// First 16 hex digits of a key in groups of four, lowercase.
 pub fn short_key(hex: &str) -> String {
-    let h: String = hex.chars().take(16).collect::<String>().to_ascii_lowercase();
+    let h: String = hex
+        .chars()
+        .take(16)
+        .collect::<String>()
+        .to_ascii_lowercase();
     h.as_bytes()
         .chunks(4)
         .map(|c| String::from_utf8_lossy(c).into_owned())
@@ -349,6 +353,9 @@ mod tests {
     #[test]
     fn formats_addresses_and_fingerprints() {
         assert_eq!(format_address("::1", 443), "[::1]:443");
-        assert_eq!(short_key(&"3F9AC1D477BE0A52".repeat(4)), "3f9a c1d4 77be 0a52");
+        assert_eq!(
+            short_key(&"3F9AC1D477BE0A52".repeat(4)),
+            "3f9a c1d4 77be 0a52"
+        );
     }
 }

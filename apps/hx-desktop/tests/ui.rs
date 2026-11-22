@@ -6,7 +6,9 @@ use std::sync::Arc;
 use hx_desktop::app::{App, Config, showcase};
 use hx_desktop::backend::demo;
 use hx_desktop::keys::MemoryKeyStore;
-use hx_desktop::{AppWindow, ConnectVm, DetailsVm, HomeVm, Nav, Screen, ThemeMode, Tokens, WizardVm};
+use hx_desktop::{
+    AppWindow, ConnectVm, DetailsVm, HomeVm, Nav, Screen, ThemeMode, Tokens, WizardVm,
+};
 use i_slint_backend_testing::ElementHandle;
 use slint::{ComponentHandle, Model};
 
@@ -18,7 +20,11 @@ struct Rig {
 
 fn rig() -> Rig {
     i_slint_backend_testing::init_no_event_loop();
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
     let ui = AppWindow::new().unwrap();
     let app = App::start(
         &ui,
@@ -64,10 +70,24 @@ fn home_lists_servers_with_status_words() {
     let n = r.ui.global::<HomeVm>().get_servers().row_count();
     assert_eq!(n, 6);
     // The card of a revoked device offers Pair again; an installing one View progress.
-    let cards: Vec<_> = (0..n).map(|i| r.ui.global::<HomeVm>().get_servers().row_data(i).unwrap()).collect();
-    assert!(cards.iter().any(|c| c.action_label.as_str() == "Pair again"));
-    assert!(cards.iter().any(|c| c.action_label.as_str() == "View progress"));
-    assert!(cards.iter().any(|c| c.action_label.as_str() == "Finish setup"));
+    let cards: Vec<_> = (0..n)
+        .map(|i| r.ui.global::<HomeVm>().get_servers().row_data(i).unwrap())
+        .collect();
+    assert!(
+        cards
+            .iter()
+            .any(|c| c.action_label.as_str() == "Pair again")
+    );
+    assert!(
+        cards
+            .iter()
+            .any(|c| c.action_label.as_str() == "View progress")
+    );
+    assert!(
+        cards
+            .iter()
+            .any(|c| c.action_label.as_str() == "Finish setup")
+    );
     assert!(find(&r.ui, "Add server").is_some());
 }
 
@@ -75,7 +95,10 @@ fn home_lists_servers_with_status_words() {
 fn empty_home_is_the_welcome_with_add_server_first() {
     let r = rig();
     showcase::apply(&r.app, "home-empty");
-    assert!(find(&r.ui, "Welcome to hash-xcreen").is_some() || r.ui.global::<HomeVm>().get_servers().row_count() == 0);
+    assert!(
+        find(&r.ui, "Welcome to hash-xcreen").is_some()
+            || r.ui.global::<HomeVm>().get_servers().row_count() == 0
+    );
     press(&r.ui, "Add server");
     assert_eq!(r.ui.global::<Nav>().get_screen(), Screen::Wizard);
     assert_eq!(r.ui.global::<WizardVm>().get_step().as_str(), "method");
@@ -101,7 +124,9 @@ fn wizard_review_masks_secrets() {
     showcase::apply(&r.app, "wizard-review");
     let vm = r.ui.global::<WizardVm>();
     let rows = vm.get_review_account();
-    let text: String = (0..rows.row_count()).map(|i| rows.row_data(i).unwrap().value.to_string()).collect();
+    let text: String = (0..rows.row_count())
+        .map(|i| rows.row_data(i).unwrap().value.to_string())
+        .collect();
     assert!(!text.contains("482913") && !text.contains("correct horse"));
     assert!(text.contains("6 digits"));
     assert_eq!(vm.get_next_label().as_str(), "Install");
@@ -112,10 +137,16 @@ fn connect_states_show_the_server_wording() {
     let r = rig();
     showcase::apply(&r.app, "connect-wrong");
     let v = r.ui.global::<ConnectVm>();
-    assert_eq!(v.get_notice_title().as_str(), "Incorrect PIN, 4 attempts left");
+    assert_eq!(
+        v.get_notice_title().as_str(),
+        "Incorrect PIN, 4 attempts left"
+    );
     assert_eq!(v.get_phase(), 0);
     showcase::apply(&r.app, "connect-last");
-    assert_eq!(v.get_notice_title().as_str(), "Incorrect PIN, 1 attempt left");
+    assert_eq!(
+        v.get_notice_title().as_str(),
+        "Incorrect PIN, 1 attempt left"
+    );
     assert!(v.get_notice_text().contains("account password"));
     showcase::apply(&r.app, "connect-wait");
     assert_eq!(v.get_phase(), 3);
@@ -145,16 +176,30 @@ fn revoke_dialog_cancel_is_the_default_and_escape_closes_it() {
     let vm = r.ui.global::<DetailsVm>();
     assert_eq!(vm.get_dialog(), 1);
     assert!(find(&r.ui, "Cancel").is_some());
-    r.ui.window().dispatch_event(slint::platform::WindowEvent::KeyPressed { text: slint::platform::Key::Escape.into() });
+    r.ui.window()
+        .dispatch_event(slint::platform::WindowEvent::KeyPressed {
+            text: slint::platform::Key::Escape.into(),
+        });
     assert_eq!(vm.get_dialog(), 0, "Escape dismisses the dialog");
 }
 
 #[test]
 fn hidden_phase_two_and_three_items_are_not_in_the_ui() {
     let r = rig();
-    for name in ["details-overview", "details-security", "details-desktop", "wizard-backups"] {
+    for name in [
+        "details-overview",
+        "details-security",
+        "details-desktop",
+        "wizard-backups",
+    ] {
         showcase::apply(&r.app, name);
-        for hidden in ["Backups", "Web access", "Passkeys", "Backup mode", "Restore from backup"] {
+        for hidden in [
+            "Backups",
+            "Web access",
+            "Passkeys",
+            "Backup mode",
+            "Restore from backup",
+        ] {
             // The wizard step "Backups" exists (fixed to Off); nowhere else.
             if name == "wizard-backups" && hidden == "Backups" {
                 continue;
@@ -186,12 +231,18 @@ fn toolbar_shows_icons_only_below_1000_px() {
     r.ui.window().set_size(slint::PhysicalSize::new(1100, 700));
     assert!(find(&r.ui, "Display").is_some());
     r.ui.window().set_size(slint::PhysicalSize::new(900, 600));
-    assert!(find(&r.ui, "Display").is_some(), "the accessible name stays");
+    assert!(
+        find(&r.ui, "Display").is_some(),
+        "the accessible name stays"
+    );
 }
 
 fn mean(buf: &slint::SharedPixelBuffer<slint::Rgba8Pixel>) -> f64 {
     let px = buf.as_slice();
-    px.iter().map(|p| (f64::from(p.r) + f64::from(p.g) + f64::from(p.b)) / 3.0).sum::<f64>() / px.len() as f64
+    px.iter()
+        .map(|p| (f64::from(p.r) + f64::from(p.g) + f64::from(p.b)) / 3.0)
+        .sum::<f64>()
+        / px.len() as f64
 }
 
 #[test]
@@ -199,7 +250,14 @@ fn a_few_screens_render_in_both_themes() {
     let r = rig();
     r.ui.show().unwrap();
     let dir = std::env::var_os("HX_SHOT_DIR").map(std::path::PathBuf::from);
-    for name in ["home", "connect-wrong", "wizard-checks-bad", "progress-running", "desktop-toolbar", "details-security"] {
+    for name in [
+        "home",
+        "connect-wrong",
+        "wizard-checks-bad",
+        "progress-running",
+        "desktop-toolbar",
+        "details-security",
+    ] {
         let mut means = Vec::new();
         for (mode, tag) in [(ThemeMode::Dark, "dark"), (ThemeMode::Light, "light")] {
             r.ui.global::<Tokens>().set_mode(mode);
@@ -221,7 +279,12 @@ fn a_few_screens_render_in_both_themes() {
             }
         }
         if name != "desktop-toolbar" {
-            assert!(means[0] < means[1], "{name}: dark ({}) must be darker than light ({})", means[0], means[1]);
+            assert!(
+                means[0] < means[1],
+                "{name}: dark ({}) must be darker than light ({})",
+                means[0],
+                means[1]
+            );
         }
     }
 }

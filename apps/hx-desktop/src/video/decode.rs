@@ -100,8 +100,18 @@ impl Decoder {
 }
 
 /// BT.709 limited-range YUV 4:2:0 to RGBA.
-pub fn yuv420_to_rgba(img: &YuvPlanarImage<u8>, out: &mut [u8], stride: u32) -> Result<(), yuvutils_rs::YuvError> {
-    yuvutils_rs::yuv420_to_rgba(img, out, stride, YuvRange::Limited, YuvStandardMatrix::Bt709)
+pub fn yuv420_to_rgba(
+    img: &YuvPlanarImage<u8>,
+    out: &mut [u8],
+    stride: u32,
+) -> Result<(), yuvutils_rs::YuvError> {
+    yuvutils_rs::yuv420_to_rgba(
+        img,
+        out,
+        stride,
+        YuvRange::Limited,
+        YuvStandardMatrix::Bt709,
+    )
 }
 
 #[cfg(test)]
@@ -112,9 +122,9 @@ mod tests {
     fn bt709_limited_primaries() {
         // 2x2 pictures of one colour each: (Y, U, V) of BT.709 limited.
         let cases: [([u8; 3], [u8; 3]); 3] = [
-            ([16, 128, 128], [0, 0, 0]),         // black
-            ([235, 128, 128], [255, 255, 255]),  // white
-            ([63, 102, 240], [255, 0, 0]),       // red
+            ([16, 128, 128], [0, 0, 0]),        // black
+            ([235, 128, 128], [255, 255, 255]), // white
+            ([63, 102, 240], [255, 0, 0]),      // red
         ];
         for (yuv, rgb) in cases {
             let (y, u, v) = ([yuv[0]; 4], [yuv[1]], [yuv[2]]);
@@ -145,7 +155,11 @@ mod tests {
     #[test]
     fn garbage_is_an_error_or_nothing_never_a_panic() {
         let mut d = Decoder::new().expect("ffmpeg h264 decoder");
-        for data in [&[0u8; 0][..], &[0, 0, 0, 1, 0x65, 1, 2, 3][..], &[0xff; 64][..]] {
+        for data in [
+            &[0u8; 0][..],
+            &[0, 0, 0, 1, 0x65, 1, 2, 3][..],
+            &[0xff; 64][..],
+        ] {
             let _ = d.decode(data);
         }
     }

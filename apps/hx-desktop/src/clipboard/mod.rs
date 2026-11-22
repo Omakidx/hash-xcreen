@@ -22,7 +22,11 @@ pub struct Policy {
 
 impl Default for Policy {
     fn default() -> Self {
-        Self { send: true, receive: true, files: true }
+        Self {
+            send: true,
+            receive: true,
+            files: true,
+        }
     }
 }
 
@@ -41,7 +45,12 @@ pub enum Incoming {
 
 /// Decides for a MIME type.
 pub fn classify_incoming(p: &Policy, mime: &str) -> Incoming {
-    let m = mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let m = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     match m.as_str() {
         "text/uri-list" => Incoming::Link,
         "text/plain" if p.receive => Incoming::Text,
@@ -89,11 +98,20 @@ mod tests {
     #[test]
     fn policy_gates_incoming() {
         let p = Policy::default();
-        assert_eq!(classify_incoming(&p, "text/plain;charset=utf-8"), Incoming::Text);
+        assert_eq!(
+            classify_incoming(&p, "text/plain;charset=utf-8"),
+            Incoming::Text
+        );
         assert_eq!(classify_incoming(&p, "image/png"), Incoming::Image);
         assert_eq!(classify_incoming(&p, "text/uri-list"), Incoming::Link);
-        assert_eq!(classify_incoming(&p, "application/x-evil"), Incoming::Ignore);
-        let off = Policy { receive: false, ..p };
+        assert_eq!(
+            classify_incoming(&p, "application/x-evil"),
+            Incoming::Ignore
+        );
+        let off = Policy {
+            receive: false,
+            ..p
+        };
         assert_eq!(classify_incoming(&off, "text/plain"), Incoming::Ignore);
         assert_eq!(classify_incoming(&off, "image/png"), Incoming::Ignore);
         // A link still gets its confirmation even when clipboard receive is off: nothing opens
@@ -110,7 +128,10 @@ mod tests {
         assert!(s.should_send(&p, "hello"));
         assert!(!s.should_send(&p, "hello"), "unchanged");
         s.received("from desktop");
-        assert!(!s.should_send(&p, "from desktop"), "echo of what the desktop sent");
+        assert!(
+            !s.should_send(&p, "from desktop"),
+            "echo of what the desktop sent"
+        );
         assert!(s.should_send(&p, "new text"));
         assert!(!s.should_send(&Policy { send: false, ..p }, "other"));
         assert!(!s.should_send(&p, ""));

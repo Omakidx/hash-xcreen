@@ -11,7 +11,8 @@ use slint::ComponentHandle;
 use super::progress::{Model, Row, RowState, Run, duration_text, long_duration};
 use super::{App, model, post, spawn_ui, ss};
 use crate::backend::{
-    InstallEvent, InstallOutcome, InstallRequest, InstallRun, PairedInfo, Secret, ServerAddr, SetupRequest, group_of,
+    InstallEvent, InstallOutcome, InstallRequest, InstallRun, PairedInfo, Secret, ServerAddr,
+    SetupRequest, group_of,
 };
 use crate::servers::{Lifecycle, short_key};
 use crate::{Kv, ProgressVm, Screen, StageRowData};
@@ -49,7 +50,10 @@ pub struct Ctx {
 }
 
 fn kv(k: &str, v: String) -> Kv {
-    Kv { key: ss(k), value: ss(v) }
+    Kv {
+        key: ss(k),
+        value: ss(v),
+    }
 }
 
 fn row_state(r: &Row) -> i32 {
@@ -69,7 +73,10 @@ pub fn push(app: &Rc<App>) {
     let c = app.prog.borrow();
     let server = c.server_id.as_deref().and_then(|id| app.server(id));
     let addr = server.as_ref().map(|s| s.address()).unwrap_or_default();
-    vm.set_server_name(ss(server.as_ref().map(|s| s.name.clone()).unwrap_or_default()));
+    vm.set_server_name(ss(server
+        .as_ref()
+        .map(|s| s.name.clone())
+        .unwrap_or_default()));
     vm.set_address(ss(&addr));
     let m = &c.model;
     vm.set_rows(model(
@@ -77,9 +84,17 @@ pub fn push(app: &Rc<App>) {
             .iter()
             .map(|r| StageRowData {
                 title: ss(r.title),
-                ids: ss(if r.state == RowState::Deferred { format!("{} · set up later", r.ids) } else { r.ids.clone() }),
+                ids: ss(if r.state == RowState::Deferred {
+                    format!("{} · set up later", r.ids)
+                } else {
+                    r.ids.clone()
+                }),
                 state: row_state(r),
-                duration: ss(if r.state == RowState::Done && r.ms > 0 { duration_text(r.ms) } else { String::new() }),
+                duration: ss(if r.state == RowState::Done && r.ms > 0 {
+                    duration_text(r.ms)
+                } else {
+                    String::new()
+                }),
                 detail: ss(&r.detail),
                 percent: r.percent,
             })
@@ -89,7 +104,9 @@ pub fn push(app: &Rc<App>) {
     match &m.image {
         Some((true, _)) => {
             vm.set_image_title(ss("Using prebuilt image (about 4 min)"));
-            vm.set_image_text(ss("The desktop image was downloaded and is only configured on the server."));
+            vm.set_image_text(ss(
+                "The desktop image was downloaded and is only configured on the server.",
+            ));
         }
         Some((false, reason)) => {
             vm.set_image_title(ss("Building on the server (about 12 minutes)"));
@@ -108,7 +125,10 @@ pub fn push(app: &Rc<App>) {
     match &m.run {
         Run::Running => {
             vm.set_state(0);
-            vm.set_headline(ss(format!("Installing on {}", server.as_ref().map(|s| s.host.clone()).unwrap_or_default())));
+            vm.set_headline(ss(format!(
+                "Installing on {}",
+                server.as_ref().map(|s| s.host.clone()).unwrap_or_default()
+            )));
             vm.set_badge(ss("Installing"));
             vm.set_badge_tone(4);
             vm.set_subline(ss(format!(
@@ -120,7 +140,8 @@ pub fn push(app: &Rc<App>) {
             vm.set_headline(ss("Install stopped"));
             vm.set_badge(ss("Failed"));
             vm.set_badge_tone(3);
-            let title = group_of(&f.stage).map_or("The install", |g| crate::backend::GROUPS[g].title);
+            let title =
+                group_of(&f.stage).map_or("The install", |g| crate::backend::GROUPS[g].title);
             vm.set_subline(ss(format!(
                 "{stage_n} failed. Nothing is lost: Retry continues from this stage and skips the finished ones."
             )));
@@ -130,7 +151,11 @@ pub fn push(app: &Rc<App>) {
                 f.message,
                 f.code,
                 f.stage,
-                if f.retryable { "This is usually temporary." } else { "This is not something a retry fixes. Copy the log and contact support." }
+                if f.retryable {
+                    "This is usually temporary."
+                } else {
+                    "This is not something a retry fixes. Copy the log and contact support."
+                }
             )));
             vm.set_retryable(f.retryable && c.retry.is_some());
         }
@@ -140,7 +165,10 @@ pub fn push(app: &Rc<App>) {
             vm.set_badge(ss("Disconnected"));
             vm.set_badge_tone(2);
             vm.set_subline(ss("Finished stages are kept on the server. Reconnect to carry on from where it stopped."));
-            vm.set_fail_title(ss(format!("The connection closed at {}", stage_n.to_lowercase())));
+            vm.set_fail_title(ss(format!(
+                "The connection closed at {}",
+                stage_n.to_lowercase()
+            )));
             vm.set_fail_text(ss(format!(
                 "The app cannot show progress until it reconnects (last stage: {stage}). Secrets are never saved, so Retry asks for the SSH password (or key passphrase) and the account password and PIN again."
             )));
@@ -153,13 +181,24 @@ pub fn push(app: &Rc<App>) {
             vm.set_subline(ss(format!(
                 "Installed in {} on {} (XFCE, {} preset).",
                 long_duration(o.elapsed_secs.max(m.elapsed_secs())),
-                if c.distro.is_empty() { "your server".to_owned() } else { c.distro.clone() },
+                if c.distro.is_empty() {
+                    "your server".to_owned()
+                } else {
+                    c.distro.clone()
+                },
                 c.preset
             )));
             vm.set_summary(model(vec![
                 kv("Server", addr.clone()),
                 kv("Account", c.username.clone()),
-                kv("Image path", if o.image_path.is_empty() { "Not reported".into() } else { o.image_path.clone() }),
+                kv(
+                    "Image path",
+                    if o.image_path.is_empty() {
+                        "Not reported".into()
+                    } else {
+                        o.image_path.clone()
+                    },
+                ),
                 kv("Server identity", short_key(&o.server_key_hex)),
                 kv("Backups", "Off (turn on later)".into()),
             ]));
@@ -180,7 +219,11 @@ pub fn start_ssh(app: &Rc<App>, server_id: String, req: InstallRequest) {
         c.server_id = Some(server_id);
         c.kind = Kind::Ssh;
         c.username = req.options.username.clone();
-        c.preset = if req.options.apps == "developer" { "developer".into() } else { "basic".into() };
+        c.preset = if req.options.apps == "developer" {
+            "developer".into()
+        } else {
+            "basic".into()
+        };
         c.distro = distro_label(&req.options.distro);
         c.epoch += 1;
     }
@@ -189,7 +232,10 @@ pub fn start_ssh(app: &Rc<App>, server_id: String, req: InstallRequest) {
 }
 
 fn distro_label(id: &str) -> String {
-    crate::wizard::DISTROS.iter().find(|d| d.0 == id).map_or(id.to_owned(), |d| d.1.to_owned())
+    crate::wizard::DISTROS
+        .iter()
+        .find(|d| d.0 == id)
+        .map_or(id.to_owned(), |d| d.1.to_owned())
 }
 
 fn launch_ssh(app: &Rc<App>, req: InstallRequest) {
@@ -201,23 +247,29 @@ fn launch_ssh(app: &Rc<App>, req: InstallRequest) {
     };
     push(app);
     let engine = app.be.install.clone();
-    spawn_ui(app, async move { engine.install(req).await }, move |a, r| {
-        if a.prog.borrow().epoch != epoch {
-            return;
-        }
-        match r {
-            Ok(run) => attach(a, id, run, Kind::Ssh),
-            Err(e) => {
-                a.prog.borrow_mut().model.apply(InstallEvent::Failed(crate::backend::InstallFailure {
-                    stage: "preflight".into(),
-                    code: "CONNECT".into(),
-                    message: e.to_string(),
-                    retryable: true,
-                }));
-                push(a);
+    spawn_ui(
+        app,
+        async move { engine.install(req).await },
+        move |a, r| {
+            if a.prog.borrow().epoch != epoch {
+                return;
             }
-        }
-    });
+            match r {
+                Ok(run) => attach(a, id, run, Kind::Ssh),
+                Err(e) => {
+                    a.prog.borrow_mut().model.apply(InstallEvent::Failed(
+                        crate::backend::InstallFailure {
+                            stage: "preflight".into(),
+                            code: "CONNECT".into(),
+                            message: e.to_string(),
+                            retryable: true,
+                        },
+                    ));
+                    push(a);
+                }
+            }
+        },
+    );
 }
 
 /// Follows a run that is already started.
@@ -291,53 +343,87 @@ fn finish(app: &Rc<App>, id: &str, o: InstallOutcome) {
     // The run is over; hold the model in "running" visuals until the pairing answers.
     app.prog.borrow_mut().model.run = Run::Running;
     push(app);
-    pair_after_install(app, id.to_owned(), ServerAddr { host: server.host, port: o.port }, token, o, epoch, 0);
+    pair_after_install(
+        app,
+        id.to_owned(),
+        ServerAddr {
+            host: server.host,
+            port: o.port,
+        },
+        token,
+        o,
+        epoch,
+        0,
+    );
 }
 
-fn pair_after_install(app: &Rc<App>, id: String, addr: ServerAddr, token: String, o: InstallOutcome, epoch: u64, tries: u32) {
+fn pair_after_install(
+    app: &Rc<App>,
+    id: String,
+    addr: ServerAddr,
+    token: String,
+    o: InstallOutcome,
+    epoch: u64,
+    tries: u32,
+) {
     let setup = app.be.setup.clone();
     let key = app.key.clone();
     let a2 = addr.clone();
     let t2 = token.clone();
-    spawn_ui(app, async move { setup.pair(&a2, key, &Secret::new(t2)).await }, move |a, r| {
-        if a.prog.borrow().epoch != epoch {
-            return;
-        }
-        match r {
-            Ok(p) if p.server_key_hex.eq_ignore_ascii_case(&o.server_key_hex) || o.server_key_hex.is_empty() => {
-                let mut oo = o.clone();
-                if oo.server_key_hex.is_empty() {
-                    oo.server_key_hex = p.server_key_hex;
+    spawn_ui(
+        app,
+        async move { setup.pair(&a2, key, &Secret::new(t2)).await },
+        move |a, r| {
+            if a.prog.borrow().epoch != epoch {
+                return;
+            }
+            match r {
+                Ok(p)
+                    if p.server_key_hex.eq_ignore_ascii_case(&o.server_key_hex)
+                        || o.server_key_hex.is_empty() =>
+                {
+                    let mut oo = o.clone();
+                    if oo.server_key_hex.is_empty() {
+                        oo.server_key_hex = p.server_key_hex;
+                    }
+                    complete(a, &id, &oo);
                 }
-                complete(a, &id, &oo);
+                Ok(_) => fail_pairing(
+                    a,
+                    "The server's identity does not match what the installer reported. The desktop was installed, but this app did not pair with it, because someone may be intercepting the connection.",
+                    false,
+                ),
+                Err(crate::backend::SetupError::Unreachable)
+                | Err(crate::backend::SetupError::PairingClosed)
+                    if tries < 20 =>
+                {
+                    let (a3, id2) = (a.clone(), id.clone());
+                    slint::Timer::single_shot(Duration::from_secs(2), move || {
+                        pair_after_install(&a3, id2, addr, token, o, epoch, tries + 1);
+                    });
+                }
+                Err(e) => fail_pairing(
+                    a,
+                    &format!(
+                        "The install finished, but pairing this device failed: {e}. Add the server again with a pairing code from `hx-agent pairing code`."
+                    ),
+                    false,
+                ),
             }
-            Ok(_) => fail_pairing(
-                a,
-                "The server's identity does not match what the installer reported. The desktop was installed, but this app did not pair with it, because someone may be intercepting the connection.",
-                false,
-            ),
-            Err(crate::backend::SetupError::Unreachable) | Err(crate::backend::SetupError::PairingClosed) if tries < 20 => {
-                let (a3, id2) = (a.clone(), id.clone());
-                slint::Timer::single_shot(Duration::from_secs(2), move || {
-                    pair_after_install(&a3, id2, addr, token, o, epoch, tries + 1);
-                });
-            }
-            Err(e) => fail_pairing(
-                a,
-                &format!("The install finished, but pairing this device failed: {e}. Add the server again with a pairing code from `hx-agent pairing code`."),
-                false,
-            ),
-        }
-    });
+        },
+    );
 }
 
 fn fail_pairing(app: &Rc<App>, msg: &str, retryable: bool) {
-    app.prog.borrow_mut().model.apply(InstallEvent::Failed(crate::backend::InstallFailure {
-        stage: "pairing".into(),
-        code: "PAIRING".into(),
-        message: msg.into(),
-        retryable,
-    }));
+    app.prog
+        .borrow_mut()
+        .model
+        .apply(InstallEvent::Failed(crate::backend::InstallFailure {
+            stage: "pairing".into(),
+            code: "PAIRING".into(),
+            message: msg.into(),
+            retryable,
+        }));
     push(app);
 }
 
@@ -377,14 +463,18 @@ fn retry(app: &Rc<App>) {
                 (c.epoch, c.server_id.clone().unwrap_or_default())
             };
             push(app);
-            spawn_ui(app, async move { setup.start_setup(&addr, key, &paired, req).await }, move |a, r| {
-                if a.prog.borrow().epoch != epoch {
-                    return;
-                }
-                if let Ok(run) = r {
-                    attach(a, id, run, Kind::Setup);
-                }
-            });
+            spawn_ui(
+                app,
+                async move { setup.start_setup(&addr, key, &paired, req).await },
+                move |a, r| {
+                    if a.prog.borrow().epoch != epoch {
+                        return;
+                    }
+                    if let Ok(run) = r {
+                        attach(a, id, run, Kind::Setup);
+                    }
+                },
+            );
         }
         None => reconnect(app),
     }
@@ -422,7 +512,9 @@ pub fn open_for_server(app: &Rc<App>, id: &str) {
                 let mut c = app.prog.borrow_mut();
                 c.model = Model::new();
                 c.server_id = Some(id.to_owned());
-                c.model.apply(InstallEvent::ConnectionLost { stage: "unknown".into() });
+                c.model.apply(InstallEvent::ConnectionLost {
+                    stage: "unknown".into(),
+                });
                 c.retry = None;
             }
             push(app);

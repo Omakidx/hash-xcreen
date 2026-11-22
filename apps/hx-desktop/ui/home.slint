@@ -49,7 +49,7 @@ export component AppBar inherits Rectangle {
 
 component ServerCard inherits Card {
     in property <ServerCardData> d;
-    height: 168px;
+    height: 190px;
     accessible-role: AccessibleRole.groupbox;
     accessible-label: d.name + ", " + d.address + ", " + d.status;
     VerticalLayout {
@@ -239,11 +239,11 @@ export component HomeScreen inherits Rectangle {
                     x: 0px;
                     y: hdr.y + hdr.preferred-height + Tokens.sp-4;
                     width: parent.width;
-                    height: ceil(HomeVm.servers.length / fl.cols) * (168px + Tokens.sp-4);
+                    height: ceil(HomeVm.servers.length / fl.cols) * (190px + Tokens.sp-4);
                     for s[i] in HomeVm.servers: ServerCard {
                         d: s;
                         x: Tokens.sp-5 + mod(i, fl.cols) * (fl.cw + Tokens.sp-4);
-                        y: floor(i / fl.cols) * (168px + Tokens.sp-4);
+                        y: floor(i / fl.cols) * (190px + Tokens.sp-4);
                         width: fl.cw;
                     }
                 }

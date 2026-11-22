@@ -10,57 +10,72 @@ use crate::{HomeVm, ServerCardData};
 
 /// The card of one server, from what is known about it.
 pub fn card(s: &Server, reachable: Option<bool>, unavailable: bool) -> ServerCardData {
-    let (status, tone, note, action, label, enabled): (&str, i32, String, &str, &str, bool) = match s.lifecycle {
-        Lifecycle::Revoked => (
-            "Pair again",
-            3,
-            format!("This device was removed from the server on {}", crate::details::date_utc(s.revoked_unix)),
-            "pair",
-            "Pair again",
-            true,
-        ),
-        Lifecycle::Installing => ("Installing", 4, "The install did not finish. Retry resumes it.".into(), "progress", "View progress", true),
-        Lifecycle::SetupPending => (
-            "Setup not finished",
-            2,
-            "Paired with this app, but the desktop was not created yet".into(),
-            "finish",
-            "Finish setup",
-            true,
-        ),
-        Lifecycle::Uninstalled => (
-            "Uninstalled",
-            0,
-            "hash-xcreen was uninstalled from this server. Remove the card when you are done.".into(),
-            "none",
-            "",
-            false,
-        ),
-        Lifecycle::Ready => match reachable {
-            None => ("Checking…", 0, String::new(), "connect", "Connect", false),
-            Some(false) => (
-                "Offline",
-                0,
-                if s.last_seen_unix == 0 {
-                    "No answer yet".into()
-                } else {
-                    format!("Last seen {}", crate::details::relative_time(s.last_seen_unix, now_unix(), false))
-                },
-                "connect",
-                "Connect",
-                false,
-            ),
-            Some(true) if unavailable => (
-                "Desktop unavailable",
-                2,
-                "The server is up; retrying every 10 minutes".into(),
-                "connect",
-                "Connect",
+    let (status, tone, note, action, label, enabled): (&str, i32, String, &str, &str, bool) =
+        match s.lifecycle {
+            Lifecycle::Revoked => (
+                "Pair again",
+                3,
+                format!(
+                    "This device was removed from the server on {}",
+                    crate::details::date_utc(s.revoked_unix)
+                ),
+                "pair",
+                "Pair again",
                 true,
             ),
-            Some(true) => ("Online", 1, String::new(), "connect", "Connect", true),
-        },
-    };
+            Lifecycle::Installing => (
+                "Installing",
+                4,
+                "The install did not finish. Retry resumes it.".into(),
+                "progress",
+                "View progress",
+                true,
+            ),
+            Lifecycle::SetupPending => (
+                "Setup not finished",
+                2,
+                "Paired with this app, but the desktop was not created yet".into(),
+                "finish",
+                "Finish setup",
+                true,
+            ),
+            Lifecycle::Uninstalled => (
+                "Uninstalled",
+                0,
+                "hash-xcreen was uninstalled from this server. Remove the card when you are done."
+                    .into(),
+                "none",
+                "",
+                false,
+            ),
+            Lifecycle::Ready => match reachable {
+                None => ("Checking…", 0, String::new(), "connect", "Connect", false),
+                Some(false) => (
+                    "Offline",
+                    0,
+                    if s.last_seen_unix == 0 {
+                        "No answer yet".into()
+                    } else {
+                        format!(
+                            "Last seen {}",
+                            crate::details::relative_time(s.last_seen_unix, now_unix(), false)
+                        )
+                    },
+                    "connect",
+                    "Connect",
+                    false,
+                ),
+                Some(true) if unavailable => (
+                    "Desktop unavailable",
+                    2,
+                    "The server is up; retrying every 10 minutes".into(),
+                    "connect",
+                    "Connect",
+                    true,
+                ),
+                Some(true) => ("Online", 1, String::new(), "connect", "Connect", true),
+            },
+        };
     ServerCardData {
         id: ss(&s.id),
         name: ss(&s.name),
@@ -85,7 +100,17 @@ pub fn refresh(app: &Rc<App>, loading: bool) {
         .borrow()
         .list()
         .iter()
-        .map(|s| card(s, if loading { None } else { reach.get(&s.id).copied() }, un.contains(&s.id)))
+        .map(|s| {
+            card(
+                s,
+                if loading {
+                    None
+                } else {
+                    reach.get(&s.id).copied()
+                },
+                un.contains(&s.id),
+            )
+        })
         .collect();
     let vm = ui.global::<HomeVm>();
     vm.set_loading(loading && !cards.is_empty());
@@ -163,7 +188,10 @@ mod tests {
     #[test]
     fn card_states_follow_the_vocabulary() {
         let c = card(&s(Lifecycle::Ready), Some(true), false);
-        assert_eq!((c.status.as_str(), c.tone, c.action_enabled), ("Online", 1, true));
+        assert_eq!(
+            (c.status.as_str(), c.tone, c.action_enabled),
+            ("Online", 1, true)
+        );
         let c = card(&s(Lifecycle::Ready), Some(false), false);
         assert_eq!(c.status.as_str(), "Offline");
         assert!(!c.action_enabled, "offline Connect is disabled");
@@ -173,10 +201,28 @@ mod tests {
         assert_eq!(c.status.as_str(), "Desktop unavailable");
         assert!(c.action_enabled);
         let c = card(&s(Lifecycle::Revoked), None, false);
-        assert_eq!((c.status.as_str(), c.action.as_str()), ("Pair again", "pair"));
+        assert_eq!(
+            (c.status.as_str(), c.action.as_str()),
+            ("Pair again", "pair")
+        );
         assert!(c.note.contains("14 Nov"));
-        assert_eq!(card(&s(Lifecycle::SetupPending), None, false).action.as_str(), "finish");
-        assert_eq!(card(&s(Lifecycle::Installing), None, false).action_label.as_str(), "View progress");
-        assert_eq!(card(&s(Lifecycle::Uninstalled), None, false).action.as_str(), "none");
+        assert_eq!(
+            card(&s(Lifecycle::SetupPending), None, false)
+                .action
+                .as_str(),
+            "finish"
+        );
+        assert_eq!(
+            card(&s(Lifecycle::Installing), None, false)
+                .action_label
+                .as_str(),
+            "View progress"
+        );
+        assert_eq!(
+            card(&s(Lifecycle::Uninstalled), None, false)
+                .action
+                .as_str(),
+            "none"
+        );
     }
 }

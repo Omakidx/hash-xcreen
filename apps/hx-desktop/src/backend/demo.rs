@@ -16,7 +16,8 @@ use hx_crypto::IdentityKey;
 use super::*;
 
 /// Fake keys: the demo server's pinned identity.
-pub const DEMO_SERVER_KEY: &str = "3f9ac1d477be0a52b81e05f7d3906c2a3f9ac1d477be0a52b81e05f7d3906c2a";
+pub const DEMO_SERVER_KEY: &str =
+    "3f9ac1d477be0a52b81e05f7d3906c2a3f9ac1d477be0a52b81e05f7d3906c2a";
 
 /// Delay per scripted event.
 #[derive(Clone, Copy, Debug)]
@@ -39,7 +40,7 @@ pub fn backends(pace: Pace) -> Backends {
         install: Arc::new(DemoInstall::new(pace)),
         setup: Arc::new(DemoSetup::new(pace)),
         admin: Arc::new(DemoAdmin::default()),
-        control: Arc::new(DemoServerControl::default()),
+        control: Arc::new(DemoServerControl),
         connector: Arc::new(crate::backend::demo_desk::DemoConnector::new()),
     }
 }
@@ -83,7 +84,9 @@ pub fn install_script(scenario: Scenario, port: u16) -> VecDeque<InstallEvent> {
         v.push_back(stage(id, StageState::Done, Some(ms)));
     };
     done(&mut v, "preflight", 1200);
-    v.push_back(InstallEvent::Log("stage preflight .......... done (1.2 s)".into()));
+    v.push_back(InstallEvent::Log(
+        "stage preflight .......... done (1.2 s)".into(),
+    ));
     done(&mut v, "packages", 38_000);
     v.push_back(stage("incus", StageState::Start, None));
     if scenario == Scenario::FailAtIncus {
@@ -97,10 +100,20 @@ pub fn install_script(scenario: Scenario, port: u16) -> VecDeque<InstallEvent> {
         return v;
     }
     v.push_back(stage("incus", StageState::Done, Some(64_000)));
-    for (id, ms) in [("release", 2000), ("system-files", 1000), ("credentials", 1500), ("config", 800), ("units", 3700)] {
+    for (id, ms) in [
+        ("release", 2000),
+        ("system-files", 1000),
+        ("credentials", 1500),
+        ("config", 800),
+        ("units", 3700),
+    ] {
         done(&mut v, id, ms);
     }
-    for (id, ms) in [("setup-window", 400), ("host", 18_000), ("firewall-port", 3600)] {
+    for (id, ms) in [
+        ("setup-window", 400),
+        ("host", 18_000),
+        ("firewall-port", 3600),
+    ] {
         done(&mut v, id, ms);
     }
     v.push_back(InstallEvent::ImagePath {
@@ -122,7 +135,11 @@ pub fn install_script(scenario: Scenario, port: u16) -> VecDeque<InstallEvent> {
             index: i as u32 + 1,
             total: steps.len() as u32,
             text: (*text).into(),
-            percent: if i == 3 { None } else { Some(((i as u32 + 1) * 100 / steps.len() as u32) as u8) },
+            percent: if i == 3 {
+                None
+            } else {
+                Some(((i as u32 + 1) * 100 / steps.len() as u32) as u8)
+            },
         });
         if scenario == Scenario::LoseConnection && i == 2 {
             v.push_back(InstallEvent::ConnectionLost {
@@ -195,9 +212,15 @@ impl InstallEngine for DemoInstall {
         })
     }
 
-    fn preflight(&self, t: &SshTarget, auth: &SshAuth, trusted: &HostKey) -> BoxFuture<'_, Result<Preflight, EngineError>> {
+    fn preflight(
+        &self,
+        t: &SshTarget,
+        auth: &SshAuth,
+        trusted: &HostKey,
+    ) -> BoxFuture<'_, Result<Preflight, EngineError>> {
         let small = t.host.contains("small");
-        let wrong = matches!(auth, SshAuth::Password { password, .. } if password.expose() == "wrong");
+        let wrong =
+            matches!(auth, SshAuth::Password { password, .. } if password.expose() == "wrong");
         let user = auth.user().to_owned();
         let changed = trusted.fingerprint != fake_host_key().fingerprint;
         Box::pin(async move {
@@ -221,8 +244,18 @@ impl InstallEngine for DemoInstall {
                 vec![
                     row("os", "Debian 12 (x86_64) is supported", "", Pass),
                     row("cpus", "2 vCPU", "At least 2 needed", Pass),
-                    row("memory", "1.9 GB memory", "Missing: this server has 1.9 GB, the minimum is 4 GB", Fail),
-                    row("disk", "18 GB free disk", "Missing: 12 GB more free space; the minimum is 30 GB", Fail),
+                    row(
+                        "memory",
+                        "1.9 GB memory",
+                        "Missing: this server has 1.9 GB, the minimum is 4 GB",
+                        Fail,
+                    ),
+                    row(
+                        "disk",
+                        "18 GB free disk",
+                        "Missing: 12 GB more free space; the minimum is 30 GB",
+                        Fail,
+                    ),
                     row("port", "Port 443 is free for TCP and UDP", "", Pass),
                 ]
             } else {
@@ -231,7 +264,12 @@ impl InstallEngine for DemoInstall {
                     row("cpus", "4 vCPU", "At least 2 needed", Pass),
                     row("memory", "7.8 GB memory", "At least 4 GB needed", Pass),
                     row("disk", "152 GB free disk", "At least 30 GB needed", Pass),
-                    row("port", "Port 443 is free for TCP and UDP", "Change it later under Resources, Advanced", Pass),
+                    row(
+                        "port",
+                        "Port 443 is free for TCP and UDP",
+                        "Change it later under Resources, Advanced",
+                        Pass,
+                    ),
                 ]
             };
             Ok(Preflight {
@@ -244,7 +282,10 @@ impl InstallEngine for DemoInstall {
         })
     }
 
-    fn install(&self, req: InstallRequest) -> BoxFuture<'_, Result<Box<dyn InstallRun>, EngineError>> {
+    fn install(
+        &self,
+        req: InstallRequest,
+    ) -> BoxFuture<'_, Result<Box<dyn InstallRun>, EngineError>> {
         let n = self.runs.fetch_add(1, SeqCst);
         let host = req.target.host.clone();
         let port = req.options.port;
@@ -295,7 +336,12 @@ impl DemoSetup {
 }
 
 impl SetupClient for DemoSetup {
-    fn pair(&self, addr: &ServerAddr, _device: Arc<IdentityKey>, token: &Secret) -> BoxFuture<'_, Result<PairedInfo, SetupError>> {
+    fn pair(
+        &self,
+        addr: &ServerAddr,
+        _device: Arc<IdentityKey>,
+        token: &Secret,
+    ) -> BoxFuture<'_, Result<PairedInfo, SetupError>> {
         let n = self.polls.fetch_add(1, SeqCst);
         let host = addr.host.clone();
         let expired = token.expose().contains("expired");
@@ -318,7 +364,13 @@ impl SetupClient for DemoSetup {
         })
     }
 
-    fn start_setup(&self, addr: &ServerAddr, _device: Arc<IdentityKey>, _paired: &PairedInfo, req: SetupRequest) -> BoxFuture<'_, Result<Box<dyn InstallRun>, SetupError>> {
+    fn start_setup(
+        &self,
+        addr: &ServerAddr,
+        _device: Arc<IdentityKey>,
+        _paired: &PairedInfo,
+        req: SetupRequest,
+    ) -> BoxFuture<'_, Result<Box<dyn InstallRun>, SetupError>> {
         let port = addr.port;
         let pace = self.pace;
         let _ = req;
@@ -342,7 +394,10 @@ pub struct DemoAdmin {
 }
 
 impl DeviceAdmin for DemoAdmin {
-    fn create_pairing_code(&self, _ctx: &AdminContext) -> BoxFuture<'_, Result<IssuedCode, AdminError>> {
+    fn create_pairing_code(
+        &self,
+        _ctx: &AdminContext,
+    ) -> BoxFuture<'_, Result<IssuedCode, AdminError>> {
         let n = self.codes.fetch_add(1, SeqCst);
         Box::pin(async move {
             let codes = ["K7QM-4XD2", "R3TN-8WPV", "H9ZC-2LBA"];
@@ -354,13 +409,19 @@ impl DeviceAdmin for DemoAdmin {
         })
     }
 
-    fn reinstate(&self, _ctx: &AdminContext, password: &Secret) -> BoxFuture<'_, Result<(), AdminError>> {
+    fn reinstate(
+        &self,
+        _ctx: &AdminContext,
+        password: &Secret,
+    ) -> BoxFuture<'_, Result<(), AdminError>> {
         let ok = password.expose() == "demo-password";
         Box::pin(async move {
             if ok {
                 Ok(())
             } else {
-                Err(AdminError::Incorrect { attempts_left: Some(4) })
+                Err(AdminError::Incorrect {
+                    attempts_left: Some(4),
+                })
             }
         })
     }
@@ -404,17 +465,39 @@ impl ServerControl for DemoServerControl {
         })
     }
 
-    fn change_pin(&self, _c: &AdminContext, current: &Secret, _new: &Secret) -> BoxFuture<'_, Result<(), AdminError>> {
+    fn change_pin(
+        &self,
+        _c: &AdminContext,
+        current: &Secret,
+        _new: &Secret,
+    ) -> BoxFuture<'_, Result<(), AdminError>> {
         let ok = current.expose() == "123456";
         Box::pin(async move {
-            if ok { Ok(()) } else { Err(AdminError::Incorrect { attempts_left: Some(4) }) }
+            if ok {
+                Ok(())
+            } else {
+                Err(AdminError::Incorrect {
+                    attempts_left: Some(4),
+                })
+            }
         })
     }
 
-    fn change_password(&self, _c: &AdminContext, current: &Secret, _new: &Secret) -> BoxFuture<'_, Result<(), AdminError>> {
+    fn change_password(
+        &self,
+        _c: &AdminContext,
+        current: &Secret,
+        _new: &Secret,
+    ) -> BoxFuture<'_, Result<(), AdminError>> {
         let ok = current.expose() == "demo-password";
         Box::pin(async move {
-            if ok { Ok(()) } else { Err(AdminError::Incorrect { attempts_left: None }) }
+            if ok {
+                Ok(())
+            } else {
+                Err(AdminError::Incorrect {
+                    attempts_left: None,
+                })
+            }
         })
     }
 
@@ -444,7 +527,9 @@ mod tests {
         let s = install_script(Scenario::Success, 443);
         assert!(matches!(s.back(), Some(InstallEvent::Finished(_))));
         for (i, g) in GROUPS.iter().enumerate() {
-            let touched = s.iter().any(|e| matches!(e, InstallEvent::Stage { id, .. } if group_of(id) == Some(i)));
+            let touched = s
+                .iter()
+                .any(|e| matches!(e, InstallEvent::Stage { id, .. } if group_of(id) == Some(i)));
             assert!(touched, "group {} ({}) never appears", i, g.title);
         }
     }
@@ -452,7 +537,9 @@ mod tests {
     #[test]
     fn failure_script_stops_at_incus() {
         let s = install_script(Scenario::FailAtIncus, 443);
-        assert!(matches!(s.back(), Some(InstallEvent::Failed(f)) if f.stage == "incus" && f.retryable));
+        assert!(
+            matches!(s.back(), Some(InstallEvent::Failed(f)) if f.stage == "incus" && f.retryable)
+        );
     }
 
     #[test]

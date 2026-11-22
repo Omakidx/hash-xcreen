@@ -336,6 +336,7 @@ impl Wizard {
     }
 
     /// Goes forward. Returns false (and turns error display on) if the step is not valid.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> bool {
         if self.step == Step::Connection {
             // The SSH step advances only through `ChecksOk`.
@@ -425,15 +426,16 @@ impl Wizard {
             Method::Ssh => self.ssh_port.trim(),
             _ => self.agent_port.trim(),
         };
-        let addr = crate::servers::format_address(
-            self.address.trim(),
-            port.parse().unwrap_or(0),
-        );
+        let addr = crate::servers::format_address(self.address.trim(), port.parse().unwrap_or(0));
         match self.method {
             Method::Ssh => format!(
                 "{addr} as {}, {}",
                 self.ssh_user.trim(),
-                if self.auth_mode == AuthMode::Key { "SSH key" } else { "SSH password" }
+                if self.auth_mode == AuthMode::Key {
+                    "SSH key"
+                } else {
+                    "SSH password"
+                }
             ),
             _ => addr,
         }
@@ -461,11 +463,17 @@ pub fn command_for(o: &InstallOptions) -> String {
     let mut c = String::from(
         "curl -fsSL https://github.com/Omakidx/hash-xcreen/releases/download/channel-stable/install.sh | sudo sh -s -- --pair",
     );
-    c.push_str(&format!(" --distro {} --desktop {} --apps {} --user {}", o.distro, o.desktop, o.apps, o.username));
+    c.push_str(&format!(
+        " --distro {} --desktop {} --apps {} --user {}",
+        o.distro, o.desktop, o.apps, o.username
+    ));
     if o.docker {
         c.push_str(" --docker");
     }
-    c.push_str(&format!(" --cpu {} --memory {}G --disk {}G", o.cpu, o.memory_gb, o.disk_gb));
+    c.push_str(&format!(
+        " --cpu {} --memory {}G --disk {}G",
+        o.cpu, o.memory_gb, o.disk_gb
+    ));
     if o.port != 443 {
         c.push_str(&format!(" --port {}", o.port));
     }
@@ -583,7 +591,10 @@ pub fn domain_problem(d: &str) -> Result<(), String> {
 
 /// Pairing code: eight characters, case and the dash do not matter.
 pub fn code_problem(c: &str) -> Result<(), String> {
-    let n: String = normalize_code(c).chars().filter(char::is_ascii_alphanumeric).collect();
+    let n: String = normalize_code(c)
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
     if n.len() == 8 {
         Ok(())
     } else {
@@ -729,7 +740,11 @@ mod tests {
         }
         assert!(password_problem("1234567").is_err());
         assert!(password_problem("12345678").is_ok());
-        assert!(confirm_problem("a", "b", "passwords").unwrap_err().contains("do not match"));
+        assert!(
+            confirm_problem("a", "b", "passwords")
+                .unwrap_err()
+                .contains("do not match")
+        );
         assert!(pin_problem("12345").is_err());
         assert!(pin_problem("123456").is_ok());
         assert!(pin_problem("12345a").is_err());
@@ -779,7 +794,9 @@ mod tests {
         w.memory_gb = 5;
         w.disk_gb = 60;
         let c = w.one_liner();
-        assert!(c.contains("--pair --distro ubuntu-24.04 --desktop xfce --apps developer --user alex"));
+        assert!(
+            c.contains("--pair --distro ubuntu-24.04 --desktop xfce --apps developer --user alex")
+        );
         assert!(c.contains("--docker --cpu 3 --memory 5G --disk 60G"));
         assert!(c.ends_with("--backup off"));
         assert!(!c.contains("hxt1-"));

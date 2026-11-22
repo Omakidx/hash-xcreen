@@ -71,7 +71,11 @@ pub fn relative_time(then: u64, now: u64, current: bool) -> String {
         3600..=86_399 => format!("{} h ago", d / 3600),
         86_400..=604_799 => {
             let n = d / 86_400;
-            if n == 1 { "yesterday".into() } else { format!("{n} days ago") }
+            if n == 1 {
+                "yesterday".into()
+            } else {
+                format!("{n} days ago")
+            }
         }
         _ => date_utc(then),
     }
@@ -88,7 +92,9 @@ pub fn date_utc(t: u64) -> String {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let _ = era;
-    const M: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const M: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
     format!("{day} {}", M[(month - 1) as usize])
 }
 
@@ -118,9 +124,15 @@ pub fn revoke_message(s: RevokeStatus) -> Option<&'static str> {
         RevokeStatus::Ok => None,
         RevokeStatus::NotFound => Some("That device is no longer on the server."),
         RevokeStatus::AlreadyRevoked => Some("That device was already revoked."),
-        RevokeStatus::LastActiveDevice => Some("This is the only active device. Pair another device first, or reinstall with the server's CLI."),
-        RevokeStatus::RateLimited => Some("Too many revokes in a minute. Wait a moment and try again."),
-        RevokeStatus::Failed | RevokeStatus::Unspecified => Some("The server could not revoke the device. Try again."),
+        RevokeStatus::LastActiveDevice => Some(
+            "This is the only active device. Pair another device first, or reinstall with the server's CLI.",
+        ),
+        RevokeStatus::RateLimited => {
+            Some("Too many revokes in a minute. Wait a moment and try again.")
+        }
+        RevokeStatus::Failed | RevokeStatus::Unspecified => {
+            Some("The server could not revoke the device. Try again.")
+        }
     }
 }
 
@@ -129,13 +141,19 @@ pub fn expiry_text(secs_left: u64, tries: u32) -> String {
     if secs_left == 0 {
         return "This code has expired. Close this window and ask for a new one.".into();
     }
-    format!("Expires in {} min {:02} s · works once · {tries} tries", secs_left / 60, secs_left % 60)
+    format!(
+        "Expires in {} min {:02} s · works once · {tries} tries",
+        secs_left / 60,
+        secs_left % 60
+    )
 }
 
 /// Validation of the Change PIN dialog: (current, new, confirm).
 pub fn pin_dialog_problems(current: &str, new: &str, confirm: &str) -> [Option<String>; 3] {
     [
-        current.is_empty().then(|| "Enter your current PIN.".to_owned()),
+        current
+            .is_empty()
+            .then(|| "Enter your current PIN.".to_owned()),
         crate::wizard::pin_problem(new).err(),
         crate::wizard::confirm_problem(new, confirm, "PINs").err(),
     ]
@@ -144,7 +162,9 @@ pub fn pin_dialog_problems(current: &str, new: &str, confirm: &str) -> [Option<S
 /// Validation of the Change password dialog.
 pub fn password_dialog_problems(current: &str, new: &str, confirm: &str) -> [Option<String>; 3] {
     [
-        current.is_empty().then(|| "Enter your current password.".to_owned()),
+        current
+            .is_empty()
+            .then(|| "Enter your current password.".to_owned()),
         crate::wizard::password_problem(new).err(),
         crate::wizard::confirm_problem(new, confirm, "passwords").err(),
     ]
@@ -175,7 +195,10 @@ pub struct DangerFlow {
 
 impl Default for DangerFlow {
     fn default() -> Self {
-        Self { state: Danger::Idle, keep: true }
+        Self {
+            state: Danger::Idle,
+            keep: true,
+        }
     }
 }
 
@@ -224,7 +247,8 @@ impl DangerFlow {
 }
 
 /// The commands shown after an uninstall to remove Incus (architecture 5.3).
-pub const REMOVE_INCUS: &str = "apt remove incus && rm /etc/apt/sources.list.d/zabbly-incus-*.sources";
+pub const REMOVE_INCUS: &str =
+    "apt remove incus && rm /etc/apt/sources.list.d/zabbly-incus-*.sources";
 
 #[cfg(test)]
 mod tests {
@@ -238,7 +262,11 @@ mod tests {
             created_unix: 1,
             last_seen_unix: last,
             status: status as i32,
-            revoke_reason: if status == DeviceStatus::Revoked { DeviceRevokeReason::User as i32 } else { 0 },
+            revoke_reason: if status == DeviceStatus::Revoked {
+                DeviceRevokeReason::User as i32
+            } else {
+                0
+            },
             revoked_unix: 0,
             current,
         }
@@ -250,7 +278,13 @@ mod tests {
         let list = [
             info(1, "Alex's desktop", DeviceStatus::Active, now, true),
             info(2, "Maya's laptop", DeviceStatus::Active, now - 7200, false),
-            info(3, "Old tablet", DeviceStatus::Revoked, now - 90 * 86_400, false),
+            info(
+                3,
+                "Old tablet",
+                DeviceStatus::Revoked,
+                now - 90 * 86_400,
+                false,
+            ),
         ];
         let r = rows(&list, now);
         assert_eq!(r.len(), 3);
@@ -284,7 +318,11 @@ mod tests {
     #[test]
     fn revoke_results_have_sentences_and_ok_has_none() {
         assert!(revoke_message(RevokeStatus::Ok).is_none());
-        assert!(revoke_message(RevokeStatus::LastActiveDevice).unwrap().contains("only active device"));
+        assert!(
+            revoke_message(RevokeStatus::LastActiveDevice)
+                .unwrap()
+                .contains("only active device")
+        );
         assert!(revoke_message(RevokeStatus::RateLimited).is_some());
     }
 
@@ -294,12 +332,18 @@ mod tests {
         assert_eq!(date_utc(0), "1 Jan");
         assert_eq!(relative_time(0, 5, false), "never");
         assert_eq!(relative_time(100, 100 + 3 * 86_400, false), "3 days ago");
-        assert_eq!(relative_time(1_699_920_000, 1_699_920_000 + 30 * 86_400, false), "14 Nov");
+        assert_eq!(
+            relative_time(1_699_920_000, 1_699_920_000 + 30 * 86_400, false),
+            "14 Nov"
+        );
     }
 
     #[test]
     fn expiry_countdown_text() {
-        assert_eq!(expiry_text(892, 3), "Expires in 14 min 52 s · works once · 3 tries");
+        assert_eq!(
+            expiry_text(892, 3),
+            "Expires in 14 min 52 s · works once · 3 tries"
+        );
         assert!(expiry_text(0, 3).contains("expired"));
     }
 
@@ -316,7 +360,10 @@ mod tests {
     #[test]
     fn danger_flow_needs_ssh_then_confirmation() {
         let mut f = DangerFlow::default();
-        assert!(!f.confirm("", "Workstation"), "cannot confirm before the SSH step");
+        assert!(
+            !f.confirm("", "Workstation"),
+            "cannot confirm before the SSH step"
+        );
         f.start();
         assert_eq!(*f.state(), Danger::NeedsSsh);
         f.ssh_given();

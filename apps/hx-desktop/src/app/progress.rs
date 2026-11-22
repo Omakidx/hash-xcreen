@@ -158,7 +158,9 @@ impl Model {
     fn refresh(&mut self, g: usize) {
         let stages = GROUPS[g].stages;
         let done = stages.iter().all(|s| self.finished.contains(*s));
-        let deferred = stages.iter().all(|s| self.seen.get(*s) == Some(&StageState::Deferred));
+        let deferred = stages
+            .iter()
+            .all(|s| self.seen.get(*s) == Some(&StageState::Deferred));
         let started = stages.iter().any(|s| self.seen.contains_key(*s));
         let row = &mut self.rows[g];
         if row.state == RowState::Failed {
@@ -199,7 +201,9 @@ impl Model {
                         let word = match state {
                             StageState::Skipped => "skipped".to_owned(),
                             StageState::Deferred => "set up later".to_owned(),
-                            _ => ms.map_or("done".to_owned(), |m| format!("done ({})", duration_text(m))),
+                            _ => ms.map_or("done".to_owned(), |m| {
+                                format!("done ({})", duration_text(m))
+                            }),
                         };
                         self.line(format!("stage {id} .......... {word}"));
                         if let (Some(g), Some(m)) = (g, ms) {
@@ -211,7 +215,13 @@ impl Model {
                     self.refresh(g);
                 }
             }
-            InstallEvent::Step { stage, index, total, text, percent } => {
+            InstallEvent::Step {
+                stage,
+                index,
+                total,
+                text,
+                percent,
+            } => {
                 self.line(format!("step {index}/{total} {text}"));
                 if let Some(g) = group_of(&stage) {
                     let row = &mut self.rows[g];
@@ -282,7 +292,11 @@ pub fn duration_text(ms: u64) -> String {
 pub fn long_duration(secs: u64) -> String {
     let (m, s) = (secs / 60, secs % 60);
     let p = |n: u64, w: &str| format!("{n} {w}{}", if n == 1 { "" } else { "s" });
-    if m == 0 { p(s, "second") } else { format!("{} {}", p(m, "minute"), p(s, "second")) }
+    if m == 0 {
+        p(s, "second")
+    } else {
+        format!("{} {}", p(m, "minute"), p(s, "second"))
+    }
 }
 
 #[cfg(test)]
@@ -294,7 +308,11 @@ mod tests {
     }
 
     fn stage(id: &str, s: StageState, ms: Option<u64>) -> InstallEvent {
-        InstallEvent::Stage { id: id.into(), state: s, ms }
+        InstallEvent::Stage {
+            id: id.into(),
+            state: s,
+            ms,
+        }
     }
 
     #[test]
@@ -309,7 +327,11 @@ mod tests {
         // "Install the agent" covers five stages
         m.apply(stage("release", StageState::Start, None));
         m.apply(stage("release", StageState::Done, Some(1000)));
-        assert_eq!(m.rows[3].state, RowState::Running, "four stages still to do");
+        assert_eq!(
+            m.rows[3].state,
+            RowState::Running,
+            "four stages still to do"
+        );
         for id in ["system-files", "credentials", "config", "units"] {
             m.apply(stage(id, StageState::Start, None));
             m.apply(stage(id, StageState::Done, Some(1000)));
@@ -322,10 +344,22 @@ mod tests {
     fn steps_without_a_percentage_show_an_indeterminate_bar() {
         let mut m = Model::with_clock(clk);
         m.apply(stage("desktop", StageState::Start, None));
-        m.apply(InstallEvent::Step { stage: "desktop".into(), index: 5, total: 12, text: "Installing apps".into(), percent: None });
+        m.apply(InstallEvent::Step {
+            stage: "desktop".into(),
+            index: 5,
+            total: 12,
+            text: "Installing apps".into(),
+            percent: None,
+        });
         assert_eq!(m.rows[5].percent, -1);
         assert_eq!(m.rows[5].detail, "Step 5 of 12: Installing apps");
-        m.apply(InstallEvent::Step { stage: "desktop".into(), index: 6, total: 12, text: "x".into(), percent: Some(61) });
+        m.apply(InstallEvent::Step {
+            stage: "desktop".into(),
+            index: 6,
+            total: 12,
+            text: "x".into(),
+            percent: Some(61),
+        });
         assert_eq!(m.rows[5].percent, 61);
         m.apply(stage("desktop", StageState::Done, Some(3000)));
         assert_eq!(m.rows[5].percent, -2);
@@ -346,7 +380,12 @@ mod tests {
             elapsed_secs: 1,
         }));
         assert_eq!(m.rows[7].state, RowState::Deferred);
-        assert!(m.rows.iter().enumerate().all(|(i, r)| i == 7 || r.state == RowState::Done));
+        assert!(
+            m.rows
+                .iter()
+                .enumerate()
+                .all(|(i, r)| i == 7 || r.state == RowState::Done)
+        );
         assert!(matches!(m.run, Run::Done(_)));
     }
 
@@ -356,10 +395,18 @@ mod tests {
         m.apply(stage("preflight", StageState::Done, Some(10)));
         m.apply(stage("packages", StageState::Done, Some(10)));
         m.apply(stage("incus", StageState::Start, None));
-        m.apply(InstallEvent::Failed(InstallFailure { stage: "incus".into(), code: "UNAVAILABLE".into(), message: "unreachable".into(), retryable: true }));
+        m.apply(InstallEvent::Failed(InstallFailure {
+            stage: "incus".into(),
+            code: "UNAVAILABLE".into(),
+            message: "unreachable".into(),
+            retryable: true,
+        }));
         assert_eq!(m.rows[2].state, RowState::Failed);
         assert_eq!(m.stage_text(), "Stage 3 of 10");
-        assert!(m.log_text().contains("stage incus failed: unreachable (UNAVAILABLE, retryable)"));
+        assert!(
+            m.log_text()
+                .contains("stage incus failed: unreachable (UNAVAILABLE, retryable)")
+        );
         m.restart();
         assert_eq!(m.run, Run::Running);
         assert_eq!(m.rows[2].state, RowState::Pending);
@@ -370,8 +417,15 @@ mod tests {
     fn connection_lost_keeps_the_stage() {
         let mut m = Model::with_clock(clk);
         m.apply(stage("desktop", StageState::Start, None));
-        m.apply(InstallEvent::ConnectionLost { stage: "desktop".into() });
-        assert_eq!(m.run, Run::Lost { stage: "desktop".into() });
+        m.apply(InstallEvent::ConnectionLost {
+            stage: "desktop".into(),
+        });
+        assert_eq!(
+            m.run,
+            Run::Lost {
+                stage: "desktop".into()
+            }
+        );
         assert_eq!(m.rows[5].state, RowState::Running);
     }
 

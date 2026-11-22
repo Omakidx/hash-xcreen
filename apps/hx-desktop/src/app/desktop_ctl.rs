@@ -20,7 +20,9 @@ use zeroize::Zeroizing;
 
 use super::{App, model, post, spawn_ui, ss};
 use crate::clipboard::{self, Incoming};
-use crate::files::{Activity, Direction, SendCheck, TransferState, check_send, human_size, refusal_text};
+use crate::files::{
+    Activity, Direction, SendCheck, TransferState, check_send, human_size, refusal_text,
+};
 use crate::input::{ChordDetector, Combo, Fit, Held, ViewTransform, hid_usage, scroll_units};
 use crate::links::{self, Link as WebLink};
 use crate::session::lifecycle::{Next, Reconnect, reconnects};
@@ -91,7 +93,13 @@ pub fn prepare(app: &Rc<App>) -> Prepared {
         Ok((tx, t)) => (Some(tx), Some(t)),
         Err(_) => (None, None),
     };
-    Prepared { tx, thread, presenter, stats, slot }
+    Prepared {
+        tx,
+        thread,
+        presenter,
+        stats,
+        slot,
+    }
 }
 
 /// Seconds of an outage, with the schedule of attempts.
@@ -134,13 +142,31 @@ pub struct Ctx {
 
 /// The `ViewConfig` for the current choices. Quality has no field of its own in the protocol:
 /// Sharp keeps the frame rate low (full detail), Smooth caps the bitrate (full motion).
-pub fn build_view(quality: i32, bandwidth_kbps: u32, fit: i32, size_px: (u32, u32), stats: bool, clipboard: bool) -> ViewConfig {
+pub fn build_view(
+    quality: i32,
+    bandwidth_kbps: u32,
+    fit: i32,
+    size_px: (u32, u32),
+    stats: bool,
+    clipboard: bool,
+) -> ViewConfig {
     let (fps, cap) = match quality {
         1 => (30, bandwidth_kbps),
-        2 => (60, if bandwidth_kbps == 0 { 12_000 } else { bandwidth_kbps.min(12_000) }),
+        2 => (
+            60,
+            if bandwidth_kbps == 0 {
+                12_000
+            } else {
+                bandwidth_kbps.min(12_000)
+            },
+        ),
         _ => (60, bandwidth_kbps),
     };
-    let (w, h) = if fit == 2 { (size_px.0.clamp(64, 16384), size_px.1.clamp(64, 16384)) } else { (0, 0) };
+    let (w, h) = if fit == 2 {
+        (size_px.0.clamp(64, 16384), size_px.1.clamp(64, 16384))
+    } else {
+        (0, 0)
+    };
     ViewConfig {
         codec: VideoCodec::H264 as i32,
         max_fps: fps,
@@ -174,7 +200,14 @@ fn send_view(app: &Rc<App>) {
 }
 
 /// A connection was accepted: show the desktop.
-pub fn enter(app: &Rc<App>, id: &str, link: Link, est: Established, prepared: Prepared, pin: Zeroizing<String>) {
+pub fn enter(
+    app: &Rc<App>,
+    id: &str,
+    link: Link,
+    est: Established,
+    prepared: Prepared,
+    pin: Zeroizing<String>,
+) {
     let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let epoch = {
         let mut c = app.desk.borrow_mut();
@@ -235,7 +268,14 @@ pub fn enter(app: &Rc<App>, id: &str, link: Link, est: Established, prepared: Pr
     let a = app.clone();
     slint::Timer::single_shot(Duration::from_secs(20), move || {
         let waiting = a.ui().global::<DesktopVm>().get_has_frame();
-        if !waiting && a.desk.borrow().active.as_ref().is_some_and(|x| x.epoch == epoch) && a.ui().global::<DesktopVm>().get_overlay() == 0 {
+        if !waiting
+            && a.desk
+                .borrow()
+                .active
+                .as_ref()
+                .is_some_and(|x| x.epoch == epoch)
+            && a.ui().global::<DesktopVm>().get_overlay() == 0
+        {
             if let Some(id) = a.desk.borrow().active.as_ref().map(|x| x.server_id.clone()) {
                 a.unavailable.borrow_mut().insert(id);
             }
@@ -246,7 +286,11 @@ pub fn enter(app: &Rc<App>, id: &str, link: Link, est: Established, prepared: Pr
 
 fn transform(c: &Ctx, fit: i32) -> ViewTransform {
     ViewTransform {
-        remote: if c.remote.0 == 0 { (1920, 1080) } else { c.remote },
+        remote: if c.remote.0 == 0 {
+            (1920, 1080)
+        } else {
+            c.remote
+        },
         view: c.view,
         fit: match fit {
             1 => Fit::Actual,
@@ -283,7 +327,9 @@ fn push_activities(app: &Rc<App>) {
             direction: ss(if a.dir == Direction::Up { "up" } else { "down" }),
             percent: a.percent() as i32,
             state: ss(match &a.state {
-                TransferState::Running => format!("{} of {}", human_size(a.done), human_size(a.total)),
+                TransferState::Running => {
+                    format!("{} of {}", human_size(a.done), human_size(a.total))
+                }
                 TransferState::Done => "done".to_owned(),
                 TransferState::Failed(_) => "not sent".to_owned(),
             }),
@@ -294,7 +340,13 @@ fn push_activities(app: &Rc<App>) {
 }
 
 fn on_event(app: &Rc<App>, epoch: u64, e: Event) {
-    if app.desk.borrow().active.as_ref().is_none_or(|a| a.epoch != epoch) {
+    if app
+        .desk
+        .borrow()
+        .active
+        .as_ref()
+        .is_none_or(|a| a.epoch != epoch)
+    {
         return;
     }
     let ui = app.ui();
@@ -311,11 +363,16 @@ fn on_event(app: &Rc<App>, epoch: u64, e: Event) {
             vm.set_st_fps(ss(format!("{} fps", s.frames)));
             let rtt = {
                 let c = app.desk.borrow();
-                c.active.as_ref().map_or(0, |a| a.desk.stats().rtt_us.load(Relaxed))
+                c.active
+                    .as_ref()
+                    .map_or(0, |a| a.desk.stats().rtt_us.load(Relaxed))
             };
             let us = if rtt > 0 { rtt } else { s.rtt_us };
             vm.set_st_latency(ss(format!("{} ms", us / 1000)));
-            vm.set_st_bitrate(ss(format!("{:.1} Mbps", f64::from(s.bitrate_kbps) / 1000.0)));
+            vm.set_st_bitrate(ss(format!(
+                "{:.1} Mbps",
+                f64::from(s.bitrate_kbps) / 1000.0
+            )));
             // The statistics message carries numbers only; the encoder is the server's choice
             // and today always software x264.
             vm.set_st_encoding(ss("Software (x264)"));
@@ -328,7 +385,9 @@ fn on_event(app: &Rc<App>, epoch: u64, e: Event) {
             }
         }
         Event::ClipboardImage(_) => {
-            tracing::debug!("the desktop copied an image; a native clipboard is needed to paste it here");
+            tracing::debug!(
+                "the desktop copied an image; a native clipboard is needed to paste it here"
+            );
         }
         Event::LinkRequest(body) => match links::from_uri_list(&body) {
             Ok(l) => {
@@ -338,9 +397,16 @@ fn on_event(app: &Rc<App>, epoch: u64, e: Event) {
                 vm.set_link_open(true);
                 app.desk.borrow_mut().link = Some(l);
             }
-            Err(_) => set_note(app, "The desktop asked to open a link that was not offered: only http and https links can be opened."),
+            Err(_) => set_note(
+                app,
+                "The desktop asked to open a link that was not offered: only http and https links can be opened.",
+            ),
         },
-        Event::Transfer { id, activity, saved } => {
+        Event::Transfer {
+            id,
+            activity,
+            saved,
+        } => {
             {
                 let mut c = app.desk.borrow_mut();
                 match c.activities.iter_mut().find(|(i, _)| *i == id) {
@@ -357,7 +423,10 @@ fn on_event(app: &Rc<App>, epoch: u64, e: Event) {
             match &activity.state {
                 TransferState::Failed(t) => set_note(app, t),
                 TransferState::Done if saved.is_some() => {
-                    set_note(app, &format!("{} was saved to your Downloads folder.", activity.name));
+                    set_note(
+                        app,
+                        &format!("{} was saved to your Downloads folder.", activity.name),
+                    );
                 }
                 _ => {}
             }
@@ -382,11 +451,19 @@ fn on_cursor(app: &Rc<App>, e: pb::CursorEvent) {
             if c.shapes.len() > 64 {
                 c.shapes.clear();
             }
-            c.shapes.insert(s.id, (Image::from_rgba8(buf), (s.hotspot_x as f32, s.hotspot_y as f32)));
+            c.shapes.insert(
+                s.id,
+                (
+                    Image::from_rgba8(buf),
+                    (s.hotspot_x as f32, s.hotspot_y as f32),
+                ),
+            );
         }
         Some(C::Position(p)) => {
             let c = app.desk.borrow();
-            let Some((img, hot)) = c.shapes.get(&p.shape_id).cloned() else { return };
+            let Some((img, hot)) = c.shapes.get(&p.shape_id).cloned() else {
+                return;
+            };
             let t = transform(&c, vm.get_fit());
             let (x, y) = t.to_view(p.x, p.y);
             vm.set_cursor(img);
@@ -408,19 +485,32 @@ fn on_cursor(app: &Rc<App>, e: pb::CursorEvent) {
 fn on_closed(app: &Rc<App>, epoch: u64, reason: CloseReason) {
     let ui = app.ui();
     let vm = ui.global::<DesktopVm>();
-    let id = app.desk.borrow().active.as_ref().map(|a| a.server_id.clone());
+    let id = app
+        .desk
+        .borrow()
+        .active
+        .as_ref()
+        .map(|a| a.server_id.clone());
     app.desk.borrow_mut().held.clear();
     match reason {
         CloseReason::Local => {}
         CloseReason::Network | CloseReason::Shutdown => start_outage(app, epoch),
-        CloseReason::TakenOver { name, id_short, id: pid } => {
+        CloseReason::TakenOver {
+            name,
+            id_short,
+            id: pid,
+        } => {
             let who = match (name.is_empty(), id_short.is_empty()) {
                 (false, false) => format!("{name} ({id_short})"),
                 (false, true) => name.clone(),
                 (true, false) => format!("Another device ({id_short})"),
                 (true, true) => "Another device".to_owned(),
             };
-            let server = id.as_deref().and_then(|i| app.server(i)).map(|s| s.name).unwrap_or_default();
+            let server = id
+                .as_deref()
+                .and_then(|i| app.server(i))
+                .map(|s| s.name)
+                .unwrap_or_default();
             vm.set_takeover_title(ss("This desktop was opened on another device"));
             vm.set_takeover_text(ss(format!(
                 "{who} connected to {server} and took over, so this session ended. Nothing on the desktop was closed."
@@ -433,7 +523,11 @@ fn on_closed(app: &Rc<App>, epoch: u64, reason: CloseReason) {
         }
         CloseReason::Revoked => {
             if let Some(i) = &id {
-                let _ = app.store.borrow_mut().set_lifecycle(i, crate::servers::Lifecycle::Revoked, super::now_unix());
+                let _ = app.store.borrow_mut().set_lifecycle(
+                    i,
+                    crate::servers::Lifecycle::Revoked,
+                    super::now_unix(),
+                );
                 leave_to_connect(app, i);
             }
         }
@@ -472,7 +566,12 @@ fn start_outage(app: &Rc<App>, epoch: u64) {
     if a.epoch != epoch {
         return;
     }
-    a.outage = Some(Outage { started: Instant::now(), schedule: Reconnect::new(), timer: slint::Timer::default(), left: 0 });
+    a.outage = Some(Outage {
+        started: Instant::now(),
+        schedule: Reconnect::new(),
+        timer: slint::Timer::default(),
+        left: 0,
+    });
     drop(c);
     app.ui().global::<DesktopVm>().set_overlay(1);
     next_attempt(app, epoch);
@@ -492,7 +591,13 @@ fn next_attempt(app: &Rc<App>, epoch: u64) {
     match step {
         Next::GiveUp => {
             vm.set_overlay(2);
-            if let Some(o) = app.desk.borrow_mut().active.as_mut().and_then(|a| a.outage.as_mut()) {
+            if let Some(o) = app
+                .desk
+                .borrow_mut()
+                .active
+                .as_mut()
+                .and_then(|a| a.outage.as_mut())
+            {
                 o.timer.stop();
             }
         }
@@ -500,24 +605,38 @@ fn next_attempt(app: &Rc<App>, epoch: u64) {
             vm.set_attempt(attempt as i32);
             vm.set_next_secs(wait.as_secs() as i32);
             let mut c = app.desk.borrow_mut();
-            let Some(o) = c.active.as_mut().and_then(|a| a.outage.as_mut()) else { return };
+            let Some(o) = c.active.as_mut().and_then(|a| a.outage.as_mut()) else {
+                return;
+            };
             o.left = wait.as_secs();
             let a2 = app.clone();
-            o.timer.start(slint::TimerMode::Repeated, Duration::from_secs(1), move || {
-                let fire = {
-                    let mut c = a2.desk.borrow_mut();
-                    let Some(o) = c.active.as_mut().and_then(|a| a.outage.as_mut()) else { return };
-                    o.left = o.left.saturating_sub(1);
-                    a2.ui().global::<DesktopVm>().set_next_secs(o.left as i32);
-                    o.left == 0
-                };
-                if fire {
-                    if let Some(o) = a2.desk.borrow_mut().active.as_mut().and_then(|a| a.outage.as_mut()) {
-                        o.timer.stop();
+            o.timer.start(
+                slint::TimerMode::Repeated,
+                Duration::from_secs(1),
+                move || {
+                    let fire = {
+                        let mut c = a2.desk.borrow_mut();
+                        let Some(o) = c.active.as_mut().and_then(|a| a.outage.as_mut()) else {
+                            return;
+                        };
+                        o.left = o.left.saturating_sub(1);
+                        a2.ui().global::<DesktopVm>().set_next_secs(o.left as i32);
+                        o.left == 0
+                    };
+                    if fire {
+                        if let Some(o) = a2
+                            .desk
+                            .borrow_mut()
+                            .active
+                            .as_mut()
+                            .and_then(|a| a.outage.as_mut())
+                        {
+                            o.timer.stop();
+                        }
+                        try_reconnect(&a2, epoch);
                     }
-                    try_reconnect(&a2, epoch);
-                }
-            });
+                },
+            );
         }
     }
 }
@@ -537,7 +656,12 @@ fn try_reconnect(app: &Rc<App>, epoch: u64) {
         app,
         async move { connector.connect(&l2, &p2, Box::new(|| {}), wiring).await },
         move |a, r| {
-            if a.desk.borrow().active.as_ref().is_none_or(|x| x.epoch != epoch) {
+            if a.desk
+                .borrow()
+                .active
+                .as_ref()
+                .is_none_or(|x| x.epoch != epoch)
+            {
                 return;
             }
             match r {
@@ -551,7 +675,11 @@ fn try_reconnect(app: &Rc<App>, epoch: u64) {
                     enter(a, &id, link, est, prepared, pin);
                 }
                 Err(Outcome::Revoked) => {
-                    let _ = a.store.borrow_mut().set_lifecycle(&id, crate::servers::Lifecycle::Revoked, super::now_unix());
+                    let _ = a.store.borrow_mut().set_lifecycle(
+                        &id,
+                        crate::servers::Lifecycle::Revoked,
+                        super::now_unix(),
+                    );
                     leave_to_connect(a, &id);
                 }
                 Err(Outcome::IdentityChanged) => leave_to_connect(a, &id),
@@ -568,7 +696,12 @@ fn retry_now(app: &Rc<App>) {
     let epoch = {
         let mut c = app.desk.borrow_mut();
         let Some(a) = c.active.as_mut() else { return };
-        a.outage = Some(Outage { started: Instant::now(), schedule: Reconnect::new(), timer: slint::Timer::default(), left: 0 });
+        a.outage = Some(Outage {
+            started: Instant::now(),
+            schedule: Reconnect::new(),
+            timer: slint::Timer::default(),
+            left: 0,
+        });
         a.epoch
     };
     let vm = app.ui().global::<DesktopVm>();
@@ -596,8 +729,16 @@ fn revoke_peer(app: &Rc<App>) {
         async move {
             // A new authenticated session that sends no ViewConfig: it claims nothing and
             // displaces nobody (protocol 5.7, 5.9).
-            let w = Wiring { frames: None, presenter: None, stats, downloads };
-            let est = connector.connect(&link, &pin, Box::new(|| {}), w).await.map_err(|_| ())?;
+            let w = Wiring {
+                frames: None,
+                presenter: None,
+                stats,
+                downloads,
+            };
+            let est = connector
+                .connect(&link, &pin, Box::new(|| {}), w)
+                .await
+                .map_err(|_| ())?;
             let r = est.desk.revoke(pid).await;
             est.desk.close().await;
             r.map_err(|_| ())
@@ -636,7 +777,9 @@ fn key_event(app: &Rc<App>, code: KeyCode, pressed: bool, repeat: bool) -> bool 
         toggle_fullscreen(app);
         return true;
     }
-    let Some(u) = hid_usage(code) else { return false };
+    let Some(u) = hid_usage(code) else {
+        return false;
+    };
     if !vm.get_capture_keys() && matches!(u, 0xE3 | 0xE7) {
         return false;
     }
@@ -672,8 +815,15 @@ fn handle_winit(app: &Rc<App>, ev: &WindowEvent) -> EventResult {
     match ev {
         WindowEvent::ModifiersChanged(m) => {
             let s = m.state();
-            let fire = app.desk.borrow_mut().chord.update(s.control_key(), s.alt_key(), s.shift_key());
-            if fire && app.desk.borrow().active.is_some() && app.ui().global::<crate::Nav>().get_screen() == Screen::Desktop {
+            let fire =
+                app.desk
+                    .borrow_mut()
+                    .chord
+                    .update(s.control_key(), s.alt_key(), s.shift_key());
+            if fire
+                && app.desk.borrow().active.is_some()
+                && app.ui().global::<crate::Nav>().get_screen() == Screen::Desktop
+            {
                 release_all(app);
                 let vm = app.ui().global::<DesktopVm>();
                 vm.set_toolbar(!vm.get_toolbar());
@@ -740,7 +890,9 @@ fn send_file(app: &Rc<App>, path: std::path::PathBuf) {
         let Some(a) = c.active.as_ref() else { return };
         (a.desk.clone(), a.events.clone())
     };
-    let name = path.file_name().map_or("file".to_owned(), |n| n.to_string_lossy().into_owned());
+    let name = path
+        .file_name()
+        .map_or("file".to_owned(), |n| n.to_string_lossy().into_owned());
     let size = match std::fs::metadata(&path) {
         Ok(m) if m.is_file() => m.len(),
         _ => {
@@ -805,7 +957,9 @@ pub fn wire(app: &Rc<App>) {
         let c = a.desk.borrow();
         let Some(act) = c.active.as_ref() else { return };
         let t = transform(&c, a.ui().global::<DesktopVm>().get_fit());
-        let Some((rx, ry)) = t.to_remote(x, y) else { return };
+        let Some((rx, ry)) = t.to_remote(x, y) else {
+            return;
+        };
         let btn = match b {
             0 => MouseButton::Left,
             1 => MouseButton::Right,
@@ -886,7 +1040,10 @@ pub fn wire(app: &Rc<App>) {
         if let Some(l) = l
             && links::open_in_browser(&l).is_err()
         {
-            set_note(&a, "The link could not be opened: no default browser handler was found.");
+            set_note(
+                &a,
+                "The link could not be opened: no default browser handler was found.",
+            );
         }
     });
     let a = app.clone();
@@ -927,7 +1084,10 @@ pub fn wire(app: &Rc<App>) {
     vm.on_take_back(move || {
         let (id, who) = {
             let c = a.desk.borrow();
-            (c.active.as_ref().map(|x| x.server_id.clone()), c.peer.as_ref().map(|p| p.1.clone()))
+            (
+                c.active.as_ref().map(|x| x.server_id.clone()),
+                c.peer.as_ref().map(|p| p.1.clone()),
+            )
         };
         teardown(&a);
         if let Some(id) = id {
@@ -949,7 +1109,10 @@ mod tests {
     #[test]
     fn view_config_follows_quality_and_resize() {
         let v = build_view(0, 0, 0, (1200, 700), false, true);
-        assert_eq!((v.max_fps, v.bandwidth_cap_kbps, v.width, v.height), (60, 0, 0, 0));
+        assert_eq!(
+            (v.max_fps, v.bandwidth_cap_kbps, v.width, v.height),
+            (60, 0, 0, 0)
+        );
         assert!(v.clipboard_enabled && !v.stats_enabled);
         let v = build_view(1, 0, 0, (0, 0), true, false);
         assert_eq!(v.max_fps, 30);

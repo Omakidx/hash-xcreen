@@ -10,7 +10,10 @@ use slint::ComponentHandle;
 
 use super::known_hosts::Known;
 use super::{App, model, spawn_ui, ss};
-use crate::backend::{AdminContext, AdminError, EngineError, HostKey, Limits, Overview, Secret, SshAuth, SshTarget, UninstallRequest};
+use crate::backend::{
+    AdminContext, AdminError, EngineError, HostKey, Limits, Overview, Secret, SshAuth, SshTarget,
+    UninstallRequest,
+};
 use crate::details::{self, DangerFlow, DeviceRow, RevokePlan};
 use crate::servers::Lifecycle;
 use crate::session::{Desk, Wiring};
@@ -33,7 +36,10 @@ pub struct Ctx {
 }
 
 fn kv(k: &str, v: impl Into<String>) -> Kv {
-    Kv { key: ss(k), value: ss(v.into()) }
+    Kv {
+        key: ss(k),
+        value: ss(v.into()),
+    }
 }
 
 fn admin_ctx(app: &App) -> Option<AdminContext> {
@@ -69,7 +75,11 @@ pub fn open(app: &Rc<App>, id: &str) {
     {
         let mut c = app.det.borrow_mut();
         let epoch = c.epoch + 1;
-        *c = Ctx { epoch, server_id: Some(id.to_owned()), ..Ctx::default() };
+        *c = Ctx {
+            epoch,
+            server_id: Some(id.to_owned()),
+            ..Ctx::default()
+        };
     }
     let vm = app.ui().global::<DetailsVm>();
     vm.set_tab(0);
@@ -133,49 +143,76 @@ fn fetch_overview(app: &Rc<App>) {
     };
     app.ui().global::<DetailsVm>().set_loading(true);
     let control = app.be.control.clone();
-    spawn_ui(app, async move { control.overview(&ctx).await }, move |a, r| {
-        if a.det.borrow().epoch != epoch {
-            return;
-        }
-        let vm = a.ui().global::<DetailsVm>();
-        vm.set_loading(false);
-        let Some(s) = a.server(&id) else { return };
-        match r {
-            Ok(o) => {
-                fill_overview(a, &s, &o);
-                a.det.borrow_mut().overview = Some(o);
+    spawn_ui(
+        app,
+        async move { control.overview(&ctx).await },
+        move |a, r| {
+            if a.det.borrow().epoch != epoch {
+                return;
             }
-            Err(_) => {
-                a.reachable.borrow_mut().insert(id, false);
-                vm.set_status(ss("Offline"));
-                vm.set_status_tone(0);
-                vm.set_can_connect(false);
-                vm.set_offline_text(ss(if s.last_seen_unix == 0 {
-                    "No answer from the server. Values are not available.".to_owned()
-                } else {
-                    format!(
-                        "Last seen {}. Values below are from then.",
-                        details::relative_time(s.last_seen_unix, super::now_unix(), false)
-                    )
-                }));
-                vm.set_ov_desktop(model(vec![kv("Status", "Unknown"), kv("Uptime", "unknown")]));
-                vm.set_ov_agent(model(vec![kv("Version", "unknown")]));
-                vm.set_ov_server(model(vec![kv("Address", s.address()), kv("Identity", s.short_fingerprint())]));
+            let vm = a.ui().global::<DetailsVm>();
+            vm.set_loading(false);
+            let Some(s) = a.server(&id) else { return };
+            match r {
+                Ok(o) => {
+                    fill_overview(a, &s, &o);
+                    a.det.borrow_mut().overview = Some(o);
+                }
+                Err(_) => {
+                    a.reachable.borrow_mut().insert(id, false);
+                    vm.set_status(ss("Offline"));
+                    vm.set_status_tone(0);
+                    vm.set_can_connect(false);
+                    vm.set_offline_text(ss(if s.last_seen_unix == 0 {
+                        "No answer from the server. Values are not available.".to_owned()
+                    } else {
+                        format!(
+                            "Last seen {}. Values below are from then.",
+                            details::relative_time(s.last_seen_unix, super::now_unix(), false)
+                        )
+                    }));
+                    vm.set_ov_desktop(model(vec![
+                        kv("Status", "Unknown"),
+                        kv("Uptime", "unknown"),
+                    ]));
+                    vm.set_ov_agent(model(vec![kv("Version", "unknown")]));
+                    vm.set_ov_server(model(vec![
+                        kv("Address", s.address()),
+                        kv("Identity", s.short_fingerprint()),
+                    ]));
+                }
             }
-        }
-    });
+        },
+    );
 }
 
 fn fill_overview(app: &Rc<App>, s: &crate::servers::Server, o: &Overview) {
     let vm = app.ui().global::<DetailsVm>();
     vm.set_ov_desktop(model(vec![
-        kv("Status", if o.desktop_running { "Running" } else { "Not answering" }),
+        kv(
+            "Status",
+            if o.desktop_running {
+                "Running"
+            } else {
+                "Not answering"
+            },
+        ),
         kv("Uptime", uptime_text(o.uptime_secs)),
-        kv("Session", o.session_with.clone().map_or("Nobody connected".to_owned(), |n| format!("In use from {n}"))),
+        kv(
+            "Session",
+            o.session_with
+                .clone()
+                .map_or("Nobody connected".to_owned(), |n| {
+                    format!("In use from {n}")
+                }),
+        ),
         kv("Setup", o.setup.clone()),
     ]));
     vm.set_ov_agent(model(vec![
-        kv("Version", format!("{} ({} channel)", o.agent_version, o.channel)),
+        kv(
+            "Version",
+            format!("{} ({} channel)", o.agent_version, o.channel),
+        ),
         kv(
             "Updates",
             match &o.update_available {
@@ -191,19 +228,32 @@ fn fill_overview(app: &Rc<App>, s: &crate::servers::Server, o: &Overview) {
         kv("Identity", s.short_fingerprint()),
         kv("Paired", format!("{} devices", o.devices)),
     ]));
-    vm.set_update_text(ss(o.update_available.as_ref().map_or(String::new(), |v| format!("Update available: {v}"))));
+    vm.set_update_text(ss(o
+        .update_available
+        .as_ref()
+        .map_or(String::new(), |v| format!("Update available: {v}"))));
     vm.set_can_update(o.update_available.is_some());
     vm.set_agent_line(ss(format!(
         "Version {}, {}. Updates also apply by themselves on the {} channel.",
         o.agent_version,
-        if o.update_available.is_some() { "an update is available" } else { "up to date" },
+        if o.update_available.is_some() {
+            "an update is available"
+        } else {
+            "up to date"
+        },
         o.channel
     )));
     vm.set_cpu_text(ss(format!("CPU: {}% of {} cores", o.cpu_pct, o.cpu_cores)));
     vm.set_cpu_frac(o.cpu_pct as f32 / 100.0);
-    vm.set_mem_text(ss(format!("Memory: {:.1} of {:.0} GB", o.mem_used_gb, o.mem_total_gb)));
+    vm.set_mem_text(ss(format!(
+        "Memory: {:.1} of {:.0} GB",
+        o.mem_used_gb, o.mem_total_gb
+    )));
     vm.set_mem_frac(o.mem_used_gb / o.mem_total_gb.max(0.1));
-    vm.set_disk_text(ss(format!("Disk: {} of {} GB", o.disk_used_gb, o.disk_total_gb)));
+    vm.set_disk_text(ss(format!(
+        "Disk: {} of {} GB",
+        o.disk_used_gb, o.disk_total_gb
+    )));
     vm.set_disk_frac(o.disk_used_gb as f32 / o.disk_total_gb.max(1) as f32);
     if o.desktop_running {
         vm.set_attention_title(ss(""));
@@ -245,24 +295,30 @@ fn show_rows(app: &Rc<App>) {
 }
 
 fn refresh_devices(app: &Rc<App>) {
-    let Some(desk) = app.det.borrow().session.clone() else { return };
+    let Some(desk) = app.det.borrow().session.clone() else {
+        return;
+    };
     let epoch = app.det.borrow().epoch;
     app.ui().global::<DetailsVm>().set_loading(true);
-    spawn_ui(app, async move { desk.list_devices().await }, move |a, r| {
-        if a.det.borrow().epoch != epoch {
-            return;
-        }
-        let vm = a.ui().global::<DetailsVm>();
-        vm.set_loading(false);
-        match r {
-            Ok(list) => {
-                a.det.borrow_mut().rows = details::rows(&list, super::now_unix());
-                vm.set_devices_note(ss("Devices paired with this server. Revoked ones stay listed so you can see what happened."));
-                show_rows(a);
+    spawn_ui(
+        app,
+        async move { desk.list_devices().await },
+        move |a, r| {
+            if a.det.borrow().epoch != epoch {
+                return;
             }
-            Err(e) => vm.set_devices_note(ss(e.to_string())),
-        }
-    });
+            let vm = a.ui().global::<DetailsVm>();
+            vm.set_loading(false);
+            match r {
+                Ok(list) => {
+                    a.det.borrow_mut().rows = details::rows(&list, super::now_unix());
+                    vm.set_devices_note(ss("Devices paired with this server. Revoked ones stay listed so you can see what happened."));
+                    show_rows(a);
+                }
+                Err(e) => vm.set_devices_note(ss(e.to_string())),
+            }
+        },
+    );
 }
 
 fn select_tab(app: &Rc<App>, t: i32) {
@@ -306,9 +362,15 @@ fn close_dialog(app: &Rc<App>) {
 
 fn admin_error_text(e: &AdminError) -> String {
     match e {
-        AdminError::Incorrect { attempts_left: Some(1) } => "Incorrect, 1 attempt left".into(),
-        AdminError::Incorrect { attempts_left: Some(n) } => format!("Incorrect, {n} attempts left"),
-        AdminError::Incorrect { attempts_left: None } => "Incorrect. Check it and try again.".into(),
+        AdminError::Incorrect {
+            attempts_left: Some(1),
+        } => "Incorrect, 1 attempt left".into(),
+        AdminError::Incorrect {
+            attempts_left: Some(n),
+        } => format!("Incorrect, {n} attempts left"),
+        AdminError::Incorrect {
+            attempts_left: None,
+        } => "Incorrect. Check it and try again.".into(),
         AdminError::RateLimited => "Too many tries. Wait a few minutes and try again.".into(),
         AdminError::Failed(m) => m.clone(),
         AdminError::Unreachable => "Cannot reach the server.".into(),
@@ -320,12 +382,20 @@ fn submit_dialog(app: &Rc<App>) {
     if vm.get_dialog_busy() {
         return;
     }
-    let (f1, f2, f3) = (vm.get_f1().to_string(), vm.get_f2().to_string(), vm.get_f3().to_string());
+    let (f1, f2, f3) = (
+        vm.get_f1().to_string(),
+        vm.get_f2().to_string(),
+        vm.get_f3().to_string(),
+    );
     match vm.get_dialog() {
         6 => unlock(app, f1),
         4 | 5 => {
             let pin = vm.get_dialog() == 4;
-            let p = if pin { details::pin_dialog_problems(&f1, &f2, &f3) } else { details::password_dialog_problems(&f1, &f2, &f3) };
+            let p = if pin {
+                details::pin_dialog_problems(&f1, &f2, &f3)
+            } else {
+                details::password_dialog_problems(&f1, &f2, &f3)
+            };
             vm.set_e1(ss(p[0].clone().unwrap_or_default()));
             vm.set_e2(ss(p[1].clone().unwrap_or_default()));
             vm.set_e3(ss(p[2].clone().unwrap_or_default()));
@@ -340,7 +410,11 @@ fn submit_dialog(app: &Rc<App>) {
                 app,
                 async move {
                     let (cur, new) = (Secret::new(f1), Secret::new(f2));
-                    if pin { control.change_pin(&ctx, &cur, &new).await } else { control.change_password(&ctx, &cur, &new).await }
+                    if pin {
+                        control.change_pin(&ctx, &cur, &new).await
+                    } else {
+                        control.change_password(&ctx, &cur, &new).await
+                    }
                 },
                 move |a, r| {
                     let vm = a.ui().global::<DetailsVm>();
@@ -348,7 +422,11 @@ fn submit_dialog(app: &Rc<App>) {
                     match r {
                         Ok(()) => {
                             close_dialog(a);
-                            vm.set_notice(ss(if pin { "PIN changed" } else { "Password changed" }));
+                            vm.set_notice(ss(if pin {
+                                "PIN changed"
+                            } else {
+                                "Password changed"
+                            }));
                         }
                         Err(e) => vm.set_dialog_error(ss(admin_error_text(&e))),
                     }
@@ -364,53 +442,85 @@ fn unlock(app: &Rc<App>, pin: String) {
         app.ui().global::<DetailsVm>().set_e1(ss("Enter your PIN."));
         return;
     }
-    let Some(id) = app.det.borrow().server_id.clone() else { return };
-    let Some(link) = super::connect_ctl::link_of(app, &id) else { return };
+    let Some(id) = app.det.borrow().server_id.clone() else {
+        return;
+    };
+    let Some(link) = super::connect_ctl::link_of(app, &id) else {
+        return;
+    };
     let vm = app.ui().global::<DetailsVm>();
     vm.set_dialog_busy(true);
     vm.set_dialog_error(ss(""));
     let connector = app.be.connector.clone();
-    let wiring = Wiring { frames: None, presenter: None, stats: Arc::new(Stats::default()), downloads: app.downloads.clone() };
+    let wiring = Wiring {
+        frames: None,
+        presenter: None,
+        stats: Arc::new(Stats::default()),
+        downloads: app.downloads.clone(),
+    };
     let epoch = app.det.borrow().epoch;
     let pin = zeroize::Zeroizing::new(pin);
-    spawn_ui(app, async move { connector.connect(&link, &pin, Box::new(|| {}), wiring).await }, move |a, r| {
-        if a.det.borrow().epoch != epoch {
-            if let Ok(est) = r {
-                a.rt.spawn(async move { est.desk.close().await });
+    spawn_ui(
+        app,
+        async move {
+            connector
+                .connect(&link, &pin, Box::new(|| {}), wiring)
+                .await
+        },
+        move |a, r| {
+            if a.det.borrow().epoch != epoch {
+                if let Ok(est) = r {
+                    a.rt.spawn(async move { est.desk.close().await });
+                }
+                return;
             }
-            return;
-        }
-        let vm = a.ui().global::<DetailsVm>();
-        vm.set_dialog_busy(false);
-        match r {
-            Ok(est) => {
-                a.det.borrow_mut().session = Some(est.desk);
-                vm.set_f1(ss(""));
-                vm.set_dialog(0);
-                refresh_devices(a);
-                fetch_overview(a);
+            let vm = a.ui().global::<DetailsVm>();
+            vm.set_dialog_busy(false);
+            match r {
+                Ok(est) => {
+                    a.det.borrow_mut().session = Some(est.desk);
+                    vm.set_f1(ss(""));
+                    vm.set_dialog(0);
+                    refresh_devices(a);
+                    fetch_overview(a);
+                }
+                Err(o) => {
+                    let text = match o {
+                        crate::session::Outcome::Wrong { attempts_left, .. } => {
+                            crate::session::connect::wrong_pin_text(attempts_left).0
+                        }
+                        crate::session::Outcome::Backoff { retry_after } => format!(
+                            "Wait {} seconds before trying again",
+                            retry_after.as_secs().max(1)
+                        ),
+                        crate::session::Outcome::Revoked => {
+                            "This device was removed from the server.".into()
+                        }
+                        crate::session::Outcome::NotAvailable { .. } => {
+                            "The server cannot check PINs right now. Try again in about a minute."
+                                .into()
+                        }
+                        crate::session::Outcome::IdentityChanged => {
+                            "This server's identity changed. Nothing was sent.".into()
+                        }
+                        crate::session::Outcome::Unreachable(m)
+                        | crate::session::Outcome::Failed(m) => m,
+                        crate::session::Outcome::Accepted => String::new(),
+                    };
+                    vm.set_dialog_error(ss(text));
+                    vm.set_f1(ss(""));
+                }
             }
-            Err(o) => {
-                let text = match o {
-                    crate::session::Outcome::Wrong { attempts_left, .. } => crate::session::connect::wrong_pin_text(attempts_left).0,
-                    crate::session::Outcome::Backoff { retry_after } => format!("Wait {} seconds before trying again", retry_after.as_secs().max(1)),
-                    crate::session::Outcome::Revoked => "This device was removed from the server.".into(),
-                    crate::session::Outcome::NotAvailable { .. } => "The server cannot check PINs right now. Try again in about a minute.".into(),
-                    crate::session::Outcome::IdentityChanged => "This server's identity changed. Nothing was sent.".into(),
-                    crate::session::Outcome::Unreachable(m) | crate::session::Outcome::Failed(m) => m,
-                    crate::session::Outcome::Accepted => String::new(),
-                };
-                vm.set_dialog_error(ss(text));
-                vm.set_f1(ss(""));
-            }
-        }
-    });
+        },
+    );
 }
 
 fn start_revoke(app: &Rc<App>, id_hex: &str) {
     let Some(id) = parse16(id_hex) else { return };
     let row = app.det.borrow().rows.iter().find(|r| r.id == id).cloned();
-    let Some(plan) = row.as_ref().and_then(details::plan_revoke) else { return };
+    let Some(plan) = row.as_ref().and_then(details::plan_revoke) else {
+        return;
+    };
     let vm = app.ui().global::<DetailsVm>();
     vm.set_dialog_text(ss(&plan.name));
     let is_self = plan.is_self;
@@ -423,7 +533,9 @@ fn confirm_revoke(app: &Rc<App>) {
         let c = app.det.borrow();
         (c.plan.clone(), c.session.clone())
     };
-    let (Some(plan), Some(desk)) = (plan, desk) else { return };
+    let (Some(plan), Some(desk)) = (plan, desk) else {
+        return;
+    };
     let vm = app.ui().global::<DetailsVm>();
     vm.set_dialog_busy(true);
     let epoch = app.det.borrow().epoch;
@@ -442,13 +554,19 @@ fn confirm_revoke(app: &Rc<App>) {
             }
         };
         match details::revoke_message(status) {
-            Some(m) if status != hx_proto::pb::RevokeStatus::AlreadyRevoked => vm.set_dialog_error(ss(m)),
+            Some(m) if status != hx_proto::pb::RevokeStatus::AlreadyRevoked => {
+                vm.set_dialog_error(ss(m))
+            }
             _ => {
                 vm.set_dialog(0);
                 if plan.is_self && status == hx_proto::pb::RevokeStatus::Ok {
                     // This device signed itself out: it is revoked here too.
                     if let Some(sid) = a.det.borrow().server_id.clone() {
-                        let _ = a.store.borrow_mut().set_lifecycle(&sid, Lifecycle::Revoked, super::now_unix());
+                        let _ = a.store.borrow_mut().set_lifecycle(
+                            &sid,
+                            Lifecycle::Revoked,
+                            super::now_unix(),
+                        );
                     }
                     teardown(a);
                     a.show_home();
@@ -469,36 +587,60 @@ fn pair_device(app: &Rc<App>) {
     vm.set_pair_address(ss(format!("{}:{}", ctx.host, ctx.port)));
     let epoch = app.det.borrow().epoch;
     let admin = app.be.admin.clone();
-    spawn_ui(app, async move { admin.create_pairing_code(&ctx).await }, move |a, r| {
-        if a.det.borrow().epoch != epoch {
-            return;
-        }
-        let vm = a.ui().global::<DetailsVm>();
-        match r {
-            Ok(code) => {
-                vm.set_pair_code(ss(&code.code));
-                vm.set_pair_expiry(ss(details::expiry_text(code.expires_in_secs, code.tries)));
-                a.det.borrow_mut().pair_started = Some((Instant::now(), code.expires_in_secs, code.tries));
-                let t = slint::Timer::default();
-                let a2 = a.clone();
-                t.start(slint::TimerMode::Repeated, Duration::from_secs(1), move || {
-                    let Some((at, total, tries)) = a2.det.borrow().pair_started else { return };
-                    let left = total.saturating_sub(at.elapsed().as_secs());
-                    a2.ui().global::<DetailsVm>().set_pair_expiry(ss(details::expiry_text(left, tries)));
-                });
-                a.det.borrow_mut().pair_timer = Some(t);
+    spawn_ui(
+        app,
+        async move { admin.create_pairing_code(&ctx).await },
+        move |a, r| {
+            if a.det.borrow().epoch != epoch {
+                return;
             }
-            Err(e) => vm.set_dialog_error(ss(match e {
-                AdminError::RateLimited => "The server limits how often a code can be created. Wait a few minutes.".to_owned(),
-                other => admin_error_text(&other),
-            })),
-        }
-    });
+            let vm = a.ui().global::<DetailsVm>();
+            match r {
+                Ok(code) => {
+                    vm.set_pair_code(ss(&code.code));
+                    vm.set_pair_expiry(ss(details::expiry_text(code.expires_in_secs, code.tries)));
+                    a.det.borrow_mut().pair_started =
+                        Some((Instant::now(), code.expires_in_secs, code.tries));
+                    let t = slint::Timer::default();
+                    let a2 = a.clone();
+                    t.start(
+                        slint::TimerMode::Repeated,
+                        Duration::from_secs(1),
+                        move || {
+                            let Some((at, total, tries)) = a2.det.borrow().pair_started else {
+                                return;
+                            };
+                            let left = total.saturating_sub(at.elapsed().as_secs());
+                            a2.ui()
+                                .global::<DetailsVm>()
+                                .set_pair_expiry(ss(details::expiry_text(left, tries)));
+                        },
+                    );
+                    a.det.borrow_mut().pair_timer = Some(t);
+                }
+                Err(e) => vm.set_dialog_error(ss(match e {
+                    AdminError::RateLimited => {
+                        "The server limits how often a code can be created. Wait a few minutes."
+                            .to_owned()
+                    }
+                    other => admin_error_text(&other),
+                })),
+            }
+        },
+    );
 }
 
 // ------------------------------------------------------------------------------- desktop
 
-fn run_control(app: &Rc<App>, label: &'static str, f: impl FnOnce(Arc<dyn crate::backend::ServerControl>, AdminContext) -> crate::backend::BoxFuture<'static, Result<(), AdminError>> + 'static) {
+fn run_control(
+    app: &Rc<App>,
+    label: &'static str,
+    f: impl FnOnce(
+        Arc<dyn crate::backend::ServerControl>,
+        AdminContext,
+    ) -> crate::backend::BoxFuture<'static, Result<(), AdminError>>
+    + 'static,
+) {
     let Some(ctx) = admin_ctx(app) else { return };
     let vm = app.ui().global::<DetailsVm>();
     vm.set_loading(true);
@@ -519,14 +661,20 @@ fn run_control(app: &Rc<App>, label: &'static str, f: impl FnOnce(Arc<dyn crate:
 fn done_text(host: &str, keep: bool) -> String {
     format!(
         "hash-xcreen was uninstalled from {host}. {} Incus and its package source remain installed. To remove them, run on the server: {}",
-        if keep { "The desktop was kept on the server." } else { "The desktop was deleted." },
+        if keep {
+            "The desktop was kept on the server."
+        } else {
+            "The desktop was deleted."
+        },
         details::REMOVE_INCUS
     )
 }
 
 fn danger_continue(app: &Rc<App>) {
     let vm = app.ui().global::<DetailsVm>();
-    let Some(id) = app.det.borrow().server_id.clone() else { return };
+    let Some(id) = app.det.borrow().server_id.clone() else {
+        return;
+    };
     let Some(s) = app.server(&id) else { return };
     let port: u16 = match vm.get_ssh_port().trim().parse() {
         Ok(p) if p > 0 => p,
@@ -536,11 +684,16 @@ fn danger_continue(app: &Rc<App>) {
         }
     };
     vm.set_danger_error(ss(""));
-    let target = SshTarget { host: s.host.clone(), port };
+    let target = SshTarget {
+        host: s.host.clone(),
+        port,
+    };
     let pending = app.det.borrow().pending_host.clone();
     if let Some(hk) = pending {
         // Second press: the user saw the fingerprint and trusts it.
-        app.hosts.borrow_mut().trust(&target.host, target.port, &hk.fingerprint);
+        app.hosts
+            .borrow_mut()
+            .trust(&target.host, target.port, &hk.fingerprint);
         app.det.borrow_mut().pending_host = None;
         app.det.borrow_mut().danger.ssh_given();
         vm.set_danger(2);
@@ -549,12 +702,15 @@ fn danger_continue(app: &Rc<App>) {
     let engine = app.be.install.clone();
     let epoch = app.det.borrow().epoch;
     let t2 = target.clone();
-    spawn_ui(app, async move { engine.probe_host_key(&t2).await }, move |a, r| {
-        if a.det.borrow().epoch != epoch {
-            return;
-        }
-        let vm = a.ui().global::<DetailsVm>();
-        match r {
+    spawn_ui(
+        app,
+        async move { engine.probe_host_key(&t2).await },
+        move |a, r| {
+            if a.det.borrow().epoch != epoch {
+                return;
+            }
+            let vm = a.ui().global::<DetailsVm>();
+            match r {
             Err(e) => vm.set_danger_error(ss(e.to_string())),
             Ok(hk) => match a.hosts.borrow().check(&target.host, target.port, &hk.fingerprint) {
                 Known::Same => {
@@ -573,12 +729,15 @@ fn danger_continue(app: &Rc<App>) {
                 }
             },
         }
-    });
+        },
+    );
 }
 
 fn danger_confirm(app: &Rc<App>) {
     let vm = app.ui().global::<DetailsVm>();
-    let Some(id) = app.det.borrow().server_id.clone() else { return };
+    let Some(id) = app.det.borrow().server_id.clone() else {
+        return;
+    };
     let Some(s) = app.server(&id) else { return };
     let typed = vm.get_confirm_name().to_string();
     let keep = vm.get_keep_desktop();
@@ -594,8 +753,18 @@ fn danger_confirm(app: &Rc<App>) {
     let user = vm.get_ssh_user().trim().to_owned();
     let pw = vm.get_ssh_password().to_string();
     vm.set_ssh_password(ss(""));
-    let auth = if pw.is_empty() { SshAuth::DefaultKeys { user } } else { SshAuth::Password { user, password: Secret::new(pw) } };
-    let target = SshTarget { host: s.host.clone(), port };
+    let auth = if pw.is_empty() {
+        SshAuth::DefaultKeys { user }
+    } else {
+        SshAuth::Password {
+            user,
+            password: Secret::new(pw),
+        }
+    };
+    let target = SshTarget {
+        host: s.host.clone(),
+        port,
+    };
     let engine = app.be.install.clone();
     let epoch = app.det.borrow().epoch;
     let host = s.host.clone();
@@ -605,7 +774,14 @@ fn danger_confirm(app: &Rc<App>) {
             // The trusted key was checked when the SSH details were given; the engine verifies it
             // again against what the server presents now.
             let hk = engine.probe_host_key(&target).await?;
-            engine.uninstall(UninstallRequest { target, auth, host_key: hk, keep_desktop: keep }).await
+            engine
+                .uninstall(UninstallRequest {
+                    target,
+                    auth,
+                    host_key: hk,
+                    keep_desktop: keep,
+                })
+                .await
         },
         move |a, r: Result<(), EngineError>| {
             if a.det.borrow().epoch != epoch {
@@ -617,7 +793,11 @@ fn danger_confirm(app: &Rc<App>) {
             match r {
                 Ok(()) => {
                     if let Some(sid) = a.det.borrow().server_id.clone() {
-                        let _ = a.store.borrow_mut().set_lifecycle(&sid, Lifecycle::Uninstalled, super::now_unix());
+                        let _ = a.store.borrow_mut().set_lifecycle(
+                            &sid,
+                            Lifecycle::Uninstalled,
+                            super::now_unix(),
+                        );
                     }
                     vm.set_done_text(ss(done_text(&host, keep)));
                     vm.set_danger(4);
@@ -676,22 +856,28 @@ pub fn wire(app: &Rc<App>) {
     let a = app.clone();
     vm.on_confirm_restart(move || {
         a.ui().global::<DetailsVm>().set_restart_dialog(false);
-        run_control(&a, "The desktop is restarting", |c, ctx| Box::pin(async move { c.restart_desktop(&ctx).await }));
+        run_control(&a, "The desktop is restarting", |c, ctx| {
+            Box::pin(async move { c.restart_desktop(&ctx).await })
+        });
     });
     let a = app.clone();
     vm.on_update_agent(move || {
         let Some(ctx) = admin_ctx(&a) else { return };
         let control = a.be.control.clone();
         a.ui().global::<DetailsVm>().set_loading(true);
-        spawn_ui(&a, async move { control.update_agent(&ctx).await }, move |a, r| {
-            let vm = a.ui().global::<DetailsVm>();
-            vm.set_loading(false);
-            vm.set_notice(ss(match r {
-                Ok(v) => format!("The agent was updated to {v}"),
-                Err(e) => format!("Could not update: {}", admin_error_text(&e)),
-            }));
-            fetch_overview(&a);
-        });
+        spawn_ui(
+            &a,
+            async move { control.update_agent(&ctx).await },
+            move |a, r| {
+                let vm = a.ui().global::<DetailsVm>();
+                vm.set_loading(false);
+                vm.set_notice(ss(match r {
+                    Ok(v) => format!("The agent was updated to {v}"),
+                    Err(e) => format!("Could not update: {}", admin_error_text(&e)),
+                }));
+                fetch_overview(a);
+            },
+        );
     });
     let a = app.clone();
     vm.on_revoke(move |id| start_revoke(&a, id.as_str()));
@@ -729,7 +915,9 @@ pub fn wire(app: &Rc<App>) {
             vm.set_docker_dialog(true);
         } else {
             vm.set_docker(false);
-            run_control(&a, "Docker is off; the desktop restarts", |c, ctx| Box::pin(async move { c.set_docker(&ctx, false).await }));
+            run_control(&a, "Docker is off; the desktop restarts", |c, ctx| {
+                Box::pin(async move { c.set_docker(&ctx, false).await })
+            });
         }
     });
     let a = app.clone();
@@ -739,21 +927,31 @@ pub fn wire(app: &Rc<App>) {
         let vm = a.ui().global::<DetailsVm>();
         vm.set_docker_dialog(false);
         vm.set_docker(true);
-        run_control(&a, "Docker is on; the desktop restarts", |c, ctx| Box::pin(async move { c.set_docker(&ctx, true).await }));
+        run_control(&a, "Docker is on; the desktop restarts", |c, ctx| {
+            Box::pin(async move { c.set_docker(&ctx, true).await })
+        });
     });
     let a = app.clone();
     vm.on_limits_changed(move || {
         let vm = a.ui().global::<DetailsVm>();
         let dirty = a.det.borrow().overview.as_ref().is_none_or(|o| {
-            vm.get_cpu() as u32 != o.cpu_cores || vm.get_memory() != o.mem_total_gb.round() as i32 || vm.get_disk() as u32 != o.disk_total_gb
+            vm.get_cpu() as u32 != o.cpu_cores
+                || vm.get_memory() != o.mem_total_gb.round() as i32
+                || vm.get_disk() as u32 != o.disk_total_gb
         });
         vm.set_limits_dirty(dirty);
     });
     let a = app.clone();
     vm.on_apply_limits(move || {
         let vm = a.ui().global::<DetailsVm>();
-        let l = Limits { cpu: vm.get_cpu().max(1) as u32, memory_gb: vm.get_memory().max(1) as u32, disk_gb: vm.get_disk().max(8) as u32 };
-        run_control(&a, "Limits applied", move |c, ctx| Box::pin(async move { c.set_limits(&ctx, l).await }));
+        let l = Limits {
+            cpu: vm.get_cpu().max(1) as u32,
+            memory_gb: vm.get_memory().max(1) as u32,
+            disk_gb: vm.get_disk().max(8) as u32,
+        };
+        run_control(&a, "Limits applied", move |c, ctx| {
+            Box::pin(async move { c.set_limits(&ctx, l).await })
+        });
     });
     let a = app.clone();
     vm.on_uninstall(move || {

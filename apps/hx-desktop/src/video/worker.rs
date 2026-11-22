@@ -40,7 +40,12 @@ pub fn spawn_decoder(
     let handle = std::thread::Builder::new()
         .name("hx-decode".into())
         .spawn(move || run(rx, presenter, stats, request_keyframe))?;
-    Ok((tx, DecodeThread { handle: Some(handle) }))
+    Ok((
+        tx,
+        DecodeThread {
+            handle: Some(handle),
+        },
+    ))
 }
 
 fn run(

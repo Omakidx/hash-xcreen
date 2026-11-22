@@ -66,7 +66,11 @@ pub fn clean_device_name(s: &str) -> String {
     while cut.len() > 64 {
         cut.pop();
     }
-    if cut.is_empty() { "hx-desktop".into() } else { cut }
+    if cut.is_empty() {
+        "hx-desktop".into()
+    } else {
+        cut
+    }
 }
 
 impl Prefs {
@@ -115,7 +119,10 @@ mod tests {
 
     #[test]
     fn device_names_are_cleaned_and_capped() {
-        assert_eq!(clean_device_name("  Alex\u{7}'s desktop "), "Alex's desktop");
+        assert_eq!(
+            clean_device_name("  Alex\u{7}'s desktop "),
+            "Alex's desktop"
+        );
         assert_eq!(clean_device_name(""), "hx-desktop");
         assert_eq!(clean_device_name(&"x".repeat(100)).len(), 64);
     }
@@ -124,7 +131,11 @@ mod tests {
     fn round_trip_and_damaged_file_falls_back() {
         let dir = std::env::temp_dir().join(format!("hx-prefs-{}", crate::servers::new_id()));
         let path = dir.join("prefs.json");
-        let p = Prefs { theme: 2, quality: 1, ..Prefs::default() };
+        let p = Prefs {
+            theme: 2,
+            quality: 1,
+            ..Prefs::default()
+        };
         p.save(Some(&path));
         assert_eq!(Prefs::load(Some(&path)).theme, 2);
         std::fs::write(&path, b"not json").unwrap();

@@ -50,8 +50,16 @@ fn device(id: u8, name: &str, last: u64, status: DeviceStatus, current: bool) ->
         created_unix: 1_690_000_000,
         last_seen_unix: last,
         status: status as i32,
-        revoke_reason: if status == DeviceStatus::Revoked { DeviceRevokeReason::User as i32 } else { 0 },
-        revoked_unix: if status == DeviceStatus::Revoked { 1_699_920_000 } else { 0 },
+        revoke_reason: if status == DeviceStatus::Revoked {
+            DeviceRevokeReason::User as i32
+        } else {
+            0
+        },
+        revoked_unix: if status == DeviceStatus::Revoked {
+            1_699_920_000
+        } else {
+            0
+        },
         current,
     }
 }
@@ -71,9 +79,21 @@ impl DemoConnector {
             dropped_once: Mutex::default(),
             devices: Arc::new(Mutex::new(vec![
                 device(0xa1, "Alex's desktop", n, DeviceStatus::Active, true),
-                device(0xb2, "Maya's laptop", n - 2 * 3600, DeviceStatus::Active, false),
+                device(
+                    0xb2,
+                    "Maya's laptop",
+                    n - 2 * 3600,
+                    DeviceStatus::Active,
+                    false,
+                ),
                 device(0xc3, "Work PC", n - 2 * 86_400, DeviceStatus::Active, false),
-                device(0xd4, "Old tablet", n - 80 * 86_400, DeviceStatus::Revoked, false),
+                device(
+                    0xd4,
+                    "Old tablet",
+                    n - 80 * 86_400,
+                    DeviceStatus::Revoked,
+                    false,
+                ),
             ])),
         }
     }
@@ -101,11 +121,16 @@ impl Connector for DemoConnector {
             on_secure();
             tokio::time::sleep(Duration::from_millis(400)).await;
             if host.contains("unavailable") {
-                return Err(Outcome::NotAvailable { retry_after: Duration::from_secs(20) });
+                return Err(Outcome::NotAvailable {
+                    retry_after: Duration::from_secs(20),
+                });
             }
             if pin != DEMO_PIN {
                 let n = {
-                    let mut f = self.failures.lock().map_err(|_| Outcome::Failed("state".into()))?;
+                    let mut f = self
+                        .failures
+                        .lock()
+                        .map_err(|_| Outcome::Failed("state".into()))?;
                     let c = f.entry(key).or_insert(0);
                     *c += 1;
                     *c
@@ -121,13 +146,19 @@ impl Connector for DemoConnector {
             if let Ok(mut f) = self.failures.lock() {
                 f.remove(&key);
             }
-            let first_drop = host.contains("drop") && self.dropped_once.lock().is_ok_and(|mut s| s.insert(key));
-            Ok(demo_established(&host, wiring, self.devices.clone(), first_drop))
+            let first_drop =
+                host.contains("drop") && self.dropped_once.lock().is_ok_and(|mut s| s.insert(key));
+            Ok(demo_established(
+                &host,
+                wiring,
+                self.devices.clone(),
+                first_drop,
+            ))
         })
     }
 
-    fn probe(&self, host: &str, _port: u16) -> BoxFuture<'_, bool> {
-        let offline = host.contains("offline") || host.contains("down");
+    fn probe(&self, host: &str, port: u16) -> BoxFuture<'_, bool> {
+        let offline = host.contains("offline") || host.contains("down") || port == 8443;
         Box::pin(async move {
             tokio::time::sleep(Duration::from_millis(400)).await;
             !offline
@@ -135,7 +166,12 @@ impl Connector for DemoConnector {
     }
 }
 
-fn demo_established(host: &str, wiring: Wiring, devices: Arc<Mutex<Vec<DeviceInfo>>>, drop_soon: bool) -> Established {
+fn demo_established(
+    host: &str,
+    wiring: Wiring,
+    devices: Arc<Mutex<Vec<DeviceInfo>>>,
+    drop_soon: bool,
+) -> Established {
     let (tx, rx) = unbounded_channel();
     let desk = Arc::new(DemoDesk {
         events: tx.clone(),
@@ -147,7 +183,9 @@ fn demo_established(host: &str, wiring: Wiring, devices: Arc<Mutex<Vec<DeviceInf
     });
     if let Some(p) = wiring.presenter.clone() {
         let (stop, ptr) = (desk.stop.clone(), desk.pointer.clone());
-        let _ = std::thread::Builder::new().name("hx-demo-video".into()).spawn(move || paint_loop(p, stop, ptr));
+        let _ = std::thread::Builder::new()
+            .name("hx-demo-video".into())
+            .spawn(move || paint_loop(p, stop, ptr));
     }
     let (stop, st) = (desk.stop.clone(), desk.stats.clone());
     let tx2 = tx.clone();
@@ -168,7 +206,11 @@ fn demo_established(host: &str, wiring: Wiring, devices: Arc<Mutex<Vec<DeviceInf
         }
     });
     let scenario_end = if host.contains("takeover") {
-        Some(CloseReason::TakenOver { name: "Maya's laptop".into(), id_short: "b2b2b2b2".into(), id: Some([0xb2; 16]) })
+        Some(CloseReason::TakenOver {
+            name: "Maya's laptop".into(),
+            id_short: "b2b2b2b2".into(),
+            id: Some([0xb2; 16]),
+        })
     } else if drop_soon {
         Some(CloseReason::Network)
     } else {
@@ -194,30 +236,51 @@ fn paint_loop(p: Arc<dyn Presenter>, stop: Arc<AtomicBool>, ptr: Arc<(AtomicU32,
         let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(w, h);
         let px = buf.make_mut_slice();
         let ball = ((t * 4) % (2 * (w - 80)), 0);
-        let bx = if ball.0 < w - 80 { ball.0 } else { 2 * (w - 80) - ball.0 };
+        let bx = if ball.0 < w - 80 {
+            ball.0
+        } else {
+            2 * (w - 80) - ball.0
+        };
         let (cx, cy) = (ptr.0.load(SeqCst), ptr.1.load(SeqCst));
         for y in 0..h {
             for x in 0..w {
                 let i = (y * w + x) as usize;
-                let mut c = [20 + (y * 40 / h) as u8, 50 + (y * 60 / h) as u8, 100 + (x * 60 / w) as u8];
+                let mut c = [
+                    20 + (y * 40 / h) as u8,
+                    50 + (y * 60 / h) as u8,
+                    100 + (x * 60 / w) as u8,
+                ];
                 if y < 28 {
                     c = [60, 64, 70];
                 } else if (60..420).contains(&x.saturating_add(0)) && (70..330).contains(&y) {
-                    c = if y < 94 { [90, 96, 108] } else { [245, 246, 248] };
+                    c = if y < 94 {
+                        [90, 96, 108]
+                    } else {
+                        [245, 246, 248]
+                    };
                     if y >= 94 && (y - 94) % 22 < 2 && x > 80 && x < 380 {
                         c = [200, 205, 212];
                     }
                 }
-                if x >= 120 + bx && x < 200 + bx && y >= 360 && y < 400 {
+                if (120 + bx..200 + bx).contains(&x) && (360..400).contains(&y) {
                     c = [255, 190, 60];
                 }
                 if (x == cx && (y.abs_diff(cy) < 12)) || (y == cy && (x.abs_diff(cx) < 12)) {
                     c = [255, 255, 255];
                 }
-                px[i] = Rgba8Pixel { r: c[0], g: c[1], b: c[2], a: 255 };
+                px[i] = Rgba8Pixel {
+                    r: c[0],
+                    g: c[1],
+                    b: c[2],
+                    a: 255,
+                };
             }
         }
-        p.present(Picture { width: w, height: h, pixels: buf });
+        p.present(Picture {
+            width: w,
+            height: h,
+            pixels: buf,
+        });
         t += 1;
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -261,14 +324,26 @@ impl Desk for DemoDesk {
     fn release_all(&self) {}
     fn send_clipboard_text(&self, _text: &str) {}
     fn send_file(&self, path: PathBuf, events: UnboundedSender<Event>) {
-        let name = path.file_name().map_or("file".into(), |n| n.to_string_lossy().into_owned());
+        let name = path
+            .file_name()
+            .map_or("file".into(), |n| n.to_string_lossy().into_owned());
         let total = std::fs::metadata(&path).map_or(1_000_000, |m| m.len().max(1));
         tokio::spawn(async move {
             for i in 0..=5u64 {
-                let st = if i == 5 { TransferState::Done } else { TransferState::Running };
+                let st = if i == 5 {
+                    TransferState::Done
+                } else {
+                    TransferState::Running
+                };
                 let _ = events.send(Event::Transfer {
                     id: 9000,
-                    activity: Activity { name: name.clone(), dir: Direction::Up, done: total * i / 5, total, state: st },
+                    activity: Activity {
+                        name: name.clone(),
+                        dir: Direction::Up,
+                        done: total * i / 5,
+                        total,
+                        state: st,
+                    },
                     saved: None,
                 });
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -286,8 +361,13 @@ impl Desk for DemoDesk {
     }
     fn revoke(&self, id: [u8; 16]) -> BoxFuture<'_, Result<RevokeStatus, MgmtError>> {
         Box::pin(async move {
-            let Ok(mut d) = self.devices.lock() else { return Ok(RevokeStatus::Failed) };
-            let active = d.iter().filter(|x| x.status() == DeviceStatus::Active).count();
+            let Ok(mut d) = self.devices.lock() else {
+                return Ok(RevokeStatus::Failed);
+            };
+            let active = d
+                .iter()
+                .filter(|x| x.status() == DeviceStatus::Active)
+                .count();
             let Some(t) = d.iter_mut().find(|x| x.device_id[..] == id[..]) else {
                 return Ok(RevokeStatus::NotFound);
             };
@@ -317,14 +397,20 @@ mod tests {
         Link {
             host: host.into(),
             port: 443,
-            server_key: crate::session::net::parse_key(&"3f9ac1d477be0a52".repeat(4)).unwrap_or_else(|| hx_crypto::IdentityKey::generate().unwrap().public()),
+            server_key: crate::session::net::parse_key(&"3f9ac1d477be0a52".repeat(4))
+                .unwrap_or_else(|| hx_crypto::IdentityKey::generate().unwrap().public()),
             device: Arc::new(hx_crypto::IdentityKey::generate().unwrap()),
             device_name: "t".into(),
         }
     }
 
     fn wiring() -> Wiring {
-        Wiring { frames: None, presenter: None, stats: Arc::new(Stats::default()), downloads: std::env::temp_dir() }
+        Wiring {
+            frames: None,
+            presenter: None,
+            stats: Arc::new(Stats::default()),
+            downloads: std::env::temp_dir(),
+        }
     }
 
     #[tokio::test]
@@ -337,7 +423,10 @@ mod tests {
                 _ => panic!("expected a wrong PIN"),
             }
         }
-        assert!(matches!(c.connect(&l, "000000", Box::new(|| {}), wiring()).await, Err(Outcome::Revoked)));
+        assert!(matches!(
+            c.connect(&l, "000000", Box::new(|| {}), wiring()).await,
+            Err(Outcome::Revoked)
+        ));
     }
 
     #[tokio::test]
@@ -345,29 +434,68 @@ mod tests {
         let c = DemoConnector::new();
         let l = link("demo.test");
         let _ = c.connect(&l, "1", Box::new(|| {}), wiring()).await;
-        let est = c.connect(&l, DEMO_PIN, Box::new(|| {}), wiring()).await.ok().expect("connected");
+        let est = c
+            .connect(&l, DEMO_PIN, Box::new(|| {}), wiring())
+            .await
+            .unwrap_or_else(|_| panic!("connected"));
         est.desk.close().await;
-        assert!(matches!(c.connect(&l, "1", Box::new(|| {}), wiring()).await, Err(Outcome::Wrong { attempts_left: 4, .. })));
+        assert!(matches!(
+            c.connect(&l, "1", Box::new(|| {}), wiring()).await,
+            Err(Outcome::Wrong {
+                attempts_left: 4,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
     async fn host_hints_pick_scenarios() {
         let c = DemoConnector::new();
-        assert!(matches!(c.connect(&link("down.test"), DEMO_PIN, Box::new(|| {}), wiring()).await, Err(Outcome::Unreachable(_))));
-        assert!(matches!(c.connect(&link("changed.test"), DEMO_PIN, Box::new(|| {}), wiring()).await, Err(Outcome::IdentityChanged)));
-        assert!(matches!(c.connect(&link("unavailable.test"), DEMO_PIN, Box::new(|| {}), wiring()).await, Err(Outcome::NotAvailable { .. })));
+        assert!(matches!(
+            c.connect(&link("down.test"), DEMO_PIN, Box::new(|| {}), wiring())
+                .await,
+            Err(Outcome::Unreachable(_))
+        ));
+        assert!(matches!(
+            c.connect(&link("changed.test"), DEMO_PIN, Box::new(|| {}), wiring())
+                .await,
+            Err(Outcome::IdentityChanged)
+        ));
+        assert!(matches!(
+            c.connect(
+                &link("unavailable.test"),
+                DEMO_PIN,
+                Box::new(|| {}),
+                wiring()
+            )
+            .await,
+            Err(Outcome::NotAvailable { .. })
+        ));
     }
 
     #[tokio::test]
     async fn revoking_follows_the_server_rules() {
         let c = DemoConnector::new();
-        let est = c.connect(&link("demo.test"), DEMO_PIN, Box::new(|| {}), wiring()).await.ok().unwrap();
+        let est = c
+            .connect(&link("demo.test"), DEMO_PIN, Box::new(|| {}), wiring())
+            .await
+            .ok()
+            .unwrap();
         assert_eq!(est.desk.revoke([0xb2; 16]).await.unwrap(), RevokeStatus::Ok);
-        assert_eq!(est.desk.revoke([0xb2; 16]).await.unwrap(), RevokeStatus::AlreadyRevoked);
-        assert_eq!(est.desk.revoke([9; 16]).await.unwrap(), RevokeStatus::NotFound);
+        assert_eq!(
+            est.desk.revoke([0xb2; 16]).await.unwrap(),
+            RevokeStatus::AlreadyRevoked
+        );
+        assert_eq!(
+            est.desk.revoke([9; 16]).await.unwrap(),
+            RevokeStatus::NotFound
+        );
         assert_eq!(est.desk.revoke([0xc3; 16]).await.unwrap(), RevokeStatus::Ok);
         // this device is now the only active one
-        assert_eq!(est.desk.revoke([0xa1; 16]).await.unwrap(), RevokeStatus::LastActiveDevice);
+        assert_eq!(
+            est.desk.revoke([0xa1; 16]).await.unwrap(),
+            RevokeStatus::LastActiveDevice
+        );
         est.desk.close().await;
     }
 }

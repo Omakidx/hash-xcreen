@@ -66,7 +66,11 @@ impl Presenter for CpuPresenter {
         if self.scheduled.swap(true, SeqCst) {
             return;
         }
-        let (latest, scheduled, sink) = (self.latest.clone(), self.scheduled.clone(), self.sink.clone());
+        let (latest, scheduled, sink) = (
+            self.latest.clone(),
+            self.scheduled.clone(),
+            self.sink.clone(),
+        );
         let posted = slint::invoke_from_event_loop(move || {
             scheduled.store(false, SeqCst);
             let pic = latest.lock().ok().and_then(|mut g| g.take());

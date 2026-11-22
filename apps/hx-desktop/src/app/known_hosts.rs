@@ -51,7 +51,9 @@ impl KnownHosts {
 
     /// Remembers a fingerprint the user confirmed (never replaces a different one).
     pub fn trust(&mut self, host: &str, port: u16, fingerprint: &str) {
-        self.map.entry(Self::key(host, port)).or_insert_with(|| fingerprint.to_owned());
+        self.map
+            .entry(Self::key(host, port))
+            .or_insert_with(|| fingerprint.to_owned());
         self.save();
     }
 
@@ -76,9 +78,22 @@ mod tests {
         assert_eq!(k.check("A.test", 22, "SHA256:a"), Known::New);
         k.trust("a.test", 22, "SHA256:a");
         assert_eq!(k.check("A.TEST", 22, "SHA256:a"), Known::Same);
-        assert_eq!(k.check("a.test", 22, "SHA256:b"), Known::Changed { trusted: "SHA256:a".into() });
+        assert_eq!(
+            k.check("a.test", 22, "SHA256:b"),
+            Known::Changed {
+                trusted: "SHA256:a".into()
+            }
+        );
         k.trust("a.test", 22, "SHA256:b");
-        assert_eq!(k.check("a.test", 22, "SHA256:a"), Known::Same, "trust never replaces");
-        assert_eq!(k.check("a.test", 2222, "SHA256:a"), Known::New, "the port is part of the key");
+        assert_eq!(
+            k.check("a.test", 22, "SHA256:a"),
+            Known::Same,
+            "trust never replaces"
+        );
+        assert_eq!(
+            k.check("a.test", 2222, "SHA256:a"),
+            Known::New,
+            "the port is part of the key"
+        );
     }
 }

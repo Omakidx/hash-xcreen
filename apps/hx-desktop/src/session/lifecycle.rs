@@ -77,7 +77,12 @@ pub fn takeover_peer(g: &Goodbye) -> (String, String, Option<[u8; 16]>) {
     };
     let id: Option<[u8; 16]> = <[u8; 16]>::try_from(&g.peer_device_id[..]).ok();
     let short = id
-        .map(|i| i.iter().take(4).map(|b| format!("{b:02x}")).collect::<String>())
+        .map(|i| {
+            i.iter()
+                .take(4)
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        })
         .unwrap_or_default();
     (name, short, id)
 }
@@ -217,7 +222,13 @@ mod tests {
             })
             .collect();
         assert_eq!(waits, vec![1, 2, 4, 8, 10, 10]);
-        assert_eq!(r.next(Duration::from_secs(119)), Next::Retry { attempt: 7, wait: Duration::from_secs(1) });
+        assert_eq!(
+            r.next(Duration::from_secs(119)),
+            Next::Retry {
+                attempt: 7,
+                wait: Duration::from_secs(1)
+            }
+        );
         assert_eq!(r.next(Duration::from_secs(120)), Next::GiveUp);
         assert_eq!(r.next(Duration::from_secs(500)), Next::GiveUp);
     }

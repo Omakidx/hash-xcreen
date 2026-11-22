@@ -94,9 +94,9 @@ impl SshAuth {
     /// The SSH user.
     pub fn user(&self) -> &str {
         match self {
-            Self::DefaultKeys { user } | Self::KeyFile { user, .. } | Self::Password { user, .. } => {
-                user
-            }
+            Self::DefaultKeys { user }
+            | Self::KeyFile { user, .. }
+            | Self::Password { user, .. } => user,
         }
     }
 }
@@ -239,7 +239,11 @@ impl SshAuth {
     pub fn duplicate(&self) -> Self {
         match self {
             Self::DefaultKeys { user } => Self::DefaultKeys { user: user.clone() },
-            Self::KeyFile { user, path, passphrase } => Self::KeyFile {
+            Self::KeyFile {
+                user,
+                path,
+                passphrase,
+            } => Self::KeyFile {
                 user: user.clone(),
                 path: path.clone(),
                 passphrase: passphrase.as_ref().map(|p| Secret::new(p.expose())),
@@ -389,7 +393,10 @@ pub trait InstallEngine: Send + Sync {
         trusted: &HostKey,
     ) -> BoxFuture<'_, Result<Preflight, EngineError>>;
     /// Starts an install and returns its event stream.
-    fn install(&self, req: InstallRequest) -> BoxFuture<'_, Result<Box<dyn InstallRun>, EngineError>>;
+    fn install(
+        &self,
+        req: InstallRequest,
+    ) -> BoxFuture<'_, Result<Box<dyn InstallRun>, EngineError>>;
     /// Uninstalls the agent.
     fn uninstall(&self, req: UninstallRequest) -> BoxFuture<'_, Result<(), EngineError>>;
 }
@@ -524,9 +531,16 @@ pub enum AdminError {
 /// Pairing codes and reinstate (protocol 1.3).
 pub trait DeviceAdmin: Send + Sync {
     /// Asks the server for a short-lived pairing code (rate-limited and audited server-side).
-    fn create_pairing_code(&self, ctx: &AdminContext) -> BoxFuture<'_, Result<IssuedCode, AdminError>>;
+    fn create_pairing_code(
+        &self,
+        ctx: &AdminContext,
+    ) -> BoxFuture<'_, Result<IssuedCode, AdminError>>;
     /// Re-enables this device after a revoke, proving the account password.
-    fn reinstate(&self, ctx: &AdminContext, password: &Secret) -> BoxFuture<'_, Result<(), AdminError>>;
+    fn reinstate(
+        &self,
+        ctx: &AdminContext,
+        password: &Secret,
+    ) -> BoxFuture<'_, Result<(), AdminError>>;
 }
 
 // ------------------------------------------------------------------------------------ server control
@@ -592,15 +606,29 @@ pub trait ServerControl: Send + Sync {
     /// Overview numbers.
     fn overview(&self, ctx: &AdminContext) -> BoxFuture<'_, Result<Overview, AdminError>>;
     /// Changes the PIN (the current one counts as an attempt).
-    fn change_pin(&self, ctx: &AdminContext, current: &Secret, new: &Secret) -> BoxFuture<'_, Result<(), AdminError>>;
+    fn change_pin(
+        &self,
+        ctx: &AdminContext,
+        current: &Secret,
+        new: &Secret,
+    ) -> BoxFuture<'_, Result<(), AdminError>>;
     /// Changes the Linux account password.
-    fn change_password(&self, ctx: &AdminContext, current: &Secret, new: &Secret) -> BoxFuture<'_, Result<(), AdminError>>;
+    fn change_password(
+        &self,
+        ctx: &AdminContext,
+        current: &Secret,
+        new: &Secret,
+    ) -> BoxFuture<'_, Result<(), AdminError>>;
     /// Restarts the desktop.
     fn restart_desktop(&self, ctx: &AdminContext) -> BoxFuture<'_, Result<(), AdminError>>;
     /// Turns Docker on or off (restarts the desktop).
     fn set_docker(&self, ctx: &AdminContext, on: bool) -> BoxFuture<'_, Result<(), AdminError>>;
     /// Applies resource limits without a restart.
-    fn set_limits(&self, ctx: &AdminContext, limits: Limits) -> BoxFuture<'_, Result<(), AdminError>>;
+    fn set_limits(
+        &self,
+        ctx: &AdminContext,
+        limits: Limits,
+    ) -> BoxFuture<'_, Result<(), AdminError>>;
     /// Updates the agent now.
     fn update_agent(&self, ctx: &AdminContext) -> BoxFuture<'_, Result<String, AdminError>>;
 }
@@ -634,16 +662,46 @@ pub struct StageGroup {
 
 /// The ten rows (architecture 5.3 stages grouped, design/mockups/progress.html).
 pub const GROUPS: [StageGroup; 10] = [
-    StageGroup { title: "Check the server", stages: &["preflight"] },
-    StageGroup { title: "Install system packages", stages: &["packages"] },
-    StageGroup { title: "Install Incus (the container manager)", stages: &["incus"] },
-    StageGroup { title: "Install the agent", stages: &["release", "system-files", "credentials", "config", "units"] },
-    StageGroup { title: "Prepare the host", stages: &["setup-window", "host", "firewall-port"] },
-    StageGroup { title: "Build the desktop", stages: &["desktop"] },
-    StageGroup { title: "Secure access: password and PIN", stages: &["verifiers", "owner-key"] },
-    StageGroup { title: "Backups", stages: &["backup"] },
-    StageGroup { title: "Pair this device", stages: &["pairing-token", "pairing"] },
-    StageGroup { title: "Finish", stages: &["finish", "done"] },
+    StageGroup {
+        title: "Check the server",
+        stages: &["preflight"],
+    },
+    StageGroup {
+        title: "Install system packages",
+        stages: &["packages"],
+    },
+    StageGroup {
+        title: "Install Incus (the container manager)",
+        stages: &["incus"],
+    },
+    StageGroup {
+        title: "Install the agent",
+        stages: &["release", "system-files", "credentials", "config", "units"],
+    },
+    StageGroup {
+        title: "Prepare the host",
+        stages: &["setup-window", "host", "firewall-port"],
+    },
+    StageGroup {
+        title: "Build the desktop",
+        stages: &["desktop"],
+    },
+    StageGroup {
+        title: "Secure access: password and PIN",
+        stages: &["verifiers", "owner-key"],
+    },
+    StageGroup {
+        title: "Backups",
+        stages: &["backup"],
+    },
+    StageGroup {
+        title: "Pair this device",
+        stages: &["pairing-token", "pairing"],
+    },
+    StageGroup {
+        title: "Finish",
+        stages: &["finish", "done"],
+    },
 ];
 
 /// The row a stage id belongs to.

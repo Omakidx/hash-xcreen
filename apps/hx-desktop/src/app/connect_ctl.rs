@@ -80,17 +80,30 @@ pub fn show(app: &Rc<App>) {
     let vm = ui.global::<ConnectVm>();
     let c = app.conn.borrow();
     let server = c.server_id.as_deref().and_then(|i| app.server(i));
-    vm.set_server_name(ss(server.as_ref().map(|s| s.name.clone()).unwrap_or_default()));
+    vm.set_server_name(ss(server
+        .as_ref()
+        .map(|s| s.name.clone())
+        .unwrap_or_default()));
     vm.set_address(ss(server.as_ref().map(|s| s.address()).unwrap_or_default()));
-    vm.set_pinned_fp(ss(server.as_ref().map(|s| s.short_fingerprint()).unwrap_or_default()));
-    vm.set_presented_fp(ss("not available: the connection was refused before the key could be read"));
+    vm.set_pinned_fp(ss(server
+        .as_ref()
+        .map(|s| s.short_fingerprint())
+        .unwrap_or_default()));
+    vm.set_presented_fp(ss(
+        "not available: the connection was refused before the key could be read",
+    ));
     vm.set_notice_title(ss(""));
     vm.set_notice_text(ss(""));
     vm.set_notice_tone(3);
     vm.set_wait_secs(0);
     vm.set_takeover_hint(ss(match &c.takeover_of {
-        Some(n) if !n.is_empty() => format!("Connecting takes the desktop over from {n}, which is disconnected."),
-        Some(_) => "Connecting takes the desktop over from the other device, which is disconnected.".to_owned(),
+        Some(n) if !n.is_empty() => {
+            format!("Connecting takes the desktop over from {n}, which is disconnected.")
+        }
+        Some(_) => {
+            "Connecting takes the desktop over from the other device, which is disconnected."
+                .to_owned()
+        }
         None => String::new(),
     }));
     let phase = match c.machine.state() {
@@ -104,9 +117,15 @@ pub fn show(app: &Rc<App>) {
         }
         ConnectState::Connecting => 1,
         ConnectState::CheckingPin => 2,
-        ConnectState::Waiting { secs, attempts_left } => {
+        ConnectState::Waiting {
+            secs,
+            attempts_left,
+        } => {
             vm.set_wait_secs(*secs as i32);
-            vm.set_notice_title(ss(format!("Wait {secs} second{} before trying again", if *secs == 1 { "" } else { "s" })));
+            vm.set_notice_title(ss(format!(
+                "Wait {secs} second{} before trying again",
+                if *secs == 1 { "" } else { "s" }
+            )));
             vm.set_notice_text(ss(match attempts_left {
                 Some(1) => "1 attempt left. Waiting does not use up an attempt.".to_owned(),
                 Some(n) => format!("{n} attempts left. Waiting does not use up an attempt."),
@@ -144,14 +163,18 @@ fn sync_timer(app: &Rc<App>) {
     }
     let t = slint::Timer::default();
     let a = app.clone();
-    t.start(slint::TimerMode::Repeated, Duration::from_secs(1), move || {
-        let back = a.conn.borrow_mut().machine.tick_second();
-        show(&a);
-        if back {
-            focus_pin(&a);
-        }
-        sync_timer(&a);
-    });
+    t.start(
+        slint::TimerMode::Repeated,
+        Duration::from_secs(1),
+        move || {
+            let back = a.conn.borrow_mut().machine.tick_second();
+            show(&a);
+            if back {
+                focus_pin(&a);
+            }
+            sync_timer(&a);
+        },
+    );
     c.timer = Some(t);
 }
 
@@ -172,7 +195,9 @@ fn submit(app: &Rc<App>) {
     vm.set_pin(ss(""));
     show(app);
     let Some(link) = link_of(app, &id) else {
-        app.conn.borrow_mut().machine.outcome(Outcome::Failed("This server was never paired with this device.".into()));
+        app.conn.borrow_mut().machine.outcome(Outcome::Failed(
+            "This server was never paired with this device.".into(),
+        ));
         show(app);
         return;
     };
@@ -189,32 +214,40 @@ fn submit(app: &Rc<App>) {
             }
         });
     });
-    spawn_ui(app, async move { connector.connect(&l2, &p2, on_secure, wiring).await }, move |a, r| {
-        if a.conn.borrow().epoch != epoch {
-            return;
-        }
-        match r {
-            Ok(est) => {
-                a.conn.borrow_mut().machine.outcome(Outcome::Accepted);
-                let _ = a.store.borrow_mut().touch(&id, super::now_unix());
-                a.unavailable.borrow_mut().remove(&id);
-                desktop_ctl::enter(a, &id, link, est, prepared, pin);
+    spawn_ui(
+        app,
+        async move { connector.connect(&l2, &p2, on_secure, wiring).await },
+        move |a, r| {
+            if a.conn.borrow().epoch != epoch {
+                return;
             }
-            Err(o) => {
-                drop(prepared);
-                if o == Outcome::Revoked {
-                    let _ = a.store.borrow_mut().set_lifecycle(&id, Lifecycle::Revoked, super::now_unix());
+            match r {
+                Ok(est) => {
+                    a.conn.borrow_mut().machine.outcome(Outcome::Accepted);
+                    let _ = a.store.borrow_mut().touch(&id, super::now_unix());
+                    a.unavailable.borrow_mut().remove(&id);
+                    desktop_ctl::enter(a, &id, link, est, prepared, pin);
                 }
-                if let Outcome::Unreachable(_) = o {
-                    a.reachable.borrow_mut().insert(id.clone(), false);
+                Err(o) => {
+                    drop(prepared);
+                    if o == Outcome::Revoked {
+                        let _ = a.store.borrow_mut().set_lifecycle(
+                            &id,
+                            Lifecycle::Revoked,
+                            super::now_unix(),
+                        );
+                    }
+                    if let Outcome::Unreachable(_) = o {
+                        a.reachable.borrow_mut().insert(id.clone(), false);
+                    }
+                    a.conn.borrow_mut().machine.outcome(o);
+                    show(a);
+                    sync_timer(a);
+                    focus_pin(a);
                 }
-                a.conn.borrow_mut().machine.outcome(o);
-                show(a);
-                sync_timer(a);
-                focus_pin(a);
             }
-        }
-    });
+        },
+    );
 }
 
 fn submit_password(app: &Rc<App>) {
@@ -223,7 +256,9 @@ fn submit_password(app: &Rc<App>) {
     if pw.is_empty() || vm.get_pairing() {
         return;
     }
-    let Some(id) = app.conn.borrow().server_id.clone() else { return };
+    let Some(id) = app.conn.borrow().server_id.clone() else {
+        return;
+    };
     let Some(s) = app.server(&id) else { return };
     vm.set_pairing(true);
     vm.set_err_password(ss(""));
@@ -235,22 +270,30 @@ fn submit_password(app: &Rc<App>) {
         session: None,
     };
     let admin = app.be.admin.clone();
-    spawn_ui(app, async move { admin.reinstate(&ctx, &Secret::new(pw)).await }, move |a, r| {
-        let vm = a.ui().global::<ConnectVm>();
-        vm.set_pairing(false);
-        match r {
-            Ok(()) => {
-                let _ = a.store.borrow_mut().set_lifecycle(&id, Lifecycle::Ready, 0);
-                vm.set_password(ss(""));
-                a.conn.borrow_mut().machine = ConnectMachine::new();
-                show(&a.clone());
+    spawn_ui(
+        app,
+        async move { admin.reinstate(&ctx, &Secret::new(pw)).await },
+        move |a, r| {
+            let vm = a.ui().global::<ConnectVm>();
+            vm.set_pairing(false);
+            match r {
+                Ok(()) => {
+                    let _ = a.store.borrow_mut().set_lifecycle(&id, Lifecycle::Ready, 0);
+                    vm.set_password(ss(""));
+                    a.conn.borrow_mut().machine = ConnectMachine::new();
+                    show(&a.clone());
+                }
+                Err(AdminError::Incorrect { .. }) => {
+                    vm.set_err_password(ss("That password did not work. Check it and try again."))
+                }
+                Err(AdminError::RateLimited) => {
+                    vm.set_err_password(ss("Too many tries. Wait a few minutes and try again."))
+                }
+                Err(AdminError::Unreachable) => vm.set_err_password(ss("Cannot reach the server.")),
+                Err(AdminError::Failed(m)) => vm.set_err_password(ss(m)),
             }
-            Err(AdminError::Incorrect { .. }) => vm.set_err_password(ss("That password did not work. Check it and try again.")),
-            Err(AdminError::RateLimited) => vm.set_err_password(ss("Too many tries. Wait a few minutes and try again.")),
-            Err(AdminError::Unreachable) => vm.set_err_password(ss("Cannot reach the server.")),
-            Err(AdminError::Failed(m)) => vm.set_err_password(ss(m)),
-        }
-    });
+        },
+    );
 }
 
 pub fn wire(app: &Rc<App>) {

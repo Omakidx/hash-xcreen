@@ -64,7 +64,9 @@ impl Stats {
         let p95 = if v.is_empty() {
             0
         } else {
-            v[((v.len() * 95).div_ceil(100)).saturating_sub(1).min(v.len() - 1)]
+            v[((v.len() * 95).div_ceil(100))
+                .saturating_sub(1)
+                .min(v.len() - 1)]
         };
         Interval {
             decoded: self.decoded.swap(0, Relaxed),

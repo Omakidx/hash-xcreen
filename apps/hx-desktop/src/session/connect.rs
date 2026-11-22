@@ -237,7 +237,8 @@ impl Machine {
                 *secs = secs.saturating_sub(1);
                 if *secs == 0 {
                     let left = *attempts_left;
-                    self.state = State::Entering(left.map(|attempts_left| Notice::Wrong { attempts_left }));
+                    self.state =
+                        State::Entering(left.map(|attempts_left| Notice::Wrong { attempts_left }));
                     true
                 } else {
                     false
@@ -306,8 +307,17 @@ mod tests {
     #[test]
     fn wrong_pin_returns_to_the_form_with_the_count_from_the_server() {
         let mut m = Machine::new();
-        run(&mut m, Outcome::Wrong { attempts_left: 4, retry_after: Duration::ZERO });
-        assert_eq!(*m.state(), State::Entering(Some(Notice::Wrong { attempts_left: 4 })));
+        run(
+            &mut m,
+            Outcome::Wrong {
+                attempts_left: 4,
+                retry_after: Duration::ZERO,
+            },
+        );
+        assert_eq!(
+            *m.state(),
+            State::Entering(Some(Notice::Wrong { attempts_left: 4 }))
+        );
         assert_eq!(wrong_pin_text(4).0, "Incorrect PIN, 4 attempts left");
         assert!(wrong_pin_text(1).0.ends_with("1 attempt left"));
         assert!(wrong_pin_text(1).1.contains("account password"));
@@ -316,21 +326,47 @@ mod tests {
     #[test]
     fn wrong_pin_with_a_wait_counts_down_then_reenables_the_form() {
         let mut m = Machine::new();
-        run(&mut m, Outcome::Wrong { attempts_left: 2, retry_after: Duration::from_millis(2500) });
-        assert_eq!(*m.state(), State::Waiting { secs: 3, attempts_left: Some(2) });
+        run(
+            &mut m,
+            Outcome::Wrong {
+                attempts_left: 2,
+                retry_after: Duration::from_millis(2500),
+            },
+        );
+        assert_eq!(
+            *m.state(),
+            State::Waiting {
+                secs: 3,
+                attempts_left: Some(2)
+            }
+        );
         assert!(!m.can_submit());
         assert!(!m.tick_second());
         assert!(!m.tick_second());
         assert!(m.tick_second());
-        assert_eq!(*m.state(), State::Entering(Some(Notice::Wrong { attempts_left: 2 })));
+        assert_eq!(
+            *m.state(),
+            State::Entering(Some(Notice::Wrong { attempts_left: 2 }))
+        );
         assert!(m.can_submit());
     }
 
     #[test]
     fn backoff_is_not_an_attempt_and_waits() {
         let mut m = Machine::new();
-        run(&mut m, Outcome::Backoff { retry_after: Duration::from_secs(8) });
-        assert_eq!(*m.state(), State::Waiting { secs: 8, attempts_left: None });
+        run(
+            &mut m,
+            Outcome::Backoff {
+                retry_after: Duration::from_secs(8),
+            },
+        );
+        assert_eq!(
+            *m.state(),
+            State::Waiting {
+                secs: 8,
+                attempts_left: None
+            }
+        );
         for _ in 0..7 {
             assert!(!m.tick_second());
         }
@@ -352,7 +388,12 @@ mod tests {
     #[test]
     fn not_available_offers_try_again_only_after_the_wait() {
         let mut m = Machine::new();
-        run(&mut m, Outcome::NotAvailable { retry_after: Duration::from_secs(2) });
+        run(
+            &mut m,
+            Outcome::NotAvailable {
+                retry_after: Duration::from_secs(2),
+            },
+        );
         assert!(!m.retry());
         m.tick_second();
         m.tick_second();
@@ -383,21 +424,38 @@ mod tests {
     #[test]
     fn library_errors_map_to_outcomes() {
         assert_eq!(
-            classify_error(&Error::WrongPin { attempts_left: 3, retry_after: Duration::from_secs(1) }),
-            Outcome::Wrong { attempts_left: 3, retry_after: Duration::from_secs(1) }
+            classify_error(&Error::WrongPin {
+                attempts_left: 3,
+                retry_after: Duration::from_secs(1)
+            }),
+            Outcome::Wrong {
+                attempts_left: 3,
+                retry_after: Duration::from_secs(1)
+            }
         );
         assert_eq!(classify_error(&Error::Revoked), Outcome::Revoked);
-        assert!(matches!(classify_error(&Error::PinNotAvailable), Outcome::NotAvailable { .. }));
+        assert!(matches!(
+            classify_error(&Error::PinNotAvailable),
+            Outcome::NotAvailable { .. }
+        ));
         assert_eq!(classify_error(&Error::InvalidKey), Outcome::IdentityChanged);
         assert_eq!(
-            classify_error(&Error::Transport(hx_transport::Error::PeerRejected("x".into()))),
+            classify_error(&Error::Transport(hx_transport::Error::PeerRejected(
+                "x".into()
+            ))),
             Outcome::IdentityChanged
         );
         assert!(matches!(
-            classify_error(&Error::Refused { reason: RefuseReason::Unauthorized, message: "not authorized".into() }),
+            classify_error(&Error::Refused {
+                reason: RefuseReason::Unauthorized,
+                message: "not authorized".into()
+            }),
             Outcome::Revoked
         ));
-        assert!(matches!(classify_error(&Error::Timeout("x")), Outcome::Unreachable(_)));
+        assert!(matches!(
+            classify_error(&Error::Timeout("x")),
+            Outcome::Unreachable(_)
+        ));
     }
 
     #[test]

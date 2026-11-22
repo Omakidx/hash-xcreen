@@ -8,29 +8,85 @@ use slint::ComponentHandle;
 
 use super::progress::Model;
 use super::{App, model, ss};
-use crate::backend::{CheckRow, CheckStatus, InstallEvent, InstallFailure, InstallOutcome, Preflight, StageState};
+use crate::backend::{
+    CheckRow, CheckStatus, InstallEvent, InstallFailure, InstallOutcome, Preflight, StageState,
+};
 use crate::servers::{Lifecycle, Server};
 use crate::session::connect::Outcome;
 use crate::wizard::{ConnPhase, Method, Step};
-use crate::{ActivityData, DesktopVm, DetailsVm, DeviceRowData, Kv, Screen, ThemeMode, Tokens, WizardVm};
+use crate::{
+    ActivityData, DesktopVm, DetailsVm, DeviceRowData, Kv, Screen, ThemeMode, Tokens, WizardVm,
+};
 
 /// Every name `apply` knows.
 pub const NAMES: &[&str] = &[
-    "home", "home-empty", "home-loading",
-    "wizard-method", "wizard-connection", "wizard-hostkey", "wizard-checks-ok", "wizard-checks-bad",
-    "wizard-desktop", "wizard-docker", "wizard-account", "wizard-account-errors", "wizard-backups",
-    "wizard-resources", "wizard-review", "wizard-oneliner-server", "wizard-run-waiting",
-    "wizard-run-expired", "wizard-run-unreachable", "wizard-run-paired", "wizard-code", "wizard-code-failed",
-    "progress-running", "progress-unknown", "progress-failed", "progress-lost", "progress-success",
-    "connect-pin", "connect-checking", "connect-wrong", "connect-wait", "connect-last", "connect-revoked",
-    "connect-pair-again", "connect-unavailable", "connect-unreachable", "connect-identity",
-    "desktop", "desktop-toolbar", "desktop-display", "desktop-quality", "desktop-keys", "desktop-transfers",
-    "desktop-stats", "desktop-files", "desktop-reconnect", "desktop-gave-up", "desktop-takeover",
-    "desktop-open-link", "desktop-unavailable",
-    "details-overview", "details-problems", "details-offline", "details-security", "details-revoke",
-    "details-revoke-self", "details-pair", "details-pin", "details-password", "details-desktop",
-    "details-docker", "details-restart", "details-danger", "details-danger-ssh", "details-danger-confirm",
-    "details-danger-done", "settings",
+    "home",
+    "home-empty",
+    "home-loading",
+    "wizard-method",
+    "wizard-connection",
+    "wizard-hostkey",
+    "wizard-checks-ok",
+    "wizard-checks-bad",
+    "wizard-desktop",
+    "wizard-docker",
+    "wizard-account",
+    "wizard-account-errors",
+    "wizard-backups",
+    "wizard-resources",
+    "wizard-review",
+    "wizard-oneliner-server",
+    "wizard-run-waiting",
+    "wizard-run-expired",
+    "wizard-run-unreachable",
+    "wizard-run-paired",
+    "wizard-code",
+    "wizard-code-failed",
+    "progress-running",
+    "progress-unknown",
+    "progress-failed",
+    "progress-lost",
+    "progress-success",
+    "connect-pin",
+    "connect-checking",
+    "connect-wrong",
+    "connect-wait",
+    "connect-last",
+    "connect-revoked",
+    "connect-pair-again",
+    "connect-unavailable",
+    "connect-unreachable",
+    "connect-identity",
+    "desktop",
+    "desktop-toolbar",
+    "desktop-display",
+    "desktop-quality",
+    "desktop-keys",
+    "desktop-transfers",
+    "desktop-stats",
+    "desktop-files",
+    "desktop-reconnect",
+    "desktop-gave-up",
+    "desktop-takeover",
+    "desktop-open-link",
+    "desktop-unavailable",
+    "details-overview",
+    "details-problems",
+    "details-offline",
+    "details-security",
+    "details-revoke",
+    "details-revoke-self",
+    "details-pair",
+    "details-pin",
+    "details-password",
+    "details-desktop",
+    "details-docker",
+    "details-restart",
+    "details-danger",
+    "details-danger-ssh",
+    "details-danger-confirm",
+    "details-danger-done",
+    "settings",
 ];
 
 const KEY_A: &str = "3f9ac1d477be0a52b81e05f7d3906c2a3f9ac1d477be0a52b81e05f7d3906c2a";
@@ -43,8 +99,16 @@ fn srv(id: &str, name: &str, host: &str, port: u16, l: Lifecycle) -> Server {
         port,
         server_key: KEY_A.into(),
         lifecycle: l,
-        last_seen_unix: if l == Lifecycle::Ready { super::now_unix().saturating_sub(3 * 86_400 + 4 * 3600) } else { 0 },
-        revoked_unix: if l == Lifecycle::Revoked { 1_699_920_000 } else { 0 },
+        last_seen_unix: if l == Lifecycle::Ready {
+            super::now_unix().saturating_sub(3 * 86_400 + 4 * 3600)
+        } else {
+            0
+        },
+        revoked_unix: if l == Lifecycle::Revoked {
+            1_699_920_000
+        } else {
+            0
+        },
     }
 }
 
@@ -55,8 +119,20 @@ pub fn demo_servers() -> Vec<Server> {
         srv("dev", "Dev box", "203.0.113.24", 443, Lifecycle::Ready),
         srv("vm", "Test VM", "203.0.113.88", 443, Lifecycle::Installing),
         srv("lab", "Home lab", "203.0.113.131", 8443, Lifecycle::Ready),
-        srv("build", "Build server", "203.0.113.142", 443, Lifecycle::SetupPending),
-        srv("old", "Old laptop box", "203.0.113.19", 443, Lifecycle::Revoked),
+        srv(
+            "build",
+            "Build server",
+            "203.0.113.142",
+            443,
+            Lifecycle::SetupPending,
+        ),
+        srv(
+            "old",
+            "Old laptop box",
+            "203.0.113.19",
+            443,
+            Lifecycle::Revoked,
+        ),
     ]
 }
 
@@ -74,7 +150,12 @@ fn wiz(app: &Rc<App>, f: impl FnOnce(&mut super::wizard_ctl::Ctx)) {
 }
 
 fn preflight(bad: bool) -> Preflight {
-    let row = |k: &str, t: &str, d: &str, s| CheckRow { key: k.into(), title: t.into(), detail: d.into(), status: s };
+    let row = |k: &str, t: &str, d: &str, s| CheckRow {
+        key: k.into(),
+        title: t.into(),
+        detail: d.into(),
+        status: s,
+    };
     use CheckStatus::{Fail, Pass};
     if bad {
         Preflight {
@@ -82,8 +163,18 @@ fn preflight(bad: bool) -> Preflight {
             rows: vec![
                 row("os", "Debian 12 (x86_64) is supported", "", Pass),
                 row("cpus", "2 vCPU", "At least 2 needed", Pass),
-                row("memory", "1.9 GB memory", "Missing: this server has 1.9 GB, the minimum is 4 GB", Fail),
-                row("disk", "18 GB free disk", "Missing: 12 GB more free space; the minimum is 30 GB", Fail),
+                row(
+                    "memory",
+                    "1.9 GB memory",
+                    "Missing: this server has 1.9 GB, the minimum is 4 GB",
+                    Fail,
+                ),
+                row(
+                    "disk",
+                    "18 GB free disk",
+                    "Missing: 12 GB more free space; the minimum is 30 GB",
+                    Fail,
+                ),
                 row("port", "Port 443 is free for TCP and UDP", "", Pass),
             ],
             cpus: 2,
@@ -98,7 +189,12 @@ fn preflight(bad: bool) -> Preflight {
                 row("cpus", "4 vCPU", "At least 2 needed", Pass),
                 row("memory", "7.8 GB memory", "At least 4 GB needed", Pass),
                 row("disk", "152 GB free disk", "At least 30 GB needed", Pass),
-                row("port", "Port 443 is free for TCP and UDP", "Change it later under Resources, Advanced", Pass),
+                row(
+                    "port",
+                    "Port 443 is free for TCP and UDP",
+                    "Change it later under Resources, Advanced",
+                    Pass,
+                ),
             ],
             cpus: 4,
             memory_mib: 7987,
@@ -129,7 +225,10 @@ fn wizard_at(app: &Rc<App>, step: Step, method: Method) {
         c.w.set_method(method);
         c.w.address = "203.0.113.10".into();
         c.w.step = step;
-        c.w.trusted = Some(("ED25519".into(), "SHA256:5Gk2xQ0m8vT1uZpJc3W9nLr7aYbHd4eFsIo6KtN2VhE".into()));
+        c.w.trusted = Some((
+            "ED25519".into(),
+            "SHA256:5Gk2xQ0m8vT1uZpJc3W9nLr7aYbHd4eFsIo6KtN2VhE".into(),
+        ));
         c.w.preflight = Some(preflight(false));
         c.w.conn = ConnPhase::ChecksOk;
         c.w.docker = false;
@@ -179,7 +278,11 @@ fn progress(app: &Rc<App>, kind: &str) {
         c.distro = "Ubuntu 24.04".into();
     }
     let mut m = Model::with_clock(|| "14:08:02".into());
-    let st = |id: &str, s: StageState, ms: Option<u64>| InstallEvent::Stage { id: id.into(), state: s, ms };
+    let st = |id: &str, s: StageState, ms: Option<u64>| InstallEvent::Stage {
+        id: id.into(),
+        state: s,
+        ms,
+    };
     match kind {
         "running" => {
             for e in progress_events("step5") {
@@ -204,10 +307,14 @@ fn progress(app: &Rc<App>, kind: &str) {
             for e in progress_events("step5").into_iter().take(40) {
                 m.apply(e);
             }
-            m.apply(InstallEvent::ConnectionLost { stage: "desktop".into() });
+            m.apply(InstallEvent::ConnectionLost {
+                stage: "desktop".into(),
+            });
         }
         _ => {
-            for e in crate::backend::demo::install_script(crate::backend::demo::Scenario::Success, 443) {
+            for e in
+                crate::backend::demo::install_script(crate::backend::demo::Scenario::Success, 443)
+            {
                 m.apply(e);
             }
             m.apply(InstallEvent::Finished(InstallOutcome {
@@ -223,15 +330,29 @@ fn progress(app: &Rc<App>, kind: &str) {
     {
         let mut c = app.prog.borrow_mut();
         c.model = m;
-        c.retry = if kind == "failed" { Some(super::progress_ctl::Retry::Ssh(crate::backend::InstallRequest {
-            target: crate::backend::SshTarget { host: "203.0.113.88".into(), port: 22 },
-            auth: crate::backend::SshAuth::DefaultKeys { user: "root".into() },
-            host_key: crate::backend::HostKey { algorithm: "ED25519".into(), fingerprint: "x".into() },
-            options: crate::wizard::Wizard::new().options(),
-            password: crate::backend::Secret::new(""),
-            pin: crate::backend::Secret::new(""),
-            pairing_token: crate::backend::Secret::new(""),
-        })) } else { None };
+        c.retry = if kind == "failed" {
+            Some(super::progress_ctl::Retry::Ssh(
+                crate::backend::InstallRequest {
+                    target: crate::backend::SshTarget {
+                        host: "203.0.113.88".into(),
+                        port: 22,
+                    },
+                    auth: crate::backend::SshAuth::DefaultKeys {
+                        user: "root".into(),
+                    },
+                    host_key: crate::backend::HostKey {
+                        algorithm: "ED25519".into(),
+                        fingerprint: "x".into(),
+                    },
+                    options: crate::wizard::Wizard::new().options(),
+                    password: crate::backend::Secret::new(""),
+                    pin: crate::backend::Secret::new(""),
+                    pairing_token: crate::backend::Secret::new(""),
+                },
+            ))
+        } else {
+            None
+        };
     }
     super::progress_ctl::push(app);
     app.go(Screen::Progress);
@@ -242,11 +363,7 @@ fn connect(app: &Rc<App>, outcome: Option<Outcome>, setup: impl FnOnce(&Rc<App>)
     setup(app);
     if let Some(o) = outcome {
         let mut c = app.conn.borrow_mut();
-        if matches!(o, Outcome::Revoked) && c.machine.state() != &crate::session::ConnectState::Revoked {
-            c.machine.submit();
-        } else {
-            c.machine.submit();
-        }
+        c.machine.submit();
         c.machine.outcome(o);
     }
     super::connect_ctl::show(app);
@@ -281,7 +398,11 @@ pub fn demo_picture() -> slint::Image {
     let px = buf.make_mut_slice();
     for y in 0..h {
         for x in 0..w {
-            let mut c = [30 + (y * 40 / h) as u8, 60 + (y * 50 / h) as u8, 110 + (x * 50 / w) as u8];
+            let mut c = [
+                30 + (y * 40 / h) as u8,
+                60 + (y * 50 / h) as u8,
+                110 + (x * 50 / w) as u8,
+            ];
             if y < 28 {
                 c = [58, 62, 68];
             } else if (60..560).contains(&x) && (70..400).contains(&y) {
@@ -290,9 +411,18 @@ pub fn demo_picture() -> slint::Image {
                     c = [90, 200, 120];
                 }
             } else if (600..900).contains(&x) && (120..360).contains(&y) {
-                c = if y < 146 { [88, 94, 106] } else { [245, 246, 248] };
+                c = if y < 146 {
+                    [88, 94, 106]
+                } else {
+                    [245, 246, 248]
+                };
             }
-            px[(y * w + x) as usize] = slint::Rgba8Pixel { r: c[0], g: c[1], b: c[2], a: 255 };
+            px[(y * w + x) as usize] = slint::Rgba8Pixel {
+                r: c[0],
+                g: c[1],
+                b: c[2],
+                a: 255,
+            };
         }
     }
     slint::Image::from_rgba8(buf)
@@ -316,12 +446,46 @@ fn security_rows(app: &Rc<App>) {
         can_revoke: can,
     };
     vm.set_devices(model(vec![
-        row("a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1", "Alex's desktop (a1a1a1a1)", "now", "Active", 1, true, true),
-        row("b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2", "Maya's laptop (b2b2b2b2)", "Today 13:58", "Active", 1, false, true),
-        row("d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4", "Old tablet (d4d4d4d4)", "14 Nov", "Revoked", 3, false, false),
-        row("c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3", "Work PC (c3c3c3c3)", "2 days ago", "Active", 1, false, true),
+        row(
+            "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+            "Alex's desktop (a1a1a1a1)",
+            "now",
+            "Active",
+            1,
+            true,
+            true,
+        ),
+        row(
+            "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+            "Maya's laptop (b2b2b2b2)",
+            "Today 13:58",
+            "Active",
+            1,
+            false,
+            true,
+        ),
+        row(
+            "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+            "Old tablet (d4d4d4d4)",
+            "14 Nov",
+            "Revoked",
+            3,
+            false,
+            false,
+        ),
+        row(
+            "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+            "Work PC (c3c3c3c3)",
+            "2 days ago",
+            "Active",
+            1,
+            false,
+            true,
+        ),
     ]));
-    vm.set_devices_note(ss("Devices paired with this server. Revoked ones stay listed so you can see what happened."));
+    vm.set_devices_note(ss(
+        "Devices paired with this server. Revoked ones stay listed so you can see what happened.",
+    ));
     vm.set_tab(1);
 }
 
@@ -331,7 +495,13 @@ pub fn apply(app: &Rc<App>, name: &str) -> bool {
     match name {
         "home" => app.show_home(),
         "home-empty" => {
-            let ids: Vec<String> = app.store.borrow().list().iter().map(|s| s.id.clone()).collect();
+            let ids: Vec<String> = app
+                .store
+                .borrow()
+                .list()
+                .iter()
+                .map(|s| s.id.clone())
+                .collect();
             for i in ids {
                 let _ = app.store.borrow_mut().remove(&i);
             }
@@ -405,7 +575,10 @@ pub fn apply(app: &Rc<App>, name: &str) -> bool {
         }
         "wizard-review" => wizard_at(app, Step::Review, Method::Ssh),
         "wizard-oneliner-server" => wizard_at(app, Step::Server, Method::OneLiner),
-        "wizard-run-waiting" | "wizard-run-expired" | "wizard-run-unreachable" | "wizard-run-paired" => {
+        "wizard-run-waiting"
+        | "wizard-run-expired"
+        | "wizard-run-unreachable"
+        | "wizard-run-paired" => {
             wizard_at(app, Step::RunOnServer, Method::OneLiner);
             wiz(app, |c| {
                 c.w.address = "203.0.113.142".into();
@@ -415,7 +588,9 @@ pub fn apply(app: &Rc<App>, name: &str) -> bool {
                 c.w.cpu = 3;
                 c.w.memory_gb = 5;
                 c.w.disk_gb = 60;
-                c.token = Some("hxt1-aaaqeayeaudaocajbifqydiob4ibceqtcqkrmfyydenbwha5dypsaijcemsckjrh".into());
+                c.token = Some(
+                    "hxt1-aaaqeayeaudaocajbifqydiob4ibceqtcqkrmfyydenbwha5dypsaijcemsckjrh".into(),
+                );
             });
             let vm = ui.global::<WizardVm>();
             vm.set_address(ss("203.0.113.142"));
@@ -423,7 +598,10 @@ pub fn apply(app: &Rc<App>, name: &str) -> bool {
                 "wizard-run-expired" => (1, ""),
                 "wizard-run-unreachable" => (2, ""),
                 "wizard-run-paired" => (3, "Server identity pinned: 3f9a c1d4 77be 0a52."),
-                _ => (0, "Waiting for the server… Looking for the agent at 203.0.113.142:443. This starts as soon as the installer opens the port."),
+                _ => (
+                    0,
+                    "Waiting for the server… Looking for the agent at 203.0.113.142:443. This starts as soon as the installer opens the port.",
+                ),
             };
             vm.set_run_phase(phase);
             vm.set_run_status(ss(status));
@@ -456,23 +634,53 @@ pub fn apply(app: &Rc<App>, name: &str) -> bool {
             app.conn.borrow_mut().machine.secure();
             super::connect_ctl::show(app);
         }
-        "connect-wrong" => connect(app, Some(Outcome::Wrong { attempts_left: 4, retry_after: Duration::ZERO }), |_| {}),
-        "connect-wait" => connect(app, Some(Outcome::Wrong { attempts_left: 2, retry_after: Duration::from_secs(8) }), |_| {}),
-        "connect-last" => connect(app, Some(Outcome::Wrong { attempts_left: 1, retry_after: Duration::ZERO }), |_| {}),
+        "connect-wrong" => connect(
+            app,
+            Some(Outcome::Wrong {
+                attempts_left: 4,
+                retry_after: Duration::ZERO,
+            }),
+            |_| {},
+        ),
+        "connect-wait" => connect(
+            app,
+            Some(Outcome::Wrong {
+                attempts_left: 2,
+                retry_after: Duration::from_secs(8),
+            }),
+            |_| {},
+        ),
+        "connect-last" => connect(
+            app,
+            Some(Outcome::Wrong {
+                attempts_left: 1,
+                retry_after: Duration::ZERO,
+            }),
+            |_| {},
+        ),
         "connect-revoked" => connect(app, Some(Outcome::Revoked), |_| {}),
         "connect-pair-again" => {
             connect(app, Some(Outcome::Revoked), |_| {});
             app.conn.borrow_mut().machine.pair_again();
             super::connect_ctl::show(app);
         }
-        "connect-unavailable" => connect(app, Some(Outcome::NotAvailable { retry_after: Duration::from_secs(58) }), |_| {}),
-        "connect-unreachable" => connect(app, Some(Outcome::Unreachable("no answer".into())), |_| {}),
+        "connect-unavailable" => connect(
+            app,
+            Some(Outcome::NotAvailable {
+                retry_after: Duration::from_secs(58),
+            }),
+            |_| {},
+        ),
+        "connect-unreachable" => {
+            connect(app, Some(Outcome::Unreachable("no answer".into())), |_| {})
+        }
         "connect-identity" => connect(app, Some(Outcome::IdentityChanged), |_| {}),
         "desktop" => {
             desk_view(app);
             ui.global::<DesktopVm>().set_hint(true);
         }
-        "desktop-toolbar" | "desktop-display" | "desktop-quality" | "desktop-keys" | "desktop-transfers" => {
+        "desktop-toolbar" | "desktop-display" | "desktop-quality" | "desktop-keys"
+        | "desktop-transfers" => {
             desk_view(app);
             let vm = ui.global::<DesktopVm>();
             vm.set_toolbar(true);
@@ -485,8 +693,20 @@ pub fn apply(app: &Rc<App>, name: &str) -> bool {
             });
             if name == "desktop-transfers" {
                 vm.set_activities(model(vec![
-                    ActivityData { name: ss("report-q3.pdf"), direction: ss("up"), percent: 62, state: ss("62%"), failed: false },
-                    ActivityData { name: ss("screenshot.png"), direction: ss("down"), percent: 100, state: ss("done"), failed: false },
+                    ActivityData {
+                        name: ss("report-q3.pdf"),
+                        direction: ss("up"),
+                        percent: 62,
+                        state: ss("62%"),
+                        failed: false,
+                    },
+                    ActivityData {
+                        name: ss("screenshot.png"),
+                        direction: ss("down"),
+                        percent: 100,
+                        state: ss("done"),
+                        failed: false,
+                    },
                 ]));
             }
         }
@@ -534,7 +754,12 @@ pub fn apply(app: &Rc<App>, name: &str) -> bool {
             };
             details(app, id, 0);
         }
-        "details-security" | "details-revoke" | "details-revoke-self" | "details-pair" | "details-pin" | "details-password" => {
+        "details-security"
+        | "details-revoke"
+        | "details-revoke-self"
+        | "details-pair"
+        | "details-pin"
+        | "details-password" => {
             details(app, "ws", 1);
             security_rows(app);
             let vm = ui.global::<DetailsVm>();
@@ -577,7 +802,10 @@ pub fn apply(app: &Rc<App>, name: &str) -> bool {
             vm.set_docker_dialog(name == "details-docker");
             vm.set_restart_dialog(name == "details-restart");
         }
-        "details-danger" | "details-danger-ssh" | "details-danger-confirm" | "details-danger-done" => {
+        "details-danger"
+        | "details-danger-ssh"
+        | "details-danger-confirm"
+        | "details-danger-done" => {
             details(app, "ws", 3);
             let vm = ui.global::<DetailsVm>();
             match name {
@@ -599,6 +827,9 @@ pub fn apply(app: &Rc<App>, name: &str) -> bool {
         "settings" => app.go(Screen::Settings),
         _ => return false,
     }
-    let _ = Kv { key: ss(""), value: ss("") };
+    let _ = Kv {
+        key: ss(""),
+        value: ss(""),
+    };
     true
 }

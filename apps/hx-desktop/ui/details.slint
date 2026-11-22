@@ -150,6 +150,14 @@ component KvList inherits VerticalLayout {
 
 export component DetailsScreen inherits Rectangle {
     background: Tokens.bg;
+    FocusScope {
+        key-pressed(e) => {
+            if (e.text == Key.Escape) {
+                DetailsVm.back();
+                return accept;
+            }
+            reject
+        }
     VerticalLayout {
         AppBar {
             crumb: "Servers  /  " + DetailsVm.server-name;
@@ -218,6 +226,7 @@ export component DetailsScreen inherits Rectangle {
                 horizontal-stretch: 1;
                 VerticalLayout {
                     padding: Tokens.sp-6;
+                max-width: 880px;
                     spacing: Tokens.sp-4;
                     alignment: start;
                     HorizontalLayout {
@@ -1102,5 +1111,6 @@ export component DetailsScreen inherits Rectangle {
                 }
             }
         }
+    }
     }
 }

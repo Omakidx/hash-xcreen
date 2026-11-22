@@ -156,7 +156,8 @@ impl Connector for RealConnector {
                     return Err(o);
                 }
             };
-            let (session, events) = Session::start(conn, wiring.frames, wiring.downloads, wiring.stats, handle);
+            let (session, events) =
+                Session::start(conn, wiring.frames, wiring.downloads, wiring.stats, handle);
             Ok(Established {
                 desk: Arc::new(session),
                 events,
@@ -170,9 +171,12 @@ impl Connector for RealConnector {
             let Ok(t) = super::net::target(&host, port).await else {
                 return false;
             };
-            tokio::time::timeout(std::time::Duration::from_secs(3), tokio::net::TcpStream::connect(t.addr))
-                .await
-                .is_ok_and(|r| r.is_ok())
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                tokio::net::TcpStream::connect(t.addr),
+            )
+            .await
+            .is_ok_and(|r| r.is_ok())
         })
     }
 }

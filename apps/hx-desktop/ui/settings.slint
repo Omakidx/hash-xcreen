@@ -46,6 +46,14 @@ component Row inherits HorizontalLayout {
 
 export component SettingsScreen inherits Rectangle {
     background: Tokens.bg;
+    FocusScope {
+        key-pressed(e) => {
+            if (e.text == Key.Escape) {
+                SettingsVm.done();
+                return accept;
+            }
+            reject
+        }
     VerticalLayout {
         AppBar {
             crumb: "Settings";
@@ -63,6 +71,7 @@ export component SettingsScreen inherits Rectangle {
             vertical-stretch: 1;
             VerticalLayout {
                 padding: Tokens.sp-6;
+                max-width: 760px;
                 spacing: Tokens.sp-4;
                 alignment: start;
                 Heading {
@@ -204,5 +213,6 @@ export component SettingsScreen inherits Rectangle {
                 }
             }
         }
+    }
     }
 }

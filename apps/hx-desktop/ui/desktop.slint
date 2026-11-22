@@ -683,6 +683,7 @@ export component DesktopScreen inherits Rectangle {
             Field {
                 text <=> DesktopVm.file-path;
                 placeholder: "Type or paste a file path";
+                horizontal-stretch: 1;
                 accepted => {
                     DesktopVm.send-file();
                 }
@@ -691,7 +692,8 @@ export component DesktopScreen inherits Rectangle {
             Btn {
                 text: "Send";
                 kind: "primary";
-                y: 0px;
+                width: 72px;
+                horizontal-stretch: 0;
                 enabled: DesktopVm.file-path != "";
                 clicked => {
                     DesktopVm.send-file();
@@ -865,23 +867,26 @@ export component DesktopScreen inherits Rectangle {
             height: lk.preferred-height + 2 * Tokens.sp-3;
             accessible-role: AccessibleRole.text;
             accessible-label: "Link " + DesktopVm.link-prefix + DesktopVm.link-host + DesktopVm.link-rest;
-            lk := HorizontalLayout {
+            lk := VerticalLayout {
                 x: Tokens.sp-3;
                 y: Tokens.sp-3;
                 width: parent.width - 2 * Tokens.sp-3;
-                Text {
-                    text: DesktopVm.link-prefix;
-                    color: Tokens.text-2;
-                    font-family: Tokens.font-mono;
-                    font-size: Tokens.fs-sm;
-                }
+                HorizontalLayout {
+                    alignment: start;
+                    Text {
+                        text: DesktopVm.link-prefix;
+                        color: Tokens.text-2;
+                        font-family: Tokens.font-mono;
+                        font-size: Tokens.fs-sm;
+                    }
 
-                Text {
-                    text: DesktopVm.link-host;
-                    color: Tokens.text;
-                    font-family: Tokens.font-mono;
-                    font-size: Tokens.fs-sm;
-                    font-weight: 700;
+                    Text {
+                        text: DesktopVm.link-host;
+                        color: Tokens.text;
+                        font-family: Tokens.font-mono;
+                        font-size: Tokens.fs-sm;
+                        font-weight: 700;
+                    }
                 }
 
                 Text {
@@ -889,7 +894,7 @@ export component DesktopScreen inherits Rectangle {
                     color: Tokens.text-2;
                     font-family: Tokens.font-mono;
                     font-size: Tokens.fs-sm;
-                    overflow: elide;
+                    wrap: word-wrap;
                 }
             }
         }

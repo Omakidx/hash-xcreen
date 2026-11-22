@@ -38,7 +38,9 @@ pub fn classify(raw: &str) -> Result<Link, Refusal> {
     if s.is_empty() || s.len() > MAX_LINK {
         return Err(Refusal::Malformed);
     }
-    if s.chars().any(|c| c.is_control() || c.is_whitespace() || !c.is_ascii()) {
+    if s.chars()
+        .any(|c| c.is_control() || c.is_whitespace() || !c.is_ascii())
+    {
         return Err(Refusal::Malformed);
     }
     let lower = s.to_ascii_lowercase();
@@ -131,7 +133,10 @@ mod tests {
         assert_eq!(classify("https://h\u{202e}x/"), Err(Refusal::Malformed));
         assert_eq!(classify("https://-oProxy/"), Err(Refusal::Malformed));
         assert_eq!(classify("https:///x"), Err(Refusal::Malformed));
-        assert_eq!(classify(&format!("https://a/{}", "x".repeat(MAX_LINK))), Err(Refusal::Malformed));
+        assert_eq!(
+            classify(&format!("https://a/{}", "x".repeat(MAX_LINK))),
+            Err(Refusal::Malformed)
+        );
     }
 
     #[test]

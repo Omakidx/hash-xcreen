@@ -20,7 +20,11 @@ pub enum SendCheck {
 
 /// A sender must not open a transfer above the effective limit.
 pub fn check_send(size: u64, limit: u64) -> SendCheck {
-    let limit = if limit == 0 { MAX_FILE } else { limit.min(MAX_FILE) };
+    let limit = if limit == 0 {
+        MAX_FILE
+    } else {
+        limit.min(MAX_FILE)
+    };
     if size > limit {
         SendCheck::TooLarge { limit }
     } else {
@@ -149,7 +153,10 @@ mod tests {
     fn limit_check_uses_the_lower_value_and_the_ceiling() {
         assert_eq!(check_send(10, 0), SendCheck::Ok);
         assert_eq!(check_send(MAX_FILE, 0), SendCheck::Ok);
-        assert_eq!(check_send(MAX_FILE + 1, 0), SendCheck::TooLarge { limit: MAX_FILE });
+        assert_eq!(
+            check_send(MAX_FILE + 1, 0),
+            SendCheck::TooLarge { limit: MAX_FILE }
+        );
         assert_eq!(check_send(101, 100), SendCheck::TooLarge { limit: 100 });
         assert_eq!(check_send(1, u64::MAX), SendCheck::Ok);
         assert_eq!(check_send(0, 1), SendCheck::Ok);

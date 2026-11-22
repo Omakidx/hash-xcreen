@@ -183,6 +183,14 @@ component CopyBlock inherits Card {
 
 export component WizardScreen inherits Rectangle {
     background: Tokens.bg;
+    FocusScope {
+        key-pressed(e) => {
+            if (e.text == Key.Escape) {
+                WizardVm.back();
+                return accept;
+            }
+            reject
+        }
     VerticalLayout {
         AppBar {
             title: "hash-xcreen";
@@ -198,6 +206,7 @@ export component WizardScreen inherits Rectangle {
                     vertical-stretch: 1;
                     VerticalLayout {
                         padding: Tokens.sp-6;
+                max-width: 680px;
                         padding-bottom: Tokens.sp-4;
                         spacing: Tokens.sp-4;
                         alignment: start;
@@ -984,5 +993,6 @@ export component WizardScreen inherits Rectangle {
                 }
             }
         }
+    }
     }
 }

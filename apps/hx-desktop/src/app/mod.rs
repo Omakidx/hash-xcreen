@@ -118,7 +118,9 @@ impl App {
             Some(d) => ServerStore::open(d.join("servers.json")),
             None => Ok(ServerStore::in_memory(cfg.seed.clone())),
         };
-        let hosts = known_hosts::KnownHosts::open(cfg.config_dir.as_ref().map(|d| d.join("known_hosts.json")));
+        let hosts = known_hosts::KnownHosts::open(
+            cfg.config_dir.as_ref().map(|d| d.join("known_hosts.json")),
+        );
         let (key, store, fatal) = match (key, store) {
             (Ok(k), Ok(s)) => (Some(k), Some(s), None),
             (Err(e), _) => (
@@ -136,7 +138,9 @@ impl App {
                 None,
                 Some((
                     "The server list could not be read".to_owned(),
-                    format!("{e}. The file was left as it is. Fix or move it, then open the app again."),
+                    format!(
+                        "{e}. The file was left as it is. Fix or move it, then open the app again."
+                    ),
                 )),
             ),
         };
@@ -192,7 +196,10 @@ impl App {
         let ui = self.ui();
         let nav = ui.global::<Nav>();
         nav.set_title(ss(match s {
-            Screen::Desktop => format!("{} - hx-desktop", ui.global::<DesktopVm>().get_server_name()),
+            Screen::Desktop => format!(
+                "{} - hx-desktop",
+                ui.global::<DesktopVm>().get_server_name()
+            ),
             _ => "hx-desktop".to_owned(),
         }));
         nav.set_screen(s);
@@ -239,7 +246,11 @@ impl App {
     /// The clipboard policy from the settings.
     pub fn clip_policy(&self) -> crate::clipboard::Policy {
         let p = self.prefs.borrow();
-        crate::clipboard::Policy { send: p.clip_send, receive: p.clip_receive, files: p.clip_files }
+        crate::clipboard::Policy {
+            send: p.clip_send,
+            receive: p.clip_receive,
+            files: p.clip_files,
+        }
     }
 
     /// Sets the local clipboard text (through the window's hidden text input).
@@ -291,11 +302,11 @@ fn wire_settings(app: &Rc<App>) {
     let a = app.clone();
     s.on_done(move || a.show_home());
     let a = app.clone();
-    ui.global::<HomeVm>().on_open_settings(move || a.go(Screen::Settings));
+    ui.global::<HomeVm>()
+        .on_open_settings(move || a.go(Screen::Settings));
 }
 
 /// Collects a model into a vec.
 pub(crate) fn to_vec<T: Clone + 'static>(m: ModelRc<T>) -> Vec<T> {
     m.iter().collect()
 }
-

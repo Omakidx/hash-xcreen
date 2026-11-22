@@ -6,6 +6,14 @@ import { ConnectVm } from "state.slint";
 
 export component ConnectScreen inherits Rectangle {
     background: Tokens.bg;
+    FocusScope {
+        key-pressed(e) => {
+            if (e.text == Key.Escape) {
+                ConnectVm.cancel();
+                return accept;
+            }
+            reject
+        }
     VerticalLayout {
         AppBar {
             crumb: "Servers  /  " + ConnectVm.server-name + "  /  Connect";
@@ -316,5 +324,6 @@ export component ConnectScreen inherits Rectangle {
                 }
             }
         }
+    }
     }
 }

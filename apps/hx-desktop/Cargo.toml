@@ -44,7 +44,7 @@ slint-build = "=1.19.0"
 [dev-dependencies]
 # The ignored end-to-end test (tests/session_e2e.rs) reuses the relay harness of hx-agent.
 hmac = "0.12"
-hx-agent = { path = "../hx-agent", features = ["test-support", "gateway-test-hooks", "install-test-hooks"] }
+hx-agent = { path = "../hx-agent", version = "0.1.0", features = ["test-support", "gateway-test-hooks", "install-test-hooks"] }
 hx-capture.workspace = true
 hx-ipc = { workspace = true, features = ["privd", "link"] }
 hx-session.workspace = true
