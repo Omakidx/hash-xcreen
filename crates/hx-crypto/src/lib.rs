@@ -21,6 +21,7 @@
 
 pub mod auth;
 pub mod clock;
+pub mod device_admin;
 mod encoding;
 pub mod error;
 #[cfg(feature = "fuzzing")]
@@ -29,6 +30,7 @@ pub mod keys;
 pub mod pairing;
 pub mod pin;
 pub mod registry;
+pub mod reinstate_client;
 pub mod secrets;
 pub mod session;
 pub mod setup;
