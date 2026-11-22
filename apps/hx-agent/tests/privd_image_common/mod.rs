@@ -363,10 +363,16 @@ impl Systemd for FakeImageSystemd {
     fn stop_image_job<'a>(&'a self, job: &'a ImageJob) -> BoxFut<'a, ()> {
         Box::pin(async move {
             self.fetcher.stopped.lock().unwrap().push(job.instance());
-            let state = self.fetcher.runs.lock().unwrap().get(&job.instance()).map(|r| {
-                r.stop.store(true, Ordering::SeqCst);
-                r.state.clone()
-            });
+            let state = self
+                .fetcher
+                .runs
+                .lock()
+                .unwrap()
+                .get(&job.instance())
+                .map(|r| {
+                    r.stop.store(true, Ordering::SeqCst);
+                    r.state.clone()
+                });
             // `systemctl stop` returns when the unit has ended: so does this.
             if let Some(state) = state {
                 for _ in 0..1000 {

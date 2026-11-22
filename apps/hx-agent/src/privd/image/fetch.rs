@@ -572,19 +572,21 @@ impl<'a> Fetch<'a> {
         }
         // The unit ends after the last marker: wait for it, then check what else is there.
         let ended = Instant::now();
-        while !unit_done {
-            match self.deps.systemd.image_job_state(job).await {
-                Ok(JobState::Succeeded) => break,
-                Ok(JobState::Failed) | Err(_) => {
-                    return Err(ImgErr::Job("the image download failed".into()));
+        if !unit_done {
+            loop {
+                match self.deps.systemd.image_job_state(job).await {
+                    Ok(JobState::Succeeded) => break,
+                    Ok(JobState::Failed) | Err(_) => {
+                        return Err(ImgErr::Job("the image download failed".into()));
+                    }
+                    Ok(JobState::Running) => {}
                 }
-                Ok(JobState::Running) => {}
+                if ended.elapsed() >= self.cfg.end_wait {
+                    return Err(ImgErr::Job("the image fetcher did not end".into()));
+                }
+                self.pause(self.cfg.poll.max(Duration::from_millis(5)))
+                    .await?;
             }
-            if ended.elapsed() >= self.cfg.end_wait {
-                return Err(ImgErr::Job("the image fetcher did not end".into()));
-            }
-            self.pause(self.cfg.poll.max(Duration::from_millis(5)))
-                .await?;
         }
         let k_end =
             u32::try_from(n_chunks).map_err(|_| ImgErr::Refused("too many chunks".into()))?;

@@ -235,7 +235,7 @@ pub fn verdict(size: u64, p: &ProbeResult) -> Verdict {
         return Verdict::ProbeFailed;
     };
     if r == 0 || u128::from(size) > u128::from(MAX_DOWNLOAD_SECS) * u128::from(r) {
-        return Verdict::TooSlow(if r == 0 { u64::MAX } else { size / r });
+        return Verdict::TooSlow(size.checked_div(r).unwrap_or(u64::MAX));
     }
     if let Some(m) = p.mirror_bps
         && u128::from(r) * MIRROR_RATIO_DEN < u128::from(m) * MIRROR_RATIO_NUM

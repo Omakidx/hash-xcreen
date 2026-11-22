@@ -452,7 +452,7 @@ pub(super) fn get_with(
 ) -> Result<Got, FetchError> {
     let mut url = url.clone();
     for _ in 0..=MAX_REDIRECTS {
-        if !opts.hosts.iter().any(|h| *h == url.host) {
+        if !opts.hosts.contains(&url.host) {
             return Err(FetchError::Refused(format!(
                 "`{}` is not an allowed host",
                 url.host

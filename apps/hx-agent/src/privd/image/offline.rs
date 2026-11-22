@@ -113,6 +113,10 @@ impl ImportDir {
         if entry.size > MAX_IMAGE_BYTES {
             return Err(refused("the entry announces more than 4 GiB"));
         }
+        crate::privd::update::fetchdir::ensure_dir(&cfg.staging_dir, 0o700).map_err(|e| {
+            log::error(&format!("staging directory: {e}"));
+            CmdError::internal("privd's staging directory is not usable")
+        })?;
         let (dir, name, size, staging) = (
             self.dir.clone(),
             name.to_string(),
