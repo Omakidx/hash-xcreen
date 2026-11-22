@@ -164,7 +164,7 @@ flowchart LR
 
 ### 1E — Installer
 - [x] `install.sh`: preflight, download, minisign verification (current and next key), hand-off to the agent
-- [ ] All options from architecture §5.2; `--interactive` mode with pairing code (implemented and tested against a simulated host; `--ssh` ran for real. Still to run on a real host: `--interactive`, `--docker` and hosts that need Zabbly, whose apt key is not provisioned yet)
+- [ ] All options from architecture §5.2; `--interactive` mode with pairing code (implemented and tested against a simulated host; `--ssh` ran for real. Still to run on a real host: `--interactive`, `--docker`, and a host that needs Zabbly, now that its pinned apt key is embedded)
 - [x] Idempotent stages with resume; `hx-agent uninstall` (resume after every stage, a no-op re-run and both uninstall modes run for real in a nested Incus container on Ubuntu 24.04 and Debian 13: docs/spikes/1e-installer-nested-incus.md)
 - [ ] Installer CI: fresh VM per host OS × both image paths
 
