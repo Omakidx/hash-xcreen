@@ -1,0 +1,247 @@
+name: Desktop packages
+
+# Builds the hx-desktop .deb (one per distro) and the AppImage on every pull request that can change
+# them, and smoke-tests each in a clean container. Nothing here is signed or published: release.yml
+# builds the same packages with the same scripts (packaging/hx-desktop/) for a release.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/hx-desktop/**"
+      - "packaging/hx-desktop/**"
+      # the app's workspace dependencies and the lockfile
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/desktop-packages.yml"
+  pull_request:
+    paths:
+      - "apps/hx-desktop/**"
+      - "packaging/hx-desktop/**"
+      # the app's workspace dependencies and the lockfile
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/desktop-packages.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-packages-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # rustup itself is pinned, as in release.yml (the toolchain is pinned by rust-toolchain.toml)
+  RUSTUP_VERSION: "1.29.3"
+  RUSTUP_SHA256: "b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55"
+
+jobs:
+  deb:
+    name: .deb build (${{ matrix.distro }})
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
+    # ubuntu-26.04 ships FFmpeg 8 and the workspace pins ffmpeg-next 7.1 (FFmpeg up to 7.1): a
+    # KNOWN GAP (packaging/hx-desktop/README.md). The cell stays visible and does not block.
+    continue-on-error: ${{ matrix.known_gap }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { distro: ubuntu-24.04, image: "ubuntu:24.04", known_gap: false }
+          - { distro: ubuntu-26.04, image: "ubuntu:26.04", known_gap: true }
+          - { distro: debian-12, image: "debian:12", known_gap: false }
+          - { distro: debian-13, image: "debian:13", known_gap: false }
+    steps:
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          # dpkg-dev: dpkg-shlibdeps and dpkg-deb. The FFmpeg dev packages are this distro's own:
+          # ffmpeg-sys-next links them through pkg-config and generates its bindings with libclang.
+          apt-get install -y --no-install-recommends ca-certificates curl git build-essential clang libclang-dev pkg-config dpkg-dev \
+            libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libx264-dev
+          # the metadata checks run on the one distro whose tools are new enough (AppStream 1.0)
+          if [ "${{ matrix.distro }}" = ubuntu-24.04 ]; then
+            apt-get install -y --no-install-recommends appstream desktop-file-utils
+          fi
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install rustup (pinned) and the pinned toolchain
+        run: |
+          set -eu
+          curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/rustup-init \
+            "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init"
+          echo "${RUSTUP_SHA256}  /tmp/rustup-init" | sha256sum -c -
+          chmod +x /tmp/rustup-init
+          /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain none
+          . "$HOME/.cargo/env"
+          rustup toolchain install
+          echo "$HOME/.cargo/bin" >>"$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: desktop-deb-${{ matrix.distro }}
+      - name: Build hx-desktop (release)
+        run: cargo build --release --locked -p hx-desktop --bin hx-desktop
+      - name: Build the .deb twice, the builds must be identical
+        env:
+          DISTRO: ${{ matrix.distro }}
+        run: |
+          set -eu
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          sde=$(git show -s --format=%ct HEAD)
+          for n in 1 2; do
+            sh packaging/hx-desktop/build-deb.sh --distro "$DISTRO" --bin target/release/hx-desktop \
+              --out "out/$n" --source-date-epoch "$sde"
+          done
+          cmp out/1/hx-desktop.deb out/2/hx-desktop.deb
+          mkdir -p "out/$DISTRO"
+          mv out/1/hx-desktop.deb "out/$DISTRO/hx-desktop.deb"
+          dpkg-deb -I "out/$DISTRO/hx-desktop.deb"
+          dpkg-deb -c "out/$DISTRO/hx-desktop.deb"
+      - name: The .deb has the expected contents and metadata
+        env:
+          DISTRO: ${{ matrix.distro }}
+        run: |
+          set -eu
+          deb="out/$DISTRO/hx-desktop.deb"
+          app=io.github.omakidx.hashxcreen
+          list=$(dpkg-deb -c "$deb")
+          for p in ./usr/bin/hx-desktop ./usr/share/applications/$app.desktop ./usr/share/metainfo/$app.metainfo.xml \
+              ./usr/share/icons/hicolor/scalable/apps/$app.svg ./usr/share/icons/hicolor/256x256/apps/$app.png \
+              ./usr/share/doc/hx-desktop/copyright; do
+            printf '%s\n' "$list" | grep -q " $p\$" || { echo "::error::$p is not in the .deb"; exit 1; }
+          done
+          # root-owned, and no setuid or setgid bit anywhere
+          if printf '%s\n' "$list" | awk '{print $2}' | grep -vq '^root/root$'; then echo "::error::a file is not root/root"; exit 1; fi
+          if printf '%s\n' "$list" | awk '{print $1}' | grep -q '^-.*[sS]'; then echo "::error::a setuid or setgid file"; exit 1; fi
+          dpkg-deb -f "$deb" Depends | tee /dev/stderr | grep -q libavcodec
+          if [ "$DISTRO" = ubuntu-24.04 ]; then
+            dpkg-deb -x "$deb" x
+            desktop-file-validate "x/usr/share/applications/$app.desktop"
+            appstreamcli validate --no-net "x/usr/share/metainfo/$app.metainfo.xml"
+            # the app id the window sets must be the one the desktop file and metainfo name
+            grep -q "^StartupWMClass=$app\$" "x/usr/share/applications/$app.desktop"
+            if ! grep -aq "$app" x/usr/bin/hx-desktop; then
+              echo "::error::hx-desktop does not contain its app id $app (slint::set_xdg_app_id is not called); StartupWMClass would not match the window"
+              exit 1
+            fi
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: desktop-deb-${{ matrix.distro }}
+          path: out/${{ matrix.distro }}/hx-desktop.deb
+          if-no-files-found: error
+
+  deb-smoke:
+    name: .deb smoke test (${{ matrix.distro }})
+    needs: deb
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
+    continue-on-error: ${{ matrix.known_gap }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { distro: ubuntu-24.04, image: "ubuntu:24.04", known_gap: false }
+          - { distro: ubuntu-26.04, image: "ubuntu:26.04", known_gap: true }
+          - { distro: debian-12, image: "debian:12", known_gap: false }
+          - { distro: debian-13, image: "debian:13", known_gap: false }
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: desktop-deb-${{ matrix.distro }}
+      - name: Install in a clean container and resolve every library
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -eu
+          apt-get update
+          # no recommends: Depends alone must be enough to start the app
+          apt-get install -y --no-install-recommends ./hx-desktop.deb
+          ldd /usr/bin/hx-desktop
+          if ldd /usr/bin/hx-desktop | grep -q 'not found'; then echo "::error::unresolved library in hx-desktop"; exit 1; fi
+          test "$(stat -c '%U:%G %a' /usr/bin/hx-desktop)" = "root:root 755"
+      - name: Install Xvfb and git, check out the smoke scripts
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: apt-get install -y --no-install-recommends xvfb xauth ca-certificates git
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run the installed app headless (--version, then --demo under Xvfb)
+        run: |
+          set -eu
+          ver=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version *= *"\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          sh packaging/hx-desktop/smoke-run.sh "$ver" hx-desktop
+
+  appimage:
+    name: AppImage build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - name: Install build dependencies
+        # The AppImage is built on 24.04, the oldest supported glibc, and bundles this FFmpeg 6.1.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev pkg-config libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libx264-dev xvfb xauth
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: desktop-appimage
+      - name: Build hx-desktop (release)
+        run: cargo build --release --locked -p hx-desktop --bin hx-desktop
+      - name: Build the AppImage twice, the builds must be identical (tools verified against appimage-tools.lock)
+        run: |
+          set -eu
+          sde=$(git show -s --format=%ct HEAD)
+          for d in out out-again; do
+            sh packaging/hx-desktop/build-appimage.sh --bin target/release/hx-desktop --out "$d" \
+              --tools-dir "$RUNNER_TEMP/appimage-tools" --source-date-epoch "$sde"
+          done
+          cmp out/*.AppImage out-again/*.AppImage
+          ls -l out
+      - name: Smoke test (extract, files, libraries, --version, --demo under Xvfb)
+        run: |
+          set -eu
+          ver=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version *= *"\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          sh packaging/hx-desktop/smoke-appimage.sh "out/hx-desktop-$ver-x86_64.AppImage" "$ver"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: desktop-appimage
+          path: out/*.AppImage
+          if-no-files-found: error
+
+  appimage-smoke:
+    name: AppImage on a clean ${{ matrix.image }}
+    needs: appimage
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Debian 13 and Ubuntu 26.04 have a different FFmpeg (or none installed): the AppImage
+        # must run on the one it bundles. Only the display libraries a desktop has are installed.
+        image: ["ubuntu:24.04", "ubuntu:26.04", "debian:13"]
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: desktop-appimage
+          path: img
+      - name: Install what a desktop provides, plus Xvfb and git
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git xvfb xauth \
+            libegl1 libxkbcommon0 libxkbcommon-x11-0 libwayland-client0 libx11-6 libxcb1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Smoke test
+        run: |
+          set -eu
+          ver=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version *= *"\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          chmod +x img/*.AppImage
+          sh packaging/hx-desktop/smoke-appimage.sh "img/hx-desktop-$ver-x86_64.AppImage" "$ver"
