@@ -636,6 +636,14 @@ pub struct PairedServer {
 }
 
 impl PairedServer {
+    /// The protocol version agreed on this pairing connection (the lower of both sides'). It is
+    /// only available after the SPAKE2 confirmation succeeded, so it is trustworthy. Store it
+    /// with the server and pass it as `confirmed_server_version` to the setup and reinstate
+    /// clients: they refuse to send a 1.3 intent to a server that did not show 1.3 here.
+    pub fn server_version(&self) -> hx_proto::version::ProtocolVersion {
+        self.connection.negotiated().version
+    }
+
     /// Close the pairing connection normally.
     pub async fn finish(self) {
         self.connection.close(CloseCode::NoError, "paired").await;

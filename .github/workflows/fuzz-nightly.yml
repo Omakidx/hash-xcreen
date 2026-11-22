@@ -104,7 +104,9 @@ jobs:
 
       - name: Build the target
         working-directory: fuzz
-        run: cargo fuzz build ${{ matrix.target }}
+        # cargo-fuzz defaults to the target it was itself built for; the prebuilt one from
+        # install-action is musl, where the address sanitizer cannot work. Name the target.
+        run: cargo fuzz build --target x86_64-unknown-linux-gnu ${{ matrix.target }}
 
       - name: Fuzz
         id: run
@@ -127,7 +129,7 @@ jobs:
           if [ -f "dicts/$TARGET.dict" ]; then dict=("-dict=dicts/$TARGET.dict"); fi
           start=$(date +%s)
           set +e
-          cargo fuzz run "$TARGET" "corpus/$TARGET" "seeds/$TARGET" -- \
+          cargo fuzz run --target x86_64-unknown-linux-gnu "$TARGET" "corpus/$TARGET" "seeds/$TARGET" -- \
             -max_total_time="$seconds" -max_len="$MAX_LEN" -timeout=20 -rss_limit_mb=2048 \
             -print_final_stats=1 "${dict[@]}" 2>&1 | tee "../fuzz-$TARGET.log"
           status=${PIPESTATUS[0]}
@@ -176,7 +178,7 @@ jobs:
           retention-days: 30
 
       # The reproducer of a crash, a hang or an out-of-memory: run it with
-      #   cargo fuzz run <target> <file>
+      #   cargo fuzz run --target x86_64-unknown-linux-gnu <target> <file>
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: failure()
         with:
@@ -194,7 +196,7 @@ jobs:
         working-directory: fuzz
         env:
           TARGET: ${{ matrix.target }}
-        run: timeout 300 cargo fuzz cmin "$TARGET" "corpus/$TARGET"
+        run: timeout 300 cargo fuzz cmin --target x86_64-unknown-linux-gnu "$TARGET" "corpus/$TARGET"
 
   verdict:
     name: Night verdict
