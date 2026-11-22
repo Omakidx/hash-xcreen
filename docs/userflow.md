@@ -83,7 +83,7 @@ The one-liner installs only the **agent**. Everything about the desktop (distro,
 | Pairing fails (wrong, expired or already used token) | "Wrong or expired token, or the connection is being intercepted" and **Generate a new token** |
 | Setup fails (for example not enough disk, a build step, the rate limit) | The failing stage, the reason and **Retry**. Retry starts a new job and sends the password again; if the app was closed since, it asks for the account password again (the PIN is already set and is kept) |
 | Not enough setup time left (less than 50 minutes in the server's 2-hour setup window) | "The setup window on the server is nearly over" and the command to run on the server, `sudo hx-agent setup extend`, then **Try again** |
-| The server's agent is too old to be set up from the app | "This server must be updated before the app can set it up", with the way to update it |
+| The server's agent is too old to be set up from the app | "This server must be updated before the app can set it up", and the commands to run on the server: `sudo hx-agent update check`, then `sudo hx-agent update apply <version>` |
 | The setup window has closed, or setup was already finished | The app does not offer setup and goes to the normal **PIN** screen |
 | Another device paired first with the same token | The app's pairing fails as above; the user reruns the one-liner for a fresh token. The device that won is listed by `hx-agent devices` |
 
