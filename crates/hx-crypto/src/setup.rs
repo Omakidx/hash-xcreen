@@ -149,7 +149,10 @@ pub async fn connect_setup(
     server_key: PublicKey,
     opts: &SetupConnectOptions,
 ) -> Result<SetupAuth> {
-    if !opts.confirmed_server_version.is_some_and(server_supports_setup) {
+    if !opts
+        .confirmed_server_version
+        .is_some_and(server_supports_setup)
+    {
         return Err(Error::UpdateRequired);
     }
     let mut transport = opts.transport.clone();
@@ -348,7 +351,7 @@ impl SetupSession {
     /// `INVALID_ARGUMENT`, ...).
     pub async fn set_pin(&mut self, pin: &Pin) -> Result<pb::SetupAck> {
         let body = pb::setup_message::Body::SetPin(pb::SetupSetPin {
-            pin: pin.as_bytes().to_vec(),
+            pin: bytes::Bytes::copy_from_slice(pin.as_bytes()),
         });
         self.request(body).await
     }
@@ -357,7 +360,7 @@ impl SetupSession {
     pub async fn start(&mut self, opts: pb::SetupOptions, pw: &Password) -> Result<pb::SetupAck> {
         let body = pb::setup_message::Body::Start(pb::SetupStart {
             options: Some(opts),
-            password: pw.as_bytes().to_vec(),
+            password: bytes::Bytes::copy_from_slice(pw.as_bytes()),
         });
         self.request(body).await
     }
@@ -522,15 +525,62 @@ fn map_transport(e: hx_transport::Error) -> Error {
     }
 }
 
+/// Zero a `Bytes` buffer if this is its only owner (otherwise a clone still holds it and the
+/// buffer is merely released).
+fn wipe(b: &mut bytes::Bytes) {
+    if let Ok(mut m) = std::mem::take(b).try_into_mut() {
+        m.as_mut().zeroize();
+    }
+}
+
 /// Overwrite the secret bytes of a message that was just sent (PIN, password, auth envelope).
 pub(crate) fn scrub_control(m: &mut pb::ControlMessage) {
     match &mut m.message {
         Some(Ctl::Setup(s)) => match &mut s.body {
-            Some(pb::setup_message::Body::SetPin(p)) => p.pin.zeroize(),
-            Some(pb::setup_message::Body::Start(st)) => st.password.zeroize(),
+            Some(pb::setup_message::Body::SetPin(p)) => wipe(&mut p.pin),
+            Some(pb::setup_message::Body::Start(st)) => wipe(&mut st.password),
             _ => {}
         },
-        Some(Ctl::Auth(o) | Ctl::Pairing(o)) => o.data.zeroize(),
+        Some(Ctl::Auth(o) | Ctl::Pairing(o)) => wipe(&mut o.data),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scrubbing_empties_the_secret_fields_of_a_sent_message() {
+        let mut m = pb::ControlMessage::new(Ctl::Setup(pb::SetupMessage {
+            request_id: 3,
+            body: Some(pb::setup_message::Body::Start(pb::SetupStart {
+                options: None,
+                password: bytes::Bytes::copy_from_slice(b"hunter2"),
+            })),
+        }));
+        scrub_control(&mut m);
+        let Some(Ctl::Setup(s)) = m.message else {
+            panic!("setup")
+        };
+        let Some(pb::setup_message::Body::Start(st)) = s.body else {
+            panic!("start")
+        };
+        assert!(st.password.is_empty());
+
+        let mut a = pb::ControlMessage::new(Ctl::Setup(pb::SetupMessage {
+            request_id: 4,
+            body: Some(pb::setup_message::Body::SetPin(pb::SetupSetPin {
+                pin: bytes::Bytes::copy_from_slice(b"482913"),
+            })),
+        }));
+        scrub_control(&mut a);
+        let Some(Ctl::Setup(s)) = a.message else {
+            panic!("setup")
+        };
+        let Some(pb::setup_message::Body::SetPin(p)) = s.body else {
+            panic!("pin")
+        };
+        assert!(p.pin.is_empty());
     }
 }

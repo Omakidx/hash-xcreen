@@ -126,7 +126,10 @@ pub async fn connect_reinstate(
     server_key: PublicKey,
     opts: &ReinstateOptions,
 ) -> Result<ReinstateConnect> {
-    if !opts.confirmed_server_version.is_some_and(server_supports_setup) {
+    if !opts
+        .confirmed_server_version
+        .is_some_and(server_supports_setup)
+    {
         return Err(Error::UpdateRequired);
     }
     let mut transport = opts.transport.clone();
@@ -156,9 +159,7 @@ pub async fn connect_reinstate(
         return Err(Error::InvalidKey);
     }
     if !server_supports_setup(connection.negotiated().version) {
-        connection
-            .close(CloseCode::NoError, "server too old")
-            .await;
+        connection.close(CloseCode::NoError, "server too old").await;
         return Err(Error::UpdateRequired);
     }
     let first = match tokio::time::timeout(opts.reply_timeout, connection.recv_control()).await {

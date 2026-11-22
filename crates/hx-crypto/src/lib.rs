@@ -21,8 +21,8 @@
 
 pub mod auth;
 pub mod clock;
-mod encoding;
 pub mod device_admin;
+mod encoding;
 pub mod error;
 #[cfg(feature = "fuzzing")]
 pub mod fuzz;

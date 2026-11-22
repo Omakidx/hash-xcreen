@@ -49,8 +49,7 @@ impl fmt::Debug for PairingCodeIssued {
     }
 }
 
-/// What the server's answer means. Isolated here so the wire fields (`status`,
-/// `retry_after_s`, §5.9) are read in one place.
+/// What the server's answer means (`status` and `retry_after_s`, §5.9).
 enum Reply {
     Issued,
     RateLimited(Duration),
@@ -58,11 +57,18 @@ enum Reply {
     Failed,
 }
 
-fn classify(c: &pb::PairingCodeIssued) -> Reply {
-    // PROTO GAP: `PairingCodeIssued` on this branch has no `status` / `retry_after_s` yet
-    // (protocol §5.9 defines fields 3 and 4). Until it does, every answer is an issued code.
-    let _ = c;
-    Reply::Issued
+fn classify(c: &pb::PairingCodeIssued) -> Result<Reply> {
+    match pb::PairingCodeStatus::try_from(c.status) {
+        Ok(pb::PairingCodeStatus::Ok) => Ok(Reply::Issued),
+        Ok(pb::PairingCodeStatus::RateLimited) => Ok(Reply::RateLimited(Duration::from_secs(
+            u64::from(c.retry_after_s),
+        ))),
+        Ok(pb::PairingCodeStatus::InvalidArgument) => Ok(Reply::InvalidArgument),
+        Ok(pb::PairingCodeStatus::Failed) => Ok(Reply::Failed),
+        Ok(pb::PairingCodeStatus::Unspecified) | Err(_) => {
+            Err(Error::Protocol("unknown pairing code status"))
+        }
+    }
 }
 
 /// Device management on an authorized session.
@@ -75,12 +81,15 @@ pub struct DeviceAdmin {
 }
 
 impl DeviceAdmin {
-    /// Wrap an authorized connection. Fails with [`Error::UpdateRequired`] if the negotiated
-    /// minor is below 3 or `DEVICE_MANAGEMENT` was not negotiated, and with a protocol error
-    /// if the connection is not authorized (a restricted connection never carries the call).
+    /// Wrap an authorized connection (get it from [`crate::AwaitingPin::into_connection`],
+    /// which refuses until the PIN was accepted: a client cannot see the server's restriction
+    /// itself, and a server answers the call on a restricted connection with a
+    /// `PROTOCOL_ERROR` close). Fails with [`Error::UpdateRequired`] if the negotiated minor
+    /// is below 3 or `DEVICE_MANAGEMENT` was not negotiated, and with a protocol error for a
+    /// control-only (setup) connection.
     pub fn new(connection: Connection) -> Result<Self> {
-        if !connection.is_authorized() || connection.is_control_only() {
-            return Err(Error::Protocol("the session is not authorized"));
+        if connection.is_control_only() {
+            return Err(Error::Protocol("not a session connection"));
         }
         let n = connection.negotiated();
         if !server_supports_setup(n.version) || !n.features.contains(Features::DEVICE_MANAGEMENT) {
@@ -107,7 +116,9 @@ impl DeviceAdmin {
     /// expiry. A new code replaces the previous one at once.
     pub async fn create_pairing_code(&mut self, expires_in_s: u32) -> Result<PairingCodeIssued> {
         if !(MIN_PAIRING_CODE_TTL_S..=MAX_PAIRING_CODE_TTL_S).contains(&expires_in_s) {
-            return Err(Error::InvalidSecret("pairing code lifetime must be 60 to 900 s"));
+            return Err(Error::InvalidSecret(
+                "pairing code lifetime must be 60 to 900 s",
+            ));
         }
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
@@ -128,15 +139,15 @@ impl DeviceAdmin {
             };
             match d.body {
                 Some(pb::device_mgmt::Body::PairingCodeIssued(c)) if d.request_id == id => {
-                    return match classify(&c) {
+                    return match classify(&c)? {
                         Reply::Issued => Ok(PairingCodeIssued {
                             code: Zeroizing::new(c.code),
                             expires_at_unix: c.expires_at_unix,
                         }),
                         Reply::RateLimited(retry_after) => Err(Error::RateLimited { retry_after }),
-                        Reply::InvalidArgument => {
-                            Err(Error::InvalidSecret("the server rejected the code lifetime"))
-                        }
+                        Reply::InvalidArgument => Err(Error::InvalidSecret(
+                            "the server rejected the code lifetime",
+                        )),
                         Reply::Failed => Err(Error::ServerFailed),
                     };
                 }
