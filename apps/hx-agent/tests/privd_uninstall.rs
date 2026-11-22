@@ -260,7 +260,7 @@ async fn keep_mode_removes_only_the_session_link_and_leaves_everything_else() {
     let st = state_file(&w).expect("uninstall-state");
     assert_eq!(st.mode, UninstallMode::Keep);
     assert!(st.privd_done);
-    assert_eq!(st.done, ["session_links"]);
+    assert_eq!(st.done, ["session_links", "images"]);
 }
 
 #[tokio::test]
@@ -342,6 +342,7 @@ async fn destroy_mode_removes_the_desktop_the_host_objects_and_the_firewall() {
         st.done,
         [
             "session_links",
+            "images",
             "desktops",
             "host_objects",
             "nft_table",
@@ -771,7 +772,7 @@ async fn resume_after_the_host_objects_step_failed() {
         &w,
         |w| w.h.incus.with(|s| s.down = true),
         |w| w.h.incus.with(|s| s.down = false),
-        &["session_links", "desktops"],
+        &["session_links", "images", "desktops"],
         ErrorDetail::Unspecified,
         &[],
     )
@@ -785,7 +786,7 @@ async fn resume_after_the_nft_table_could_not_be_deleted() {
         &w,
         |w| w.host.lock().unwrap().fail_nft_delete = true,
         |w| w.host.lock().unwrap().fail_nft_delete = false,
-        &["session_links", "desktops", "host_objects"],
+        &["session_links", "images", "desktops", "host_objects"],
         ErrorDetail::Nft,
         &["desktop:main", "pool:hx-pool", "network:hxbr0"],
     )
@@ -804,7 +805,7 @@ async fn resume_after_the_ruleset_file_could_not_be_removed() {
             std::fs::create_dir(&fw).unwrap();
         },
         |_| std::fs::remove_dir(&fw).unwrap(),
-        &["session_links", "desktops", "host_objects", "nft_table"],
+        &["session_links", "images", "desktops", "host_objects", "nft_table"],
         ErrorDetail::Unspecified,
         &["nft-table:inet hx", "desktop:main"],
     )
@@ -820,6 +821,7 @@ async fn resume_after_a_docker_user_rule_could_not_be_deleted() {
         |w| w.host.lock().unwrap().fail_iptables_delete = false,
         &[
             "session_links",
+            "images",
             "desktops",
             "host_objects",
             "nft_table",
@@ -844,6 +846,7 @@ async fn resume_after_the_sysctl_file_could_not_be_removed() {
         |_| std::fs::remove_dir(&sysctl).unwrap(),
         &[
             "session_links",
+            "images",
             "desktops",
             "host_objects",
             "nft_table",

@@ -90,6 +90,8 @@ pub struct FakeProbe {
     pub incus_free: Option<u64>,
     /// Whether the sysctls are in place.
     pub sysctl_ok: bool,
+    /// What `image_space` answers: `None` means unreadable, so the disk rule fails closed.
+    pub image_space: Option<super::probe::ImageSpace>,
 }
 
 impl Default for FakeProbe {
@@ -102,6 +104,11 @@ impl Default for FakeProbe {
             pool: Some((100 * GIB, 80 * GIB)),
             incus_free: Some(500 * GIB),
             sysctl_ok: true,
+            image_space: Some(super::probe::ImageSpace {
+                state_free: 500 * GIB,
+                incus_free: 500 * GIB,
+                same_device: false,
+            }),
         }
     }
 }
@@ -125,6 +132,13 @@ impl HostProbe for FakeProbe {
     fn sysctl_ok(&self) -> bool {
         self.sysctl_ok
     }
+    fn image_space(
+        &self,
+        _state_dir: &std::path::Path,
+        _incus_dir: &std::path::Path,
+    ) -> Option<super::probe::ImageSpace> {
+        self.image_space
+    }
 }
 
 // ----- fake Incus ----------------------------------------------------------------------------
@@ -140,6 +154,19 @@ pub struct FakeInstance {
     pub devices: BTreeMap<String, BTreeMap<String, String>>,
     /// Snapshot names.
     pub snapshots: Vec<String>,
+    /// The `source` object of the create request (which image it was made from).
+    pub source: Value,
+}
+
+/// An image of the fake image store.
+#[derive(Debug, Clone, Default)]
+pub struct FakeImage {
+    /// Aliases pointing at it.
+    pub aliases: Vec<String>,
+    /// Bytes of the uploaded file.
+    pub size: u64,
+    /// The uploaded bytes (small test images).
+    pub data: Vec<u8>,
 }
 
 struct FakeOp {
@@ -185,6 +212,14 @@ pub struct FakeState {
     pub writes: Vec<Value>,
     /// Every Incus request fails to connect (Incus is down).
     pub down: bool,
+    /// The image store by fingerprint.
+    pub images: BTreeMap<String, FakeImage>,
+    /// Imports (uploads) received, as `(fingerprint, bytes)`, in order.
+    pub imports: Vec<(String, u64)>,
+    /// An image import fails with this HTTP status and message (a failed unpack).
+    pub import_fails: Option<(u16, String)>,
+    /// Creating an instance fails with this HTTP status and message (a launch failure).
+    pub create_fails: Option<(u16, String)>,
     /// Objects of the generic collections (`storage-pools`, `networks`, `network-acls`,
     /// `profiles`) by `collection/name`.
     pub objects: BTreeMap<String, Value>,
@@ -211,6 +246,16 @@ fn json_response(status: u16, v: Value) -> Response {
         body: Bytes::from(serde_json::to_vec(&v).unwrap_or_default()),
         headers: BTreeMap::new(),
     }
+}
+
+fn image_json(fp: &str, i: &FakeImage) -> Value {
+    json!({
+        "fingerprint": fp,
+        "aliases": i.aliases.iter().map(|a| json!({"name": a, "description": ""})).collect::<Vec<_>>(),
+        "size": i.size,
+        "created_at": "2026-11-21T09:15:00.000000000Z",
+        "properties": {},
+    })
 }
 
 fn err_response(code: u16, msg: &str) -> Response {
@@ -247,6 +292,10 @@ impl FakeIncus {
                 pushed: Vec::new(),
                 writes: Vec::new(),
                 down: false,
+                images: BTreeMap::new(),
+                imports: Vec::new(),
+                import_fails: None,
+                create_fails: None,
                 objects: BTreeMap::new(),
                 ops: BTreeMap::new(),
                 next_op: 1,
@@ -294,6 +343,7 @@ impl FakeIncus {
                     config: cfg,
                     devices: [("root".to_string(), root)].into_iter().collect(),
                     snapshots: Vec::new(),
+                    source: Value::Null,
                 },
             );
         });
@@ -459,7 +509,39 @@ impl FakeIncus {
                     err_response(404, "not found")
                 }
             }
+            ("GET", ["1.0", "images"]) => ok_sync(Value::Array(
+                s.images
+                    .iter()
+                    .map(|(fp, i)| image_json(fp, i))
+                    .collect(),
+            )),
+            ("POST", ["1.0", "images", "aliases"]) => {
+                let alias = body["name"].as_str().unwrap_or_default().to_string();
+                let target = body["target"].as_str().unwrap_or_default().to_string();
+                if s.images.values().any(|i| i.aliases.contains(&alias)) {
+                    err_response(409, "Alias already exists")
+                } else if let Some(img) = s.images.get_mut(&target) {
+                    img.aliases.push(alias);
+                    ok_sync(Value::Null)
+                } else {
+                    err_response(404, "Image not found")
+                }
+            }
+            ("GET", ["1.0", "images", fp]) => match s.images.get(*fp) {
+                Some(i) => ok_sync(image_json(fp, i)),
+                None => err_response(404, "Image not found"),
+            },
+            ("DELETE", ["1.0", "images", fp]) => {
+                if s.images.remove(*fp).is_some() {
+                    ok_sync(Value::Null)
+                } else {
+                    err_response(404, "Image not found")
+                }
+            }
             ("POST", ["1.0", "instances"]) => {
+                if let Some((code, msg)) = s.create_fails.clone() {
+                    return Ok(err_response(code, &msg));
+                }
                 let name = body["name"].as_str().unwrap_or_default().to_string();
                 let map = |v: &Value| -> BTreeMap<String, String> {
                     v.as_object()
@@ -481,6 +563,7 @@ impl FakeIncus {
                         config: map(&body["config"]),
                         devices,
                         snapshots: Vec::new(),
+                        source: body["source"].clone(),
                     },
                 );
                 ok_sync(Value::Null)
@@ -737,6 +820,56 @@ impl FakeIncus {
 impl Transport for FakeIncus {
     async fn send(&self, request: Request) -> Result<Response, IncusError> {
         self.handle(request).await
+    }
+
+    /// An image upload (`POST /1.0/images`): the first `len` bytes of `body` are stored under their
+    /// own SHA-256, which the answer reports as the fingerprint (the client compares it with the
+    /// one it announced). A duplicate import is `500 already exists`, as real Incus 6.0.0 answers.
+    async fn send_file(
+        &self,
+        head: Request,
+        body: std::fs::File,
+        len: u64,
+    ) -> Result<Response, IncusError> {
+        use std::os::unix::fs::FileExt;
+        let mut data = vec![0u8; usize::try_from(len).unwrap_or(0)];
+        body.read_exact_at(&mut data, 0)
+            .map_err(|e| IncusError::Http(e.to_string()))?;
+        let fp = {
+            use sha2::{Digest, Sha256};
+            let h = Sha256::digest(&data);
+            h.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
+        let mut s = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        s.log.push(format!("{} {}", head.method.as_str(), head.path));
+        if s.down {
+            return Err(IncusError::Connect {
+                path: "fake".into(),
+                message: "Incus is down".into(),
+            });
+        }
+        if head.path != "/1.0/images" {
+            return Ok(err_response(404, "the fake daemon does not implement this"));
+        }
+        if let Some((code, msg)) = s.import_fails.clone() {
+            return Ok(err_response(code, &msg));
+        }
+        s.imports.push((fp.clone(), len));
+        if s.images.contains_key(&fp) {
+            return Ok(err_response(
+                500,
+                "Failed creating image record: This image already exists",
+            ));
+        }
+        s.images.insert(
+            fp.clone(),
+            FakeImage {
+                aliases: Vec::new(),
+                size: len,
+                data,
+            },
+        );
+        Ok(ok_sync(json!({"fingerprint": fp})))
     }
 }
 

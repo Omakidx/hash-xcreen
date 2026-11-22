@@ -58,7 +58,7 @@ use crate::privd::runner::CommandRunner;
 
 pub use health::HealthPolicy;
 pub use keys::UpdateKeys;
-pub use system::{HealthProbe, SocketProbe, Systemd, SystemdCtl, Unit};
+pub use system::{HealthProbe, JobState, SocketProbe, Systemd, SystemdCtl, Unit};
 
 /// Where the agent's releases live.
 pub const VERSIONS_DIR: &str = "/usr/lib/hx";
