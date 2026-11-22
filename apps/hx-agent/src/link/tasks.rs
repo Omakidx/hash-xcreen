@@ -65,7 +65,7 @@ pub(crate) async fn ctl_reader(sh: Arc<Shared>, mut lane: LaneReader) {
     run(&sh, async move { ctl_loop(&s, &mut lane).await }).await;
 }
 
-async fn ctl_loop(sh: &Arc<Shared>, lane: &mut LaneReader) -> Fail {
+pub(crate) async fn ctl_loop(sh: &Arc<Shared>, lane: &mut LaneReader) -> Fail {
     loop {
         let raw = match lane.next().await {
             Ok(r) => r,
@@ -235,7 +235,7 @@ pub(crate) async fn media_reader(sh: Arc<Shared>, mut lane: LaneReader) {
     run(&sh, async move { media_loop(&s, &mut lane).await }).await;
 }
 
-async fn media_loop(sh: &Arc<Shared>, lane: &mut LaneReader) -> Fail {
+pub(crate) async fn media_loop(sh: &Arc<Shared>, lane: &mut LaneReader) -> Fail {
     loop {
         let raw = match lane.next().await {
             Ok(r) => r,
@@ -467,7 +467,7 @@ fn abort_frame(sh: &Shared, id: u32, code: u32) {
     }
 }
 
-async fn bulk_loop(sh: &Arc<Shared>, lane: &mut LaneReader) -> Fail {
+pub(crate) async fn bulk_loop(sh: &Arc<Shared>, lane: &mut LaneReader) -> Fail {
     loop {
         let raw = match lane.next().await {
             Ok(r) => r,

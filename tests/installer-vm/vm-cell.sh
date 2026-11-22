@@ -11,6 +11,9 @@
 #     rescue                  plant a pending update whose hx-privd cannot start; expect rollback
 #     reboot-check            after a VM reboot: the firewall table, unit order, the desktop
 #     leftovers <keep|destroy>  nothing the installer created may remain
+#     zabbly <min>            Incus came from the Zabbly repository, and is at least <min> (x.y.z)
+#     docker <user>           --docker: nesting and intercepts on hx-main, <user> in the docker
+#                             group, `docker run --rm hello-world` works inside the desktop
 #
 # POSIX sh; `set -eu`. Every failure prints what it saw and exits non-zero.
 set -eu
@@ -185,6 +188,55 @@ leftovers)
         incus list hx-main -c n --format csv | grep -q '^hx-main$' || fail "keep mode must keep the desktop"
     fi
     pass "no leftover after uninstall ($mode)"
+    ;;
+
+zabbly)
+    min=${1:?zabbly <min x.y.z>}
+    [ -s /etc/apt/keyrings/hx-zabbly.asc ] || fail "the pinned Zabbly key is not installed"
+    src=/etc/apt/sources.list.d/hx-zabbly-incus.sources
+    [ -s "$src" ] || fail "$src is missing"
+    grep -q '^URIs: https://pkgs.zabbly.com/incus/lts-6.0$' "$src" || fail "unexpected Zabbly source: $(cat "$src")"
+    grep -q '^Signed-By: /etc/apt/keyrings/hx-zabbly.asc$' "$src" || fail "the Zabbly source is not signed by the pinned key only: $(cat "$src")"
+    v=$(dpkg-query -W -f='${Version}' incus)
+    # The installed version must come from that repository, not from the distro archive.
+    apt-cache policy incus | grep -A3 -F '***' | grep -q 'pkgs.zabbly.com' || fail "the installed incus $v is not from pkgs.zabbly.com: $(apt-cache policy incus)"
+    # "1:6.0.5-ubuntu24.04-202..." to numbers
+    nums=$(echo "$v" | sed -E 's/^[0-9]+://; s/^([0-9]+)\.([0-9]+)\.([0-9]+).*/\1 \2 \3/')
+    # shellcheck disable=SC2086
+    set -- $nums
+    [ $# = 3 ] || fail "cannot read the version '$v'"
+    have=$(($1 * 1000000 + $2 * 1000 + $3))
+    # shellcheck disable=SC2086
+    set -- $(echo "$min" | tr . ' ')
+    want=$(($1 * 1000000 + $2 * 1000 + $3))
+    [ "$have" -ge "$want" ] || fail "Incus $v is older than $min"
+    srv=$(incus version 2>/dev/null | sed -n 's/^Server version: //p')
+    pass "Incus $v (server $srv) from pkgs.zabbly.com, at least $min, signed by the pinned key only"
+    ;;
+
+docker)
+    user=${1:?docker <user>}
+    for k in security.nesting security.syscalls.intercept.mknod security.syscalls.intercept.setxattr; do
+        [ "$(incus config get hx-main "$k")" = true ] || fail "hx-main: $k is not true (got '$(incus config get hx-main "$k")')"
+    done
+    [ "$(incus config get hx-main security.privileged)" != true ] || fail "hx-main is privileged"
+    for k in security.syscalls.intercept.bpf security.syscalls.intercept.mount security.syscalls.intercept.sched_setscheduler; do
+        [ "$(incus config get hx-main "$k")" != true ] || fail "hx-main: $k must stay off"
+    done
+    incus exec hx-main -- id -nG "$user" | tr ' ' '\n' | grep -qx docker || fail "$user is not in the docker group of hx-main"
+    # The docker service may still be coming up right after a reboot.
+    i=0
+    while [ $i -lt 30 ]; do
+        [ "$(incus exec hx-main -- systemctl is-active docker 2>/dev/null || true)" = active ] && break
+        i=$((i + 1))
+        sleep 2
+    done
+    [ "$(incus exec hx-main -- systemctl is-active docker)" = active ] || fail "docker.service is not active in hx-main"
+    ver=$(incus exec hx-main -- docker --version)
+    # As the desktop user (runuser reads the group list from /etc/group, as a login would).
+    out=$(incus exec hx-main -- runuser -u "$user" -- docker run --rm hello-world 2>&1) || fail "docker run hello-world as $user failed: $out"
+    echo "$out" | grep -q 'Hello from Docker!' || fail "hello-world did not print its greeting: $out"
+    pass "hx-main: nesting and the mknod and setxattr intercepts on, privileged off, $user in docker, '$ver', hello-world runs as $user"
     ;;
 
 *)

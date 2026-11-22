@@ -590,7 +590,7 @@ fn take_lock(path: &Path) -> Result<fs::File> {
 
 delegate_registry!(FileRegistry);
 
-fn decode_file(bytes: &[u8]) -> Result<State> {
+pub(crate) fn decode_file(bytes: &[u8]) -> Result<State> {
     let doc =
         FileDoc::decode(bytes).map_err(|_| Error::Corrupt("registry does not parse".into()))?;
     if doc.version != FILE_VERSION {

@@ -8,6 +8,11 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# Entry points for the cargo-fuzz targets in `fuzz/` (module `fuzz`). Never enabled by a build of the
+# product: only the `fuzz` crate switches it on.
+fuzzing = []
+
 [lints]
 workspace = true
 

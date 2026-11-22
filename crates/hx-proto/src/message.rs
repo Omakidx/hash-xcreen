@@ -335,16 +335,35 @@ impl pb::DeviceMgmt {
                 Ok(())
             }
             B::PairingCodeIssued(c) => {
-                if c.code.is_empty()
-                    || c.code.len() > MAX_PAIRING_CODE
-                    || !c
-                        .code
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-                {
+                let status = match pb::PairingCodeStatus::try_from(c.status) {
+                    Ok(pb::PairingCodeStatus::Unspecified) | Err(_) => {
+                        return Err(invalid("pairing_code_issued.status", "unknown status"));
+                    }
+                    Ok(s) => s,
+                };
+                if status == pb::PairingCodeStatus::Ok {
+                    if c.code.is_empty()
+                        || c.code.len() > MAX_PAIRING_CODE
+                        || !c
+                            .code
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                    {
+                        return Err(invalid(
+                            "pairing_code_issued.code",
+                            "must be 1..=16 ASCII letters, digits or dashes",
+                        ));
+                    }
+                } else if !c.code.is_empty() {
                     return Err(invalid(
                         "pairing_code_issued.code",
-                        "must be 1..=16 ASCII letters, digits or dashes",
+                        "must be empty unless the status is OK",
+                    ));
+                }
+                if c.retry_after_s != 0 && status != pb::PairingCodeStatus::RateLimited {
+                    return Err(invalid(
+                        "pairing_code_issued.retry_after_s",
+                        "must be 0 unless the status is RATE_LIMITED",
                     ));
                 }
                 Ok(())

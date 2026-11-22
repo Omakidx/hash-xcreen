@@ -2,13 +2,19 @@
 # One cell of .github/workflows/installer-vm.yml: the real installer on a fresh KVM VM.
 #
 #   CELL_OS=ubuntu-24.04 CELL_IMAGE=build ART=/path/to/artifacts OUT=/path/to/out \
-#       [CELL_VARIANT=none|ufw|docker-host|private] tests/installer-vm/run-cell.sh
+#       [CELL_VARIANT=none|ufw|docker-host|private|docker|interactive] tests/installer-vm/run-cell.sh
 #
 #   CELL_OS       ubuntu-24.04 | ubuntu-26.04 | debian-12 | debian-13 (the VM's OS)
 #   CELL_IMAGE    build    : the full install, every check below
 #                 prebuilt : `--image prebuilt` must be refused cleanly (exit 6, nothing changed):
 #                            privd answers UNIMPLEMENTED for the prebuilt path in this release
 #   CELL_VARIANT  none         plain host
+#                 docker       install with --docker: the incus stage must take Zabbly (6.0.5 or newer),
+#                              the desktop gets nesting and the syscall intercepts, and Docker
+#                              runs inside it (hello-world), also after a reboot
+#                 interactive  install with --interactive, answered on a pseudo-terminal
+#                              (tty-driver.py): prompts, hidden secrets, the printed pairing code,
+#                              QUIC pairing with that code and a PIN login; a shorter cell
 #                 ufw          ufw is active on the VM before the install (the port rule must open 443)
 #                 docker-host  Docker runs on the VM, with a published port (DOCKER-USER, DNAT drop)
 #                 private      install with --allow-private-networks (checklist item 5)
@@ -24,7 +30,9 @@
 # with secrets on stdin; units and credentials; pairing and PIN login from the runner over QUIC and
 # WebSocket, and the first frame of the real desktop; the secrets canary; the host-ruleset checklist
 # from inside the desktop; idempotence; a pending update whose privd fails (OnFailure rollback); a
-# VM reboot; uninstall in both modes with an empty-leftovers check.
+# VM reboot; uninstall in both modes with an empty-leftovers check. The interactive variant runs
+# only: launch, the interactive install, pairing and login with the printed code, the canary, the
+# checklist, a re-run that must not ask again, and uninstall with the leftovers check.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -126,6 +134,7 @@ docker-host)
 esac
 extra=()
 [ "$variant" = private ] && extra+=(--allow-private-networks)
+[ "$variant" = docker ] && extra+=(--docker)
 chk=()
 [ "$variant" = private ] && chk+=(private)
 [ "$variant" = docker-host ] && chk+=(docker)
@@ -160,6 +169,79 @@ run_install() { # run_install <tag> [extra installer args...]
 }
 result_of() { jq -c 'select(.t=="result")' "$OUT/$1.jsonl" | tail -n 1; }
 
+# ---- the interactive cell: --interactive on a pseudo-terminal ----
+if [ "$variant" = interactive ]; then
+    step "the pty driver needs python3 (the cell's minimal set has python3-minimal only)"
+    vmsh 'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 >/dev/null'
+    $INCUS file push --uid 0 --gid 0 --mode 0755 "$here/tty-driver.py" "$vm/root/tty-driver.py" >/dev/null
+    $INCUS file push --uid 0 --gid 0 --mode 0644 "$here/interactive-steps.json" "$vm/root/interactive-steps.json" >/dev/null
+    # The typed secrets: files in the VM that only the driver reads (never argv, never the environment).
+    $INCUS file push --uid 0 --gid 0 --mode 0600 "$S/password" "$vm/root/hx1e-pw" >/dev/null
+    $INCUS file push --uid 0 --gid 0 --mode 0600 "$S/pin" "$vm/root/hx1e-pin" >/dev/null
+
+    step "install.sh --interactive, answered on a pseudo-terminal"
+    rc=0
+    $INCUS exec "$vm" --force-noninteractive -- python3 /root/tty-driver.py /root/interactive-steps.json /root/interactive.out -- \
+        sh /root/release/install.sh --release-dir /root/release --progress json --interactive 2>"$OUT/interactive-driver.err" || rc=$?
+    $INCUS file pull "$vm/root/interactive.out" "$OUT/interactive.out" >/dev/null 2>&1 || true
+    [ "$rc" = 0 ] || { tail -n 30 "$OUT/interactive.out" >&2 || true; die "the interactive install exited $rc (97: ended before every prompt, 98: a prompt never came): $(cat "$OUT/interactive-driver.err")"; }
+    out=$OUT/interactive.out
+    for sec in password pin; do
+        if grep -qF -f <(cat "$S/$sec") "$out"; then die "the $sec was echoed on the terminal: it must be hidden"; fi
+    done
+    echo "PASS: exit 0; the hidden answers (password, PIN) never reached the terminal output"
+    grep -q 'must be basic or developer' "$out" || die "the bad answer for --apps was not rejected with a message"
+    grep -q 'Repeat the password: ' "$out" && grep -q 'Repeat the PIN: ' "$out" || die "the secrets were not asked twice"
+    echo "PASS: a bad answer was refused and asked again; the password and the PIN were asked twice"
+    # Nothing may change before every question is answered: the first stage that changes the host
+    # ("packages") starts after the last prompt.
+    last=$(grep -n 'Repeat the PIN: ' "$out" | head -n 1 | cut -d: -f1)
+    first=$(grep -n '"id":"packages"' "$out" | head -n 1 | cut -d: -f1)
+    [ -n "$last" ] && [ -n "$first" ] && [ "$first" -gt "$last" ] || die "the packages stage (line ${first:-none}) did not come after the last prompt (line ${last:-none})"
+    echo "PASS: every prompt came before the first stage that changes the host"
+    grep -E '^\{' "$out" >"$OUT/interactive.jsonl" || true
+    res=$(jq -c 'select(.t=="result")' "$OUT/interactive.jsonl" | tail -n 1)
+    echo "$res" | jq -e '.ok == true and .exit == 0 and (.server_public_key | length == 64) and .port == 443 and .pairing.kind == "code" and .pairing.expires_at_unix_s > 0' >/dev/null || die "bad result: $res"
+    server_key=$(echo "$res" | jq -r .server_public_key)
+    pair_code=$(grep -Eo 'pairing code: [0-9A-Z]{4}-[0-9A-Z]{4}' "$out" | head -n 1 | sed 's/^pairing code: //')
+    [ -n "$pair_code" ] || die "no 'pairing code: XXXX-XXXX' in the output"
+    grep -q 'address: ' "$out" && grep -q 'valid until ' "$out" || die "the address and the expiry were not printed"
+    grep -q 'Enter this code in the app to pair' "$out" || die "the pairing instruction was not printed"
+    echo "PASS: the result is ok, the code ${pair_code:0:2}.. was printed with the address, the port and the expiry"
+    jq -r 'select(.t=="stage" and .state=="done") | [.id, .ms] | @tsv' "$OUT/interactive.jsonl" >"$OUT/stages.tsv"
+
+    step "units and credentials"
+    vmx sh /root/vm-cell.sh units
+
+    step "pairing with the printed code over QUIC, and PIN login"
+    HX1E_VM_DIR="$S" HX1E_VM_ADDR="$vm_ip:443" HX1E_VM_SERVER_KEY="$server_key" HX1E_VM_STREAM=1 \
+        HX1E_VM_CREDS="quic:$pair_code" \
+        "$CLIENT" --ignored --exact vm_login --nocapture 2>&1 | tee "$OUT/client.log" | grep -E '^(PASS|thread)' || die "client failed: see client.log"
+    grep -q 'first frame' "$OUT/client.log" || die "no first frame"
+    echo "PASS: the printed code paired a device over QUIC and the typed PIN logged in"
+
+    step "secrets canary"
+    vmx sh /root/vm-cell.sh canary-check
+
+    step "host-ruleset checklist"
+    vmx bash /root/checklist.sh
+
+    step "a re-run without a mode must not ask again"
+    rc=0
+    $INCUS exec "$vm" --force-noninteractive -- sh /root/release/install.sh --release-dir /root/release --progress json \
+        </dev/null >"$OUT/again.jsonl" 2>"$OUT/again.err" || rc=$?
+    [ "$rc" = 0 ] || die "the re-run exited $rc: $(cat "$OUT/again.err")"
+    jq -e 'select(.t=="result") | .ok == true' "$OUT/again.jsonl" >/dev/null || die "the re-run did not end ok: $(tail -n 3 "$OUT/again.jsonl")"
+    echo "PASS: the re-run (no --interactive, no terminal) ended ok without a question"
+
+    step "uninstall --destroy-desktop"
+    vmsh "$AGENT uninstall --destroy-desktop --yes" || die "uninstall --destroy-desktop failed"
+    vmx sh /root/vm-cell.sh leftovers destroy
+    echo
+    echo "CELL PASSED: $CELL_OS / $CELL_IMAGE / $variant"
+    exit 0
+fi
+
 # ---- failure injection and resume (Gate 1) ----
 for stage in incus host; do
     step "stop after $stage, then resume"
@@ -167,6 +249,16 @@ for stage in incus host; do
     run_install "fail-$stage" --test-fail-after "$stage" || rc=$?
     [ "$rc" = 1 ] || die "--test-fail-after $stage exited $rc: $(cat "$OUT/fail-$stage.err")"
     [ "$(result_of "fail-$stage" | jq -r .code)" = TEST_HOOK ] || die "stage $stage did not stop at the hook: $(result_of "fail-$stage")"
+    if [ "$stage" = incus ]; then
+        # Where did Incus come from? Always logged; with --docker it must be Zabbly (the distro
+        # Incus of ubuntu-24.04 is 6.0.0 and of debian-13 6.0.4, both below the 6.0.5 Docker needs).
+        src=$(vmsh 'cat /var/lib/hx/install-state.json' | jq -r '.created.incus.source // "none"')
+        echo "incus source: $src ($(vmsh "dpkg-query -W -f='\${Version}' incus"))"
+        if [ "$variant" = docker ]; then
+            [ "$src" = zabbly ] || die "--docker: the incus stage took '$src', want zabbly"
+            vmx sh /root/vm-cell.sh zabbly 6.0.5
+        fi
+    fi
 done
 
 # ---- the install ----
@@ -185,6 +277,17 @@ vmx sh /root/vm-cell.sh units
 if [ "$variant" = ufw ]; then
     vmsh 'ufw status | grep -E "^443/(tcp|udp).*ALLOW"' || die "ufw: the installer did not open 443"
     echo "PASS: ufw allows 443/tcp and 443/udp"
+fi
+
+if [ "$variant" = docker ]; then
+    step "--docker: the result, nesting and intercepts, and Docker inside the desktop"
+    n=$(jq -r 'select(.t=="step" and .privd_stage=="DOCKER") | .id' "$OUT/install.jsonl" | wc -l)
+    [ "$n" -gt 0 ] || die "no DOCKER progress step in the install output: privd did not enable Docker"
+    bad=$(jq -r 'select(.t=="warn") | .message | select(test("docker"; "i"))' "$OUT/install.jsonl" || true)
+    [ -z "$bad" ] || die "a Docker warning in the install output: $bad"
+    echo "$res" | jq -e '[.desktop.warnings[] | select(test("docker"; "i"))] | length == 0' >/dev/null || die "the result carries a Docker warning: $res"
+    vmx sh /root/vm-cell.sh docker alice
+    echo "PASS: $n DOCKER progress steps, no Docker warning in the result"
 fi
 
 # ---- pairing and PIN login from the runner ----
@@ -226,6 +329,7 @@ for _ in $(seq 1 60); do
 done
 vm_ip=$(vm_addr)
 vmx sh /root/vm-cell.sh reboot-check
+[ "$variant" != docker ] || vmx sh /root/vm-cell.sh docker alice
 [ -n "$vm_ip" ] || die "the VM has no address after the reboot"
 HX1E_VM_DIR="$S" HX1E_VM_ADDR="$vm_ip:443" HX1E_VM_SERVER_KEY="$server_key" HX1E_VM_CREDS="quic:$(code)" \
     "$CLIENT" --ignored --exact vm_login --nocapture 2>&1 | tee "$OUT/client-reboot.log" | grep -E '^(PASS|thread)' ||
