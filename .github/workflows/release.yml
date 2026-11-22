@@ -272,6 +272,8 @@ jobs:
           apt-get install -y --no-install-recommends ca-certificates curl git build-essential clang libclang-dev pkg-config dpkg-dev \
             libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libx264-dev libfontconfig1-dev
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Install rustup (pinned) and the pinned toolchain
         run: |
           set -eu
@@ -336,6 +338,8 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: apt-get install -y --no-install-recommends xvfb xauth ca-certificates git
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run the installed app headless (--version, then --demo under Xvfb)
         env:
           VERSION: ${{ needs.gate.outputs.version }}
@@ -347,6 +351,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Install pinned toolchain
         run: rustup toolchain install
       - name: Install build dependencies
