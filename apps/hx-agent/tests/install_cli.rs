@@ -82,6 +82,8 @@ fn usage_errors_exit_2_before_anything_else() {
         vec!["install", "--interactive", "--pair"],
         vec!["install", "--pair", "--ssh"],
         vec!["install", "--pair", "--token", "hxt1-x"],
+        vec!["install", "--token", "hxt1-x"],
+        vec!["install", "--pair", "--token-on-command-line"],
         vec!["install", "--password", "x"],
         vec!["install", "--pin=123456"],
         vec!["install", "--frobnicate"],

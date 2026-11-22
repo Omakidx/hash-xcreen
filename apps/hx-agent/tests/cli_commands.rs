@@ -382,7 +382,27 @@ async fn pairing_token_in_argv_works_with_a_loud_warning() {
     let w = World::start().await;
     let token = PairingToken::generate().unwrap();
     let text = token.to_text();
+    // Without the explicit opt-in the token in argv is refused before anything is sent.
     let r = cli(&w.cfg, &["pairing", "token", "--token", &text], &[], &[]).await;
+    assert_eq!(r.code, 2, "{r:?}");
+    assert!(r.stderr.contains("--token-on-command-line"), "{}", r.stderr);
+    assert!(
+        !r.stderr.contains(text.as_str()),
+        "the refusal never echoes the token"
+    );
+    let r = cli(
+        &w.cfg,
+        &[
+            "pairing",
+            "token",
+            "--token",
+            &text,
+            "--token-on-command-line",
+        ],
+        &[],
+        &[],
+    )
+    .await;
     assert_eq!(r.code, 0, "{r:?}");
     assert!(r.stderr.contains("WEAKER"), "{}", r.stderr);
     assert!(r.stderr.contains("process list") && r.stderr.contains("shell history"));
