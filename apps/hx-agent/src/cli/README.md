@@ -21,7 +21,7 @@ hx-agent [--json] <command> [options]
 status
 devices list | revoke <id-prefix> | reinstate <id-prefix> [--yes]
 pairing code [--ttl 15m]
-pairing token [--ttl 15m] [--generate | --token <t>]
+pairing token [--ttl 15m] [--generate | --token <t> --token-on-command-line]
 pin set [--device <id-prefix>]
 pin reset-lockout [--purpose pin|password] [--yes]
 setup begin [--for 2h] [--yes] | extend <time> | finish [--force]
@@ -33,7 +33,7 @@ snapshots list|create [--desktop main] | delete <name> [--desktop main]
 logs [-f|--follow] [-n <lines>] [--journal] [--audit]
 update check | apply [<version>] [--yes] | rollback [--yes]
 uninstall [--keep-desktop | --destroy-desktop] [--yes]
-install --interactive | --pair | --ssh | --token <t>  [options]      (see "install" below)
+install --interactive | --pair | --ssh | --token <t> --token-on-command-line  [options]      (see "install" below)
 port-rule apply
 help [command]    --help    --version
 ```
@@ -144,7 +144,7 @@ an argument, an environment, a log or the state.
 |---|---|
 | `--interactive` | asks every question on `/dev/tty` before any change; ends with a pairing code |
 | `--pair` | the one-liner: the token is typed at a hidden prompt; the stages run through `pairing-token` and stop, the setup window stays open for the app |
-| `--token <t>` | like `--pair` with the token on the command line (weaker: a warning is printed) |
+| `--token <t>` | like `--pair` with the token on the command line (weaker: a warning is printed); refused (exit 2) without `--token-on-command-line` |
 | `--ssh` | the secrets arrive on stdin (framed: `HXI1`, then records of kind, length and bytes: password, PIN, optional token and owner key; at most 8192 bytes in 30 s); `--json` is implied; the token, if any, is installed last |
 | none | resume or re-verify the recorded install; a fresh host refuses (exit 2) |
 
@@ -187,7 +187,9 @@ held in zeroizing memory, and sent as a **kind-2 secret frame** (ipc.md 5.2): ne
 environment, a file, a protobuf field or a log. `--password` and `--pin` do not exist (they are
 refused with an explanation).
 
-`pairing token --token <t>` exists for **unattended** installs only. It is **weaker**: the token is
+`pairing token --token <t> --token-on-command-line` exists for **unattended** installs only; without
+the explicit flag `--token` is refused (exit 2), so a token never reaches argv by accident. It is
+**weaker**: the token is
 visible in the process list while the command runs, stays in your shell history, and under `sudo` is
 written to the auth log and the journal. A token is single use and expires (15 minutes), which
 bounds but does not remove that exposure. The command prints that warning every time. The default,

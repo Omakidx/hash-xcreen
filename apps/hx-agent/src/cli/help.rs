@@ -28,11 +28,12 @@ const BLOCKS: &[(&str, &str)] = &[
         "pairing",
         "\
   pairing code [--ttl 15m]        A short pairing code, printed once.
-  pairing token [--ttl 15m] [--generate | --token <t>]
+  pairing token [--ttl 15m] [--generate | --token <t> --token-on-command-line]
                                   Install a pairing token. Default: a hidden prompt on the
                                   terminal. --generate makes one and prints it once. --token puts
                                   the token on the command line: WEAKER (process list, shell
-                                  history, auth log); for unattended installs only.
+                                  history, auth log); for unattended installs only, and refused
+                                  without --token-on-command-line.
 ",
     ),
     (
@@ -103,14 +104,15 @@ const BLOCKS: &[(&str, &str)] = &[
     (
         "install",
         "\
-  install --interactive | --pair | --ssh | --token <t>  [options]
+  install --interactive | --pair | --ssh | --token <t> --token-on-command-line  [options]
                                   Install and set up the server (normally run by install.sh).
                                   --interactive  ask every question on the terminal
                                   --pair         the one-liner: type the pairing token at a hidden
                                                  prompt; stops after installing it
                                   --ssh          secrets on stdin (framed), JSON Lines on stdout
                                   --token <t>    like --pair, but the token is on the command line:
-                                                 WEAKER (process list, shell history, auth log)
+                                                 WEAKER (process list, shell history, auth log);
+                                                 needs --token-on-command-line
                                   Run again to resume or to re-verify; a finished install says so.
   options: --distro ubuntu-24.04|ubuntu-26.04|debian-12|debian-13  --desktop xfce
            --user <name>  --hostname <h>  --timezone <tz>  --locale <l>  --keyboard <k>

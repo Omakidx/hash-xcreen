@@ -141,6 +141,24 @@ fn usage(m: impl Into<String>) -> CliError {
     CliError::Usage(m.into())
 }
 
+/// The opt-in for a token in argv (Gate 1: no secret in any command line unless the operator asks
+/// for it). `--token` needs `--token-on-command-line`, and the flag alone means nothing.
+const TOKEN_OPT_IN: &str = "--token-on-command-line";
+
+fn check_token_opt_in(token_given: bool, opted_in: bool) -> Result<(), CliError> {
+    match (token_given, opted_in) {
+        (true, false) => Err(usage(
+            "--token puts the token on the command line, where the process list, your shell \
+             history and the sudo auth log keep it. Type it at a hidden prompt instead (--pair, \
+             or `pairing token` without --token), or add --token-on-command-line to accept that",
+        )),
+        (false, true) => Err(usage(
+            "--token-on-command-line is only meaningful with --token",
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Copies of the command line made while parsing. They may hold a token given with `--token`, so
 /// they are wiped when dropped (the original argv, which the kernel and `/proc` keep, is not ours
 /// to wipe).
@@ -387,8 +405,9 @@ fn parse_cmd(args: &[String], help: bool) -> Result<Cmd, CliError> {
                     Ok(Cmd::PairingCode { ttl_s: ttl(&o)? })
                 }
                 _ => {
-                    let o = opts(&r, &["--generate"], &["--ttl", "--token"])?;
+                    let o = opts(&r, &["--generate", TOKEN_OPT_IN], &["--ttl", "--token"])?;
                     o.positionals(0, "")?;
+                    check_token_opt_in(o.value("--token").is_some(), o.flag(TOKEN_OPT_IN))?;
                     if o.flag("--generate") && o.value("--token").is_some() {
                         return Err(usage("--generate and --token cannot be combined"));
                     }
@@ -653,6 +672,7 @@ const INSTALL_FLAGS: &[&str] = &[
     "--ssh",
     "--docker",
     "--allow-private-networks",
+    TOKEN_OPT_IN,
 ];
 #[cfg(feature = "install-test-hooks")]
 const INSTALL_FLAGS: &[&str] = &[
@@ -661,6 +681,7 @@ const INSTALL_FLAGS: &[&str] = &[
     "--ssh",
     "--docker",
     "--allow-private-networks",
+    TOKEN_OPT_IN,
     "--test-allow-container",
 ];
 
@@ -720,6 +741,7 @@ const INSTALL_VALUED: &[&str] = &[
 fn parse_install(rest: &[String]) -> Result<Cmd, CliError> {
     let o = opts(rest, INSTALL_FLAGS, INSTALL_VALUED)?;
     o.positionals(0, "")?;
+    check_token_opt_in(o.value("--token").is_some(), o.flag(TOKEN_OPT_IN))?;
     let modes = [
         (o.flag("--interactive"), Mode::Interactive),
         (o.flag("--pair"), Mode::Pair),
@@ -841,13 +863,23 @@ mod tests {
             }
         ));
         assert!(matches!(
-            p(&["pairing", "token", "--token=abc"]).unwrap().cmd,
+            p(&["pairing", "token", "--token=abc", "--token-on-command-line"])
+                .unwrap()
+                .cmd,
             Cmd::PairingToken {
                 source: TokenSource::Argv(_),
                 ..
             }
         ));
         assert!(p(&["pairing", "token", "--generate", "--token", "x"]).is_err());
+        // A token in argv only with the explicit opt-in, and the opt-in only with a token.
+        let e = p(&["pairing", "token", "--token", "abc"]).unwrap_err();
+        assert!(e.to_string().contains("--token-on-command-line"), "{e}");
+        assert!(
+            !e.to_string().contains("abc"),
+            "the refusal never echoes the token"
+        );
+        assert!(p(&["pairing", "token", "--token-on-command-line"]).is_err());
         assert!(p(&["pairing", "code", "--ttl", "10"]).is_err());
         assert!(p(&["pairing", "code", "--ttl", "20m"]).is_err());
     }
@@ -915,7 +947,17 @@ mod tests {
             "--ssh implies --json"
         );
         assert!(!p(&["install", "--pair"]).unwrap().json);
-        let Cmd::Install(t) = p(&["install", "--token", "hxt1-abc"]).unwrap().cmd else {
+        let e = p(&["install", "--token", "hxt1-abc"]).unwrap_err();
+        assert!(e.to_string().contains("--token-on-command-line"), "{e}");
+        assert!(
+            !e.to_string().contains("hxt1-abc"),
+            "the refusal never echoes the token"
+        );
+        assert!(p(&["install", "--pair", "--token-on-command-line"]).is_err());
+        let Cmd::Install(t) = p(&["install", "--token", "hxt1-abc", "--token-on-command-line"])
+            .unwrap()
+            .cmd
+        else {
             panic!()
         };
         assert_eq!(t.mode, Some(Mode::Token));
@@ -927,7 +969,16 @@ mod tests {
             panic!()
         };
         assert_eq!(n.mode, None, "no mode: resume the recorded one");
-        assert!(p(&["install", "--interactive", "--token", "x"]).is_err());
+        assert!(
+            p(&[
+                "install",
+                "--interactive",
+                "--token",
+                "x",
+                "--token-on-command-line"
+            ])
+            .is_err()
+        );
         assert!(p(&["install", "--user", "a", "--user", "b"]).is_err());
         assert!(p(&["install", "--password", "x"]).is_err());
     }
