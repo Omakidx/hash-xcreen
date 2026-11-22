@@ -24,6 +24,9 @@ pub mod server;
 pub mod transfer;
 mod ws;
 
+#[cfg(feature = "fuzzing")]
+pub use ws::fuzz;
+
 pub use ack::{AckHandler, AckOutcome, FrameAck, FrameTicket};
 pub use client::{Client, ClientHello, ClientOptions, Target, TransportPreference};
 pub use conn::{

@@ -67,6 +67,10 @@ use crate::{
     },
 };
 
+#[cfg(feature = "fuzzing")]
+#[path = "fuzz.rs"]
+pub mod fuzz;
+
 pub(crate) trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 type BoxIo = Box<dyn Io>;

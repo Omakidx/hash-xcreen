@@ -1,0 +1,7 @@
+# libFuzzer dictionary for the crypto_pin_record target
+k0="hx-pin1$"
+k1="m="
+k2=",t="
+k3=",p="
+k4="$"
+k5="65536"

@@ -216,9 +216,22 @@ message CreatePairingCode {
 
 // 1.3: the issued code. The code is a secret: Debug is redacted (hand-written in hx-proto).
 message PairingCodeIssued {
-  // The short code, 8 characters in two groups of four (XXXX-XXXX), at most 16 bytes.
+  // The short code, 8 characters in two groups of four (XXXX-XXXX), at most 16 bytes. Set if
+  // and only if status is OK.
   string code = 1;
   uint64 expires_at_unix = 2;
+  PairingCodeStatus status = 3;
+  // Only with RATE_LIMITED: seconds until a new code may be requested.
+  uint32 retry_after_s = 4;
+}
+
+enum PairingCodeStatus {
+  PAIRING_CODE_STATUS_UNSPECIFIED = 0;
+  PAIRING_CODE_STATUS_OK = 1;
+  PAIRING_CODE_STATUS_RATE_LIMITED = 2;
+  PAIRING_CODE_STATUS_INVALID_ARGUMENT = 3;
+  // A server fault.
+  PAIRING_CODE_STATUS_FAILED = 4;
 }
 
 message DeviceMgmt {

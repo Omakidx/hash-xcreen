@@ -1,0 +1,26 @@
+[package]
+name = "hx-sshsetup"
+description = "The app's SSH setup engine: connect, preflight, run install.sh, stream its progress, pair."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+hx-crypto.workspace = true
+hx-transport.workspace = true
+russh = { version = "0.65", default-features = false, features = ["ring", "rsa"] }
+serde_json = "1"
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "net", "io-util"] }
+zeroize.workspace = true
+
+[dev-dependencies]
+getrandom = "0.4"
+hx-agent = { version = "0.1.0", path = "../../apps/hx-agent" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "sync", "io-util"] }

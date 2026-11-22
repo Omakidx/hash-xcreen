@@ -613,15 +613,33 @@ fn create_pairing_code_range_direction_and_request_id() {
 
 #[test]
 fn pairing_code_issued_validation_and_direction() {
-    let issued = |id: u32, code: &str| {
+    use pb::PairingCodeStatus as St;
+    let with = |id: u32, code: &str, status: i32, retry: u32| {
         mgmt(
             id,
             Dm::PairingCodeIssued(pb::PairingCodeIssued {
                 code: code.into(),
                 expires_at_unix: 1_900_000_000,
+                status,
+                retry_after_s: retry,
             }),
         )
     };
+    let issued = |id: u32, code: &str| with(id, code, St::Ok as i32, 0);
+    // Refusals carry no code; only RATE_LIMITED carries a wait.
+    ok(&with(5, "", St::RateLimited as i32, 1800));
+    ok(&with(5, "", St::RateLimited as i32, 0));
+    ok(&with(5, "", St::InvalidArgument as i32, 0));
+    ok(&with(5, "", St::Failed as i32, 0));
+    bad(&with(5, "", St::Unspecified as i32, 0), "status");
+    bad(&with(5, "ABCD-2345", 0, 0), "status");
+    bad(&with(5, "ABCD-2345", 99, 0), "status");
+    bad(&with(5, "ABCD-2345", St::RateLimited as i32, 5), "code");
+    bad(&with(5, "ABCD-2345", St::Failed as i32, 0), "code");
+    bad(&with(5, "ABCD-2345", St::InvalidArgument as i32, 0), "code");
+    bad(&with(5, "", St::InvalidArgument as i32, 5), "retry_after_s");
+    bad(&with(5, "", St::Failed as i32, 5), "retry_after_s");
+    bad(&with(5, "ABCD-2345", St::Ok as i32, 5), "retry_after_s");
     ok(&issued(5, "ABCD-2345"));
     bad(&issued(0, "ABCD-2345"), "request_id");
     bad(&issued(5, ""), "pairing_code_issued.code");
@@ -660,6 +678,8 @@ fn debug_of_every_secret_type_is_redacted() {
     let issued = pb::PairingCodeIssued {
         code: secret_code.into(),
         expires_at_unix: 42,
+        status: pb::PairingCodeStatus::Ok as i32,
+        retry_after_s: 0,
     };
 
     let dumps = [
@@ -702,6 +722,15 @@ fn debug_of_every_secret_type_is_redacted() {
     // Non-secret context survives: the options and the expiry stay debuggable.
     assert!(format!("{st:?}").contains("alice"));
     assert!(format!("{issued:?}").contains("42"));
+    // The status is shown (and the wait), the code is not.
+    let refused = pb::PairingCodeIssued {
+        status: pb::PairingCodeStatus::RateLimited as i32,
+        retry_after_s: 1800,
+        ..Default::default()
+    };
+    let d = format!("{refused:?}");
+    assert!(d.contains("RateLimited") && d.contains("1800"), "{d}");
+    assert!(format!("{issued:?}").contains("Ok"));
     // No length leaks either.
     assert!(!format!("{pin:?}").contains(&secret_pin.len().to_string()));
 }

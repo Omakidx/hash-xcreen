@@ -1,0 +1,10 @@
+# libFuzzer dictionary for the agent_install_stdin target
+k0="HXI1"
+k1="\x01"
+k2="\x02"
+k3="\x03"
+k4="\x04"
+k5="\x05"
+k6="\x00\x00\x00"
+k7="hxt1-"
+k8="123456"
