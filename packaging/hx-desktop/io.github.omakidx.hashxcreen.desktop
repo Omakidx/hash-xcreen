@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=hash-xcreen
+GenericName=Remote Desktop
+Comment=Your own remote desktop, on a server you control
+Exec=hx-desktop
+Icon=io.github.omakidx.hashxcreen
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=remote;desktop;server;vnc;rdp;screen;
+StartupNotify=true
+# Must equal the app id the window sets (slint::set_xdg_app_id), which is also this file's name
+# without ".desktop": the Wayland app_id and the X11 WM_CLASS.
+StartupWMClass=io.github.omakidx.hashxcreen
