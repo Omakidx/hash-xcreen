@@ -4,7 +4,7 @@
 #   release/gate.sh [--tag vX.Y.Z] [--dry-run] [--workflow FILE]
 #
 # --dry-run (the workflow_dispatch rehearsal, which signs with a per-run TEST key and publishes
-# nothing) skips checks 2 and 3, the provisioned-key checks.
+# nothing) skips checks 2, 3 and 7, the provisioned-key checks.
 #
 # Checks (all of them run; any failure makes the exit status 1):
 #   1. --tag, when given: it matches the ipc.md 6.12 rule 1 syntax and equals "v" + the workspace
@@ -12,6 +12,11 @@
 #   2. apps/hx-agent/release-keys/current.pub AND next.pub are provisioned (a minisign public key,
 #      not the word UNPROVISIONED) and parse (42 bytes, algorithm "Ed"), and are different keys;
 #   3. installer/install.sh embeds exactly those two keys (KEY_CURRENT, KEY_NEXT);
+#   7. apps/hx-agent/image-keys/current.pub AND next.pub (the SEPARATE key pair of the desktop
+#      images, secret half in the `image-signing` environment of images.yml) are provisioned, parse,
+#      are different keys and differ from the release keys: an agent that ships without them could
+#      never use a prebuilt image until it updates. The check is skipped only while the directory
+#      does not exist at all (a tree from before the prebuilt-image work);
 #   5. release.yml enables none of the test-hook features (test-support, install-test-hooks,
 #      privd-test-hooks, gateway-test-hooks, test-release-key, test-shadow-path);
 #   6. supply chain of release.yml: every `uses:` is pinned to a full 40-hex commit SHA, and no
@@ -94,6 +99,38 @@ else
         bad "install.sh KEY_CURRENT / KEY_NEXT differ from release-keys/current.pub / next.pub"
     fi
 
+
+    # ---- 7. the image keys: a separate pair, provisioned ----
+    ikdir="$root/apps/hx-agent/image-keys"
+    if [ ! -d "$ikdir" ]; then
+        good "apps/hx-agent/image-keys/ does not exist in this tree: the image-key check is skipped"
+    else
+        iidc='' iidn=''
+        for which in current next; do
+            f="$ikdir/$which.pub"
+            if [ ! -f "$f" ]; then
+                bad "image-keys/$which.pub is missing"
+                continue
+            fi
+            k=$(keyline "$f")
+            if [ -z "$k" ] || [ "$k" = UNPROVISIONED ]; then
+                bad "image-keys/$which.pub is UNPROVISIONED: a release needs both image keys (the maintainer provisions them)"
+                continue
+            fi
+            if b64_file "$k" "$tmp/image-$which.raw" 42 && [ "$(dd if="$tmp/image-$which.raw" bs=1 count=2 2>/dev/null)" = Ed ]; then
+                good "image-keys/$which.pub is a minisign public key"
+                id=$(hex_of "$tmp/image-$which.raw" 2 8)
+                if [ "$which" = current ]; then iidc=$id; else iidn=$id; fi
+            else
+                bad "image-keys/$which.pub does not hold a valid minisign public key line"
+                continue
+            fi
+            if [ "$k" = "$kc" ] || [ "$k" = "$kn" ]; then
+                bad "image-keys/$which.pub is a release key: the image key pair must be separate (a leaked image key must not sign agent releases)"
+            fi
+        done
+        if [ -n "$iidc" ] && [ "$iidc" = "$iidn" ]; then bad "image-keys/current.pub and next.pub are the same key"; fi
+    fi
 fi
 
 # ---- 4. the compile-time gate exists ----

@@ -1,0 +1,565 @@
+name: Images
+
+# The prebuilt desktop images (design in docs/architecture.md 4.3, 12 and 13; manifest rules in
+# docs/ipc.md 6.12 "Images manifest"). Eight recipes (4 distros x xfce x basic/developer):
+#
+#   plan     which (ref, recipe) cells are missing or at least 7 days old
+#   image    one cell per entry: build and seal the image in Incus, then the EQUIVALENCE CHECK (a
+#            desktop built on the server against a desktop made from this image, same user, password
+#            and settings; any drift fails the cell and blocks signing and publishing)
+#   rehearse pull requests and non-publish runs: build the manifest, sign it with a per-run TEST key
+#            and prove `hx-imagectl verify` accepts it (and refuses a tampered one)
+#   sign     environment `image-signing` (main only, no per-run approval): build the manifest with the
+#            previous one's still-wanted entries, sign it with the image key, verify the result
+#   attest   build provenance of the image files (audit only)
+#   publish  contents: write, only here: the release `images-<build_id>` first, then the manifest
+#            and its signature on the moving release `images`, then prune
+#
+# Publishing needs the maintainer's image key pair. While apps/hx-agent/image-keys/{current,next}.pub
+# are UNPROVISIONED (or missing) the sign, attest and publish jobs are skipped: everything before
+# them still runs, so the recipes and the equivalence are checked every day.
+#
+# Triggers: a daily schedule (a publish run), workflow_dispatch (input `publish`, only effective on
+# main), and pull requests touching what an image is made of. A pull request builds and checks with
+# per-run test keys and never publishes. A trigger on `release: published` would not work: releases
+# created with GITHUB_TOKEN start no workflows.
+#
+# Supply chain, as release.yml: every `uses:` is pinned to a commit SHA, and none of the jobs that
+# sign or publish restores or saves a build cache (no cache is used anywhere in this workflow).
+#
+# This workflow could not be run where it was written; the first run on a pull request is the test
+# (see release/README.md, "Desktop images").
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Sign and publish (only effective on main, and only once the image keys are provisioned)"
+        type: boolean
+        default: false
+      drop:
+        description: "Withdraw published images (space-separated recipe/build_id) in a publish run; leave empty normally"
+        type: string
+        default: ""
+  pull_request:
+    paths:
+      - "recipes/**"
+      - "crates/hx-provision/**"
+      - "apps/hx-imagectl/**"
+      - ".github/workflows/images.yml"
+
+permissions:
+  contents: read
+
+# Runs that can publish (schedule, manual) are serialized in one group and never cancelled. A pull
+# request has its own group per ref and a newer push cancels the stale run, so a pull request never
+# queues behind, or displaces, a publish run.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('images-pr-{0}', github.ref) || 'images' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      count: ${{ steps.matrix.outputs.count }}
+      publish: ${{ steps.mode.outputs.publish }}
+      keys: ${{ steps.keys.outputs.provisioned }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Mode
+        id: mode
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+          REF: ${{ github.ref }}
+        run: |
+          set -eu
+          # Only the main branch publishes: a schedule always runs on the default branch, a manual
+          # run needs the input, a pull request never publishes.
+          publish=false
+          if [ "$REF" = refs/heads/main ]; then
+            if [ "$EVENT" = schedule ]; then publish=true; fi
+            if [ "$EVENT" = workflow_dispatch ] && [ "$INPUT_PUBLISH" = true ]; then publish=true; fi
+          fi
+          echo "publish=$publish" >>"$GITHUB_OUTPUT"
+          echo "publish run: $publish"
+      - name: Image keys provisioned?
+        id: keys
+        run: |
+          set -eu
+          # Same test as release/gate.sh: a minisign public key line (42 bytes, base64: RW + 54), not
+          # the word UNPROVISIONED; a missing file counts as unprovisioned.
+          ok=true
+          for k in current next; do
+            f="apps/hx-agent/image-keys/$k.pub"
+            if [ ! -f "$f" ] || ! grep -v '^[[:space:]]*#' "$f" | grep -v '^untrusted comment:' |
+              tr -d '[:space:]' | grep -Eq '^RW[A-Za-z0-9+/]{54}$'; then
+              ok=false
+              echo "::notice::$f is not provisioned: the sign, attest and publish jobs are skipped"
+            fi
+          done
+          echo "provisioned=$ok" >>"$GITHUB_OUTPUT"
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - name: Build hx-imagectl
+        run: cargo build --release --locked -p hx-imagectl
+      - name: Published manifest
+        id: prev
+        if: steps.mode.outputs.publish == 'true' && steps.keys.outputs.provisioned == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          mkdir prev
+          if ! gh release download images --repo "$REPO" --dir prev \
+            --pattern 'images-manifest-x86_64.json' --pattern 'images-manifest-x86_64.json.minisig'; then
+            echo "::notice::no published manifest yet: every recipe is built"
+            exit 0
+          fi
+          # Trust it only if it verifies; otherwise rebuild everything.
+          if ! target/release/hx-imagectl verify --manifest prev/images-manifest-x86_64.json \
+            --sig prev/images-manifest-x86_64.json.minisig \
+            --pubkey apps/hx-agent/image-keys/current.pub apps/hx-agent/image-keys/next.pub; then
+            echo "::warning::the published manifest does not verify; it is ignored and every recipe is built"
+            rm -rf prev
+            mkdir prev
+          fi
+      - name: Matrix
+        id: matrix
+        env:
+          PUBLISH: ${{ steps.mode.outputs.publish }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -eu
+          bin="$PWD/target/release/hx-imagectl"
+          : >cands.tsv
+          # add_ref <label> <sha> <imagectl binary>: one line per recipe of that ref's recipes
+          add_ref() {
+            "$3" digest --all | while read -r recipe digest; do
+              printf '%s\t%s\t%s\t%s\n' "$recipe" "$digest" "$2" "$1" >>cands.tsv
+            done
+          }
+          if [ "$PUBLISH" != true ]; then
+            # a pull request or a manual run without publishing: this commit, all 8 recipes
+            add_ref head "$GITHUB_SHA" "$bin"
+          else
+            # the newest stable tag and the newest pre-release tag (by tag date), each built with the
+            # tool of its own tree (the recipes are embedded in it). A tag older than the first
+            # release that ships hx-imagectl is skipped.
+            stable=$(git tag --list 'v*' --sort=-creatordate | grep -Ev -- '-' | head -n 1 || true)
+            beta=$(git tag --list 'v*' --sort=-creatordate | grep -E -- '-(alpha|beta|rc)\.' | head -n 1 || true)
+            n=0
+            for pair in "stable:$stable" "beta:$beta"; do
+              label=${pair%%:*}
+              tag=${pair#*:}
+              [ -n "$tag" ] || continue
+              n=$((n + 1))
+              wt="$RUNNER_TEMP/wt-$n"
+              git worktree add --detach "$wt" "refs/tags/$tag"
+              if [ ! -d "$wt/apps/hx-imagectl" ]; then
+                echo "::notice::$tag has no hx-imagectl: skipped"
+                continue
+              fi
+              (cd "$wt" && CARGO_TARGET_DIR="$RUNNER_TEMP/target-refs" cargo build --release --locked -p hx-imagectl)
+              add_ref "$label" "$(git -C "$wt" rev-parse HEAD)" "$RUNNER_TEMP/target-refs/release/hx-imagectl"
+            done
+          fi
+          # every (recipe, digest) that is still wanted: the manifest keeps nothing else
+          cut -f1,2 cands.tsv | sort -u | tr '\t' ' ' >wanted.txt
+          now=$(date +%s)
+          date=$(date -u +%Y%m%d)
+          base=$(((RUN_NUMBER % 90) + 1))
+          : >sel.tsv
+          : >seen.txt
+          while IFS="$(printf '\t')" read -r recipe digest sha label; do
+            # the same recipe digest on two refs is built once (the first, the stable one)
+            if grep -qx "$recipe $digest" seen.txt; then continue; fi
+            echo "$recipe $digest" >>seen.txt
+            if [ "$PUBLISH" = true ] && [ -f prev/images-manifest-x86_64.json ]; then
+              newest=$(jq -r --arg r "$recipe" --arg d "$digest" \
+                '[.images[] | select(.recipe == $r and .recipe_digest == $d) | .created] | max // 0' \
+                prev/images-manifest-x86_64.json)
+              # present and younger than 7 days: nothing to do for this cell
+              if [ "$newest" -gt 0 ] && [ $((now - newest)) -lt 604800 ]; then continue; fi
+            fi
+            # build ids are unique per (recipe, run): a second digest of the same recipe in one run
+            # (stable and beta differ) gets the next number
+            occ=$(awk -F '\t' -v r="$recipe" '$1 == r' sel.tsv | wc -l)
+            printf '%s\t%s\t%s\t%s\t%s.%s\n' "$recipe" "$digest" "$sha" "$label" "$date" "$((base + occ))" >>sel.tsv
+          done <cands.tsv
+          jq -R -n -c '[inputs | split("\t") | {recipe: .[0], digest: .[1], sha: .[2], label: .[3], build_id: .[4]}]' <sel.tsv >sel.json
+          echo "matrix={\"include\":$(cat sel.json)}" >>"$GITHUB_OUTPUT"
+          echo "count=$(jq length sel.json)" >>"$GITHUB_OUTPUT"
+          {
+            echo "### Plan"
+            echo
+            echo "| recipe | ref | digest | build id |"
+            echo "|---|---|---|---|"
+            jq -r '.[] | "| \(.recipe) | \(.label) | `\(.digest[0:12])` | \(.build_id) |"' sel.json
+          } >>"$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: plan
+          path: |
+            wanted.txt
+            prev
+            sel.json
+          if-no-files-found: ignore
+          retention-days: 3
+
+  image:
+    name: Image ${{ matrix.recipe }} (${{ matrix.label }})
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      RECIPE: ${{ matrix.recipe }}
+      BUILD_ID: ${{ matrix.build_id }}
+    steps:
+      # The ref's own tree: its embedded recipes are what the image is built from.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ matrix.sha }}
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - name: Build hx-imagectl
+        run: cargo build --release --locked -p hx-imagectl
+      - name: Install and prepare Incus (containers only, no KVM)
+        run: |
+          set -eu
+          # With recommends: incus only recommends dnsmasq-base (its managed bridge needs it).
+          # This is the CI runner, not a host under test.
+          sudo apt-get update -q
+          sudo apt-get install -y incus incus-client dnsmasq-base btrfs-progs zstd
+          sudo incus admin init --minimal
+          # The storage pool is a btrfs loop file: Incus keeps those under /var/lib/incus/disks, so
+          # that directory is the big disk of the runner (/mnt).
+          sudo mkdir -p /mnt/incus-disks /var/lib/incus/disks
+          sudo mount --bind /mnt/incus-disks /var/lib/incus/disks
+          sudo modprobe btrfs || true
+          grep -qw btrfs /proc/filesystems || { echo "::error::this runner kernel has no btrfs"; exit 1; }
+          # Docker on the runner drops forwarded traffic of an Incus bridge: the same rules as
+          # installer-vm.yml, for the bridge of this job (hxci-br0) and the default one.
+          for br in hxci-br0 incusbr0; do
+            sudo iptables -I DOCKER-USER -i "$br" -j ACCEPT || true
+            sudo iptables -I DOCKER-USER -o "$br" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT || true
+          done
+          # Ubuntu 24.04 restricts unprivileged user namespaces with AppArmor, which can stop
+          # containers from starting. Runner only; this is not the host the product installs on.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo incus version
+          df -h /mnt /var/lib/incus/disks
+      - name: Build and seal the image
+        run: |
+          set -eu
+          sudo "$PWD/target/release/hx-imagectl" build-image --recipe "$RECIPE" --prefix hxci \
+            --build-id "$BUILD_ID" --out "$RUNNER_TEMP/out" --pool-gib 40
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/out"
+          ls -l "$RUNNER_TEMP/out"
+      - name: Equivalence check (a desktop built on the server against one made from this image)
+        run: |
+          set -eu
+          umask 077
+          # A throwaway password for the test desktops; it is never printed.
+          openssl rand -base64 18 >"$RUNNER_TEMP/pw"
+          mkdir "$RUNNER_TEMP/equiv"
+          bin="$PWD/target/release/hx-imagectl"
+          image=$(find "$RUNNER_TEMP/out" -maxdepth 1 \( -name 'hx-image-*.img' -o -name 'hx-image-*.img.p0' \) | head -n 1)
+          [ -n "$image" ] || { echo "::error::no image file was built"; exit 1; }
+          # A: build_on_server. B: import the image just built, then finish_prebuilt. Same user.
+          sudo "$bin" desktop --recipe "$RECIPE" --path build --user alice \
+            --password-file "$RUNNER_TEMP/pw" --facts "$RUNNER_TEMP/equiv/a.json" --prefix hxci
+          sudo "$bin" desktop --recipe "$RECIPE" --path prebuilt --image "$image" --user alice \
+            --password-file "$RUNNER_TEMP/pw" --facts "$RUNNER_TEMP/equiv/b.json" --prefix hxci
+          rm -f "$RUNNER_TEMP/pw"
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/equiv"
+          rc=0
+          "$bin" compare "$RUNNER_TEMP/equiv/a.json" "$RUNNER_TEMP/equiv/b.json" --recipe "$RECIPE" \
+            >"$RUNNER_TEMP/equiv/table.md" || rc=$?
+          {
+            echo "### Equivalence: $RECIPE ($BUILD_ID)"
+            echo
+            cat "$RUNNER_TEMP/equiv/table.md"
+          } >>"$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/equiv/table.md"
+          exit "$rc"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image-${{ matrix.recipe }}-${{ matrix.label }}
+          path: ${{ runner.temp }}/out
+          # the image is already zstd-compressed
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 3
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: equiv-${{ matrix.recipe }}-${{ matrix.label }}
+          path: ${{ runner.temp }}/equiv
+          if-no-files-found: ignore
+          retention-days: 7
+
+  rehearse:
+    name: Manifest rehearsal (test key, nothing published)
+    needs: [plan, image]
+    # whenever `sign` will not run: a pull request, a run without publishing, or keys not provisioned
+    if: >-
+      needs.image.result == 'success'
+      && (needs.plan.outputs.publish != 'true' || needs.plan.outputs.keys != 'true')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - name: Build hx-imagectl
+        run: cargo build --release --locked -p hx-imagectl
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: image-*
+          path: cells
+      - name: Install minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends minisign
+      - name: Build, sign with a per-run test key, verify
+        run: |
+          set -eu
+          bin="$PWD/target/release/hx-imagectl"
+          t=$(date +%s)
+          # a per-run key without a password; it exists on this runner only
+          minisign -G -W -f -p "$RUNNER_TEMP/test.pub" -s "$RUNNER_TEMP/test.key"
+          "$bin" manifest --entries cells/image-* --timestamp "$t" --out manifest.json
+          minisign -S -s "$RUNNER_TEMP/test.key" -m manifest.json -x manifest.json.minisig \
+            -t "hx-images-manifest schema=1 arch=x86_64 timestamp=$t"
+          "$bin" verify --manifest manifest.json --sig manifest.json.minisig --pubkey "$RUNNER_TEMP/test.pub"
+          for f in cells/image-*/hx-image-*; do
+            "$bin" verify --manifest manifest.json --sig manifest.json.minisig \
+              --pubkey "$RUNNER_TEMP/test.pub" --image "$f"
+          done
+          # a manifest with one flipped byte must be refused (exit 1)
+          sed 's/xfce/xfcf/' manifest.json >tampered.json
+          rc=0
+          "$bin" verify --manifest tampered.json --sig manifest.json.minisig \
+            --pubkey "$RUNNER_TEMP/test.pub" || rc=$?
+          test "$rc" = 1
+          {
+            echo "### Manifest rehearsal"
+            echo
+            jq -r '.images[] | "- \(.recipe) \(.build_id): \(.size) bytes, \(.parts | length) part(s)"' manifest.json
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  sign:
+    name: Sign
+    needs: [plan, image]
+    # Runs after partial failures too (a failed cell keeps its previous entry); it needs a publish
+    # run on main, both image keys provisioned, and something to publish: an image of this run, or a
+    # withdrawal (input `drop`), which re-signs the published manifest without the named images.
+    if: >-
+      always() && needs.plan.result == 'success' && needs.plan.outputs.publish == 'true'
+      && needs.plan.outputs.keys == 'true' && (needs.plan.outputs.count != '0' || inputs.drop != '')
+    runs-on: ubuntu-24.04
+    environment: image-signing
+    outputs:
+      cells: ${{ steps.sign.outputs.cells }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - name: Build hx-imagectl
+        run: cargo build --release --locked -p hx-imagectl
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: plan
+          path: plan
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: image-*
+          path: cells
+      - name: Install minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends minisign
+      - name: Manifest, signature and verification
+        id: sign
+        env:
+          IMAGE_MINISIGN_SECRET_KEY: ${{ secrets.IMAGE_MINISIGN_SECRET_KEY }}
+          IMAGE_MINISIGN_KEY_PASSWORD: ${{ secrets.IMAGE_MINISIGN_KEY_PASSWORD }}
+          DROP: ${{ inputs.drop }}
+        run: |
+          set -eu
+          shopt -s nullglob
+          cells=(cells/image-*/)
+          # the input is untrusted text: only well-formed names reach the command line
+          drops=()
+          # shellcheck disable=SC2086
+          for d in $DROP; do
+            if ! printf '%s\n' "$d" | grep -Eq '^[a-z0-9.-]+/[0-9]{8}\.[0-9]{1,2}$'; then
+              echo "::error::'$d' is not recipe/build_id"
+              exit 1
+            fi
+            drops+=("$d")
+          done
+          if [ "${#cells[@]}" = 0 ] && [ "${#drops[@]}" = 0 ]; then
+            echo "::error::no cell produced an image: nothing to publish"
+            exit 1
+          fi
+          bin="$PWD/target/release/hx-imagectl"
+          keys="apps/hx-agent/image-keys/current.pub apps/hx-agent/image-keys/next.pub"
+          t=$(date +%s)
+          prev=''
+          if [ -f plan/prev/images-manifest-x86_64.json ]; then
+            # shellcheck disable=SC2086
+            prev="--previous plan/prev/images-manifest-x86_64.json --previous-sig plan/prev/images-manifest-x86_64.json.minisig --pubkey $keys"
+          fi
+          mkdir signed
+          # timestamp = signing time (privd refuses a manifest older than the last one it accepted)
+          entries=()
+          if [ "${#cells[@]}" != 0 ]; then entries=(--entries "${cells[@]}"); fi
+          dropargs=()
+          if [ "${#drops[@]}" != 0 ]; then dropargs=(--drop "${drops[@]}"); fi
+          # shellcheck disable=SC2086
+          "$bin" manifest "${entries[@]}" $prev --wanted plan/wanted.txt "${dropargs[@]}" \
+            --timestamp "$t" --out signed/images-manifest-x86_64.json
+          cat signed/images-manifest-x86_64.json
+          echo
+          umask 077
+          key="$RUNNER_TEMP/minisign.key"
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$IMAGE_MINISIGN_SECRET_KEY" >"$key"
+          # a prehashed (ED) signature, the minisign default; the password goes in on stdin
+          printf '%s\n' "$IMAGE_MINISIGN_KEY_PASSWORD" | minisign -S -s "$key" \
+            -m signed/images-manifest-x86_64.json \
+            -x signed/images-manifest-x86_64.json.minisig \
+            -t "hx-images-manifest schema=1 arch=x86_64 timestamp=$t"
+          # The tool that verifies on the host must accept what was just signed, with the keys that
+          # are embedded in the agent, and must accept every image file of this run.
+          # shellcheck disable=SC2086
+          "$bin" verify --manifest signed/images-manifest-x86_64.json \
+            --sig signed/images-manifest-x86_64.json.minisig --pubkey $keys
+          for f in cells/image-*/hx-image-*; do
+            # shellcheck disable=SC2086
+            "$bin" verify --manifest signed/images-manifest-x86_64.json \
+              --sig signed/images-manifest-x86_64.json.minisig --pubkey $keys --image "$f"
+          done
+          # for the publish job, which builds nothing: the verifier and the keys it checks against
+          mkdir signed/keys
+          cp apps/hx-agent/image-keys/current.pub apps/hx-agent/image-keys/next.pub signed/keys/
+          cp "$bin" signed/hx-imagectl
+          if [ "${#cells[@]}" != 0 ]; then echo "cells=true" >>"$GITHUB_OUTPUT"; else echo "cells=false" >>"$GITHUB_OUTPUT"; fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: signed
+          path: signed
+          if-no-files-found: error
+          retention-days: 3
+
+  attest:
+    name: Attest (audit only)
+    needs: [plan, sign]
+    # nothing to attest in a pure withdrawal
+    if: needs.sign.result == 'success' && needs.sign.outputs.cells == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: image-*
+          path: cells
+      # Audit only: no server verifies these (no gh or Sigstore client on the host).
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: cells/image-*/hx-image-*
+
+  publish:
+    name: Publish
+    needs: [plan, sign, attest]
+    if: >-
+      always() && needs.sign.result == 'success'
+      && (needs.attest.result == 'success' || needs.attest.result == 'skipped')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: signed
+          path: signed
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: image-*
+          path: cells
+      - name: Create the image releases, then move the manifest, then prune
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          # a withdrawal has no cells: every loop over them must then do nothing
+          shopt -s nullglob
+          bin="$PWD/signed/hx-imagectl"
+          chmod +x "$bin"
+          m=signed/images-manifest-x86_64.json
+          sig=signed/images-manifest-x86_64.json.minisig
+          # Publish exactly what was signed: the signature must verify, and every image file of this
+          # run must be listed in the signed manifest with the size and SHA-256 it states.
+          "$bin" verify --manifest "$m" --sig "$sig" --pubkey signed/keys/current.pub signed/keys/next.pub
+          for f in cells/image-*/hx-image-*; do
+            "$bin" verify --manifest "$m" --sig "$sig" --pubkey signed/keys/current.pub signed/keys/next.pub --image "$f"
+          done
+
+          # One release per build id (two refs of one run get different build ids), created before
+          # the manifest points at it.
+          mapfile -t bids < <(for e in cells/image-*/entry.json; do jq -r .build_id "$e"; done | sort -u)
+          for bid in "${bids[@]}"; do
+            tag="images-$bid"
+            files=()
+            for e in cells/image-*/entry.json; do
+              if [ "$(jq -r .build_id "$e")" = "$bid" ]; then files+=("$(dirname "$e")"/hx-image-*); fi
+            done
+            mkdir -p "sums/$bid"
+            sha256sum "${files[@]}" | sed 's#  .*/#  #' >"sums/$bid/SHA256SUMS"
+            if gh release view "$tag" --repo "$REPO" >/dev/null 2>&1; then
+              # a re-run of a half-finished publish: add what is missing
+              gh release upload "$tag" --repo "$REPO" --clobber "${files[@]}" "sums/$bid/SHA256SUMS"
+            else
+              gh release create "$tag" --repo "$REPO" --target "$SHA" --prerelease --latest=false \
+                --title "$tag" --notes "Desktop images built by images.yml (build $bid). They are authenticated by the signed manifest on the release \`images\`." \
+                "${files[@]}" "sums/$bid/SHA256SUMS"
+            fi
+          done
+
+          # The moving release: what privd's fetcher reads.
+          if ! gh release view images --repo "$REPO" >/dev/null 2>&1; then
+            gh release create images --repo "$REPO" --target "$SHA" --prerelease --latest=false \
+              --title images --notes "Moving release: the current signed images manifest."
+          fi
+          gh release upload images --repo "$REPO" --clobber "$m" "$sig"
+
+          # Keep the 4 newest images-* releases, and never one the current manifest references.
+          jq -r '.images[].build_id' "$m" | sort -u | sed 's/^/images-/' >referenced
+          gh release list --repo "$REPO" --limit 100 --json tagName,createdAt \
+            --jq 'map(select(.tagName | test("^images-[0-9]{8}\\.[0-9]{1,2}$"))) | sort_by(.createdAt) | reverse | .[4:] | .[].tagName' |
+            while read -r old; do
+              if grep -qx "$old" referenced; then continue; fi
+              echo "pruning $old"
+              gh release delete "$old" --repo "$REPO" --cleanup-tag --yes
+            done
