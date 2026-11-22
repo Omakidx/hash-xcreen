@@ -386,81 +386,6 @@ pub async fn create_desktop<T: Transport + Clone + 'static>(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn bounds() -> HostBounds {
-        HostBounds {
-            cpus: 8,
-            ram_mib: 16_384,
-            pool_free_gib: 100,
-        }
-    }
-
-    #[test]
-    fn omitted_limits_default_to_the_host_minus_the_reserve() {
-        let (cpu, mem, disk) = resolve_limits(None, &bounds(), 100).unwrap();
-        assert_eq!((cpu, mem, disk), (8, 12_288, 80));
-    }
-
-    #[test]
-    fn given_limits_are_still_bounded() {
-        let l = pb::Limits {
-            cpu: 9,
-            memory_mib: 4096,
-            disk_gib: 20,
-        };
-        assert!(resolve_limits(Some(&l), &bounds(), 100).is_err());
-        let l = pb::Limits {
-            cpu: 2,
-            memory_mib: 4096,
-            disk_gib: 20,
-        };
-        assert_eq!(
-            resolve_limits(Some(&l), &bounds(), 100).unwrap(),
-            (2, 4096, 20)
-        );
-    }
-
-    #[test]
-    fn settings_are_validated_by_hx_provision() {
-        let zi = std::path::Path::new("/usr/share/zoneinfo");
-        let ok = pb::DesktopSettings {
-            hostname: "desk-1".into(),
-            timezone: String::new(),
-            locale: "en_US.UTF-8".into(),
-            keyboard: "us".into(),
-        };
-        assert!(build_settings(&ok, zi).is_ok());
-        assert!(
-            build_settings(&pb::DesktopSettings::default(), zi)
-                .unwrap()
-                .is_empty()
-        );
-        for bad in [
-            pb::DesktopSettings {
-                hostname: "bad name;".into(),
-                ..Default::default()
-            },
-            pb::DesktopSettings {
-                locale: "xx".into(),
-                ..Default::default()
-            },
-            pb::DesktopSettings {
-                keyboard: "$(x)".into(),
-                ..Default::default()
-            },
-            pb::DesktopSettings {
-                timezone: "../../etc/passwd".into(),
-                ..Default::default()
-            },
-        ] {
-            assert!(build_settings(&bad, zi).is_err(), "{bad:?}");
-        }
-    }
-}
-
 /// Adopts a ready desktop that `uninstall --keep-desktop` left behind: registers it again,
 /// **sets the password given in this request** (so that the verifier the installer writes next
 /// matches the Linux account), and provisions the session link and the session again.
@@ -542,6 +467,81 @@ async fn adopt_kept_desktop<T: Transport + Clone + 'static>(
         Err(e) => {
             let _ = d.unregister_desktop(id);
             Err(e)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bounds() -> HostBounds {
+        HostBounds {
+            cpus: 8,
+            ram_mib: 16_384,
+            pool_free_gib: 100,
+        }
+    }
+
+    #[test]
+    fn omitted_limits_default_to_the_host_minus_the_reserve() {
+        let (cpu, mem, disk) = resolve_limits(None, &bounds(), 100).unwrap();
+        assert_eq!((cpu, mem, disk), (8, 12_288, 80));
+    }
+
+    #[test]
+    fn given_limits_are_still_bounded() {
+        let l = pb::Limits {
+            cpu: 9,
+            memory_mib: 4096,
+            disk_gib: 20,
+        };
+        assert!(resolve_limits(Some(&l), &bounds(), 100).is_err());
+        let l = pb::Limits {
+            cpu: 2,
+            memory_mib: 4096,
+            disk_gib: 20,
+        };
+        assert_eq!(
+            resolve_limits(Some(&l), &bounds(), 100).unwrap(),
+            (2, 4096, 20)
+        );
+    }
+
+    #[test]
+    fn settings_are_validated_by_hx_provision() {
+        let zi = std::path::Path::new("/usr/share/zoneinfo");
+        let ok = pb::DesktopSettings {
+            hostname: "desk-1".into(),
+            timezone: String::new(),
+            locale: "en_US.UTF-8".into(),
+            keyboard: "us".into(),
+        };
+        assert!(build_settings(&ok, zi).is_ok());
+        assert!(
+            build_settings(&pb::DesktopSettings::default(), zi)
+                .unwrap()
+                .is_empty()
+        );
+        for bad in [
+            pb::DesktopSettings {
+                hostname: "bad name;".into(),
+                ..Default::default()
+            },
+            pb::DesktopSettings {
+                locale: "xx".into(),
+                ..Default::default()
+            },
+            pb::DesktopSettings {
+                keyboard: "$(x)".into(),
+                ..Default::default()
+            },
+            pb::DesktopSettings {
+                timezone: "../../etc/passwd".into(),
+                ..Default::default()
+            },
+        ] {
+            assert!(build_settings(&bad, zi).is_err(), "{bad:?}");
         }
     }
 }
