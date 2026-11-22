@@ -69,7 +69,7 @@ record to clean up) and never touches an instance it did not.
 
 privd reads the pepper of the PIN and password verifiers (ipc.md 5.3) from the systemd credential
 `pepper` (`$CREDENTIALS_DIRECTORY/pepper`, accepted only under `/run/credentials/`) when the unit has
-one, else from the root-only `/var/lib/hx/pepper.key`, creating that file on first use (written to a
+one, else (development and test builds only; a `release-build` binary refuses to start without the credential) from the root-only `/var/lib/hx/pepper.key`, creating that file on first use (written to a
 temporary file, synced, hard-linked into place, so it never exists half written; owner and mode are
 checked on every load). A credential that is present but has the wrong length, owner or mode is an
 error, never a silent fallback. The shipped unit has
@@ -363,7 +363,7 @@ to `incus.service` through a drop-in.
 
 * The pepper is sealed: the unit loads it with `LoadCredentialEncrypted=` (see "The pepper") and
   does not start without `/etc/hx/creds/pepper.cred`. The plaintext `pepper.key` fallback exists
-  only for a development run or a host that has not migrated.
+  only in non-release builds (a development run); a release build refuses to start without it.
 * Host addresses are enumerated with `ip -j address show` (fixed argv, parsed with `serde_json`), not
   with a netlink socket of our own.
 * Security-relevant budgets are written on every change (rarer than once a second by construction)

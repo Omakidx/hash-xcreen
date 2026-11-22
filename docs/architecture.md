@@ -361,6 +361,8 @@ The file is root 0600, written atomically (`privd::state::write_atomic`). The in
 
 If both files exist and the decrypted value equals the key, the key is deleted; if it differs, the key is renamed `pepper.key.orphaned-<ts>` with a warning.
 
+`hx-privd` of a release build (`--features release-build`) does not start without the `pepper` credential: the plaintext `pepper.key` fallback is compiled in only for development and test builds, and a `pepper.key` that is still present next to a credential is logged as a warning.
+
 **Resolvers drop-in.** The update fetcher's kernel egress filter denies local and private ranges ([ipc.md](ipc.md) §6.12), and `IPAddressAllow=` cannot be limited to a port, so an allowed address is open to the fetcher on every port. The image fetcher (§4.3) has the same filter and gets the same drop-in. For every `nameserver` in `/etc/resolv.conf`, other than 127.0.0.53 and 127.0.0.54 (already allowed by the unit), that falls inside a **private** range (RFC 1918, `100.64.0.0/10`, `fc00::/7`), the installer writes `IPAddressAllow=<addr>/32` (or `/128`) into `hx-update-fetcher@.service.d/resolvers.conf` and `hx-image-fetcher@.service.d/resolvers.conf`, and removes the drop-ins when the list is empty; the accepted cost is that a compromised fetcher can reach that resolver host on any port. It **never** allows loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`, `fe80::/10`, which includes the cloud metadata service at 169.254.169.254 used as a resolver on Google Cloud and Oracle Cloud) or multicast: such a nameserver is skipped with a warning that updates need systemd-resolved (whose stub forwards to it) or a private resolver. The install does not fail. (Security review M2, 1E.)
 
 ### 5.8 Machine-readable progress
