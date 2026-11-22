@@ -255,7 +255,7 @@ fn submit(app: &Rc<App>) {
 
 fn submit_password(app: &Rc<App>) {
     let vm = app.ui().global::<ConnectVm>();
-    let pw = vm.get_password().to_string();
+    let pw = Zeroizing::new(vm.get_password().to_string());
     if pw.is_empty() || vm.get_pairing() {
         return;
     }
@@ -264,6 +264,7 @@ fn submit_password(app: &Rc<App>) {
     };
     let Some(s) = app.server(&id) else { return };
     vm.set_pairing(true);
+    vm.set_password(ss(""));
     vm.set_err_password(ss(""));
     let ctx = AdminContext {
         host: s.host.clone(),
@@ -276,7 +277,7 @@ fn submit_password(app: &Rc<App>) {
     let admin = app.be.admin.clone();
     spawn_ui(
         app,
-        async move { admin.reinstate(&ctx, &Secret::new(pw)).await },
+        async move { admin.reinstate(&ctx, &Secret::new(pw.to_string())).await },
         move |a, r| {
             let vm = a.ui().global::<ConnectVm>();
             vm.set_pairing(false);

@@ -432,11 +432,11 @@ impl InstallEngine for SshInstallEngine {
             } else {
                 "--destroy-desktop"
             };
-            let path =
-                "PATH=\"$PATH:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"";
+            // The installer places the CLI only here; sudo may not have it on its PATH.
+            let agent = "/usr/lib/hx/current/hx-agent";
             let (cmd, stdin) = match &req.auth {
                 SshAuth::Password { password, user } if user != "root" => (
-                    format!("{path} sudo -S -k -p '' hx-agent uninstall {flag} --yes"),
+                    format!("sudo -S -k -p '' {agent} uninstall {flag} --yes"),
                     Some(Zeroizing::new(
                         format!("{}\n", password.expose()).into_bytes(),
                     )),
@@ -445,7 +445,7 @@ impl InstallEngine for SshInstallEngine {
                 | SshAuth::KeyFile { .. }
                 | SshAuth::DefaultKeys { .. } => (
                     format!(
-                        "if [ \"$(id -u)\" = 0 ]; then {path} hx-agent uninstall {flag} --yes; else {path} sudo -n hx-agent uninstall {flag} --yes; fi"
+                        "if [ \"$(id -u)\" = 0 ]; then {agent} uninstall {flag} --yes; else sudo -n {agent} uninstall {flag} --yes; fi"
                     ),
                     None,
                 ),

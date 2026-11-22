@@ -219,6 +219,12 @@ impl DangerFlow {
             self.state = Danger::Confirm;
         }
     }
+    /// The SSH username or port was edited after the check: the host key must be checked again.
+    pub fn ssh_changed(&mut self) {
+        if self.state == Danger::Confirm {
+            self.state = Danger::NeedsSsh;
+        }
+    }
     /// Whether the confirm button is enabled: keep asks nothing, delete needs the server name.
     pub fn can_confirm(&self, typed: &str, server_name: &str) -> bool {
         self.state == Danger::Confirm && (self.keep || typed == server_name)
@@ -389,5 +395,16 @@ mod tests {
         assert_eq!(*f.state(), Danger::Confirm);
         f.cancel();
         assert_eq!(*f.state(), Danger::Idle);
+    }
+
+    #[test]
+    fn editing_the_ssh_details_returns_to_the_ssh_step() {
+        let mut f = DangerFlow::default();
+        f.start();
+        f.ssh_given();
+        assert_eq!(*f.state(), Danger::Confirm);
+        f.ssh_changed();
+        assert_eq!(*f.state(), Danger::NeedsSsh);
+        assert!(!f.can_confirm("", "x"));
     }
 }
