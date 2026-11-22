@@ -119,6 +119,7 @@ jobs:
         run: |
           sh installer/tests/run.sh dash
           sh installer/tests/handoff.sh dash
+          sh release/tests/gate-image-keys.sh
       - name: Signature KATs under posh (strict POSIX)
         # posh was not available where this was written: informative until it has run green once.
         continue-on-error: true

@@ -124,30 +124,38 @@ One run per profile, release build, 1280x720, on the shared development host (lo
 | lan | 18.1 ms | 15.5 ms | 0.11 / 0.20 | 0.019, 64 | 111, 52, 40 ms | 0.000 % wrong |
 | broadband | 32.9 ms | 30.8 ms | 0.12 / 0.17 | 0.019, 93 | 317, 123, 61 ms | 0.000 % |
 | mobile | 107.1 ms | 114.0 ms | 0.13 / 0.23 | 0.018, 55 | 914, 399, 141 ms | 0.000 % |
-| lossy | 52 to 110 ms | 74 ms to 1.1 s | 0.11 / 0.2 | 0.02, 65 to 230 | 508, 246, 109 ms | **fails in most runs, see 2.8** |
+| lossy | 52 to 110 ms | 74 ms to 1.1 s | 0.11 / 0.2 | 0.02, 65 to 230 | 508, 246, 109 ms | 0.000 % (was failing in most runs, see 2.8) |
 
 The LAN profile meets the Gate 1 numbers even on this loaded host (p95 under 40 ms, 0.20 cores, idle 0.02 cores and 64 bytes a second). At 1080p (the macro run, 5 runs, load average 29) the median p95 is 63 ms typing and 92 ms scrolling: the host, not the code, is the limit there, which is why such numbers are never used as a baseline.
 
-### 2.8 Known failure: the lossy profile
+### 2.8 The lossy defect (found by this suite, fixed)
 
-With 1.5 % loss in each direction at 40 ms RTT the flow does not end with a correct picture in most runs (observed: 4 of the last 5 runs and 3 of the 5 before them failed the picture check). The client in the test does what protocol section 6 asks of one (it decodes every released frame, asks for a key frame on a decode failure and, after a gap in the frame numbers, drops frames until a key frame arrives and sends `request_keyframe`), and the failure remains:
+With 1.5 % loss in each direction at 40 ms RTT the flow used to end with a corrupt picture in most runs (4 of 5, then 3 of 5 failed the picture check), and sometimes marks never appeared. The test client was right (it follows protocol section 6) and the server's statistics were clean (0 dropped frames): two independent causes, found by logging every frame at each layer.
 
-* The final decoded picture is partly or wholly grey (2 to 62 % of the pixels wrong, contrast down to 6 of 210) while the desktop is fine. The **ffmpeg program decoding the exact bytes handed to the test's decoder produces the same grey picture**, so it is not the test's decoder; the stream the client receives is damaged.
-* Every key frame the client received carries an IDR slice (NAL type 5) and arrived 77 to 850 ms after the gap that asked for it, yet the picture after the last one is still wrong in most runs.
-* In some runs the video stops for 20 s or more while input events are still unseen (the last 1 to 40 marks of a phase never appear), with the server's own statistics (`ServerStats`, enabled in the test) reporting 0 dropped frames throughout.
-* The relay and session counters give no sign of it: that is what makes it worth an owner's time.
+1. **A starved key frame was never refined (the grey picture).** The ffmpeg program decoding `stream.h264` gave the same grey picture, and every key frame carried an IDR slice, so the bytes were what the encoder made: the key frame itself decodes to flat grey. An IDR requested while the VBV buffer is empty (a scroll of dense text, the ladder at 2 Mbit/s) was 2 to 4 KB at QP 55 to 64 (the S2 "known quality gap", here at its worst), and the display then stopped changing, so no further frame was captured and the client kept that picture. Decoding each IDR of the dump alone shows it; the lossy flow makes several IDRs per run, the LAN flow only the first one (a blank screen). A codec test pins the mechanism (a starved IDR is far from the screen, and repeating the unchanged picture refines it) and a pipeline test the cure.
+2. **A late frame was skipped instead of waited for (the loop that fed it).** Frame streams are reliable, but the reorder window held a late frame for 10 ms: any retransmission (one to three round trips, 40 to 150 ms here) made the window release past it, the late frame arrived to be dropped as stale, the decoder skipped a frame, the client asked for a key frame, and the key frame (the biggest frame) was itself overtaken by the small frames behind it: more gaps, more key frames (the encoder log showed IDRs ten frames apart). Typical run before: 2 to 3 gaps in each phase. After: none.
 
-Suspects, in the order the evidence points at them (none is established): the reorder window releasing a frame past a late one, so that P frames refer to a frame the decoder never saw while the frame numbers stay contiguous at the client; a tail frame lost without a successor to reveal the gap; a key frame that does not repair the picture because later frames still refer to older content. Reproduce:
+Fixes: `hx-session::refine` (refinement frames of the unchanged screen after a frame the rate control starved, QP from `hx-codec`), the reorder window default of 32 frames and 250 ms (protocol 6.1), and a client that repeats `request_keyframe` while it waits for a key frame (a request or its answer can be lost; the test client asked once). Not a protocol change: the wire format and the window rules are unchanged, only the client's default sizes and its duty to repeat.
+
+Evidence, lossy profile, release build, loaded host (load 15 to 50 on 16 CPUs), picture check strict:
+
+| | before | after |
+|---|---|---|
+| runs passing | 3 of 6 on the unmodified branch (4 of 5 failing in the earlier report), 2 of 6 with a first refinement version | 12 of 12 (6 and 5 lossy-only runs and the lossy leg of the all-profile run) |
+| frame gaps per run | 2 to 5 | 0 in every run of the last 11 |
+| picture | 2 to 62 % wrong | 0.000 % wrong |
+
+Ablation (refinement fixed, reorder hold put back to 10 ms): 4 of 5 passed and one showed 51 % wrong, with 1 to 3 gaps per phase, so both fixes are kept. Regression tests that fail without them: `hx-codec` `tests/encode.rs` `a_starved_key_frame_is_refined_by_repeating_the_unchanged_picture`; `hx-session` `tests/pipeline.rs` `a_starved_key_frame_is_followed_by_refinement_frames_of_the_static_screen` (0 refinement frames before) and `src/refine.rs` unit tests; `hx-transport` `tests/channels.rs` `video_late_frame_is_waited_for` (both transports; the late frame was dropped before). Reproduce a failure, if one ever returns:
 
 ```sh
 HX_NETEM_LOGS=1 HX_NETEM_OUT=/tmp/hx-netem HX_E2E_NETEM=1 HX_REQUIRE_XVFB=1 HX_NETEM_PROFILES=lossy \
   cargo nextest run --release -p hx-agent --run-ignored only --test e2e_netem --no-capture \
   -E 'test(netem_e2e_over_all_profiles)'
 # on a mismatch: /tmp/hx-netem/mismatch-decoded.pgm and mismatch-desk.pgm (what was decoded and what the
-# desk drew) and stream.h264 (the bytes handed to the decoder; `ffmpeg -i stream.h264 -update 1 last.png`)
+# desk drew) and stream.h264 (the bytes handed to the decoder; decode each IDR alone to see its quality)
 ```
 
-`e2e-netem.yml` therefore runs lossy as its own step with `continue-on-error`; remove that when the defect is fixed.
+Build `hx-session` as well as the test (`cargo build --release -p hx-session --bins`): the end-to-end test starts the binary next to the gateway and `cargo nextest run -p hx-agent` does not rebuild it. `e2e-netem.yml` runs lossy as its own step, and it fails the job.
 
 ### 2.9 What it does not cover
 
