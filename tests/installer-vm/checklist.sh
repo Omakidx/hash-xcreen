@@ -95,7 +95,10 @@ fi
 if [ "$docker" = 1 ]; then
     docker run -d --name hx1e-pub -p 8099:80 busybox httpd -f -p 80 >/dev/null
     sleep 2
-    curl -fsS -m 5 -o /dev/null "http://127.0.0.1:8099/" || fail "control: the published Docker port does not answer on the host"
+    # Any HTTP answer will do: busybox httpd has no index page and answers 404 (curl -f called that
+    # a failure). 000 means no connection.
+    code=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:8099/" || true)
+    [ -n "$code" ] && [ "$code" != 000 ] || fail "control: the published Docker port does not answer on the host"
     if tcp_ok "$pub" 8099; then fail "item 3: the desktop reached a Docker-published host port"; fi
     pass "item 3: a port published with Docker is unreachable from the desktop"
 fi
