@@ -581,7 +581,11 @@ fn malformed_messages_are_rejected() {
     let v = Some(pb::Version { major: 1, minor: 0 });
     assert!(hello(None, 1, String::new()).validate().is_err());
     assert!(hello(v, 0, String::new()).validate().is_err());
-    assert!(hello(v, 3, String::new()).validate().is_err());
+    assert!(hello(v, 4, String::new()).validate().is_err());
+    assert!(
+        hello(v, 3, String::new()).validate().is_ok(),
+        "INTENT_SETUP exists from 1.3"
+    );
     assert!(hello(v, 1, "x".repeat(129)).validate().is_err());
     assert!(hello(v, 1, "x".repeat(128)).validate().is_ok());
     // Unknown codec in capabilities.
@@ -856,6 +860,7 @@ fn close_codes_roundtrip() {
         CloseCode::Shutdown,
         CloseCode::InternalError,
         CloseCode::TakenOver,
+        CloseCode::SetupClosed,
     ] {
         assert_eq!(CloseCode::from_code(u64::from(c.code())), c);
         assert_eq!(CloseCode::from_websocket_code(c.websocket_code()), Some(c));
@@ -864,7 +869,7 @@ fn close_codes_roundtrip() {
     assert_eq!(CloseCode::TakenOver.code(), 9);
     assert_eq!(CloseCode::TakenOver.websocket_code(), 4009);
     // Codes after the defined ones are unknown, not aliases of TakenOver.
-    assert_eq!(CloseCode::from_code(10), CloseCode::InternalError);
+    assert_eq!(CloseCode::from_code(11), CloseCode::InternalError);
     assert_eq!(CloseCode::from_websocket_code(1000), None);
     assert!(ChannelId::from_u8(0).is_err());
 }
@@ -1552,7 +1557,7 @@ fn device_management_feature_exists_from_1_2_only() {
     assert!(!Features::defined_up_to(1).contains(Features::DEVICE_MANAGEMENT));
     assert!(Features::defined_up_to(2).contains(Features::DEVICE_MANAGEMENT));
     assert!(Features::defined_up_to(2).contains(Features::SERVER_STATS));
-    assert_eq!(ProtocolVersion::CURRENT.minor, 2);
+    assert_eq!(ProtocolVersion::CURRENT.minor, 3);
     let all = hx_proto::version::capabilities(&[], Features(u64::MAX));
     for minor in [0, 1] {
         let older = ProtocolVersion { major: 1, minor };

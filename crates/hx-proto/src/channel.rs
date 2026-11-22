@@ -68,6 +68,9 @@ pub enum CloseCode {
     InternalError = 8,
     /// Another device took over this desktop (protocol 1.1, §5.7).
     TakenOver = 9,
+    /// `INTENT_SETUP` while setup is not open for this device, or the setup binding moved
+    /// away from it (protocol 1.3). Sent only on `INTENT_SETUP` connections.
+    SetupClosed = 10,
 }
 
 impl CloseCode {
@@ -88,6 +91,7 @@ impl CloseCode {
             6 => Self::PairingClosed,
             7 => Self::Shutdown,
             9 => Self::TakenOver,
+            10 => Self::SetupClosed,
             _ => Self::InternalError,
         }
     }
@@ -134,6 +138,16 @@ pub const DEVICE_ID_LEN: usize = 16;
 pub const MAX_STATS_INTERVAL_MS: u32 = 60_000;
 /// Most devices in one `DeviceList` (protocol §5.9).
 pub const MAX_DEVICE_LIST: usize = 128;
+/// Most bytes of a PIN in `SetupSetPin` (hard cap; the digits rule is semantic, protocol 5.10).
+pub const MAX_SETUP_PIN: usize = 16;
+/// Most bytes of the password in `SetupStart` (hard cap; the content rules are semantic).
+pub const MAX_SETUP_PASSWORD: usize = 1_024;
+/// Most bytes of a desktop user name in `SetupOptions` (hard cap).
+pub const MAX_SETUP_USERNAME: usize = 32;
+/// Most warnings in a `SetupResult`.
+pub const MAX_SETUP_WARNINGS: usize = 16;
+/// Longest pairing code in `PairingCodeIssued`.
+pub const MAX_PAIRING_CODE: usize = 16;
 /// Maximum WebSocket transfer chunk.
 pub const MAX_TRANSFER_CHUNK: usize = 65_536;
 /// Maximum cursor image edge in pixels.

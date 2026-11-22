@@ -11,7 +11,8 @@ use crate::{
     channel::{
         DEVICE_ID_LEN, MAX_CLIPBOARD_SIZE, MAX_CONTROL_MESSAGE, MAX_CURSOR_EDGE,
         MAX_CURSOR_MESSAGE, MAX_DEVICE_LIST, MAX_DEVICE_NAME, MAX_FILE_SIZE, MAX_INPUT_MESSAGE,
-        MAX_OPAQUE, MAX_STATS_INTERVAL_MS, MAX_TRANSFER_HEADER,
+        MAX_OPAQUE, MAX_PAIRING_CODE, MAX_SETUP_PASSWORD, MAX_SETUP_PIN, MAX_SETUP_USERNAME,
+        MAX_SETUP_WARNINGS, MAX_STATS_INTERVAL_MS, MAX_TRANSFER_HEADER,
     },
     error::ProtoError,
     pb::{
@@ -24,6 +25,14 @@ use crate::{
 pub const FRAME_PREFIX_LEN: usize = 4;
 /// Largest remote dimension in pixels.
 pub const MAX_DIMENSION: u32 = 16_384;
+/// Shortest lifetime a client may request for a pairing code, in seconds (1.3).
+pub const MIN_PAIRING_CODE_TTL_S: u32 = 60;
+/// Longest lifetime a client may request for a pairing code, in seconds (1.3).
+pub const MAX_PAIRING_CODE_TTL_S: u32 = 900;
+/// Most bytes of a desktop password (privd and libxcrypt read no more).
+pub const MAX_PASSWORD_BYTES: usize = 511;
+/// Fewest and most digits of a PIN.
+pub const PIN_LEN: std::ops::RangeInclusive<usize> = 6..=16;
 /// Highest USB HID keyboard usage accepted.
 pub const MAX_SCANCODE: u32 = 0xE7;
 
@@ -164,9 +173,9 @@ impl Wire for ControlMessage {
                 }
                 if !matches!(
                     pb::Intent::try_from(h.intent),
-                    Ok(pb::Intent::Session | pb::Intent::Pair)
+                    Ok(pb::Intent::Session | pb::Intent::Pair | pb::Intent::Setup)
                 ) {
-                    return Err(invalid("hello.intent", "must be SESSION or PAIR"));
+                    return Err(invalid("hello.intent", "must be SESSION, PAIR or SETUP"));
                 }
                 check_str("hello.software", &h.software, 128)?;
                 check_str("hello.device_name", &h.device_name, 64)?;
@@ -189,7 +198,8 @@ impl Wire for ControlMessage {
                     Ok(pb::RefuseReason::UpdateRequired
                         | pb::RefuseReason::Unauthorized
                         | pb::RefuseReason::Busy
-                        | pb::RefuseReason::PairingClosed)
+                        | pb::RefuseReason::PairingClosed
+                        | pb::RefuseReason::SetupClosed)
                 ) {
                     return Err(invalid("refuse.reason", "unknown reason"));
                 }
@@ -259,6 +269,7 @@ impl Wire for ControlMessage {
                 }
             }
             Ctl::DeviceMgmt(d) => d.validate_body()?,
+            Ctl::Setup(s) => s.validate_body()?,
             Ctl::Pairing(o) | Ctl::Auth(o) => {
                 if o.data.len() > MAX_OPAQUE {
                     return Err(invalid("opaque.data", "too long"));
@@ -269,9 +280,10 @@ impl Wire for ControlMessage {
     }
 }
 
-/// Which way a `DeviceMgmt` body travels (protocol §5.9). One envelope carries both
-/// directions, so the transport cannot enforce the role from the variant alone: the receiving
-/// application checks it with [`pb::DeviceMgmt::direction`].
+/// Which way a `DeviceMgmt` or `SetupMessage` body travels (protocol §5.9, §5.10). One
+/// envelope carries both directions, so the transport cannot enforce the role from the variant
+/// alone: the receiving application checks it with [`pb::DeviceMgmt::direction`] or
+/// [`pb::SetupMessage::direction`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MgmtDirection {
     /// A request: only a client sends it.
@@ -285,8 +297,10 @@ impl pb::DeviceMgmt {
     pub fn direction(&self) -> Option<MgmtDirection> {
         use pb::device_mgmt::Body as B;
         Some(match self.body.as_ref()? {
-            B::List(_) | B::Revoke(_) => MgmtDirection::ClientToServer,
-            B::DeviceList(_) | B::RevokeResult(_) | B::Event(_) => MgmtDirection::ServerToClient,
+            B::List(_) | B::Revoke(_) | B::CreatePairingCode(_) => MgmtDirection::ClientToServer,
+            B::DeviceList(_) | B::RevokeResult(_) | B::Event(_) | B::PairingCodeIssued(_) => {
+                MgmtDirection::ServerToClient
+            }
         })
     }
 
@@ -305,6 +319,30 @@ impl pb::DeviceMgmt {
         }
         match body {
             B::List(_) => Ok(()),
+            B::CreatePairingCode(c) => {
+                if !(MIN_PAIRING_CODE_TTL_S..=MAX_PAIRING_CODE_TTL_S).contains(&c.expires_in_s) {
+                    return Err(invalid(
+                        "create_pairing_code.expires_in_s",
+                        "must be 60..=900",
+                    ));
+                }
+                Ok(())
+            }
+            B::PairingCodeIssued(c) => {
+                if c.code.is_empty()
+                    || c.code.len() > MAX_PAIRING_CODE
+                    || !c
+                        .code
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                {
+                    return Err(invalid(
+                        "pairing_code_issued.code",
+                        "must be 1..=16 ASCII letters, digits or dashes",
+                    ));
+                }
+                Ok(())
+            }
             B::Revoke(r) => check_device_id("revoke.device_id", &r.device_id, false),
             B::RevokeResult(r) => match pb::RevokeStatus::try_from(r.status) {
                 Ok(pb::RevokeStatus::Unspecified) | Err(_) => {
@@ -595,4 +633,153 @@ impl ControlMessage {
     pub fn new(m: Ctl) -> Self {
         Self { message: Some(m) }
     }
+}
+
+/// Why `pw` cannot be the desktop user's password, or `None` when it can: 1 to
+/// [`MAX_PASSWORD_BYTES`] bytes of valid UTF-8 without NUL, CR or LF. The one checker shared by
+/// the setup client and the gateway (protocol §5.10); the messages never include the value.
+pub fn password_problem(pw: &[u8]) -> Option<&'static str> {
+    if pw.is_empty() {
+        return Some("must not be empty");
+    }
+    if pw.len() > MAX_PASSWORD_BYTES {
+        return Some("is longer than 511 bytes");
+    }
+    if pw.iter().any(|b| matches!(b, 0 | b'\n' | b'\r')) {
+        return Some("contains a NUL, carriage return or newline");
+    }
+    if std::str::from_utf8(pw).is_err() {
+        return Some("is not valid UTF-8");
+    }
+    None
+}
+
+/// Why `pin` cannot be a PIN, or `None` when it can: 6 to 16 ASCII digits.
+pub fn pin_problem(pin: &[u8]) -> Option<&'static str> {
+    if !PIN_LEN.contains(&pin.len()) {
+        return Some("must be 6 to 16 digits");
+    }
+    if !pin.iter().all(u8::is_ascii_digit) {
+        return Some("must be digits only");
+    }
+    None
+}
+
+impl pb::SetupMessage {
+    /// The direction this body may travel, or `None` if no body is set.
+    pub fn direction(&self) -> Option<MgmtDirection> {
+        use pb::setup_message::Body as B;
+        Some(match self.body.as_ref()? {
+            B::SetPin(_) | B::Start(_) | B::Cancel(_) | B::Finish(_) => {
+                MgmtDirection::ClientToServer
+            }
+            B::State(_) | B::Ack(_) | B::Progress(_) | B::Result(_) => {
+                MgmtDirection::ServerToClient
+            }
+        })
+    }
+
+    /// Structure and hard size caps (protocol §5.10), independent of direction. Semantic
+    /// checks (PIN digits, password rules, user name, enum values, Docker acknowledgement) are
+    /// the receiver's business and are answered with `SetupAck`, not a protocol error.
+    fn validate_body(&self) -> Result<(), ProtoError> {
+        use pb::setup_message::Body as B;
+        let Some(body) = &self.body else {
+            return Err(invalid("setup", "no body set"));
+        };
+        // Requests and their acks carry the request id; pushes never do.
+        match (body, self.request_id) {
+            (B::State(_) | B::Progress(_) | B::Result(_), 0) => {}
+            (B::State(_) | B::Progress(_) | B::Result(_), _) => {
+                return Err(invalid("setup.request_id", "must be 0"));
+            }
+            (_, 0) => return Err(invalid("setup.request_id", "must not be 0")),
+            _ => {}
+        }
+        match body {
+            B::SetPin(p) => {
+                if p.pin.len() > MAX_SETUP_PIN {
+                    return Err(invalid("set_pin.pin", "too long"));
+                }
+            }
+            B::Start(s) => {
+                if s.password.len() > MAX_SETUP_PASSWORD {
+                    return Err(invalid("start.password", "too long"));
+                }
+                if let Some(o) = &s.options {
+                    check_setup_options(o)?;
+                }
+            }
+            B::Cancel(_) | B::Finish(_) => {}
+            B::State(s) => {
+                if let Some(h) = &s.host {
+                    check_str("state.host.os", &h.os, 64)?;
+                    check_str("state.host.arch", &h.arch, 16)?;
+                }
+                if let Some(p) = &s.last_progress {
+                    check_setup_progress(p)?;
+                }
+                if let Some(r) = &s.last_result {
+                    check_setup_result(r)?;
+                }
+            }
+            B::Ack(a) => {
+                check_str("ack.field", &a.field, 64)?;
+                check_str("ack.message", &a.message, 256)?;
+            }
+            B::Progress(p) => check_setup_progress(p)?,
+            B::Result(r) => check_setup_result(r)?,
+        }
+        Ok(())
+    }
+}
+
+fn check_setup_options(o: &pb::SetupOptions) -> Result<(), ProtoError> {
+    check_str("options.username", &o.username, MAX_SETUP_USERNAME)?;
+    if let Some(l) = &o.limits {
+        if l.cpu > 1024 {
+            return Err(invalid("options.limits.cpu", "above 1024"));
+        }
+        if l.memory_mib > 16_777_216 {
+            return Err(invalid("options.limits.memory_mib", "above 16777216"));
+        }
+        if l.disk_gib > 65_536 {
+            return Err(invalid("options.limits.disk_gib", "above 65536"));
+        }
+    }
+    if let Some(s) = &o.settings {
+        check_str("options.settings.hostname", &s.hostname, 63)?;
+        check_str("options.settings.timezone", &s.timezone, 64)?;
+        check_str("options.settings.locale", &s.locale, 32)?;
+        check_str("options.settings.keyboard", &s.keyboard, 40)?;
+    }
+    Ok(())
+}
+
+fn check_setup_progress(p: &pb::SetupProgress) -> Result<(), ProtoError> {
+    check_str("progress.step", &p.step, 128)?;
+    if p.percent > 100 && p.percent != 255 {
+        return Err(invalid("progress.percent", "must be 0..=100 or 255"));
+    }
+    Ok(())
+}
+
+fn check_setup_result(r: &pb::SetupResult) -> Result<(), ProtoError> {
+    check_str("result.reason", &r.reason, 256)?;
+    if r.warnings.len() > MAX_SETUP_WARNINGS {
+        return Err(invalid("result.warnings", "too many warnings"));
+    }
+    for w in &r.warnings {
+        check_str("result.warnings", w, 256)?;
+    }
+    if let Some(d) = &r.docker {
+        check_str("result.docker.docker_version", &d.docker_version, 64)?;
+        check_str("result.docker.found", &d.found, 64)?;
+        check_str("result.docker.required", &d.required, 64)?;
+        check_str("result.docker.hint", &d.hint, 256)?;
+    }
+    if let Some(e) = &r.error {
+        check_str("result.error.message", &e.message, 256)?;
+    }
+    Ok(())
 }
