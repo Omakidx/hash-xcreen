@@ -53,9 +53,12 @@ on:
 permissions:
   contents: read
 
+# Runs that can publish (schedule, manual) are serialized in one group and never cancelled. A pull
+# request has its own group per ref and a newer push cancels the stale run, so a pull request never
+# queues behind, or displaces, a publish run.
 concurrency:
-  group: images
-  cancel-in-progress: false
+  group: ${{ github.event_name == 'pull_request' && format('images-pr-{0}', github.ref) || 'images' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -314,7 +317,10 @@ jobs:
   rehearse:
     name: Manifest rehearsal (test key, nothing published)
     needs: [plan, image]
-    if: needs.plan.outputs.publish != 'true' && needs.image.result == 'success'
+    # whenever `sign` will not run: a pull request, a run without publishing, or keys not provisioned
+    if: >-
+      needs.image.result == 'success'
+      && (needs.plan.outputs.publish != 'true' || needs.plan.outputs.keys != 'true')
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
