@@ -17,3 +17,10 @@ ffmpeg-next.workspace = true
 rustix = { workspace = true, features = ["time"] }
 thiserror.workspace = true
 yuvutils-rs.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "handoff"
+harness = false

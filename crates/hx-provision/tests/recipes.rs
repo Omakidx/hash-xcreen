@@ -912,6 +912,10 @@ fn ensure_user_refuses_system_accounts_and_uid_mismatches_and_rename_is_idempote
         "idempotent guard"
     );
     assert!(s.contains("from='desk'") && s.contains("to='alice'"));
+    assert!(
+        s.contains("/etc/subuid /etc/subgid") && s.contains("sed -i \"s/^$from:/$to:/\""),
+        "the subordinate id ranges follow the rename (found by the equivalence check)"
+    );
 }
 
 #[test]

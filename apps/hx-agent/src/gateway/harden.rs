@@ -28,7 +28,7 @@
 //! | time, randomness | `clock_gettime clock_getres gettimeofday nanosleep clock_nanosleep getrandom` |
 //! | descriptors | `read write readv writev pread64 pwrite64 close lseek dup dup3 fcntl pipe2 eventfd2 epoll_create1 epoll_ctl epoll_wait epoll_pwait poll ppoll ioctl` (**only** `FIONBIO FIONREAD FIOCLEX FIONCLEX`) |
 //! | sockets | `socket` (**only** `AF_UNIX AF_INET AF_INET6` and type `SOCK_STREAM` or `SOCK_DGRAM`, with `NONBLOCK`/`CLOEXEC` only), `socketpair` (**only** `AF_UNIX`, `SOCK_STREAM`), `connect accept4 shutdown getsockname getpeername getsockopt setsockopt sendto recvfrom sendmsg recvmsg sendmmsg recvmmsg` |
-//! | files (registry, verifiers) | `openat fstat newfstatat statx fsync fdatasync fchmod unlinkat renameat renameat2 flock readlinkat access faccessat faccessat2 ftruncate fallocate getdents64` |
+//! | files (registry, verifiers, setup store) | `openat fstat newfstatat statx fsync fdatasync fchmod unlinkat renameat renameat2 flock readlinkat access faccessat faccessat2 ftruncate fallocate getdents64` |
 //! | identity, limits | `getuid geteuid getgid getegid getpid getrlimit prlimit64 uname` |
 //!
 //! Deliberately **absent**: `execve execveat vfork ptrace mount umount2 setuid setgid setns

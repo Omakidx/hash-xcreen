@@ -59,6 +59,10 @@ fn main() -> Result<(), slint::PlatformError> {
         .build()
         .expect("tokio runtime");
 
+    // The id of the packaged desktop file (X11 WM_CLASS, Wayland app id).
+    // The app id needs an existing platform: select the backend (SLINT_BACKEND is honoured) first.
+    slint::BackendSelector::new().select()?;
+    slint::set_xdg_app_id("io.github.omakidx.hashxcreen")?;
     let ui = AppWindow::new()?;
     let cfg = if demo_mode {
         Config {

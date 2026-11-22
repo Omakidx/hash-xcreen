@@ -15,7 +15,7 @@ use crate::backend::{
     UninstallRequest,
 };
 use crate::details::{self, DangerFlow, DeviceRow, RevokePlan};
-use crate::servers::Lifecycle;
+use crate::servers::{Lifecycle, parse_version};
 use crate::session::{Desk, Wiring};
 use crate::video::Stats;
 use crate::{DetailsVm, DeviceRowData, Kv, Screen};
@@ -50,6 +50,7 @@ fn admin_ctx(app: &App) -> Option<AdminContext> {
         port: s.port,
         server_key_hex: s.server_key,
         device: app.key.clone(),
+        server_version: parse_version(&s.server_version),
         session: app.det.borrow().session.clone(),
     })
 }
@@ -374,6 +375,7 @@ fn admin_error_text(e: &AdminError) -> String {
         AdminError::RateLimited => "Too many tries. Wait a few minutes and try again.".into(),
         AdminError::Failed(m) => m.clone(),
         AdminError::Unreachable => "Cannot reach the server.".into(),
+        AdminError::UpdateRequired => "This server must be updated first.".into(),
     }
 }
 
@@ -617,6 +619,11 @@ fn pair_device(app: &Rc<App>) {
                         },
                     );
                     a.det.borrow_mut().pair_timer = Some(t);
+                }
+                Err(AdminError::UpdateRequired) => {
+                    close_dialog(a);
+                    let id = a.det.borrow().server_id.clone().unwrap_or_default();
+                    super::update_ctl::show(a, &id);
                 }
                 Err(e) => vm.set_dialog_error(ss(match e {
                     AdminError::RateLimited => {

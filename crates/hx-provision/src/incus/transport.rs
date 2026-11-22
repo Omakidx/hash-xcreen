@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use bytes::Bytes;
+use http_body_util::channel::Channel;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::Method;
+use hyper::body::Frame;
 use hyper_util::rt::TokioIo;
 use tokio::net::UnixStream;
 
@@ -66,7 +68,25 @@ pub struct Response {
 pub trait Transport: Send + Sync {
     /// Send one request and read the whole response.
     fn send(&self, request: Request) -> impl Future<Output = Result<Response, IncusError>> + Send;
+
+    /// Send `head` with the first `len` bytes of `body` as its body, streamed: the file is read
+    /// in [`UPLOAD_FRAME`]-sized pieces and never held in memory as a whole. `head.body` is
+    /// ignored. The default refuses, so scripted fakes need not implement it.
+    fn send_file(
+        &self,
+        head: Request,
+        body: std::fs::File,
+        len: u64,
+    ) -> impl Future<Output = Result<Response, IncusError>> + Send {
+        async move {
+            let _ = (head, body, len);
+            Err(IncusError::Unsupported("streaming upload".into()))
+        }
+    }
 }
+
+/// Size of one frame of a streamed upload: 1 MiB.
+pub const UPLOAD_FRAME: usize = 1024 * 1024;
 
 /// Talks to the Incus daemon over its unix socket (`/var/lib/incus/unix.socket`).
 ///
@@ -91,6 +111,82 @@ impl UnixTransport {
     }
 
     async fn exchange(&self, request: Request) -> Result<Response, IncusError> {
+        let body = Full::new(request.body.clone());
+        self.exchange_with(request, body, None).await
+    }
+
+    /// Stream `len` bytes of `file` as the request body, reading with `pread` (`read_at`, so the
+    /// file offset is never shared) in [`UPLOAD_FRAME`] pieces on the blocking pool, two frames
+    /// ahead of the socket at most.
+    async fn exchange_file(
+        &self,
+        request: Request,
+        file: std::fs::File,
+        len: u64,
+    ) -> Result<Response, IncusError> {
+        let (mut tx, body) = Channel::<Bytes, std::io::Error>::new(2);
+        let file = std::sync::Arc::new(file);
+        let reader = tokio::spawn(async move {
+            let mut offset: u64 = 0;
+            while offset < len {
+                let want = usize::try_from((len - offset).min(UPLOAD_FRAME as u64))
+                    .unwrap_or(UPLOAD_FRAME);
+                let f = file.clone();
+                let read = tokio::task::spawn_blocking(move || {
+                    use std::os::unix::fs::FileExt;
+                    let mut buf = vec![0u8; want];
+                    let mut got = 0;
+                    while got < want {
+                        match f.read_at(&mut buf[got..], offset + got as u64) {
+                            Ok(0) => break,
+                            Ok(n) => got += n,
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    buf.truncate(got);
+                    Ok(buf)
+                })
+                .await;
+                let buf = match read {
+                    Ok(Ok(b)) if !b.is_empty() => b,
+                    Ok(Ok(_)) => {
+                        tx.abort(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "the file is shorter than its declared length",
+                        ));
+                        return;
+                    }
+                    Ok(Err(e)) => {
+                        tx.abort(e);
+                        return;
+                    }
+                    Err(e) => {
+                        tx.abort(std::io::Error::other(e.to_string()));
+                        return;
+                    }
+                };
+                offset += buf.len() as u64;
+                if tx.send(Frame::data(Bytes::from(buf))).await.is_err() {
+                    return; // the exchange ended; nobody is reading
+                }
+            }
+        });
+        let result = self.exchange_with(request, body, Some(len)).await;
+        reader.abort();
+        result
+    }
+
+    async fn exchange_with<B>(
+        &self,
+        request: Request,
+        body: B,
+        content_length: Option<u64>,
+    ) -> Result<Response, IncusError>
+    where
+        B: hyper::body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
         let stream = UnixStream::connect(&self.path)
             .await
             .map_err(|e| IncusError::Connect {
@@ -111,11 +207,14 @@ impl UnixTransport {
         if let Some(ct) = request.content_type {
             builder = builder.header("Content-Type", ct);
         }
+        if let Some(n) = content_length {
+            builder = builder.header("Content-Length", n);
+        }
         for (k, v) in &request.headers {
             builder = builder.header(*k, v.as_str());
         }
         let req = builder
-            .body(Full::new(request.body))
+            .body(body)
             .map_err(|e| IncusError::InvalidArgument(format!("bad request: {e}")))?;
         let limit = request.max_response.unwrap_or(MAX_BODY);
         let result = async {
@@ -163,6 +262,23 @@ impl Transport for UnixTransport {
         let timeout = request.timeout;
         let what = format!("{} {}", request.method, request.path);
         match tokio::time::timeout(timeout, self.exchange(request)).await {
+            Ok(r) => r,
+            Err(_) => Err(IncusError::Timeout {
+                what,
+                after: timeout,
+            }),
+        }
+    }
+
+    async fn send_file(
+        &self,
+        head: Request,
+        body: std::fs::File,
+        len: u64,
+    ) -> Result<Response, IncusError> {
+        let timeout = head.timeout;
+        let what = format!("{} {}", head.method, head.path);
+        match tokio::time::timeout(timeout, self.exchange_file(head, body, len)).await {
             Ok(r) => r,
             Err(_) => Err(IncusError::Timeout {
                 what,

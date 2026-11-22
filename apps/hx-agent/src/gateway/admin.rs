@@ -20,7 +20,7 @@
 use std::collections::HashSet;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use hx_crypto::{Authenticator, PairingToken};
@@ -39,6 +39,7 @@ use super::devices::{DeviceService, device_info};
 use super::ipc_io::read_frame;
 use super::live::LiveSessions;
 use super::session::SessionManager;
+use super::setup::SetupCoordinator;
 use super::util::{device_id, now_unix};
 use super::verifier::{VerifierRecord, VerifierStore};
 use hx_ipc::privd::pb::AuditEvent;
@@ -69,59 +70,6 @@ const MAX_LISTED: usize = 256;
 /// Request ids remembered per connection before it is closed (a repeat is refused).
 const MAX_IDS: usize = 4096;
 
-/// The mirror of privd's setup window (`SetupWindow` command, ipc.md 6.3 and 9).
-#[derive(Debug, Default, Clone, Copy)]
-struct SetupMirror {
-    opened_unix: u64,
-    expires_unix: u64,
-}
-
-/// Longest total lifetime of one setup window (ipc.md 5.1).
-const MAX_SETUP_SECS: u64 = 24 * 3600;
-
-impl SetupMirror {
-    fn is_open(&self, now: u64) -> bool {
-        self.expires_unix > now
-    }
-
-    /// Opens a window of `secs` (never more than 24 hours). Opening a window that is already
-    /// open keeps its start, so repeated opens cannot stretch it past 24 hours in total.
-    fn open(&mut self, now: u64, secs: u64) {
-        let secs = secs.min(MAX_SETUP_SECS);
-        if self.is_open(now) {
-            let cap = self.opened_unix + MAX_SETUP_SECS;
-            self.expires_unix = now.saturating_add(secs).min(cap);
-        } else {
-            *self = Self {
-                opened_unix: now,
-                expires_unix: now.saturating_add(secs),
-            };
-        }
-    }
-
-    /// Extends the open window by `secs`, never past 24 hours since it was opened. False if it
-    /// is not open.
-    fn extend(&mut self, now: u64, secs: u64) -> bool {
-        if !self.is_open(now) {
-            return false;
-        }
-        let cap = self.opened_unix + MAX_SETUP_SECS;
-        self.expires_unix = self.expires_unix.saturating_add(secs).min(cap);
-        true
-    }
-
-    fn state(&self, now: u64) -> pb::SetupWindowState {
-        pb::SetupWindowState {
-            open: self.is_open(now),
-            expires_at_unix_s: if self.is_open(now) {
-                self.expires_unix
-            } else {
-                0
-            },
-        }
-    }
-}
-
 /// What the admin commands act on.
 pub struct AdminState {
     /// Device operations.
@@ -140,7 +88,8 @@ pub struct AdminState {
     pub pairing_ttl_s: u64,
     /// The server listens (for `Status`).
     pub listening: bool,
-    setup: Mutex<SetupMirror>,
+    /// The setup coordinator: the window mirror (persisted), the binding and the job.
+    pub setup: SetupCoordinator,
 }
 
 impl AdminState {
@@ -154,6 +103,7 @@ impl AdminState {
         live: Arc<LiveSessions>,
         min_argon_memory_kib: u32,
         pairing_ttl_s: u64,
+        setup: SetupCoordinator,
     ) -> Arc<Self> {
         Arc::new(Self {
             devices,
@@ -164,7 +114,7 @@ impl AdminState {
             min_argon_memory_kib,
             pairing_ttl_s,
             listening: true,
-            setup: Mutex::new(SetupMirror::default()),
+            setup,
         })
     }
 }
@@ -415,11 +365,12 @@ async fn handle(
     let now = now_unix();
     match cmd {
         C::Status(_) => {
-            let setup = st
-                .setup
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .state(now);
+            let (open, expires) = st.setup.window_state();
+            let setup = pb::SetupWindowState {
+                open,
+                expires_at_unix_s: expires,
+            };
+            let sub = st.setup.status();
             Ok(R::Status(pb::StatusResult {
                 gatewayd_version: env!("CARGO_PKG_VERSION").into(),
                 listening: st.listening,
@@ -430,6 +381,20 @@ async fn handle(
                 session_link: st.sessions.link().state() as i32,
                 link_faults_10min: 0,
                 registry_version: st.devices.registry_version(),
+                setup_device_bound: sub.device.is_some(),
+                setup_device_id: sub
+                    .device
+                    .map(|d| bytes::Bytes::copy_from_slice(d.as_bytes()))
+                    .unwrap_or_default(),
+                setup_token_pending: sub.token_pending,
+                setup_job: match sub.job {
+                    hx_proto::pb::SetupJobState::Running => pb::SetupJobState::Running,
+                    hx_proto::pb::SetupJobState::Succeeded => pb::SetupJobState::Succeeded,
+                    hx_proto::pb::SetupJobState::Failed => pb::SetupJobState::Failed,
+                    hx_proto::pb::SetupJobState::Cancelled => pb::SetupJobState::Cancelled,
+                    _ => pb::SetupJobState::Idle,
+                } as i32,
+                setup_job_id: sub.job_id,
             }))
         }
         C::ListDevices(_) => {
@@ -560,6 +525,9 @@ async fn handle(
                 .pairing()
                 .install_token(&token, ttl)
                 .map_err(|e| internal("installing the token failed", e))?;
+            // While the setup window is open this is the installer's token: its public id
+            // is how the device that pairs with it becomes the setup device (ipc.md 5.5).
+            st.setup.on_token_installed(token.id());
             st.devices
                 .audit_opt(AuditEvent::PairingOpened, None, "token");
             Ok(R::CreatePairingToken(pb::CreatePairingTokenResult {
@@ -581,20 +549,19 @@ async fn handle(
             }))
         }
         C::SetupWindow(r) => {
-            let mut m = st.setup.lock().unwrap_or_else(|p| p.into_inner());
             match pb::SetupWindowAction::try_from(r.action)
                 .unwrap_or(pb::SetupWindowAction::Unspecified)
             {
-                pb::SetupWindowAction::Open => m.open(now, u64::from(r.expires_in_s)),
+                pb::SetupWindowAction::Open => st.setup.on_window_open(u64::from(r.expires_in_s)),
                 pb::SetupWindowAction::Extend => {
-                    if !m.extend(now, u64::from(r.expires_in_s)) {
+                    if !st.setup.on_window_extend(u64::from(r.expires_in_s)) {
                         return Err(error(
                             privd_pb::ErrorCode::FailedPrecondition,
                             "the setup window is not open",
                         ));
                     }
                 }
-                pb::SetupWindowAction::Close => *m = SetupMirror::default(),
+                pb::SetupWindowAction::Close => st.setup.on_window_close(),
                 pb::SetupWindowAction::Unspecified => {
                     return Err(error(
                         privd_pb::ErrorCode::InvalidArgument,
@@ -602,8 +569,12 @@ async fn handle(
                     ));
                 }
             }
+            let (open, expires) = st.setup.window_state();
             Ok(R::SetupWindow(pb::SetupWindowResult {
-                state: Some(m.state(now)),
+                state: Some(pb::SetupWindowState {
+                    open,
+                    expires_at_unix_s: expires,
+                }),
             }))
         }
         C::CloseSessions(_) => {
@@ -640,8 +611,6 @@ fn parse_verifier(bytes: &[u8], min_memory_kib: u32) -> Result<VerifierRecord, p
 mod tests {
     use super::*;
 
-    const H: u64 = 3600;
-
     #[test]
     fn a_pairing_code_reply_is_wiped_after_it_is_written() {
         let mut r = pb::response::Result::CreatePairingCode(pb::CreatePairingCodeResult {
@@ -653,43 +622,5 @@ mod tests {
             panic!()
         };
         assert!(c.code.is_empty(), "the code text is gone");
-    }
-
-    #[test]
-    fn open_is_capped_at_24_hours_whatever_is_asked() {
-        let mut m = SetupMirror::default();
-        m.open(1000, u64::MAX);
-        assert_eq!(m.expires_unix, 1000 + 24 * H);
-        let mut m = SetupMirror::default();
-        m.open(1000, 7200);
-        assert_eq!(m.expires_unix, 1000 + 7200);
-    }
-
-    #[test]
-    fn opening_an_open_window_cannot_stretch_it_past_24_hours() {
-        let mut m = SetupMirror::default();
-        m.open(0, 24 * H);
-        // 20 hours later, "open" again for another 24 hours: still ends 24 hours after the start.
-        m.open(20 * H, 24 * H);
-        assert_eq!(m.opened_unix, 0);
-        assert_eq!(m.expires_unix, 24 * H);
-        // Many reopens, never beyond the cap.
-        for t in (21..24).map(|h| h * H) {
-            m.open(t, 24 * H);
-            assert!(m.expires_unix <= 24 * H);
-        }
-        // Once it has expired a new window starts fresh.
-        m.open(30 * H, H);
-        assert_eq!((m.opened_unix, m.expires_unix), (30 * H, 31 * H));
-    }
-
-    #[test]
-    fn extend_is_capped_and_needs_an_open_window() {
-        let mut m = SetupMirror::default();
-        assert!(!m.extend(5, 600));
-        m.open(0, 2 * H);
-        assert!(m.extend(10, 100 * H));
-        assert_eq!(m.expires_unix, 24 * H);
-        assert!(!m.extend(25 * H, 600), "expired");
     }
 }

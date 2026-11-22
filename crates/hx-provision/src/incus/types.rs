@@ -232,6 +232,51 @@ pub struct Snapshot {
     pub stateful: bool,
 }
 
+/// An image in the local image store.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+pub struct ImageInfo {
+    /// SHA-256 of the image file (lower-case hex).
+    #[serde(default)]
+    pub fingerprint: String,
+    /// Aliases that point at it.
+    #[serde(default, deserialize_with = "alias_names")]
+    pub aliases: Vec<String>,
+    /// Size of the image file in bytes.
+    #[serde(default)]
+    pub size: u64,
+    /// Creation time as reported (RFC 3339).
+    #[serde(default)]
+    pub created_at: String,
+    /// Free-form properties (`os`, `release`, `description`, ...).
+    #[serde(default)]
+    pub properties: BTreeMap<String, String>,
+}
+
+/// Incus lists aliases as objects with `name` and `description`; keep the names.
+fn alias_names<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    struct A {
+        #[serde(default)]
+        name: String,
+    }
+    Ok(Vec::<A>::deserialize(d)?
+        .into_iter()
+        .map(|a| a.name)
+        .collect())
+}
+
+/// An image file to import with [`Client::import_image`](super::Client::import_image).
+#[derive(Debug)]
+pub struct ImageUpload {
+    /// The file, opened by the caller (verified, regular, not shared with a writer).
+    pub file: std::fs::File,
+    /// Number of bytes to send from offset 0; the whole file.
+    pub len: u64,
+    /// The SHA-256 the file must have. Sent as `X-Incus-fingerprint`, and the fingerprint Incus
+    /// reports back must equal it.
+    pub fingerprint: String,
+}
+
 /// An asynchronous Incus operation.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Operation {

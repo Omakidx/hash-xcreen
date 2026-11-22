@@ -32,4 +32,9 @@ thiserror.workspace = true
 x11rb.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 x11rb = { workspace = true, features = ["xtest"] }
+
+[[bench]]
+name = "capture_to_encode"
+harness = false

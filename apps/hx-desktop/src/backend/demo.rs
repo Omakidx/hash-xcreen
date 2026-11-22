@@ -360,6 +360,7 @@ impl SetupClient for DemoSetup {
             Ok(PairedInfo {
                 server_key_hex: DEMO_SERVER_KEY.into(),
                 server_name: "demo".into(),
+                server_version: Some(if host.contains("old") { (1, 2) } else { (1, 3) }),
             })
         })
     }
@@ -374,10 +375,34 @@ impl SetupClient for DemoSetup {
         let port = addr.port;
         let pace = self.pace;
         let _ = req;
+        let old = _paired.server_version.is_some_and(|v| v < (1, 3));
         Box::pin(async move {
+            if old {
+                return Err(SetupError::UpdateRequired);
+            }
             let mut events = install_script(Scenario::Success, port);
             // The agent is already installed on this path: the first stages are not run by the app.
-            events.retain(|e| !matches!(e, InstallEvent::Stage { id, .. } if ["preflight","packages","incus","release","system-files","credentials","config","units"].contains(&id.as_str())));
+            let done_before = [
+                "preflight",
+                "packages",
+                "incus",
+                "release",
+                "system-files",
+                "credentials",
+                "config",
+                "units",
+                "setup-window",
+                "host",
+                "firewall-port",
+            ];
+            events.retain(|e| !matches!(e, InstallEvent::Stage { id, .. } if done_before.contains(&id.as_str())));
+            for id in done_before.iter().rev() {
+                events.push_front(InstallEvent::Stage {
+                    id: (*id).into(),
+                    state: StageState::Skipped,
+                    ms: None,
+                });
+            }
             Ok(Box::new(Script {
                 events,
                 pace,

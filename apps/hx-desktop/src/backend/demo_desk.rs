@@ -226,7 +226,11 @@ fn demo_established(
             }
         });
     }
-    Established { desk, events: rx }
+    Established {
+        server_version: Some((1, 3)),
+        desk,
+        events: rx,
+    }
 }
 
 fn paint_loop(p: Arc<dyn Presenter>, stop: Arc<AtomicBool>, ptr: Arc<(AtomicU32, AtomicU32)>) {
@@ -386,6 +390,18 @@ impl Desk for DemoDesk {
     fn close(&self) -> BoxFuture<'_, ()> {
         self.stop.store(true, SeqCst);
         Box::pin(async {})
+    }
+    fn create_pairing_code(
+        &self,
+        _ttl: u32,
+    ) -> BoxFuture<'_, Result<crate::backend::IssuedCode, crate::backend::AdminError>> {
+        Box::pin(async {
+            Ok(crate::backend::IssuedCode {
+                code: "K7QM-4XD2".into(),
+                expires_in_secs: 900,
+                tries: 3,
+            })
+        })
     }
 }
 

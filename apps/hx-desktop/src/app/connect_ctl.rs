@@ -225,6 +225,9 @@ fn submit(app: &Rc<App>) {
                 Ok(est) => {
                     a.conn.borrow_mut().machine.outcome(Outcome::Accepted);
                     let _ = a.store.borrow_mut().touch(&id, super::now_unix());
+                    if let Some(v) = est.server_version {
+                        let _ = a.store.borrow_mut().set_version(&id, v);
+                    }
                     a.unavailable.borrow_mut().remove(&id);
                     desktop_ctl::enter(a, &id, link, est, prepared, pin);
                 }
@@ -267,6 +270,7 @@ fn submit_password(app: &Rc<App>) {
         port: s.port,
         server_key_hex: s.server_key.clone(),
         device: app.key.clone(),
+        server_version: s.version(),
         session: None,
     };
     let admin = app.be.admin.clone();
@@ -290,6 +294,7 @@ fn submit_password(app: &Rc<App>) {
                     vm.set_err_password(ss("Too many tries. Wait a few minutes and try again."))
                 }
                 Err(AdminError::Unreachable) => vm.set_err_password(ss("Cannot reach the server.")),
+                Err(AdminError::UpdateRequired) => super::update_ctl::show(a, &id),
                 Err(AdminError::Failed(m)) => vm.set_err_password(ss(m)),
             }
         },

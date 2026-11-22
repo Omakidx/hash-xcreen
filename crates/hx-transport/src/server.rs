@@ -565,6 +565,7 @@ pub(crate) fn close_code_for(reason: RefuseReason) -> CloseCode {
         RefuseReason::UpdateRequired => CloseCode::UpdateRequired,
         RefuseReason::Busy => CloseCode::Busy,
         RefuseReason::PairingClosed => CloseCode::PairingClosed,
+        RefuseReason::SetupClosed => CloseCode::SetupClosed,
         _ => CloseCode::Unauthorized,
     }
 }
@@ -644,8 +645,9 @@ impl PendingSession {
     }
 
     /// Accept: answer `HelloAck` and return the established [`Connection`], which is
-    /// **restricted** until [`Connection::authorize`] is called (see there). For an
-    /// `INTENT_PAIR` hello the advertised features and codecs are empty.
+    /// **restricted** until [`Connection::authorize`] or
+    /// [`Connection::authorize_control_only`] is called (see there). For an `INTENT_PAIR` hello
+    /// the advertised features and codecs are empty.
     pub async fn accept(self, reply: ServerHello) -> Result<Connection> {
         // Everything that can fail locally is checked before the transport is touched, and a
         // failure closes the connection with an explicit code (never 0).

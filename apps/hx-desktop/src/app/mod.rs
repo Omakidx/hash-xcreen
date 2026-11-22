@@ -13,6 +13,7 @@ pub mod prefs;
 pub mod progress;
 pub mod progress_ctl;
 pub mod showcase;
+pub mod update_ctl;
 pub mod wizard_ctl;
 
 use std::cell::RefCell;
@@ -175,6 +176,7 @@ impl App {
         desktop_ctl::wire(&app);
         details_ctl::wire(&app);
         wire_settings(&app);
+        update_ctl::wire(&app);
         if let Some((title, text)) = fatal {
             let nav = ui.global::<Nav>();
             nav.set_fatal_title(ss(title));

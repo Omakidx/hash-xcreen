@@ -726,6 +726,10 @@ fn start_code_pairing(app: &Rc<App>) {
                         lifecycle: Lifecycle::Ready,
                         last_seen_unix: 0,
                         revoked_unix: 0,
+                        server_version: p
+                            .server_version
+                            .map(crate::servers::format_version)
+                            .unwrap_or_default(),
                     };
                     let _ = a.store.borrow_mut().upsert(s);
                     a.wiz.borrow_mut().w.wipe_secrets();
@@ -740,6 +744,14 @@ fn start_code_pairing(app: &Rc<App>) {
                         SetupError::PairingClosed | SetupError::PairingFailed => (
                             "That code did not work".to_owned(),
                             "It may have expired (15 minutes), been used, or typed wrong. After 3 wrong tries a code stops working. Run hx-agent pairing code on the server for a new one.".to_owned(),
+                        ),
+                        SetupError::UpdateRequired => (
+                            "This server must be updated".to_owned(),
+                            "Run sudo hx-agent update check on the server, then sudo hx-agent update apply <version>.".to_owned(),
+                        ),
+                        SetupError::Closed => (
+                            "Setup is closed on this server".to_owned(),
+                            "Add the server with a pairing code instead, then connect with your PIN.".to_owned(),
                         ),
                         SetupError::Other(m) => ("Pairing failed".to_owned(), m),
                     };
@@ -799,6 +811,7 @@ fn start_install(app: &Rc<App>) {
         lifecycle: Lifecycle::Installing,
         last_seen_unix: 0,
         revoked_unix: 0,
+        server_version: String::new(),
     };
     let _ = app.store.borrow_mut().upsert(server);
     {
@@ -900,6 +913,10 @@ fn paired(app: &Rc<App>, addr: ServerAddr, p: crate::backend::PairedInfo) {
         lifecycle: Lifecycle::SetupPending,
         last_seen_unix: 0,
         revoked_unix: 0,
+        server_version: p
+            .server_version
+            .map(crate::servers::format_version)
+            .unwrap_or_default(),
     };
     let _ = app.store.borrow_mut().upsert(server);
     app.wiz.borrow_mut().server_id = Some(id.clone());
@@ -920,7 +937,8 @@ fn finish_existing(app: &Rc<App>, id: &str) {
         addr,
         crate::backend::PairedInfo {
             server_key_hex: key,
-            server_name: s.name,
+            server_name: s.name.clone(),
+            server_version: s.version(),
         },
     );
 }
@@ -973,6 +991,7 @@ fn begin_setup(app: &Rc<App>, id: String, addr: ServerAddr, p: crate::backend::P
                 Ok(run) => {
                     super::progress_ctl::attach(a, id, run, super::progress_ctl::Kind::Setup)
                 }
+                Err(SetupError::UpdateRequired) => super::update_ctl::show(a, &id),
                 Err(e) => {
                     let vm = a.ui().global::<WizardVm>();
                     vm.set_run_phase(3);

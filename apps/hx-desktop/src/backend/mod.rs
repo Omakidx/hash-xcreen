@@ -14,6 +14,8 @@
 pub mod demo;
 pub mod demo_desk;
 pub mod real;
+pub mod setup_real;
+pub mod ssh;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -419,6 +421,9 @@ pub struct PairedInfo {
     pub server_key_hex: String,
     /// Label the server reported.
     pub server_name: String,
+    /// The protocol version the server showed on this pairing (`major`, `minor`); `None` when
+    /// it was never confirmed. Setup, reinstate and pairing codes need 1.3.
+    pub server_version: Option<(u32, u32)>,
 }
 
 /// Why pairing or setup failed.
@@ -433,6 +438,13 @@ pub enum SetupError {
     /// Pairing is closed on the server.
     #[error("pairing is closed on the server")]
     PairingClosed,
+    /// The server is older than protocol 1.3: it must be updated first.
+    #[error("the server must be updated")]
+    UpdateRequired,
+    /// Setup is no longer open for this device (it was finished or the window closed): go to
+    /// the normal PIN login.
+    #[error("setup is no longer open on this server; connect with your PIN")]
+    Closed,
     /// Anything else.
     #[error("{0}")]
     Other(String),
@@ -492,6 +504,8 @@ pub struct AdminContext {
     pub server_key_hex: String,
     /// This device's key.
     pub device: Arc<IdentityKey>,
+    /// The protocol version the server last showed (`major`, `minor`).
+    pub server_version: Option<(u32, u32)>,
     /// A PIN-authenticated management connection, when the user unlocked one (the real
     /// implementations send their requests over it).
     pub session: Option<Arc<dyn crate::session::Desk>>,
@@ -526,6 +540,9 @@ pub enum AdminError {
     /// No answer.
     #[error("cannot reach the server")]
     Unreachable,
+    /// The server is older than protocol 1.3: it must be updated first.
+    #[error("the server must be updated")]
+    UpdateRequired,
 }
 
 /// Pairing codes and reinstate (protocol 1.3).
@@ -706,5 +723,6 @@ pub const GROUPS: [StageGroup; 10] = [
 
 /// The row a stage id belongs to.
 pub fn group_of(stage: &str) -> Option<usize> {
-    GROUPS.iter().position(|g| g.stages.contains(&stage))
+    // The engine's table also knows the `bootstrap-*` ids of `install.sh`.
+    hx_sshsetup::group_of(stage)
 }

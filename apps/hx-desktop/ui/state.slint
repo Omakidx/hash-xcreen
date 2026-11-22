@@ -1,7 +1,7 @@
 // The view models: plain properties and callbacks that the Rust controller (src/app) fills and
 // handles. The screens bind to these only, so they can be tested with the Slint testing backend.
 
-export enum Screen { home, wizard, progress, connect, desktop, details, settings, fatal }
+export enum Screen { home, wizard, progress, connect, desktop, details, settings, fatal, update }
 
 // -------------------------------------------------------------------------------------------- common
 
@@ -15,6 +15,15 @@ export global Nav {
     in property <string> fatal-text;
     in property <bool> demo: false;
     callback quit();
+}
+
+export global UpdateVm {
+    in property <string> server-name;
+    // What the app knows about the server's version.
+    in property <string> found;
+    in property <string> commands;
+    callback back();
+    callback copy-commands();
 }
 
 // -------------------------------------------------------------------------------------------- home

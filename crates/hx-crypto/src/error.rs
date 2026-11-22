@@ -73,6 +73,24 @@ pub enum Error {
     /// The server cannot verify a PIN (none configured).
     #[error("the server has no PIN configured")]
     PinNotAvailable,
+    /// The server closed the setup connection with `SETUP_CLOSED` (protocol 1.3 §5.10): setup
+    /// is not open for this device (finished, window closed, binding moved). Go to the normal
+    /// PIN login.
+    #[error("setup is closed on this server")]
+    SetupClosed,
+    /// The server is older than protocol 1.3 (or was never confirmed to be newer): the
+    /// feature cannot be used. The user must update the server.
+    #[error("the server must be updated to protocol 1.3 or newer")]
+    UpdateRequired,
+    /// The server rate-limited the request (for example pairing codes: 3 per hour).
+    #[error("rate limited; retry in {retry_after:?}")]
+    RateLimited {
+        /// How long to wait, as told by the server (zero if it did not say).
+        retry_after: std::time::Duration,
+    },
+    /// The server reported a fault of its own for the request.
+    #[error("the server could not complete the request")]
+    ServerFailed,
     /// The operation did not finish in time.
     #[error("timed out: {0}")]
     Timeout(&'static str),

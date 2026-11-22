@@ -93,7 +93,17 @@ export component ProgressScreen inherits Rectangle {
             }
         }
 
-        ScrollView {
+        // Focusing the action button on arrival must not leave the heading scrolled away.
+        Timer {
+            interval: 80ms;
+            running: true;
+            triggered => {
+                sv.content-y = 0px;
+                self.running = false;
+            }
+        }
+
+        sv := ScrollView {
             vertical-stretch: 1;
             VerticalLayout {
                 padding: Tokens.sp-6;

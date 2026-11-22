@@ -59,6 +59,9 @@ pub enum IncusError {
         /// The rejected name.
         name: String,
     },
+    /// The transport cannot do this (a scripted fake without streaming upload).
+    #[error("not supported by this transport: {0}")]
+    Unsupported(String),
     /// A value passed by the caller is not acceptable.
     #[error("invalid argument: {0}")]
     InvalidArgument(String),

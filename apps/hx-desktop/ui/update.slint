@@ -1,0 +1,85 @@
+import { Tokens } from "tokens.slint";
+import { ScrollView } from "std-widgets.slint";
+import { Btn, Banner, ButtonRow, Card, Heading, Label, Mono, Muted } from "widgets.slint";
+import { AppBar } from "home.slint";
+import { UpdateVm } from "state.slint";
+
+// "This server must be updated": the server is older than protocol 1.3, which setup, pairing
+// codes from the app and "Pair again" need.
+export component UpdateScreen inherits Rectangle {
+    background: Tokens.bg;
+    FocusScope {
+        key-pressed(e) => {
+            if (e.text == Key.Escape) {
+                UpdateVm.back();
+                return accept;
+            }
+            reject
+        }
+        VerticalLayout {
+            AppBar {
+                crumb: UpdateVm.server-name;
+            }
+
+            ScrollView {
+                vertical-stretch: 1;
+                VerticalLayout {
+                    padding: Tokens.sp-6;
+                    alignment: start;
+                    VerticalLayout {
+                        max-width: 640px;
+                        spacing: Tokens.sp-4;
+                        Heading {
+                            text: "This server must be updated";
+                            level: 1;
+                        }
+
+                        Banner {
+                            title: "The software on " + UpdateVm.server-name + " is too old for this step";
+                            text: UpdateVm.found + " This step needs protocol 1.3 or newer. Nothing was sent to the server.";
+                            tone: 2;
+                        }
+
+                        Label {
+                            text: "Update the server, then try again. On the server, in a root shell:";
+                        }
+
+                        Card {
+                            height: cmd.preferred-height + 2 * Tokens.sp-4;
+                            cmd := Mono {
+                                x: Tokens.sp-4;
+                                y: Tokens.sp-4;
+                                width: parent.width - 2 * Tokens.sp-4;
+                                text: UpdateVm.commands;
+                                accessible-role: AccessibleRole.text;
+                                accessible-label: "Commands to run on the server: " + UpdateVm.commands;
+                            }
+                        }
+
+                        Muted {
+                            text: "The first command shows which version is available. Use that version in the second.";
+                        }
+
+                        ButtonRow {
+                            Btn {
+                                text: "Copy commands";
+                                clicked => {
+                                    UpdateVm.copy-commands();
+                                }
+                            }
+
+                            Btn {
+                                text: "Back to Home";
+                                kind: "primary";
+                                autofocus: true;
+                                clicked => {
+                                    UpdateVm.back();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

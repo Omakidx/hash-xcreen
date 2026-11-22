@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hx_crypto::auth::{BoxFuture, RevocationGuard, RevocationPermit};
-use hx_crypto::{Authenticator, Clock, DeviceId, DeviceRecord, RevokeReason};
+use hx_crypto::{Authenticator, Clock, DeviceId, DeviceRecord, RevokeReason, RevokedBy};
 use hx_ipc::privd::pb::AuditEvent;
 use hx_proto::channel::MAX_DEVICE_LIST;
 use hx_proto::message::sanitize_device_name;
@@ -73,7 +73,16 @@ pub struct DeviceService {
     /// Revocations of *other* devices that a device made recently, for the cooling-off rule.
     recent: Mutex<HashMap<DeviceId, Vec<(DeviceId, std::time::Instant)>>>,
     version: AtomicU64,
+    /// When codes were issued from the app (the 3-per-hour limit holds per server).
+    code_times: Mutex<VecDeque<std::time::Instant>>,
+    /// The configured lifetime of pairing credentials, in seconds (caps a requested code).
+    pairing_ttl_s: AtomicU64,
 }
+
+/// Pairing codes issued from the app per [`CODE_WINDOW`], per server (protocol 5.9).
+pub const CODES_PER_WINDOW: usize = 3;
+/// The window of [`CODES_PER_WINDOW`].
+pub const CODE_WINDOW: Duration = Duration::from_secs(3600);
 
 /// Revoke requests one device may make per [`REVOKE_WINDOW`], over all its connections
 /// (protocol 5.9).
@@ -98,7 +107,12 @@ impl RevokeTicket<'_> {
     pub async fn commit(self) -> pb::RevokeStatus {
         use pb::RevokeStatus as S;
         let (svc, requester, target) = (self.svc, self.requester, self.target);
-        match svc.auth.revoke(&target, RevokeReason::User).await {
+        let by = if target == requester {
+            RevokedBy::SelfRevoke
+        } else {
+            RevokedBy::Device
+        };
+        match svc.auth.revoke(&target, RevokeReason::User, by).await {
             Ok(true) => {
                 if target != requester {
                     svc.recent
@@ -182,6 +196,8 @@ impl DeviceService {
             revoke_times: Mutex::new(HashMap::new()),
             recent: Mutex::new(HashMap::new()),
             version: AtomicU64::new(1),
+            code_times: Mutex::new(VecDeque::new()),
+            pairing_ttl_s: AtomicU64::new(900),
         });
         // A lockout revocation is serialized with the others by the same lock.
         auth.set_revocation_guard(Arc::new(LockoutGuard(svc.revoke_lock.clone())));
@@ -380,6 +396,99 @@ impl DeviceService {
         }));
     }
 
+    /// A device reinstated itself with the account password (protocol 11.7): record it
+    /// (`DEVICE_REINSTATED`, cause `password`, never the password), tell the live sessions, and
+    /// let a later lockout of the same device be recorded again.
+    pub fn announce_reinstated_with_password(&self, rec: &DeviceRecord) {
+        self.recorded_lockouts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&rec.id);
+        self.bump_version();
+        self.audit(AuditEvent::DeviceReinstated, rec.id, "password");
+        let _ = self.tx.send(Arc::new(DeviceNotice {
+            kind: pb::DeviceEventKind::Reinstated,
+            device: device_info(rec, false),
+            by: None,
+        }));
+    }
+
+    /// Sets the configured lifetime of pairing credentials, which caps an in-app code.
+    pub fn set_pairing_ttl_s(&self, secs: u64) {
+        self.pairing_ttl_s.store(secs, Ordering::Relaxed);
+    }
+
+    /// `CreatePairingCode` (protocol 5.9, 1.3) for `requester`, an authenticated session of an
+    /// active device (the session checked the connection; this checks the device again):
+    ///
+    /// * `expires_in_s` outside 60..=900 is `INVALID_ARGUMENT` and creates nothing; a value above
+    ///   the configured lifetime is capped, so `expires_at_unix` is authoritative;
+    /// * at most 3 per hour per server (`RATE_LIMITED` with `retry_after_s`);
+    /// * one live code: the new code replaces the previous one, which stops working at once
+    ///   (`PairingWindow::issue_code_with_ttl` keeps a single code);
+    /// * the code is the admin socket's short code, and the audit event
+    ///   `DEVICE_PAIRING_CODE_ISSUED` names the requester, never the code.
+    pub fn create_pairing_code(
+        &self,
+        requester: DeviceId,
+        expires_in_s: u32,
+    ) -> pb::PairingCodeIssued {
+        use pb::PairingCodeStatus as S;
+        let refuse = |status: S, retry: u32| pb::PairingCodeIssued {
+            code: String::new(),
+            expires_at_unix: 0,
+            status: status as i32,
+            retry_after_s: retry,
+        };
+        if !(hx_proto::message::MIN_PAIRING_CODE_TTL_S..=hx_proto::message::MAX_PAIRING_CODE_TTL_S)
+            .contains(&expires_in_s)
+        {
+            return refuse(S::InvalidArgument, 0);
+        }
+        if !self.is_active(&requester) {
+            return refuse(S::Failed, 0);
+        }
+        let now = self.clock.now();
+        let ttl = Duration::from_secs(
+            u64::from(expires_in_s).min(self.pairing_ttl_s.load(Ordering::Relaxed)),
+        );
+        // The slot is taken only if the code is issued: a failure must not burn the limit.
+        let mut times = self.code_times.lock().unwrap_or_else(|p| p.into_inner());
+        while times
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) >= CODE_WINDOW)
+        {
+            times.pop_front();
+        }
+        if times.len() >= CODES_PER_WINDOW {
+            let wait = times
+                .front()
+                .map(|t| CODE_WINDOW.saturating_sub(now.saturating_duration_since(*t)))
+                .unwrap_or(CODE_WINDOW);
+            return refuse(
+                S::RateLimited,
+                u32::try_from(wait.as_secs().max(1)).unwrap_or(u32::MAX),
+            );
+        }
+        let code = match self.auth.pairing().issue_code_with_ttl(ttl) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "issuing a pairing code failed");
+                return refuse(S::Failed, 0);
+            }
+        };
+        times.push_back(now);
+        drop(times);
+        // The requesting device's id, never the code.
+        self.audit(AuditEvent::DevicePairingCodeIssued, requester, "app");
+        pb::PairingCodeIssued {
+            code: code.to_text().to_string(),
+            expires_at_unix: self.clock.unix_secs() + ttl.as_secs(),
+            status: S::Ok as i32,
+            retry_after_s: 0,
+        }
+    }
+
     /// Writes an audit event about a device to privd, retrying in the background.
     pub fn audit(&self, event: AuditEvent, id: DeviceId, label: &str) {
         self.audit_opt(event, Some(id), label);
@@ -507,7 +616,11 @@ impl DeviceService {
             return Ok(Some(0));
         }
         let sessions = self.live.count_for(&target);
-        if self.auth.revoke(&target, RevokeReason::User).await? {
+        if self
+            .auth
+            .revoke(&target, RevokeReason::User, RevokedBy::Operator)
+            .await?
+        {
             self.record_revoked(target, None).await;
         }
         Ok(Some(sessions))

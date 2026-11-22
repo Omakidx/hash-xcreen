@@ -116,34 +116,18 @@ impl AwaitingPin {
     /// Send one PIN attempt and wait for the verdict. A revoked device is an error
     /// ([`Error::Revoked`]) and the connection is closed by the server.
     pub async fn submit(&mut self, pin: &Pin) -> Result<PinReply> {
-        let msg = AuthMessage::new(Body::Pin(PinAttempt {
-            pin: pin.as_bytes().to_vec(),
-        }))
-        .into_control()?;
-        self.connection.send_control(&msg).await?;
-        drop(msg);
-        let reply = tokio::time::timeout(self.reply_timeout, self.connection.recv_control())
-            .await
-            .map_err(|_| Error::Timeout("PIN reply"))??;
-        let Some(Body::Result(r)) = AuthMessage::from_control(&reply)?.body else {
-            return Err(Error::Protocol("expected an auth result"));
-        };
-        let status = AuthStatus::try_from(r.status).unwrap_or(AuthStatus::Unspecified);
-        let wait = Duration::from_millis(u64::from(r.retry_after_ms));
-        match status {
-            AuthStatus::Ok => {
-                self.accepted = true;
-                Ok(PinReply::Accepted)
-            }
-            AuthStatus::WrongPin => Ok(PinReply::Wrong {
-                attempts_left: r.attempts_left,
-                retry_after: wait,
-            }),
-            AuthStatus::Backoff => Ok(PinReply::Backoff { retry_after: wait }),
-            AuthStatus::Revoked => Err(Error::Revoked),
-            AuthStatus::NotAvailable => Err(Error::PinNotAvailable),
-            AuthStatus::Unspecified => Err(Error::Protocol("unknown auth status")),
+        let reply = pin_exchange(&self.connection, pin, self.reply_timeout).await?;
+        if reply == PinReply::Accepted {
+            self.accepted = true;
         }
+        Ok(reply)
+    }
+
+    /// The protocol version agreed with the server (the lower of both sides'). Remember it per
+    /// server: the 1.3 features (setup, reinstate) are used only against a server that has
+    /// shown version 1.3 or newer.
+    pub fn server_version(&self) -> hx_proto::version::ProtocolVersion {
+        self.connection.negotiated().version
     }
 
     /// True once the server accepted the PIN.
@@ -194,5 +178,45 @@ pub async fn connect_with_pin(
             a.abandon().await;
             Err(Error::Backoff { retry_after })
         }
+    }
+}
+
+/// Send one PIN attempt on `connection` and read the `AuthResult` (the exchange of §11.4,
+/// shared by sessions and setup connections).
+pub(crate) async fn pin_exchange(
+    connection: &Connection,
+    pin: &Pin,
+    reply_timeout: Duration,
+) -> Result<PinReply> {
+    let mut msg = AuthMessage::new(Body::Pin(PinAttempt {
+        pin: pin.as_bytes().to_vec(),
+    }))
+    .into_control()?;
+    let sent = connection.send_control(&msg).await;
+    crate::setup::scrub_control(&mut msg);
+    sent?;
+    let reply = tokio::time::timeout(reply_timeout, connection.recv_control())
+        .await
+        .map_err(|_| Error::Timeout("PIN reply"))??;
+    let Some(Body::Result(r)) = AuthMessage::from_control(&reply)?.body else {
+        return Err(Error::Protocol("expected an auth result"));
+    };
+    let status = AuthStatus::try_from(r.status).unwrap_or(AuthStatus::Unspecified);
+    let wait = Duration::from_millis(u64::from(r.retry_after_ms));
+    match status {
+        AuthStatus::Ok => Ok(PinReply::Accepted),
+        AuthStatus::WrongPin => Ok(PinReply::Wrong {
+            attempts_left: r.attempts_left,
+            retry_after: wait,
+        }),
+        AuthStatus::Backoff => Ok(PinReply::Backoff { retry_after: wait }),
+        AuthStatus::Revoked => Err(Error::Revoked),
+        AuthStatus::NotAvailable => Err(Error::PinNotAvailable),
+        // Only an INTENT_SETUP server sends PIN_REQUIRED, and only first; the rest answer
+        // other intents.
+        AuthStatus::PinRequired
+        | AuthStatus::PasswordRequired
+        | AuthStatus::WrongPassword
+        | AuthStatus::Unspecified => Err(Error::Protocol("unknown auth status")),
     }
 }

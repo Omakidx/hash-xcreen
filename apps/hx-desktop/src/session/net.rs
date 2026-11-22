@@ -103,6 +103,10 @@ pub async fn pair(
             let info = PairedInfo {
                 server_key_hex: key_hex(&p.server_key),
                 server_name: p.server_name.clone(),
+                server_version: Some({
+                    let v = p.server_version();
+                    (v.major, v.minor)
+                }),
             };
             p.finish().await;
             Ok(info)
@@ -137,6 +141,8 @@ pub fn parse_key(h: &str) -> Option<PublicKey> {
 /// A secure connection that waits for the PIN.
 pub struct PinLogin {
     awaiting: AwaitingPin,
+    /// The protocol version the server showed in this connection.
+    pub version: (u32, u32),
 }
 
 /// Opens the pinned connection (step one of Connect).
@@ -148,7 +154,11 @@ pub async fn open_pin_login(link: &Link) -> Result<PinLogin, Outcome> {
     let awaiting = connect_session(&t, &link.device, link.server_key, &opts)
         .await
         .map_err(|e| classify_error(&e))?;
-    Ok(PinLogin { awaiting })
+    let version = {
+        let v = awaiting.server_version();
+        (v.major, v.minor)
+    };
+    Ok(PinLogin { awaiting, version })
 }
 
 impl PinLogin {
@@ -251,6 +261,7 @@ pub enum MgmtError {
     Timeout,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum Out {
     Control(Ctl),
     Input(InputEvent),
@@ -666,6 +677,52 @@ impl Session {
                 Ok(RevokeStatus::try_from(r.status).unwrap_or(RevokeStatus::Failed))
             }
             _ => Err(MgmtError::Closed),
+        }
+    }
+
+    /// A short-lived pairing code for a new device (protocol 1.3). The server must speak 1.3
+    /// and have negotiated device management, else [`AdminError::UpdateRequired`].
+    pub async fn create_pairing_code(
+        &self,
+        expires_in_s: u32,
+    ) -> Result<crate::backend::IssuedCode, crate::backend::AdminError> {
+        use crate::backend::{AdminError, IssuedCode};
+        let n = self.conn.negotiated();
+        if n.version < (hx_proto::version::ProtocolVersion { major: 1, minor: 3 })
+            || !self.can_manage_devices()
+        {
+            return Err(AdminError::UpdateRequired);
+        }
+        let ttl = expires_in_s.clamp(60, 900);
+        let b = self
+            .request(Body::CreatePairingCode(pb::CreatePairingCode {
+                expires_in_s: ttl,
+            }))
+            .await
+            .map_err(|e| match e {
+                MgmtError::Unsupported => AdminError::UpdateRequired,
+                MgmtError::Timeout | MgmtError::Closed => AdminError::Unreachable,
+            })?;
+        let Body::PairingCodeIssued(c) = b else {
+            return Err(AdminError::Failed(
+                "The server answered with something unexpected.".into(),
+            ));
+        };
+        match pb::PairingCodeStatus::try_from(c.status) {
+            Ok(pb::PairingCodeStatus::Ok) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                Ok(IssuedCode {
+                    code: c.code,
+                    expires_in_secs: c.expires_at_unix.saturating_sub(now).min(u64::from(ttl)),
+                    tries: 3,
+                })
+            }
+            Ok(pb::PairingCodeStatus::RateLimited) => Err(AdminError::RateLimited),
+            _ => Err(AdminError::Failed(
+                "The server could not create a code right now.".into(),
+            )),
         }
     }
 

@@ -45,6 +45,12 @@ pub trait Desk: Send + Sync {
     fn revoke(&self, id: [u8; 16]) -> BoxFuture<'_, Result<RevokeStatus, MgmtError>>;
     /// Ends the connection.
     fn close(&self) -> BoxFuture<'_, ()>;
+    /// Asks the server for a pairing code (protocol 1.3, over this connection's own control
+    /// path: the one place that reads `DeviceMgmt` answers).
+    fn create_pairing_code(
+        &self,
+        expires_in_s: u32,
+    ) -> BoxFuture<'_, Result<crate::backend::IssuedCode, crate::backend::AdminError>>;
 }
 
 impl Desk for Session {
@@ -90,6 +96,12 @@ impl Desk for Session {
     fn close(&self) -> BoxFuture<'_, ()> {
         Box::pin(Session::close(self))
     }
+    fn create_pairing_code(
+        &self,
+        expires_in_s: u32,
+    ) -> BoxFuture<'_, Result<crate::backend::IssuedCode, crate::backend::AdminError>> {
+        Box::pin(Session::create_pairing_code(self, expires_in_s))
+    }
 }
 
 /// What a connection needs from the app: where video goes and where files land.
@@ -106,6 +118,8 @@ pub struct Wiring {
 
 /// An authorized connection and its events.
 pub struct Established {
+    /// The protocol version the server showed (`major`, `minor`).
+    pub server_version: Option<(u32, u32)>,
     /// The connection.
     pub desk: Arc<dyn Desk>,
     /// Everything the connection reports.
@@ -147,6 +161,7 @@ impl Connector for RealConnector {
         Box::pin(async move {
             let login = super::net::open_pin_login(&link).await?;
             on_secure();
+            let version = Some(login.version);
             let conn = match login.submit(&pin).await {
                 Ok(c) => c,
                 Err((o, rest)) => {
@@ -159,6 +174,7 @@ impl Connector for RealConnector {
             let (session, events) =
                 Session::start(conn, wiring.frames, wiring.downloads, wiring.stats, handle);
             Ok(Established {
+                server_version: version,
                 desk: Arc::new(session),
                 events,
             })

@@ -7,7 +7,7 @@ use hx_desktop::app::{App, Config, showcase};
 use hx_desktop::backend::demo;
 use hx_desktop::keys::MemoryKeyStore;
 use hx_desktop::{
-    AppWindow, ConnectVm, DetailsVm, HomeVm, Nav, Screen, ThemeMode, Tokens, WizardVm,
+    AppWindow, ConnectVm, DetailsVm, HomeVm, Nav, Screen, ThemeMode, Tokens, UpdateVm, WizardVm,
 };
 use i_slint_backend_testing::ElementHandle;
 use slint::{ComponentHandle, Model};
@@ -287,4 +287,21 @@ fn a_few_screens_render_in_both_themes() {
             );
         }
     }
+}
+
+#[test]
+fn an_old_server_gets_the_update_screen_with_the_two_commands() {
+    let r = rig();
+    showcase::apply(&r.app, "update-required");
+    assert_eq!(r.ui.global::<Nav>().get_screen(), Screen::Update);
+    let v = r.ui.global::<UpdateVm>();
+    assert!(v.get_found().contains("1.2"));
+    assert!(v.get_commands().contains("sudo hx-agent update check"));
+    assert!(
+        v.get_commands()
+            .contains("sudo hx-agent update apply <version>")
+    );
+    assert!(find(&r.ui, "This server must be updated").is_some());
+    press(&r.ui, "Back to Home");
+    assert_eq!(r.ui.global::<Nav>().get_screen(), Screen::Home);
 }

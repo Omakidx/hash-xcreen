@@ -50,6 +50,9 @@ pub struct Server {
     /// Unix time the device was revoked (Revoked only).
     #[serde(default)]
     pub revoked_unix: u64,
+    /// The protocol version the server last showed, `"1.3"`; empty when never confirmed.
+    #[serde(default)]
+    pub server_version: String,
 }
 
 impl Server {
@@ -58,10 +61,26 @@ impl Server {
         format_address(&self.host, self.port)
     }
 
+    /// The server's last confirmed protocol version.
+    pub fn version(&self) -> Option<(u32, u32)> {
+        parse_version(&self.server_version)
+    }
+
     /// The pinned key as four groups of four hex digits (`3f9a c1d4 77be 0a52`).
     pub fn short_fingerprint(&self) -> String {
         short_key(&self.server_key)
     }
+}
+
+/// `"1.3"` to `(1, 3)`.
+pub fn parse_version(s: &str) -> Option<(u32, u32)> {
+    let (a, b) = s.split_once('.')?;
+    Some((a.parse().ok()?, b.parse().ok()?))
+}
+
+/// `(1, 3)` to `"1.3"`.
+pub fn format_version(v: (u32, u32)) -> String {
+    format!("{}.{}", v.0, v.1)
 }
 
 /// `host:port`, bracketing IPv6.
@@ -204,6 +223,18 @@ impl ServerStore {
         Ok(())
     }
 
+    /// Records the protocol version the server showed.
+    pub fn set_version(&mut self, id: &str, v: (u32, u32)) -> Result<(), StoreError> {
+        let text = format_version(v);
+        if let Some(s) = self.servers.iter_mut().find(|s| s.id == id)
+            && s.server_version != text
+        {
+            s.server_version = text;
+            self.save()?;
+        }
+        Ok(())
+    }
+
     /// Records a successful connection time.
     pub fn touch(&mut self, id: &str, now: u64) -> Result<(), StoreError> {
         if let Some(s) = self.servers.iter_mut().find(|s| s.id == id) {
@@ -302,6 +333,7 @@ mod tests {
             lifecycle: Lifecycle::Ready,
             last_seen_unix: 0,
             revoked_unix: 0,
+            server_version: String::new(),
         }
     }
 
@@ -348,6 +380,16 @@ mod tests {
             Err(StoreError::Corrupt(_))
         ));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn versions_round_trip_and_are_stored() {
+        assert_eq!(parse_version("1.3"), Some((1, 3)));
+        assert_eq!(parse_version("x"), None);
+        let mut s = ServerStore::in_memory(vec![srv("a")]);
+        assert_eq!(s.get("a").unwrap().version(), None);
+        s.set_version("a", (1, 3)).unwrap();
+        assert_eq!(s.get("a").unwrap().version(), Some((1, 3)));
     }
 
     #[test]

@@ -86,6 +86,7 @@ pub const NAMES: &[&str] = &[
     "details-danger-ssh",
     "details-danger-confirm",
     "details-danger-done",
+    "update-required",
     "settings",
 ];
 
@@ -103,6 +104,11 @@ fn srv(id: &str, name: &str, host: &str, port: u16, l: Lifecycle) -> Server {
             super::now_unix().saturating_sub(3 * 86_400 + 4 * 3600)
         } else {
             0
+        },
+        server_version: if id == "old" {
+            "1.2".into()
+        } else {
+            "1.3".into()
         },
         revoked_unix: if l == Lifecycle::Revoked {
             1_699_920_000
@@ -825,6 +831,7 @@ pub fn apply(app: &Rc<App>, name: &str) -> bool {
             }
         }
         "settings" => app.go(Screen::Settings),
+        "update-required" => super::update_ctl::show(app, "old"),
         _ => return false,
     }
     let _ = Kv {

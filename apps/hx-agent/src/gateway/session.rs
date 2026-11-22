@@ -449,7 +449,11 @@ impl Session {
     }
 
     async fn send(&self, m: pb::ControlMessage) -> Result<(), Flow> {
-        match tokio::time::timeout(SEND_TIMEOUT, self.conn.send_control(&m)).await {
+        self.send_ref(&m).await
+    }
+
+    async fn send_ref(&self, m: &pb::ControlMessage) -> Result<(), Flow> {
+        match tokio::time::timeout(SEND_TIMEOUT, self.conn.send_control(m)).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) => Err(Flow::End(None)),
             // A client that does not read its control channel: the write may be half done, so
@@ -506,6 +510,8 @@ impl Session {
             Some(Ctl::Pairing(_) | Ctl::Auth(_)) => {
                 violation("pairing or auth after authorization")
             }
+            // Setup messages belong to INTENT_SETUP connections only (protocol 1.3, 5.10).
+            Some(Ctl::Setup(_)) => violation("setup message on a session"),
             // Ping and Pong never surface; a message with no variant never validates.
             Some(Ctl::Ping(_) | Ctl::Pong(_)) | None => Flow::Continue,
         }
@@ -632,13 +638,34 @@ impl Session {
                     status: status as i32,
                 })
             }
+            Some(B::CreatePairingCode(c)) => {
+                // 1.3 only: a 1.2 peer cannot skip the body (protocol 5.9). The session is
+                // PIN-authenticated by construction (an `Outcome::Authorized` connection).
+                if self.conn.negotiated().version.minor < 3 {
+                    return violation("create_pairing_code below protocol 1.3");
+                }
+                B::PairingCodeIssued(
+                    self.mgr
+                        .devices
+                        .create_pairing_code(self.device.id, c.expires_in_s),
+                )
+            }
             _ => return violation("unexpected DeviceMgmt body"),
         };
-        let out = pb::ControlMessage::new(Ctl::DeviceMgmt(pb::DeviceMgmt {
+        let mut out = pb::ControlMessage::new(Ctl::DeviceMgmt(pb::DeviceMgmt {
             request_id: m.request_id,
             body: Some(reply),
         }));
-        match self.send(out).await {
+        let sent = self.send_ref(&out).await;
+        // The reply of `CreatePairingCode` carries a secret: wipe our copy once written.
+        if let Some(Ctl::DeviceMgmt(pb::DeviceMgmt {
+            body: Some(B::PairingCodeIssued(p)),
+            ..
+        })) = &mut out.message
+        {
+            zeroize::Zeroize::zeroize(&mut p.code);
+        }
+        match sent {
             Ok(()) if requester_gone => {
                 Flow::End(Some((CloseCode::Unauthorized, "device revoked")))
             }

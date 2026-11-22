@@ -8,6 +8,7 @@ import { ConnectScreen } from "connect.slint";
 import { DesktopScreen } from "desktop.slint";
 import { DetailsScreen } from "details.slint";
 import { SettingsScreen } from "settings.slint";
+import { UpdateScreen } from "update.slint";
 
 export { Tokens, ThemeMode }
 export * from "state.slint";
@@ -85,6 +86,7 @@ export component AppWindow inherits Window {
     if Nav.screen == Screen.details: DetailsScreen { }
     if Nav.screen == Screen.settings: SettingsScreen { }
     if Nav.screen == Screen.fatal: FatalScreen { }
+    if Nav.screen == Screen.update: UpdateScreen { }
 
     if Nav.demo: Rectangle {
         x: parent.width - self.width - 8px;

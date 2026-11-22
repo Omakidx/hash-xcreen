@@ -25,6 +25,7 @@ bytes.workspace = true
 ffmpeg-next.workspace = true # software H.264 decode (hx-codec has no decode side yet)
 hx-crypto.workspace = true
 hx-proto.workspace = true
+hx-sshsetup = { path = "../../crates/hx-sshsetup", version = "0.1.0" }
 hx-transport.workspace = true
 keyring = "4" # Secret Service (zbus, no C library) for the device key
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] } # ServerName for hx_transport::Target
@@ -43,6 +44,7 @@ slint-build = "=1.19.0"
 
 [dev-dependencies]
 # The ignored end-to-end test (tests/session_e2e.rs) reuses the relay harness of hx-agent.
+getrandom = "0.4"
 hmac = "0.12"
 hx-agent = { path = "../hx-agent", version = "0.1.0", features = ["test-support", "gateway-test-hooks", "install-test-hooks"] }
 hx-capture.workspace = true
@@ -50,6 +52,7 @@ hx-ipc = { workspace = true, features = ["privd", "link"] }
 hx-session.workspace = true
 rustix = { workspace = true, features = ["fs", "process", "net", "event", "rand", "termios"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+russh = { version = "0.65", default-features = false, features = ["ring", "rsa"] }
 sha2 = "0.10"
 tempfile = "3.27.0"
 x11rb = { workspace = true, features = ["xtest"] }

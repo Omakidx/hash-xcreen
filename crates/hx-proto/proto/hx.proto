@@ -1,4 +1,4 @@
-// hash-xcreen wire protocol, version 1.2 (1.0 base, 1.1 and 1.2 additive). Normative description:
+// hash-xcreen wire protocol, version 1.3 (1.0 base, 1.1 to 1.3 additive). Normative description:
 // docs/protocol.md.
 // Field numbers are never reused; adding fields or messages is a minor-version change.
 syntax = "proto3";
@@ -28,6 +28,11 @@ enum Intent {
   INTENT_UNSPECIFIED = 0;
   INTENT_SESSION = 1;
   INTENT_PAIR = 2;
+  // 1.3: post-pairing setup connection. Only sent to a server known to speak at least 1.3.
+  INTENT_SETUP = 3;
+  // 1.3: reinstate a device revoked by the PIN lockout, with the account password. Only sent to
+  // a server known to speak at least 1.3.
+  INTENT_REINSTATE = 4;
 }
 
 message Hello {
@@ -51,6 +56,8 @@ enum RefuseReason {
   REFUSE_REASON_UNAUTHORIZED = 2;
   REFUSE_REASON_BUSY = 3;
   REFUSE_REASON_PAIRING_CLOSED = 4;
+  // 1.3, INTENT_SETUP only: setup is not open for this device.
+  REFUSE_REASON_SETUP_CLOSED = 5;
 }
 
 message Refuse {
@@ -200,6 +207,33 @@ message DeviceEvent {
   bytes by_device_id = 3;
 }
 
+// 1.3: ask the server for a short pairing code to enrol another device. Only on a
+// PIN-authenticated INTENT_SESSION connection (the server checks that).
+message CreatePairingCode {
+  // 60..=900; the server may cap it lower.
+  uint32 expires_in_s = 1;
+}
+
+// 1.3: the issued code. The code is a secret: Debug is redacted (hand-written in hx-proto).
+message PairingCodeIssued {
+  // The short code, 8 characters in two groups of four (XXXX-XXXX), at most 16 bytes. Set if
+  // and only if status is OK.
+  string code = 1;
+  uint64 expires_at_unix = 2;
+  PairingCodeStatus status = 3;
+  // Only with RATE_LIMITED: seconds until a new code may be requested.
+  uint32 retry_after_s = 4;
+}
+
+enum PairingCodeStatus {
+  PAIRING_CODE_STATUS_UNSPECIFIED = 0;
+  PAIRING_CODE_STATUS_OK = 1;
+  PAIRING_CODE_STATUS_RATE_LIMITED = 2;
+  PAIRING_CODE_STATUS_INVALID_ARGUMENT = 3;
+  // A server fault.
+  PAIRING_CODE_STATUS_FAILED = 4;
+}
+
 message DeviceMgmt {
   // Non-zero in a request and in the response that answers it; 0 only in a DeviceEvent.
   uint32 request_id = 1;
@@ -209,6 +243,278 @@ message DeviceMgmt {
     RevokeDevice revoke = 12;        // client to server
     RevokeResult revoke_result = 13; // server to client
     DeviceEvent event = 14;          // server to client
+    // 1.3 (a client sends these only after negotiating at least 1.3).
+    CreatePairingCode create_pairing_code = 15; // client to server
+    PairingCodeIssued pairing_code_issued = 16; // server to client
+  }
+}
+
+// ----- 1.3: post-pairing setup (protocol 5.10), feature SETUP, INTENT_SETUP connections only -----
+
+enum SetupDistro {
+  SETUP_DISTRO_UNSPECIFIED = 0;
+  SETUP_DISTRO_UBUNTU_24_04 = 1;
+  SETUP_DISTRO_UBUNTU_26_04 = 2;
+  SETUP_DISTRO_DEBIAN_12 = 3;
+  SETUP_DISTRO_DEBIAN_13 = 4;
+}
+
+enum SetupDesktop {
+  // Same as XFCE.
+  SETUP_DESKTOP_UNSPECIFIED = 0;
+  SETUP_DESKTOP_XFCE = 1;
+}
+
+enum SetupPreset {
+  SETUP_PRESET_UNSPECIFIED = 0;
+  SETUP_PRESET_BASIC = 1;
+  SETUP_PRESET_DEVELOPER = 2;
+}
+
+enum SetupImageMode {
+  // Same as AUTO.
+  SETUP_IMAGE_MODE_UNSPECIFIED = 0;
+  SETUP_IMAGE_MODE_AUTO = 1;
+  SETUP_IMAGE_MODE_BUILD = 2;
+  SETUP_IMAGE_MODE_PREBUILT = 3;
+}
+
+// 0 = server default; the host bounds are checked by the privileged daemon.
+message SetupLimits {
+  // At most 1024.
+  uint32 cpu = 1;
+  // At most 16777216.
+  uint64 memory_mib = 2;
+  // At most 65536.
+  uint64 disk_gib = 3;
+}
+
+// Printable ASCII; the privileged daemon validates the content.
+message SetupDesktopSettings {
+  // At most 63 bytes.
+  string hostname = 1;
+  // At most 64 bytes.
+  string timezone = 2;
+  // At most 32 bytes.
+  string locale = 3;
+  // At most 40 bytes.
+  string keyboard = 4;
+}
+
+message SetupOptions {
+  // Required.
+  SetupDistro distro = 1;
+  SetupDesktop desktop = 2;
+  // Required.
+  SetupPreset preset = 3;
+  // 1..=32 bytes, ^[a-z_][a-z0-9_-]{0,31}$, reserved names refused by the server.
+  string username = 4;
+  SetupImageMode image_mode = 5;
+  SetupLimits limits = 6;
+  bool docker = 7;
+  // MUST be true when docker is true.
+  bool docker_isolation_acknowledged = 8;
+  SetupDesktopSettings settings = 9;
+}
+
+// 6..=16 ASCII digits. A secret: Debug is redacted.
+message SetupSetPin {
+  bytes pin = 1;
+}
+
+// Fields 3 to 9 are reserved for the Phase 2 sealed secrets (the Drive token).
+message SetupStart {
+  SetupOptions options = 1;
+  // 1..=511 bytes, UTF-8, no NUL, CR or LF. A secret: Debug is redacted.
+  bytes password = 2;
+  reserved 3 to 9;
+}
+
+message SetupCancel {}
+
+message SetupFinish {}
+
+enum SetupJobState {
+  SETUP_JOB_STATE_UNSPECIFIED = 0;
+  SETUP_JOB_STATE_IDLE = 1;
+  SETUP_JOB_STATE_RUNNING = 2;
+  SETUP_JOB_STATE_SUCCEEDED = 3;
+  SETUP_JOB_STATE_FAILED = 4;
+  SETUP_JOB_STATE_CANCELLED = 5;
+}
+
+enum SetupDesktopState {
+  SETUP_DESKTOP_STATE_UNSPECIFIED = 0;
+  SETUP_DESKTOP_STATE_NONE = 1;
+  SETUP_DESKTOP_STATE_CREATING = 2;
+  SETUP_DESKTOP_STATE_READY = 3;
+  SETUP_DESKTOP_STATE_FAILED = 4;
+  // The privileged daemon could not be asked.
+  SETUP_DESKTOP_STATE_UNKNOWN = 5;
+}
+
+message SetupHostFacts {
+  uint32 cpu_count = 1;
+  uint64 memory_total_mib = 2;
+  uint64 pool_total_gib = 3;
+  uint64 pool_free_gib = 4;
+  bool docker_supported = 5;
+  // At most 64 bytes.
+  string os = 6;
+  // At most 16 bytes.
+  string arch = 7;
+}
+
+enum SetupStage {
+  SETUP_STAGE_UNSPECIFIED = 0;
+  SETUP_STAGE_PREFLIGHT = 1;
+  SETUP_STAGE_IMAGE_FETCH = 2;
+  SETUP_STAGE_IMAGE_IMPORT = 3;
+  SETUP_STAGE_BUILD = 4;
+  SETUP_STAGE_LAUNCH = 5;
+  SETUP_STAGE_POST = 6;
+  SETUP_STAGE_SESSION = 7;
+  SETUP_STAGE_DOCKER = 8;
+  SETUP_STAGE_VERIFIERS = 9;
+  SETUP_STAGE_FINISH = 10;
+  SETUP_STAGE_DONE = 11;
+}
+
+message SetupProgress {
+  uint32 job_id = 1;
+  SetupStage stage = 2;
+  uint32 index = 3;
+  uint32 total = 4;
+  // At most 128 bytes, sanitized by the server.
+  string step = 5;
+  // 0..=100, or 255 for "unknown".
+  uint32 percent = 6;
+  bool ok = 7;
+  uint32 elapsed_ms = 8;
+}
+
+enum SetupPathTaken {
+  SETUP_PATH_TAKEN_UNSPECIFIED = 0;
+  SETUP_PATH_TAKEN_PREBUILT = 1;
+  SETUP_PATH_TAKEN_BUILD = 2;
+  SETUP_PATH_TAKEN_EXISTING = 3;
+}
+
+enum SetupDockerStatus {
+  SETUP_DOCKER_STATUS_UNSPECIFIED = 0;
+  SETUP_DOCKER_STATUS_NOT_REQUESTED = 1;
+  SETUP_DOCKER_STATUS_ENABLED = 2;
+  SETUP_DOCKER_STATUS_UNSUPPORTED_INCUS = 3;
+  SETUP_DOCKER_STATUS_SELF_TEST_FAILED = 4;
+  SETUP_DOCKER_STATUS_NOT_ENABLED = 5;
+}
+
+message SetupDocker {
+  SetupDockerStatus status = 1;
+  // At most 64 bytes.
+  string docker_version = 2;
+  // At most 64 bytes.
+  string found = 3;
+  // At most 64 bytes.
+  string required = 4;
+  bool isolation_restored = 5;
+  // At most 256 bytes. The daemon's output tail is never forwarded.
+  string hint = 6;
+}
+
+enum SetupErrorCode {
+  SETUP_ERROR_CODE_UNSPECIFIED = 0;
+  SETUP_ERROR_CODE_INVALID_ARGUMENT = 1;
+  SETUP_ERROR_CODE_DESKTOP_EXISTS = 2;
+  SETUP_ERROR_CODE_INSUFFICIENT_SPACE = 3;
+  SETUP_ERROR_CODE_RATE_LIMITED = 4;
+  SETUP_ERROR_CODE_LOCKED = 5;
+  SETUP_ERROR_CODE_WINDOW_CLOSED = 6;
+  SETUP_ERROR_CODE_TIMED_OUT = 7;
+  SETUP_ERROR_CODE_CANCELLED = 8;
+  SETUP_ERROR_CODE_UNAVAILABLE = 9;
+  SETUP_ERROR_CODE_UNSUPPORTED = 10;
+  SETUP_ERROR_CODE_ISOLATION_NOT_RESTORED = 11;
+  SETUP_ERROR_CODE_INTERNAL = 12;
+}
+
+message SetupError {
+  SetupErrorCode code = 1;
+  SetupStage stage = 2;
+  // At most 256 bytes.
+  string message = 3;
+  bool retryable = 4;
+  uint32 retry_after_ms = 5;
+}
+
+message SetupResult {
+  uint32 job_id = 1;
+  SetupJobState status = 2;
+  SetupPathTaken path_taken = 3;
+  // At most 256 bytes.
+  string reason = 4;
+  // At most 16 entries of at most 256 bytes.
+  repeated string warnings = 5;
+  SetupDocker docker = 6;
+  SetupError error = 7;
+  bool finished = 8;
+  uint32 elapsed_ms = 9;
+}
+
+message SetupState {
+  SetupJobState job = 1;
+  uint32 job_id = 2;
+  bool pin_set = 3;
+  SetupDesktopState desktop = 4;
+  uint64 window_expires_unix = 5;
+  bool finished = 6;
+  // Set while a job is RUNNING.
+  SetupProgress last_progress = 7;
+  // Set once a job has ended (kept in memory only; lost when the gateway restarts).
+  SetupResult last_result = 8;
+  SetupHostFacts host = 9;
+}
+
+enum SetupAckStatus {
+  SETUP_ACK_STATUS_UNSPECIFIED = 0;
+  SETUP_ACK_STATUS_OK = 1;
+  SETUP_ACK_STATUS_INVALID_ARGUMENT = 2;
+  SETUP_ACK_STATUS_PIN_REQUIRED = 3;
+  SETUP_ACK_STATUS_PIN_ALREADY_SET = 4;
+  SETUP_ACK_STATUS_BUSY = 5;
+  SETUP_ACK_STATUS_NOT_RUNNING = 6;
+  SETUP_ACK_STATUS_ALREADY_FINISHED = 7;
+  SETUP_ACK_STATUS_WINDOW_TOO_SHORT = 8;
+  SETUP_ACK_STATUS_RATE_LIMITED = 9;
+  SETUP_ACK_STATUS_LOCKED = 10;
+  SETUP_ACK_STATUS_UNAVAILABLE = 11;
+  SETUP_ACK_STATUS_DESKTOP_NOT_READY = 12;
+  SETUP_ACK_STATUS_FAILED = 13;
+}
+
+message SetupAck {
+  SetupAckStatus status = 1;
+  // At most 64 bytes: the name of the invalid field, never a value.
+  string field = 2;
+  // At most 256 bytes, sanitized.
+  string message = 3;
+  uint32 retry_after_ms = 4;
+  uint32 job_id = 5;
+}
+
+message SetupMessage {
+  // Non-zero in set_pin, start, cancel, finish and in the ack that answers them; 0 in state,
+  // progress and result.
+  uint32 request_id = 1;
+  oneof body {
+    SetupState state = 10;       // server to client
+    SetupSetPin set_pin = 11;    // client to server
+    SetupStart start = 12;       // client to server
+    SetupCancel cancel = 13;     // client to server
+    SetupFinish finish = 14;     // client to server
+    SetupAck ack = 15;           // server to client
+    SetupProgress progress = 16; // server to client
+    SetupResult result = 17;     // server to client
   }
 }
 
@@ -232,6 +538,8 @@ message ControlMessage {
     ServerStats server_stats = 11;
     // 1.2, feature DEVICE_MANAGEMENT: list and revoke paired devices (protocol 5.9).
     DeviceMgmt device_mgmt = 12;
+    // 1.3, feature SETUP: post-pairing setup, INTENT_SETUP connections only (protocol 5.10).
+    SetupMessage setup = 13;
     Opaque pairing = 100;
     Opaque auth = 101;
   }

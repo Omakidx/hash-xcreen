@@ -182,6 +182,7 @@ mod tests {
             lifecycle: l,
             last_seen_unix: 0,
             revoked_unix: 1_699_920_000,
+            server_version: String::new(),
         }
     }
 
