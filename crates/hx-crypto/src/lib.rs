@@ -42,8 +42,8 @@ pub mod wire;
 
 pub use auth::{
     Authenticator, AuthenticatorConfig, BoxFuture, DEFAULT_LOCKED_WAIT, MAX_LOCKED_WAIT, Outcome,
-    PasswordVerdict, PinVerdict, PinVerifier, RegistryView, ReinstateGate, RevocationGuard,
-    RevocationPermit, SetupAdmission, SetupGate,
+    PasswordVerdict, PinCheck, PinVerdict, PinVerifier, RegistryView, ReinstateGate,
+    RevocationGuard, RevocationPermit, SetupAdmission, SetupGate,
 };
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use error::{Error, Result};

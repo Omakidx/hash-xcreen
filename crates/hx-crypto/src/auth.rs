@@ -325,6 +325,46 @@ impl PinVerifier for PinHash {
     }
 }
 
+/// The result of [`Authenticator::check_pin_for`]: a PIN checked outside a login, with the
+/// login's rules (counted before it is checked, shared backoff, 5th wrong revokes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinCheck {
+    /// The PIN is right (the counter was reset).
+    Right,
+    /// The PIN is wrong (or malformed, or the counter was already past the limit). `revoked`
+    /// is true if this attempt reached the limit: the device is **already revoked and
+    /// announced** when this returns.
+    Wrong {
+        /// Attempts left before the lockout.
+        attempts_left: u32,
+        /// The wait before the next attempt is checked.
+        retry_after: Duration,
+        /// The device was revoked by this attempt.
+        revoked: bool,
+    },
+    /// A wait is running: not checked, not counted.
+    Backoff {
+        /// Attempts left before the lockout.
+        attempts_left: u32,
+        /// The remaining wait.
+        retry_after: Duration,
+    },
+    /// The verifier could not decide: refunded, not a failure.
+    Unavailable {
+        /// The wait before retrying.
+        retry_after: Duration,
+    },
+    /// The verifier refuses to check PINs: refunded; the device is held for the wait.
+    Locked {
+        /// The hold.
+        retry_after: Duration,
+    },
+    /// No PIN can be checked for this device (no verifier, or none for it).
+    NotAvailable,
+    /// The device is revoked (or was removed).
+    Revoked,
+}
+
 /// What one counted attempt came to.
 enum Judged {
     Right,
@@ -381,7 +421,9 @@ pub enum Outcome {
     /// device active again (PIN counter reset, revocation cleared) and `AuthResult{OK}` was
     /// sent. **No session is authorized**; the connection was closed with `NO_ERROR`. The
     /// application announces the change (`DeviceEvent REINSTATED`) and audits it
-    /// (`DEVICE_REINSTATED`, cause `PASSWORD`).
+    /// (`DEVICE_REINSTATED`, cause `PASSWORD`). The outcome is only returned if the exchange
+    /// finishes before its deadline, so an application must announce from
+    /// [`Authenticator::subscribe_reinstatements`], which fires from the commit itself.
     Reinstated {
         /// The device, as now stored (active).
         device: DeviceRecord,
@@ -430,6 +472,7 @@ struct Inner {
     revocations: broadcast::Sender<DeviceId>,
     /// Earliest time each device may try its PIN again (memory only).
     not_before: Mutex<HashMap<DeviceId, Instant>>,
+    reinstatements: broadcast::Sender<DeviceId>,
     /// One PIN verification at a time per device, so parallel connections cannot multiply
     /// guesses past the failure limit.
     device_locks: Mutex<HashMap<DeviceId, Arc<tokio::sync::Mutex<()>>>>,
@@ -460,6 +503,7 @@ impl Authenticator {
         clock: Arc<dyn Clock>,
     ) -> Self {
         let (revocations, _) = broadcast::channel(64);
+        let (reinstatements, _) = broadcast::channel(64);
         Self {
             inner: Arc::new(Inner {
                 identity,
@@ -473,6 +517,7 @@ impl Authenticator {
                 revocation_guard: RwLock::new(None),
                 config,
                 revocations,
+                reinstatements,
                 not_before: Mutex::new(HashMap::new()),
                 device_locks: Mutex::new(HashMap::new()),
             }),
@@ -666,11 +711,41 @@ impl Authenticator {
             .map_err(|_| Error::Protocol("registry task failed"))?
     }
 
+    /// Like [`commit`](Self::commit) for a reinstatement: when `f` reports that the device was
+    /// reinstated, the announcement is sent from inside the same blocking unit.
+    async fn commit_reinstatement(
+        &self,
+        id: DeviceId,
+        f: impl FnOnce(&dyn DeviceRegistry) -> Result<bool> + Send + 'static,
+    ) -> Result<bool> {
+        let (r, tx) = (
+            self.inner.registry.clone(),
+            self.inner.reinstatements.clone(),
+        );
+        tokio::task::spawn_blocking(move || {
+            let done = f(&*r)?;
+            if done {
+                let _ = tx.send(id);
+            }
+            Ok(done)
+        })
+        .await
+        .map_err(|_| Error::Protocol("registry task failed"))?
+    }
+
     /// Every revocation (by an operator or by the PIN lockout) is announced here, for
     /// components that keep per-device state (for example the session supervisor). Live
     /// connections authorized by this authenticator are closed by it directly.
     pub fn subscribe_revocations(&self) -> broadcast::Receiver<DeviceId> {
         self.inner.revocations.subscribe()
+    }
+
+    /// Every self-reinstatement with the account password (`INTENT_REINSTATE`) is announced
+    /// here, from the same unit that commits it to the registry: it cannot be lost to a
+    /// deadline or a dropped connection, unlike [`Outcome::Reinstated`], which is only
+    /// returned if the exchange finishes. The application audits and announces from this.
+    pub fn subscribe_reinstatements(&self) -> broadcast::Receiver<DeviceId> {
+        self.inner.reinstatements.subscribe()
     }
 
     /// Run a registry call on a blocking thread (it may fsync).
@@ -1044,8 +1119,13 @@ impl Authenticator {
                         cfg.reinstate_max_age.as_secs(),
                         self.inner.clock.unix_secs(),
                     );
+                    // Commit and announce as one blocking unit: once started it completes
+                    // even if the deadline drops this future, so a reinstatement that is in
+                    // the registry is never left unannounced.
                     let done = self
-                        .reg(move |r| r.reinstate_after_lockout(&id, now_unix, max_age))
+                        .commit_reinstatement(id, move |r| {
+                            r.reinstate_after_lockout(&id, now_unix, max_age)
+                        })
                         .await?;
                     if !done {
                         // Revoked again by someone else, or too old by now: stays revoked.
@@ -1412,6 +1492,56 @@ impl Authenticator {
             }
         }
         Err(Error::Protocol("too many PIN attempts on one connection"))
+    }
+
+    /// Checks `pin` for `id` **outside a login** (a "current PIN" of another request) with
+    /// exactly the login's rules, under the same per-device guard: the attempt is counted before
+    /// it is checked, on the same counter; a wait that is running (from a login or from an
+    /// earlier call) refuses it without checking or counting; an attempt past the limit is
+    /// answered `Wrong` without asking the verifier; the 5th consecutive wrong PIN revokes the
+    /// device (persisted, announced, its connections closed) **before this returns**. A wrong
+    /// verdict sets the shared backoff.
+    ///
+    /// Fails with [`Error::UnknownDevice`] for an unknown id.
+    pub async fn check_pin_for(&self, id: &DeviceId, pin: Zeroizing<Vec<u8>>) -> Result<PinCheck> {
+        let cfg = &self.inner.config;
+        let id = *id;
+        let guard = self.device_lock(&id).lock_owned().await;
+        let current = self
+            .reg(move |r| r.get(&id))
+            .await?
+            .ok_or(Error::UnknownDevice)?;
+        if current.is_revoked() {
+            return Ok(PinCheck::Revoked);
+        }
+        let left = cfg.max_pin_failures.saturating_sub(current.failed_pins);
+        let wait = self.backoff_remaining(&id);
+        if !wait.is_zero() {
+            return Ok(PinCheck::Backoff {
+                attempts_left: left,
+                retry_after: wait,
+            });
+        }
+        let verifier = match self.pin_verifier() {
+            Some(v) if v.has_pin(&id) => v,
+            _ => return Ok(PinCheck::NotAvailable),
+        };
+        Ok(match self.check_pin(id, verifier, pin, guard).await? {
+            Judged::Right => PinCheck::Right,
+            Judged::Wrong { failed, revoked } => PinCheck::Wrong {
+                attempts_left: cfg.max_pin_failures.saturating_sub(failed),
+                retry_after: if revoked {
+                    Duration::ZERO
+                } else {
+                    backoff_after(failed)
+                },
+                revoked,
+            },
+            Judged::Unavailable { .. } => PinCheck::Unavailable {
+                retry_after: cfg.unavailable_retry,
+            },
+            Judged::Locked { wait } => PinCheck::Locked { retry_after: wait },
+        })
     }
 
     /// Count the attempt, verify, then record the outcome, as one detached unit that owns the

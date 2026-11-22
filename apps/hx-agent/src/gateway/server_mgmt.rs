@@ -6,11 +6,13 @@
 //! * **Nothing widens in privd's contract.** Every command used is class `A` or `R` and
 //!   already allowed to the gateway role. Turning Docker **on** after setup is Admin-only
 //!   (`EnableDocker` is class `S`), so it is answered `ADMIN_ONLY` without calling privd.
-//! * **The current PIN is checked like a login**: the attempt is counted on the device's own
-//!   failure counter (the registry's, the one a PIN login uses) *before* it is checked, a wrong
-//!   one backs off, the 5th consecutive wrong one revokes the device through
-//!   `Authenticator::revoke` (so the sessions close and the audit follows the login's path),
-//!   and a verifier that cannot answer is refunded, never a wrong PIN.
+//! * **The current PIN is checked like a login**, by the authenticator itself
+//!   (`Authenticator::check_pin_for`): under the login's per-device guard, counted on the
+//!   device's own failure counter *before* it is checked, with the login's shared backoff, not
+//!   verified at all once the counter is past the limit, and the 5th consecutive wrong one
+//!   revokes the device (persisted and announced) before the answer is built; a verifier that
+//!   cannot answer is refunded, never a wrong PIN. The new PIN replaces the one the device
+//!   authenticated with: its own if it has one, otherwise the shared PIN (protocol 5.11).
 //! * **Secrets** are copied into `Zeroizing` memory at once and the message is dropped. The
 //!   new password and the current password go to privd through the dedicated lane's owned-secret
 //!   path (wiped as soon as the frames are written). Nothing here logs a secret, and no status
@@ -21,11 +23,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use hx_crypto::auth::{PinVerdict, PinVerifier};
-use hx_crypto::pin::{MAX_PIN_FAILURES, backoff_after};
-use hx_crypto::{
-    Authenticator, Clock, DeviceId, DeviceRegistry, PinParams, RevokeReason, RevokedBy,
-};
+use hx_crypto::{Authenticator, Clock, DeviceId, PinParams};
 use hx_ipc::privd::pb::{self as privd_pb, AuditEvent, ErrorCode, ErrorDetail};
 use hx_ipc::text::sanitize_text;
 use hx_proto::message::{password_problem, pin_problem};
@@ -34,7 +32,7 @@ use zeroize::Zeroizing;
 
 use super::devices::DeviceService;
 use super::privd_client::{PrivdClient, PrivdError, PrivdLane};
-use super::verifier::{self, PrivdPinVerifier, VerifierError, VerifierStore};
+use super::verifier::{self, VerifierError, VerifierStore};
 
 /// Overview requests one device may make per minute (over all its connections).
 pub const OVERVIEW_PER_MINUTE: usize = 30;
@@ -75,8 +73,7 @@ struct Limits {
 #[derive(Default)]
 struct Mem {
     rate: HashMap<DeviceId, Limits>,
-    /// Wait after a wrong current PIN / password, per device (not counted again while it runs).
-    pin_not_before: HashMap<DeviceId, Instant>,
+    /// Wait after a wrong current password, per device (not counted again while it runs).
     password_not_before: HashMap<DeviceId, Instant>,
     update: Option<pb::ServerUpdateInfo>,
 }
@@ -85,10 +82,11 @@ struct Mem {
 pub struct Answer {
     /// The response body.
     pub body: Body,
-    /// The request was the device's 5th wrong PIN: send `body` first, then call
-    /// [`ServerMgmtService::lockout`] (revoking closes the device's connections at once and
-    /// would swallow the answer).
-    pub lockout: bool,
+    /// The device is revoked now (this request was its 5th wrong PIN, or it was already
+    /// revoked): the revocation is persisted and announced before the answer is returned, the
+    /// answer is sent on a best-effort basis (the authenticator closes the device's connections
+    /// as soon as it is revoked) and the session ends.
+    pub revoked: bool,
 }
 
 /// The service. Create it once per gateway.
@@ -96,16 +94,15 @@ pub struct ServerMgmtService {
     privd: PrivdClient,
     lane: PrivdLane,
     verifiers: Arc<VerifierStore>,
-    pin_verifier: Arc<PrivdPinVerifier>,
-    registry: Arc<dyn DeviceRegistry>,
     auth: Authenticator,
     devices: Arc<DeviceService>,
     clock: Arc<dyn Clock>,
     settings: ServerMgmtSettings,
     started: Instant,
     mem: Mutex<Mem>,
-    /// Serializes the secret-checking requests (PIN and password), so the counting and the
-    /// check of one device cannot interleave.
+    /// Serializes the password changes (the password is one shared secret and privd's PASSWORD
+    /// budget is global, so a change at a time is the point). PIN changes do not take it: the
+    /// current-PIN check is serialized per device by the authenticator.
     secret_lock: tokio::sync::Mutex<()>,
 }
 
@@ -260,8 +257,7 @@ impl ServerMgmtService {
     pub fn new(
         privd: PrivdClient,
         verifiers: Arc<VerifierStore>,
-        pin_verifier: Arc<PrivdPinVerifier>,
-        registry: Arc<dyn DeviceRegistry>,
+        lane: PrivdLane,
         auth: Authenticator,
         devices: Arc<DeviceService>,
         clock: Arc<dyn Clock>,
@@ -269,11 +265,9 @@ impl ServerMgmtService {
     ) -> Arc<Self> {
         let started = clock.now();
         Arc::new(Self {
-            lane: privd.dedicated(),
+            lane,
             privd,
             verifiers,
-            pin_verifier,
-            registry,
             auth,
             devices,
             clock,
@@ -315,21 +309,6 @@ impl ServerMgmtService {
         Ok(())
     }
 
-    /// Revokes `device` after its 5th wrong PIN, the consequence a wrong PIN at login has.
-    pub async fn lockout(&self, device: DeviceId) {
-        if let Err(e) = self
-            .auth
-            .revoke(
-                &device,
-                RevokeReason::TooManyPinFailures,
-                RevokedBy::Lockout,
-            )
-            .await
-        {
-            tracing::error!(error = %e, "revoking after the lockout failed");
-        }
-    }
-
     /// Handles one request of `device`. `session_active` says whether some client holds the
     /// desktop (the session asks its manager).
     pub async fn handle(&self, device: DeviceId, body: Body, session_active: bool) -> Answer {
@@ -337,7 +316,7 @@ impl ServerMgmtService {
         if let Err(wait) = self.allow(device, overview) {
             return Answer {
                 body: Body::Result(retry(pb::ServerStatus::RateLimited, wait)),
-                lockout: false,
+                revoked: false,
             };
         }
         if let Body::ChangePin(p) = body {
@@ -345,15 +324,15 @@ impl ServerMgmtService {
             let current = Zeroizing::new(p.current.to_vec());
             let new = Zeroizing::new(p.new.to_vec());
             drop(p);
-            let (r, lockout) = self.change_pin(device, current, new).await;
+            let (r, revoked) = self.change_pin(device, current, new).await;
             return Answer {
                 body: Body::Result(r),
-                lockout,
+                revoked,
             };
         }
         Answer {
             body: self.handle_other(device, body, session_active).await,
-            lockout: false,
+            revoked: false,
         }
     }
 
@@ -454,15 +433,12 @@ impl ServerMgmtService {
 
     // ------------------------------------------------------------------ secrets
 
-    /// Waits left after a wrong secret of `device`, if any.
-    fn backoff_left(&self, device: &DeviceId, pin: bool) -> Option<Duration> {
+    /// Waits left after a wrong current password of `device`, if any. (The PIN's backoff is the
+    /// authenticator's, shared with the login.)
+    fn backoff_left(&self, device: &DeviceId) -> Option<Duration> {
         let now = self.clock.now();
         let mut m = self.mem();
-        let map = if pin {
-            &mut m.pin_not_before
-        } else {
-            &mut m.password_not_before
-        };
+        let map = &mut m.password_not_before;
         match map.get(device) {
             Some(t) if *t > now => Some(*t - now),
             Some(_) => {
@@ -473,24 +449,9 @@ impl ServerMgmtService {
         }
     }
 
-    fn set_backoff(&self, device: DeviceId, pin: bool, wait: Duration) {
+    fn set_backoff(&self, device: DeviceId, wait: Duration) {
         let until = self.clock.now() + wait;
-        let mut m = self.mem();
-        if pin {
-            m.pin_not_before.insert(device, until);
-        } else {
-            m.password_not_before.insert(device, until);
-        }
-    }
-
-    async fn blocking_registry<R: Send + 'static>(
-        &self,
-        f: impl FnOnce(&dyn DeviceRegistry) -> hx_crypto::Result<R> + Send + 'static,
-    ) -> hx_crypto::Result<R> {
-        let r = self.registry.clone();
-        tokio::task::spawn_blocking(move || f(&*r))
-            .await
-            .map_err(|_| hx_crypto::Error::Protocol("registry task failed"))?
+        self.mem().password_not_before.insert(device, until);
     }
 
     async fn change_pin(
@@ -499,11 +460,11 @@ impl ServerMgmtService {
         current: Zeroizing<Vec<u8>>,
         new: Zeroizing<Vec<u8>>,
     ) -> (pb::ServerResult, bool) {
-        let mut lockout = false;
+        let mut revoked = false;
         let r = self
-            .change_pin_inner(device, current, new, &mut lockout)
+            .change_pin_inner(device, current, new, &mut revoked)
             .await;
-        (r, lockout)
+        (r, revoked)
     }
 
     async fn change_pin_inner(
@@ -511,69 +472,49 @@ impl ServerMgmtService {
         device: DeviceId,
         current: Zeroizing<Vec<u8>>,
         new: Zeroizing<Vec<u8>>,
-        lockout: &mut bool,
+        revoked: &mut bool,
     ) -> pb::ServerResult {
+        use hx_crypto::PinCheck as C;
         use pb::ServerStatus as S;
         if pin_problem(&current).is_some() || pin_problem(&new).is_some() {
             return with_message(S::InvalidArgument, "a PIN must be 6 to 16 digits");
         }
-        let _one = self.secret_lock.lock().await;
-        if let Some(wait) = self.backoff_left(&device, true) {
-            return retry(S::Backoff, wait);
-        }
-        if self.verifiers.pin_for(&device).is_none() {
-            return result(S::Failed);
-        }
-        // Counted before it is checked, on the counter a login uses.
-        let failures = match self
-            .blocking_registry(move |r| r.begin_pin_attempt(&device))
-            .await
-        {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::error!(error = %e, "counting a PIN attempt failed");
-                return result(S::Failed);
-            }
-        };
-        match self.pin_verifier.verify(&device, current).await {
-            PinVerdict::Right => {
-                let now = self.clock.unix_secs();
-                if let Err(e) = self
-                    .blocking_registry(move |r| r.record_pin_success(&device, now))
-                    .await
-                {
-                    tracing::error!(error = %e, "resetting the PIN counter failed");
-                }
-            }
-            PinVerdict::Wrong => {
-                if failures >= MAX_PIN_FAILURES {
-                    // The same consequence as the 5th wrong PIN at login, applied by the
-                    // caller after the answer is on its way.
-                    *lockout = true;
+        // The current PIN is checked by the authenticator, exactly like a login: under the
+        // same per-device guard, counted before it is checked, on the same counter and the same
+        // backoff, refused without a check once the counter is past the limit, and the 5th
+        // wrong PIN revokes the device (persisted and announced) before this returns. No
+        // server-wide lock is involved: one device's PIN check never waits for another's.
+        match self.auth.check_pin_for(&device, current).await {
+            Ok(C::Right) => {}
+            Ok(C::Wrong {
+                attempts_left,
+                retry_after,
+                revoked: r,
+            }) => {
+                if r {
+                    *revoked = true;
                     return pb::ServerResult {
                         attempts_left: 0,
                         ..with_message(S::WrongPin, "too many wrong PINs: this device was revoked")
                     };
                 }
-                let wait = backoff_after(failures);
-                self.set_backoff(device, true, wait);
                 return pb::ServerResult {
-                    attempts_left: MAX_PIN_FAILURES - failures,
-                    retry_after_s: u32::try_from(wait.as_secs()).unwrap_or(u32::MAX),
+                    attempts_left,
+                    retry_after_s: u32::try_from(retry_after.as_secs()).unwrap_or(u32::MAX),
                     ..result(S::WrongPin)
                 };
             }
-            PinVerdict::Unavailable => {
-                let _ = self
-                    .blocking_registry(move |r| r.refund_pin_attempt(&device))
-                    .await;
-                return retry(S::Unavailable, Duration::from_secs(2));
+            Ok(C::Backoff { retry_after, .. }) => return retry(S::Backoff, retry_after),
+            Ok(C::Unavailable { retry_after }) => return retry(S::Unavailable, retry_after),
+            Ok(C::Locked { retry_after }) => return retry(S::Locked, retry_after),
+            Ok(C::Revoked) => {
+                *revoked = true;
+                return with_message(S::Locked, "this device was revoked");
             }
-            PinVerdict::Locked { retry_after } => {
-                let _ = self
-                    .blocking_registry(move |r| r.refund_pin_attempt(&device))
-                    .await;
-                return retry(S::Locked, retry_after.unwrap_or(Duration::from_secs(60)));
+            Ok(C::NotAvailable) => return result(S::Failed),
+            Err(e) => {
+                tracing::error!(error = %e, "checking the current PIN failed");
+                return result(S::Failed);
             }
         }
         // The current PIN was right: enrol the new one (Argon2id here, `PepperEnrol(PIN)`).
@@ -589,12 +530,24 @@ impl ServerMgmtService {
             Err(e) => return map_verifier(&e),
         };
         drop(new);
-        if let Err(e) = self.verifiers.set_pin(None, record) {
+        // The PIN that was just proven is the one this device logs in with: its own, if the
+        // operator gave it one, otherwise the shared PIN (protocol 5.11). Changing a device's
+        // own PIN never touches the other devices'.
+        let target = self.verifiers.has_own_pin(&device).then_some(device);
+        if let Err(e) = self.verifiers.set_pin(target, record) {
             tracing::error!(error = %e, "storing the new PIN failed");
             return result(S::Failed);
         }
         self.devices.bump_version();
-        self.devices.audit(AuditEvent::PinChanged, device, "app");
+        self.devices.audit(
+            AuditEvent::PinChanged,
+            device,
+            if target.is_some() {
+                "app (own PIN)"
+            } else {
+                "app"
+            },
+        );
         result(S::Ok)
     }
 
@@ -609,7 +562,7 @@ impl ServerMgmtService {
             return with_message(S::InvalidArgument, "a password must be 1 to 511 bytes");
         }
         let _one = self.secret_lock.lock().await;
-        if let Some(wait) = self.backoff_left(&device, false) {
+        if let Some(wait) = self.backoff_left(&device) {
             return retry(S::Backoff, wait);
         }
         // privd checks `CURRENT_PASSWORD` against the desktop user's hash (charged to its
@@ -637,7 +590,7 @@ impl ServerMgmtService {
                 if r.status == S::WrongPassword as i32 {
                     // privd charged the failure to its own budget; this wait keeps one device
                     // from hammering it.
-                    self.set_backoff(device, false, Duration::from_secs(2));
+                    self.set_backoff(device, Duration::from_secs(2));
                 }
                 return r;
             }
