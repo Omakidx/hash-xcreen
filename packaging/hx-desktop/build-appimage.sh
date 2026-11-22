@@ -20,6 +20,7 @@
 # libxkbcommon are loaded at run time) and, for saved servers, a Secret Service (keyring).
 set -eu
 export LC_ALL=C
+# shellcheck source=packaging/hx-desktop/common.sh
 . "$(dirname "$0")/common.sh"
 
 version='' bin='' out='' sde='' tools=''
@@ -75,6 +76,8 @@ export SOURCE_DATE_EPOCH
 find "$appdir" -exec touch -h -d "@$sde" {} +
 
 mkdir -p "$out"
+# absolute: appimagetool runs in the work directory
+out=$(cd "$out" && pwd)
 name=hx-desktop-$version-x86_64.AppImage
 rm -f "$out/$name"
 # -n: do not run appstreamcli (CI validates the metainfo itself); --runtime-file: the pinned runtime

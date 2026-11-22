@@ -45,17 +45,17 @@ jobs:
     name: .deb build (${{ matrix.distro }})
     runs-on: ubuntu-24.04
     container: ${{ matrix.image }}
-    # ubuntu-26.04 ships FFmpeg 8 and the workspace pins ffmpeg-next 7.1 (FFmpeg up to 7.1): a
-    # KNOWN GAP (packaging/hx-desktop/README.md). The cell stays visible and does not block.
-    continue-on-error: ${{ matrix.known_gap }}
+    # No ubuntu-26.04 cell: it ships FFmpeg 8 and the workspace pins ffmpeg-next 7.1 (FFmpeg up to
+    # 7.1), a KNOWN GAP (packaging/hx-desktop/README.md). Its build fails at ffmpeg-sys-next's
+    # bindings (avfft.h is gone in FFmpeg 8); the cell comes back with ffmpeg-next 8. Ubuntu 26.04
+    # users get the AppImage (FFmpeg bundled), smoke-tested on a clean 26.04 below.
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { distro: ubuntu-24.04, image: "ubuntu:24.04", known_gap: false }
-          - { distro: ubuntu-26.04, image: "ubuntu:26.04", known_gap: true }
-          - { distro: debian-12, image: "debian:12", known_gap: false }
-          - { distro: debian-13, image: "debian:13", known_gap: false }
+          - { distro: ubuntu-24.04, image: "ubuntu:24.04" }
+          - { distro: debian-12, image: "debian:12" }
+          - { distro: debian-13, image: "debian:13" }
     steps:
       - name: Install build dependencies
         env:
@@ -142,15 +142,13 @@ jobs:
     needs: deb
     runs-on: ubuntu-24.04
     container: ${{ matrix.image }}
-    continue-on-error: ${{ matrix.known_gap }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { distro: ubuntu-24.04, image: "ubuntu:24.04", known_gap: false }
-          - { distro: ubuntu-26.04, image: "ubuntu:26.04", known_gap: true }
-          - { distro: debian-12, image: "debian:12", known_gap: false }
-          - { distro: debian-13, image: "debian:13", known_gap: false }
+          - { distro: ubuntu-24.04, image: "ubuntu:24.04" }
+          - { distro: debian-12, image: "debian:12" }
+          - { distro: debian-13, image: "debian:13" }
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
