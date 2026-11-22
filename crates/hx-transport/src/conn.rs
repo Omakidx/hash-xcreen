@@ -71,11 +71,22 @@ pub struct ConnectionOptions {
     pub reorder_hold: Duration,
 }
 
+/// Default window of [`ConnectionOptions`]. Frame streams are reliable: a frame that is late
+/// is late by a loss recovery (about one to three round trips), not gone, and releasing past it
+/// makes the decoder skip a frame, which costs a key frame (hundreds of milliseconds and a
+/// burst of bytes that is itself overtaken by the frames behind it). So the window waits for
+/// a late frame much longer than reordering alone would need. A cancelled frame never makes
+/// the window wait: the sender follows a cancel with a `KEY | RESYNC` frame, which is released
+/// at once and discards everything older. The capacity covers the hold at 60 fps.
+pub const DEFAULT_REORDER_CAPACITY: usize = 32;
+/// See [`DEFAULT_REORDER_CAPACITY`].
+pub const DEFAULT_REORDER_HOLD: Duration = Duration::from_millis(250);
+
 impl Default for ConnectionOptions {
     fn default() -> Self {
         Self {
-            reorder_capacity: 4,
-            reorder_hold: Duration::from_millis(10),
+            reorder_capacity: DEFAULT_REORDER_CAPACITY,
+            reorder_hold: DEFAULT_REORDER_HOLD,
         }
     }
 }
