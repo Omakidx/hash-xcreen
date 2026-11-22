@@ -20,8 +20,8 @@ use super::marker::{NETWORK_DESCRIPTION, POOL_DESCRIPTION};
 use super::operation::{OperationEnd, OperationId};
 use super::transport::{Request, Response, Transport, UnixTransport};
 use super::types::{
-    Acl, ExecResult, ExecSpec, Instance, InstanceCreate, InstanceState, Network, ObjectInfo,
-    Operation, ProfileSpec, ServerInfo, Snapshot, StateAction, StoragePool,
+    Acl, ExecResult, ExecSpec, ImageInfo, ImageUpload, Instance, InstanceCreate, InstanceState,
+    Network, ObjectInfo, Operation, ProfileSpec, ServerInfo, Snapshot, StateAction, StoragePool,
 };
 
 /// Default timeout of a plain request.
@@ -37,6 +37,34 @@ pub(crate) fn valid_name(s: &str) -> bool {
     matches!(c.next(), Some(f) if f.is_ascii_alphanumeric())
         && s.len() <= 63
         && c.all(|x| x.is_ascii_alphanumeric() || matches!(x, '-' | '_' | '.'))
+}
+
+/// Prefix of the local aliases this product puts on the images it imports. Only images with such
+/// an alias are ever deleted by [`Client::delete_image`].
+pub const IMAGE_ALIAS_PREFIX: &str = "hx-img-";
+
+fn check_fingerprint(s: &str) -> Result<(), IncusError> {
+    if s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        Ok(())
+    } else {
+        Err(IncusError::InvalidArgument(
+            "an image fingerprint is 64 lower-case hex digits".into(),
+        ))
+    }
+}
+
+fn check_image_alias(name: &str) -> Result<(), IncusError> {
+    if valid_name(name) && name.starts_with(IMAGE_ALIAS_PREFIX) {
+        Ok(())
+    } else {
+        Err(IncusError::InvalidName {
+            what: "image alias (must start with `hx-img-`)",
+            name: name.to_string(),
+        })
+    }
 }
 
 fn checked<'a>(what: &'static str, name: &'a str) -> Result<&'a str, IncusError> {
@@ -784,6 +812,147 @@ impl<T: Transport> Client<T> {
         self.sync(Method::DELETE, format!("/1.0/profiles/{name}"), None)
             .await
             .map(drop)
+    }
+
+    // --- images ----------------------------------------------------------------------------
+
+    /// Import an image file into the local store (`POST /1.0/images`, body streamed from the
+    /// file, never buffered). Sends `X-Incus-fingerprint` and `X-Incus-public: 0`, waits for the
+    /// unpacking operation within what is left of `deadline`, and returns the fingerprint Incus
+    /// reports, which it checks equals `upload.fingerprint`: an image Incus stored under another
+    /// fingerprint is an error (and is left in place for the caller to look at, not deleted).
+    ///
+    /// Importing an image that is already in the store is an API error (409).
+    pub async fn import_image(
+        &self,
+        upload: ImageUpload,
+        deadline: Duration,
+    ) -> Result<String, IncusError> {
+        let expected = upload.fingerprint;
+        check_fingerprint(&expected)?;
+        if upload.len == 0 {
+            return Err(IncusError::InvalidArgument("empty image file".into()));
+        }
+        let started = Instant::now();
+        let r = self
+            .transport
+            .send_file(
+                Request {
+                    method: Method::POST,
+                    path: "/1.0/images".into(),
+                    headers: vec![
+                        ("X-Incus-fingerprint", expected.clone()),
+                        ("X-Incus-public", "0".into()),
+                    ],
+                    body: Bytes::new(),
+                    content_type: Some("application/octet-stream"),
+                    max_response: None,
+                    timeout: deadline,
+                },
+                upload.file,
+                upload.len,
+            )
+            .await?;
+        let env = parse_envelope(r.status, &r.body)?;
+        let metadata = if env.kind == "async" {
+            let left = deadline.saturating_sub(started.elapsed());
+            match self
+                .wait_operation(&op_path(&env)?, left, "the image import")
+                .await
+            {
+                Ok(op) => op.metadata,
+                Err(IncusError::Purged(w)) => {
+                    // The result is gone; the store says whether the image is there.
+                    if self.get_image(&expected).await?.is_some() {
+                        return Ok(expected);
+                    }
+                    return Err(IncusError::Purged(w));
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            env.metadata
+        };
+        let got = metadata
+            .get("fingerprint")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if got != expected {
+            return Err(IncusError::Protocol(format!(
+                "Incus stored the image as `{}`, not the expected `{expected}`",
+                if check_fingerprint(got).is_ok() {
+                    got
+                } else {
+                    "(no valid fingerprint)"
+                }
+            )));
+        }
+        Ok(expected)
+    }
+
+    /// Point the alias `name` (which must start with `hx-img-`) at an image.
+    /// An alias that already exists is an API error (409).
+    pub async fn create_image_alias(
+        &self,
+        name: &str,
+        fingerprint: &str,
+    ) -> Result<(), IncusError> {
+        check_image_alias(name)?;
+        check_fingerprint(fingerprint)?;
+        let body = json!({
+            "name": name,
+            "target": fingerprint,
+            "description": "hash-xcreen prebuilt desktop image",
+        });
+        self.sync(Method::POST, "/1.0/images/aliases".into(), Some(&body))
+            .await
+            .map(drop)
+    }
+
+    /// The image with this fingerprint, or `None`.
+    pub async fn get_image(&self, fingerprint: &str) -> Result<Option<ImageInfo>, IncusError> {
+        check_fingerprint(fingerprint)?;
+        self.get_optional(format!("/1.0/images/{fingerprint}"))
+            .await?
+            .map(|v| decode("image", v))
+            .transpose()
+    }
+
+    /// Every image in the local store (`recursion=1`).
+    pub async fn list_images(&self) -> Result<Vec<ImageInfo>, IncusError> {
+        decode(
+            "image list",
+            self.sync(Method::GET, "/1.0/images?recursion=1".into(), None)
+                .await?,
+        )
+    }
+
+    /// Delete an image, **only** if it carries an alias starting with `hx-img-` (that is, one this
+    /// product created): any other image is refused with [`IncusError::InvalidArgument`], so a
+    /// bug upstream cannot remove an image the administrator imported. `Ok(false)`: no such image.
+    pub async fn delete_image(&self, fingerprint: &str) -> Result<bool, IncusError> {
+        let Some(img) = self.get_image(fingerprint).await? else {
+            return Ok(false);
+        };
+        if !img
+            .aliases
+            .iter()
+            .any(|a| a.starts_with(IMAGE_ALIAS_PREFIX))
+        {
+            return Err(IncusError::InvalidArgument(format!(
+                "image {fingerprint} has no `{IMAGE_ALIAS_PREFIX}` alias; refusing to delete it"
+            )));
+        }
+        self.run_verified(
+            Method::DELETE,
+            format!("/1.0/images/{fingerprint}"),
+            None,
+            Duration::from_secs(120),
+            "the image delete",
+            async || Ok(self.get_image(fingerprint).await?.is_none()),
+        )
+        .await?;
+        Ok(true)
     }
 
     // --- instances -------------------------------------------------------------------------
