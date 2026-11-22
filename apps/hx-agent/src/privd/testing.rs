@@ -218,7 +218,7 @@ pub struct FakeState {
     pub imports: Vec<(String, u64)>,
     /// An image import fails with this HTTP status and message (a failed unpack).
     pub import_fails: Option<(u16, String)>,
-    /// Creating an instance fails with this HTTP status and message (a launch failure).
+    /// The next instance creation fails once with this HTTP status and message (a launch failure).
     pub create_fails: Option<(u16, String)>,
     /// Objects of the generic collections (`storage-pools`, `networks`, `network-acls`,
     /// `profiles`) by `collection/name`.
@@ -510,10 +510,7 @@ impl FakeIncus {
                 }
             }
             ("GET", ["1.0", "images"]) => ok_sync(Value::Array(
-                s.images
-                    .iter()
-                    .map(|(fp, i)| image_json(fp, i))
-                    .collect(),
+                s.images.iter().map(|(fp, i)| image_json(fp, i)).collect(),
             )),
             ("POST", ["1.0", "images", "aliases"]) => {
                 let alias = body["name"].as_str().unwrap_or_default().to_string();
@@ -539,7 +536,7 @@ impl FakeIncus {
                 }
             }
             ("POST", ["1.0", "instances"]) => {
-                if let Some((code, msg)) = s.create_fails.clone() {
+                if let Some((code, msg)) = s.create_fails.take() {
                     return Ok(err_response(code, &msg));
                 }
                 let name = body["name"].as_str().unwrap_or_default().to_string();
@@ -841,7 +838,8 @@ impl Transport for FakeIncus {
             h.iter().map(|b| format!("{b:02x}")).collect::<String>()
         };
         let mut s = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        s.log.push(format!("{} {}", head.method.as_str(), head.path));
+        s.log
+            .push(format!("{} {}", head.method.as_str(), head.path));
         if s.down {
             return Err(IncusError::Connect {
                 path: "fake".into(),

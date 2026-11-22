@@ -396,9 +396,13 @@ pub async fn create_desktop<T: Transport + Clone + 'static>(
     let id = r.desktop_id.clone();
     // Parse every argument into a typed value first.
     let image_mode = pb::ImageMode::try_from(r.image_mode).unwrap_or(pb::ImageMode::Unspecified);
-    if r.image_file.is_some() {
+    if let Some(f) = &r.image_file {
         if ctx.role != Role::Admin {
             return Err(CmdError::denied("create_desktop.image_file: Admin only"));
+        }
+        // The wire decoder checks this too; a name is never a path (ipc.md 6.5).
+        if !hx_ipc::privd::is_valid_image_file_name(f) {
+            return Err(CmdError::invalid("create_desktop.image_file"));
         }
         if image_mode == pb::ImageMode::Build {
             return Err(CmdError::invalid(

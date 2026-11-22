@@ -805,7 +805,13 @@ async fn resume_after_the_ruleset_file_could_not_be_removed() {
             std::fs::create_dir(&fw).unwrap();
         },
         |_| std::fs::remove_dir(&fw).unwrap(),
-        &["session_links", "images", "desktops", "host_objects", "nft_table"],
+        &[
+            "session_links",
+            "images",
+            "desktops",
+            "host_objects",
+            "nft_table",
+        ],
         ErrorDetail::Unspecified,
         &["nft-table:inet hx", "desktop:main"],
     )
