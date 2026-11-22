@@ -1,0 +1,5 @@
+# actionlint configuration (the CI "Workflow lint" job).
+self-hosted-runner:
+  # The quiet performance runner of .github/workflows/perf.yml (docs/testing.md section 4).
+  labels:
+    - hx-perf

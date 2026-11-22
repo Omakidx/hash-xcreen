@@ -1,0 +1,189 @@
+{
+  "schema": 1,
+  "recorded": {
+    "reference": false,
+    "date": "2026-11-22",
+    "machine": "development machine",
+    "noisy": true,
+    "cpus": 16,
+    "loadavg_1m": 29.31,
+    "release_build": true,
+    "runs": 5
+  },
+  "macro": {
+    "typing_latency_p95_ms": {
+      "gate": 40,
+      "regress_pct": 25,
+      "slack": 3,
+      "timing": true,
+      "baseline": 63.3748
+    },
+    "scroll_latency_p95_ms": {
+      "gate": 40,
+      "regress_pct": 25,
+      "slack": 3,
+      "timing": true,
+      "baseline": 92.24
+    },
+    "typing_cores": {
+      "gate": 1.5,
+      "regress_pct": 30,
+      "slack": 0.03,
+      "timing": true,
+      "baseline": 0.2442
+    },
+    "scroll_cores": {
+      "gate": 1.5,
+      "regress_pct": 30,
+      "slack": 0.03,
+      "timing": true,
+      "baseline": 0.4273
+    },
+    "idle_cores": {
+      "gate": 0.05,
+      "regress_pct": 100,
+      "slack": 0.01,
+      "timing": true,
+      "baseline": 0.023
+    },
+    "idle_bytes_per_s": {
+      "gate": 2048,
+      "regress_pct": 100,
+      "slack": 50,
+      "baseline": 198.9102
+    },
+    "first_frame_ms": {
+      "gate": 5000,
+      "regress_pct": 100,
+      "slack": 100,
+      "timing": true,
+      "baseline": 176.6903
+    },
+    "mismatch_pct_worst": {
+      "gate": 1.0,
+      "baseline": 0.4664
+    }
+  },
+  "micro": {
+    "media_header/encode": {
+      "regress_pct": 30,
+      "baseline_ns": 19.3,
+      "max_ns": 400.0
+    },
+    "media_header/decode_frame_64k": {
+      "regress_pct": 30,
+      "baseline_ns": 13.0,
+      "max_ns": 300.0
+    },
+    "media_header/decode": {
+      "regress_pct": 30,
+      "baseline_ns": 3.8,
+      "max_ns": 100.0
+    },
+    "link_video_frame/read_and_parse/262144": {
+      "regress_pct": 30,
+      "baseline_ns": 15608.9,
+      "max_ns": 312200.0
+    },
+    "link_video_frame/read_and_parse/16384": {
+      "regress_pct": 30,
+      "baseline_ns": 785.9,
+      "max_ns": 15800.0
+    },
+    "link_video_frame/read_and_parse/512": {
+      "regress_pct": 30,
+      "baseline_ns": 200.3,
+      "max_ns": 4100.0
+    },
+    "link_video_frame/encode_prefix/262144": {
+      "regress_pct": 30,
+      "baseline_ns": 43.4,
+      "max_ns": 900.0
+    },
+    "link_video_frame/encode_prefix/16384": {
+      "regress_pct": 30,
+      "baseline_ns": 49.8,
+      "max_ns": 1000.0
+    },
+    "link_video_frame/encode_prefix/512": {
+      "regress_pct": 30,
+      "baseline_ns": 84.1,
+      "max_ns": 1700.0
+    },
+    "link_ctl/read_and_parse_frame_feedback_64": {
+      "regress_pct": 30,
+      "baseline_ns": 4485.3,
+      "max_ns": 89800.0
+    },
+    "link_ctl/encode_frame_feedback_64": {
+      "regress_pct": 30,
+      "baseline_ns": 3096.8,
+      "max_ns": 62000.0
+    },
+    "convert_bgrx_1080p/i420": {
+      "regress_pct": 30,
+      "baseline_ns": 9036440.1,
+      "max_ns": 180728900.0
+    },
+    "convert_bgrx_1080p/nv12": {
+      "regress_pct": 30,
+      "baseline_ns": 7803853.7,
+      "max_ns": 156077100.0
+    },
+    "session_pipeline/damage_to_encoded_frame_720p": {
+      "regress_pct": 30,
+      "baseline_ns": 15485243.2,
+      "max_ns": 309704900.0
+    },
+    "datagram/mouse_move_encode": {
+      "regress_pct": 30,
+      "baseline_ns": 8.1,
+      "max_ns": 200.0
+    },
+    "datagram/mouse_coalesce_100": {
+      "regress_pct": 30,
+      "baseline_ns": 55.6,
+      "max_ns": 1200.0
+    },
+    "datagram/mouse_move_decode": {
+      "regress_pct": 30,
+      "baseline_ns": 14.7,
+      "max_ns": 300.0
+    },
+    "x264_encode_1080p/p_frame/typing": {
+      "regress_pct": 30,
+      "baseline_ns": 23176768.6,
+      "max_ns": 463535400.0
+    },
+    "x264_encode_1080p/p_frame/scrolling": {
+      "regress_pct": 30,
+      "baseline_ns": 22751296.5,
+      "max_ns": 455026000.0
+    },
+    "control_framing/decode_framed_input_event": {
+      "regress_pct": 30,
+      "baseline_ns": 70.7,
+      "max_ns": 1500.0
+    },
+    "control_framing/encode_framed_control_ping": {
+      "regress_pct": 30,
+      "baseline_ns": 144.3,
+      "max_ns": 2900.0
+    },
+    "control_framing/encode_framed_input_event": {
+      "regress_pct": 30,
+      "baseline_ns": 67.2,
+      "max_ns": 1400.0
+    },
+    "control_framing/decode_framed_control_ping": {
+      "regress_pct": 30,
+      "baseline_ns": 68.7,
+      "max_ns": 1400.0
+    },
+    "bufpool_get_fill_drop_16k": {
+      "regress_pct": 30,
+      "baseline_ns": 750.8,
+      "max_ns": 15100.0
+    }
+  }
+}
