@@ -1,4 +1,5 @@
 #!/bin/sh
+# shellcheck disable=SC2034 # the paths assigned after sourcing install.sh are read by its functions
 # install.sh's download path in a fake root, with a fake curl that serves a test release dir and
 # ignores --max-filesize (an old curl). Run by the shell under test (installer/tests/handoff.sh).
 #   download-case.sh <install.sh> <release dir> <fake dir> <mode: ok|big-manifest|big-artifact>

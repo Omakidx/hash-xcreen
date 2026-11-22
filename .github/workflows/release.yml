@@ -115,7 +115,7 @@ jobs:
           mkdir "$out"
           rel=target/x86_64-unknown-linux-musl/release
           for f in "$rel"/hx-*; do
-            [ -f "$f" ] && [ -x "$f" ] || continue
+            if [ ! -f "$f" ] || [ ! -x "$f" ]; then continue; fi
             case "$f" in *.d) continue ;; esac
             # statically linked: no program interpreter
             if readelf -l "$f" | grep -q INTERP; then echo "::error::$f is dynamically linked"; exit 1; fi

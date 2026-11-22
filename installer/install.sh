@@ -516,7 +516,7 @@ main() {
     esac
     check_tools flock id mktemp ||
         die 9 bootstrap-preflight PREFLIGHT 'a required tool is missing'
-    json_stage bootstrap-preflight done
+    json_stage bootstrap-preflight 'done'
 
     # ---- the lock, held across the exec (C4) ----
     if [ -L "$LOCK_FILE" ] || ! (: >>"$LOCK_FILE") 2>/dev/null; then
@@ -575,7 +575,7 @@ main() {
         fetch "$_base/manifest-x86_64.json.minisig" "$BOOT/manifest.json.minisig" 4096 ||
             die 1 bootstrap-download DOWNLOAD 'cannot download the manifest signature'
     fi
-    json_stage bootstrap-download done
+    json_stage bootstrap-download 'done'
 
     # ---- bootstrap-verify ----
     json_stage bootstrap-verify start
@@ -622,7 +622,7 @@ main() {
     [ -f "$BOOT/hx-agent" ] && [ ! -L "$BOOT/hx-agent" ] ||
         die 10 bootstrap-verify VERIFY 'hx-agent is not a regular file'
     chmod 0700 "$BOOT/hx-agent"
-    json_stage bootstrap-verify done
+    json_stage bootstrap-verify 'done'
 
     # ---- hand off (C4): the lock stays held on fd 9 ----
     if [ "$PROGRESS" = json ]; then
