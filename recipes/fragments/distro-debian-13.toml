@@ -9,6 +9,11 @@ base_image = "images:debian/13"
 distro = "debian"
 codename = "trixie"
 distro_version = "13"
+# FFmpeg runtime of the hx-session .deb: its Depends (dpkg-shlibdeps) names exactly these
+# sonames, and privd's InstallSession runs `dpkg -i`, which resolves nothing. FFmpeg 7.1.5, 7:7.1.5-0+deb13u1 (packages.debian.org, trixie, checked 2026-11-21).
+# packaging/hx-session/check-recipe-covers-depends.sh keeps them in step with the .deb.
+libavcodec_pkg = "libavcodec61"
+libavutil_pkg = "libavutil59"
 
 [apt]
 packages = ["firefox-esr"]

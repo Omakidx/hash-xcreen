@@ -19,6 +19,8 @@
     "gnupg",
     "jq",
     "less",
+    "libavcodec61",
+    "libavutil59",
     "libpam-systemd",
     "locales",
     "mousepad",

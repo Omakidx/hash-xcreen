@@ -24,6 +24,8 @@ packages = [
   "xfce4-terminal", "xfce4-notifyd", "thunar", "mousepad", "adwaita-icon-theme", "fonts-dejavu-core",
   # audio
   "pipewire", "pipewire-pulse", "wireplumber", "pipewire-bin", "pulseaudio-utils",
+  # FFmpeg runtime libraries the hx-session .deb depends on (per-distro vars, distro-*.toml)
+  "{{libavcodec_pkg}}", "{{libavutil_pkg}}",
 ]
 
 [user]

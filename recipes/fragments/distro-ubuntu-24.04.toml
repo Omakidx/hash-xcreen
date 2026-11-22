@@ -9,6 +9,11 @@ base_image = "images:ubuntu/24.04"
 distro = "ubuntu"
 codename = "noble"
 distro_version = "24.04"
+# FFmpeg runtime of the hx-session .deb: its Depends (dpkg-shlibdeps) names exactly these
+# sonames, and privd's InstallSession runs `dpkg -i`, which resolves nothing. FFmpeg 6.1, verified on a 24.04 host (spike 1c-e2e).
+# packaging/hx-session/check-recipe-covers-depends.sh keeps them in step with the .deb.
+libavcodec_pkg = "libavcodec60"
+libavutil_pkg = "libavutil58"
 
 [[apt_repo]]
 name = "mozillateam"

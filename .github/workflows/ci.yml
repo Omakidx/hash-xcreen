@@ -20,7 +20,7 @@ jobs:
     name: Format
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned toolchain
         run: rustup toolchain install
       - run: cargo fmt --all --check
@@ -29,7 +29,7 @@ jobs:
     name: Clippy
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned toolchain
         run: rustup toolchain install
       - name: Install system libraries
@@ -38,14 +38,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang libclang-dev pkg-config libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libx264-dev
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
     name: Test
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned toolchain
         run: rustup toolchain install
       - name: Install system libraries and Xvfb
@@ -54,8 +54,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang libclang-dev pkg-config libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libx264-dev xvfb
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2
         with:
           tool: cargo-nextest
       - name: Run tests
@@ -68,10 +68,10 @@ jobs:
     name: Licences and advisories (cargo-deny)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned toolchain
         run: rustup toolchain install
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2
         with:
           tool: cargo-deny
       - run: cargo deny check
@@ -80,20 +80,72 @@ jobs:
     name: Advisories (cargo-audit)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned toolchain
         run: rustup toolchain install
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2
         with:
           tool: cargo-audit
       - run: cargo audit
+
+  shellcheck:
+    name: Shell scripts (shellcheck)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+      - name: shellcheck (POSIX sh)
+        # install.sh is POSIX sh; its tests and the release and packaging scripts are written to
+        # the same dialect so that they run under dash. Severity "warning": the info and style
+        # notes (for example SC2015 on `a && b || c` guards) are not enforced.
+        run: >
+          shellcheck -s sh -x --severity=warning
+          installer/install.sh installer/tests/*.sh
+          release/*.sh packaging/hx-session/*.sh
+
+  installer-kat:
+    name: install.sh known-answer tests (dash, posh)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install the shells
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dash posh
+      - name: Signature KATs and hand-off suite under dash
+        run: |
+          sh installer/tests/run.sh dash
+          sh installer/tests/handoff.sh dash
+      - name: Signature KATs under posh (strict POSIX)
+        # posh was not available where this was written: informative until it has run green once.
+        continue-on-error: true
+        run: sh installer/tests/run.sh posh
+      - name: install.sh refuses to run without a provisioned key, and its self-test passes
+        run: |
+          dash installer/install.sh --help
+          # the repository file embeds no key yet, so it must stop at preflight (exit 7 as a
+          # non-root user, never a download)
+          rc=0; dash installer/install.sh --pair >/dev/null 2>&1 || rc=$?
+          test "$rc" = 7
+
+  actionlint:
+    name: Workflow lint (actionlint)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker://rhysd/actionlint:1.7.7
+        with:
+          args: -color
 
   dco:
     name: DCO sign-off
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
       - name: Check every commit is signed off

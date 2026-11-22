@@ -9,6 +9,11 @@ base_image = "images:ubuntu/26.04"
 distro = "ubuntu"
 codename = "resolute"
 distro_version = "26.04"
+# FFmpeg runtime of the hx-session .deb: its Depends (dpkg-shlibdeps) names exactly these
+# sonames, and privd's InstallSession runs `dpkg -i`, which resolves nothing. FFmpeg 8.0.1, 7:8.0.1-3ubuntu2 (packages.ubuntu.com, resolute, checked 2026-11-21).
+# packaging/hx-session/check-recipe-covers-depends.sh keeps them in step with the .deb.
+libavcodec_pkg = "libavcodec62"
+libavutil_pkg = "libavutil60"
 
 # The PPA's signing key as reported by the Launchpad API (signing_key_fingerprint of
 # ~mozillateam/+archive/ubuntu/ppa). Its Release files are signed by this key and by the older
