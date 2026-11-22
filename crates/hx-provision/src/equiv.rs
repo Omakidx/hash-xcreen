@@ -782,9 +782,11 @@ fn compare_accounts(a: &Facts, b: &Facts, manifest: &Manifest, out: &mut Vec<Dri
             ));
         }
         // The rename check: the build user must be gone.
-        if let Some(build) = manifest.user.as_deref()
-            && build != side.user
-        {
+        let mut builders = vec![crate::user::DEFAULT_USERNAME];
+        builders.extend(manifest.user.as_deref());
+        builders.sort();
+        builders.dedup();
+        for build in builders.into_iter().filter(|b| *b != side.user) {
             for (what, lines) in [("passwd", &side.passwd), ("group", &side.group)] {
                 if has(lines, build) {
                     out.push(Drift::error(
