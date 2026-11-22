@@ -22,11 +22,13 @@
 pub mod auth;
 pub mod clock;
 mod encoding;
+pub mod device_admin;
 pub mod error;
 pub mod keys;
 pub mod pairing;
 pub mod pin;
 pub mod registry;
+pub mod reinstate_client;
 pub mod secrets;
 pub mod session;
 pub mod setup;
