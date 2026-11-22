@@ -255,9 +255,17 @@ pub fn verify_manifest(
     arch: &str,
     now: u64,
 ) -> Result<ImagesManifest, String> {
-    keys.verify_manifest(bytes, sig)
+    let signed = keys
+        .verify_manifest(bytes, sig)
         .map_err(|e| e.to_string())?;
     let m = ImagesManifest::parse(bytes).map_err(|e| sanitize_text(&e.to_string(), 160))?;
+    // The signed comment names this manifest's arch and timestamp, no other's.
+    if signed.arch != m.arch || signed.timestamp != m.timestamp {
+        return Err(
+            "the signed trusted comment does not match the manifest's arch and timestamp"
+                .to_string(),
+        );
+    }
     m.validate(arch, now)
         .map_err(|e| sanitize_text(&e.to_string(), 160))?;
     Ok(m)

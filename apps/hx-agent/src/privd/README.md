@@ -220,8 +220,9 @@ ipc.md 6.12 is the contract; this is how it is built (code in `update/`, `cmd/up
 - **Keys** (`image/keys.rs`): `image-keys/{current,next}.pub`, a pair separate from the release keys,
   `UNPROVISIONED` until the maintainer supplies them. `release-build` fails to compile while either
   is unprovisioned, and with `test-image-key`; `test-image-key` adds the key of
-  `HX_TEST_IMAGE_PUBKEY` for the installer VM tests and image CI. The trusted comment must start with
-  `hx-images-manifest ` (CI signs `hx-images-manifest schema=1 arch=<arch> timestamp=<T>`).
+  `HX_TEST_IMAGE_PUBKEY` for the installer VM tests and image CI. The trusted comment must be exactly
+  `hx-images-manifest schema=1 arch=<arch> timestamp=<T>` (what CI signs), and its `arch` and
+  `timestamp` must equal the manifest's own.
 - **Fetch** (`image/fetch.rs`): jobs of `hx-image-fetcher@.service` through the `Systemd` trait
   (`start_image_job`, `image_job_state`, `stop_image_job`); chunks read through the directory
   descriptor with `openat2`, exactly the signed size, copied once into one `O_TMPFILE` in staging

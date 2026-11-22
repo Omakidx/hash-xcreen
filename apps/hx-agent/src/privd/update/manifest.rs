@@ -114,6 +114,16 @@ impl Manifest {
         serde_json::from_slice(bytes).map_err(|_| ManifestError::Malformed)
     }
 
+    /// The trusted comment the release workflow signs this manifest with
+    /// (`hx-manifest v<version> channel=<channel> arch=<arch>`); a signature whose comment is any
+    /// other text was not made for this manifest.
+    pub fn trusted_comment(&self) -> String {
+        format!(
+            "hx-manifest v{} channel={} arch={}",
+            self.version, self.channel, self.arch
+        )
+    }
+
     /// Checks every field against what this host expects.
     pub fn check(self, e: &Expect<'_>) -> Result<Release, ManifestError> {
         let bad = ManifestError::Field;

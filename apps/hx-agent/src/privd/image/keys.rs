@@ -7,9 +7,13 @@
 //! host. A build whose keys are all unprovisioned accepts no image: `auto` builds on the server
 //! (`NO_IMAGE_KEY`) and `prebuilt` fails `FAILED_PRECONDITION`.
 //!
-//! On top of the signature privd requires the **trusted comment** to start with
-//! `hx-images-manifest ` (the signature check itself ignores what the comment says), as defence in
-//! depth: a signature made over these bytes for another purpose does not pass.
+//! On top of the signature privd requires the **trusted comment** to be exactly
+//! `hx-images-manifest schema=1 arch=<arch> timestamp=<T>` (what `hx-imagectl` writes; the
+//! signature check itself ignores what the comment says), as defence in depth: a signature made
+//! over these bytes for another purpose does not pass. [`ImageKeys::verify_manifest`] returns the
+//! parsed `arch` and `timestamp`, and the caller refuses a manifest whose own `arch` and
+//! `timestamp` differ, so the signed comment is bound to the document it signs (domain
+//! separation, and a comment cannot be replayed onto another manifest).
 //!
 //! # The release gate
 //!
@@ -32,6 +36,38 @@ const NEXT: &str = include_str!("../../../image-keys/next.pub");
 
 /// What the trusted comment of a signed images manifest starts with.
 pub const TRUSTED_COMMENT_PREFIX: &str = "hx-images-manifest ";
+
+/// The fields of a signed images manifest's trusted comment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedComment {
+    /// `arch=` of the comment.
+    pub arch: String,
+    /// `timestamp=` of the comment, Unix seconds.
+    pub timestamp: u64,
+}
+
+/// Parses `hx-images-manifest schema=1 arch=<arch> timestamp=<T>` exactly (single spaces, a
+/// canonical decimal timestamp, nothing after it).
+pub fn parse_trusted_comment(comment: &str) -> Option<SignedComment> {
+    let rest = comment.strip_prefix(TRUSTED_COMMENT_PREFIX)?;
+    let mut parts = rest.split(' ');
+    (parts.next()? == "schema=1").then_some(())?;
+    let arch = parts.next()?.strip_prefix("arch=")?;
+    let ts = parts.next()?.strip_prefix("timestamp=")?;
+    if parts.next().is_some()
+        || arch.is_empty()
+        || !arch
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    {
+        return None;
+    }
+    let timestamp: u64 = ts.parse().ok()?;
+    (timestamp.to_string() == ts).then(|| SignedComment {
+        arch: arch.to_string(),
+        timestamp,
+    })
+}
 
 #[cfg(all(feature = "release-build", feature = "test-image-key"))]
 compile_error!(
@@ -121,19 +157,22 @@ impl ImageKeys {
 
     /// Verifies `sig_text` (a `.minisig` file) over exactly `manifest`: a prehashed signature by an
     /// embedded key (the legacy form is refused; the trusted comment's global signature is checked
-    /// too) whose trusted comment starts with [`TRUSTED_COMMENT_PREFIX`].
-    pub fn verify_manifest(&self, manifest: &[u8], sig_text: &str) -> Result<(), ImageVerifyError> {
+    /// too) whose trusted comment is exactly `hx-images-manifest schema=1 arch=<a> timestamp=<T>`.
+    /// Returns the comment's `arch` and `timestamp`: the caller must check them against the
+    /// manifest's own.
+    pub fn verify_manifest(
+        &self,
+        manifest: &[u8],
+        sig_text: &str,
+    ) -> Result<SignedComment, ImageVerifyError> {
         if self.keys.is_empty() {
             return Err(ImageVerifyError::NoKeys);
         }
         let sig = Signature::decode(sig_text).map_err(|_| ImageVerifyError::BadSignatureFile)?;
         for k in &self.keys {
             if k.verify(manifest, &sig, false).is_ok() {
-                return if sig.trusted_comment().starts_with(TRUSTED_COMMENT_PREFIX) {
-                    Ok(())
-                } else {
-                    Err(ImageVerifyError::BadComment)
-                };
+                return parse_trusted_comment(sig.trusted_comment())
+                    .ok_or(ImageVerifyError::BadComment);
             }
         }
         Err(ImageVerifyError::SignatureMismatch)

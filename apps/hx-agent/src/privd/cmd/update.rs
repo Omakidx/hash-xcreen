@@ -32,7 +32,7 @@ use crate::privd::state::write_atomic;
 use crate::privd::timefmt::snapshot_stamp;
 use crate::privd::update::extract::{self, ExtractError, Limits};
 use crate::privd::update::fetchdir::{self, FetchDir, ReadError};
-use crate::privd::update::manifest::{Expect, Manifest, ManifestError, Release};
+use crate::privd::update::manifest::{Expect, ManifestError, Release};
 use crate::privd::update::state::{Pending, UpdateState};
 use crate::privd::update::switch::Layout;
 use crate::privd::update::verify::digest_eq;
@@ -173,16 +173,15 @@ fn verify_manifest<T: Transport + Clone + 'static>(
     sig: &[u8],
 ) -> Result<Release, CmdError> {
     let sig = std::str::from_utf8(sig).map_err(|_| refused("the signature file is not text"))?;
-    keys.verify(bytes, sig)
+    let manifest = keys
+        .verify_manifest(bytes, sig)
         .map_err(|e| refused(format!("the release manifest was refused: {e}")))?;
     let u = &d.cfg.update;
-    Manifest::parse(bytes)
-        .and_then(|m| {
-            m.check(&Expect {
-                channel: u.channel.as_str(),
-                arch: &u.arch,
-                now: d.now(),
-            })
+    manifest
+        .check(&Expect {
+            channel: u.channel.as_str(),
+            arch: &u.arch,
+            now: d.now(),
         })
         .map_err(|e: ManifestError| refused(format!("the release manifest was refused: {e}")))
 }
