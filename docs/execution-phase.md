@@ -193,7 +193,7 @@ Design: architecture §4.1, §4.2, §5 and §13, and ipc.md §5.4, §6.12 and §
 - [ ] `.deb` and AppImage packaging
 
 ### 1H — Hardening
-- [ ] Fuzz targets for every pre-auth and container-supplied parser, running nightly
+- [x] Fuzz targets for every pre-auth and container-supplied parser, running nightly
 - [ ] Performance suite on the dedicated runner with regression thresholds
 - [ ] End-to-end tests: install → pair → connect → type and scroll → disconnect, under netem profiles
 - [ ] Independent security review of 1B, 1C and 1E; findings fixed
