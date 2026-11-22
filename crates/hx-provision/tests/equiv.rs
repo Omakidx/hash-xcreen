@@ -381,6 +381,17 @@ fn services_and_boot_state() {
 }
 
 #[test]
+fn on_demand_services_do_not_block() {
+    let mut b = repo_facts();
+    b.running_services.push("systemd-hostnamed.service".into());
+    let d = compare(&repo_facts(), &b, &manifest());
+    assert_eq!(d.len(), 1);
+    assert_eq!(d[0].severity, Severity::Info);
+    b.running_services.push("other.service".into());
+    assert!(has_errors(&compare(&repo_facts(), &b, &manifest())));
+}
+
+#[test]
 fn the_manifest_must_be_satisfied_by_both_sides() {
     let mut a = repo_facts();
     a.packages.retain(|p| p.name != "bash");

@@ -35,6 +35,18 @@ pub const MAX_AUTO_PACKAGE_DRIFT: usize = 5;
 /// so that two instances with different names compare equal and an image that carries the
 /// *build* instance's name does not.
 pub const INSTANCE_PLACEHOLDER: &str = "@INSTANCE@";
+/// Services started on demand (by D-Bus or a socket) whose running state is not compared.
+pub const ON_DEMAND_SERVICES: [&str; 9] = [
+    "systemd-hostnamed.service",
+    "systemd-timedated.service",
+    "systemd-localed.service",
+    "packagekit.service",
+    "colord.service",
+    "upower.service",
+    "udisks2.service",
+    "accounts-daemon.service",
+    "rtkit-daemon.service",
+];
 /// Version of the [`Facts`] document.
 pub const FACTS_SCHEMA: u32 = 1;
 
@@ -152,8 +164,10 @@ sort /etc/subuid > "$d/subuid" 2>/dev/null
 sort /etc/subgid > "$d/subgid" 2>/dev/null
 awk -F: 'BEGIN{OFS=":"} {$2=""; $3=""; print}' /etc/shadow | sort > "$d/shadow"
 id -nG "$u" 2>/dev/null | tr ' ' '\n' | sort > "$d/usergroups"
-# Home and state trees: structure only. Caches and per-application state are not compared.
-find "/home/$u" -xdev \( -path '*/.cache' -printf "$fmt" -prune \) -o \( -path '*/.local/share/*/*' -prune \) -o -printf "$fmt" > "$d/tree0" 2>/dev/null
+# Home and state trees: structure only. Caches, per-application state and what the XFCE session
+# generates at its own pace (.config/xfce4: panel, desktop and xfconf files appear when the session
+# first runs) are not compared.
+find "/home/$u" -xdev \( \( -path '*/.cache' -o -path '*/.config/xfce4' \) -printf "$fmt" -prune \) -o \( -path '*/.local/share/*/*' -prune \) -o -printf "$fmt" > "$d/tree0" 2>/dev/null
 find /var/lib/hx-session -xdev -printf "$fmt" > "$d/tree1" 2>/dev/null
 find /var/lib/systemd/linger -xdev -printf "$fmt" > "$d/tree2" 2>/dev/null
 systemctl list-unit-files --state=enabled --no-legend --no-pager > "$d/svc_enabled" 2>/dev/null
@@ -865,14 +879,24 @@ fn compare_services(a: &Facts, b: &Facts, out: &mut Vec<Drift>) {
         &id,
         out,
     );
+    // Services that D-Bus or a socket starts on demand and that stop again when idle run or not
+    // depending on what happened to use them last: reported, not blocking.
+    let mut running = Vec::new();
     set_diff(
         Area::Services,
         "running",
         &a.running_services,
         &b.running_services,
         &id,
-        out,
+        &mut running,
     );
+    for mut d in running {
+        if ON_DEMAND_SERVICES.contains(&d.subject.as_str()) {
+            d.severity = Severity::Info;
+            d.detail.push_str(" (started on demand)");
+        }
+        out.push(d);
+    }
     for (label, side) in [("A", a), ("B", b)] {
         if side.system_state != "running" {
             out.push(Drift::error(
