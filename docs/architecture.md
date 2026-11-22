@@ -224,7 +224,7 @@ The agent reads no environment variable; its children get a cleared environment 
 | `--interactive`, `--pair`, `--ssh` | modes; at most one of them, and none together with `--token` | n/a | the mode may change between runs |
 | `--channel` | `stable`, `beta` | `stable` | reconcilable. Chooses the manifest `install.sh` fetches and sets `[update] channel` in `/etc/hx/privd.toml` |
 | `--allow-private-networks` | flag (interactive: a typed `yes`); the opt-in promised in §4.2 | off | reconcilable (`SetupHost` converges) |
-| `--release-dir` (`install.sh` only) | absolute, root-owned directory holding a manifest, signature and tarball, **still verified** | none | n/a |
+| `--release-dir` (`install.sh` only) | absolute, root-owned directory (every parent directory root-owned and not group/other-writable too) holding a manifest, signature and tarball, **still verified** | none | n/a |
 | `--allow-old-release` (`install.sh` only) | flag: accept a signed manifest older than 90 days, with a warning | off | n/a |
 | `--progress` (`install.sh` only) | `text`, `json` | `text` | n/a |
 
