@@ -143,7 +143,9 @@ fn intent_setup_is_accepted_and_garbage_intents_are_not() {
     ok(&hello(pb::Intent::Session as i32));
     ok(&hello(pb::Intent::Pair as i32));
     bad(&hello(0), "hello.intent");
-    bad(&hello(4), "hello.intent");
+    ok(&hello(pb::Intent::Reinstate as i32));
+    assert_eq!(pb::Intent::Reinstate as i32, 4);
+    bad(&hello(5), "hello.intent");
 }
 
 #[test]

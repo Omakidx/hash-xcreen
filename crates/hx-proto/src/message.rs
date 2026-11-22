@@ -173,9 +173,15 @@ impl Wire for ControlMessage {
                 }
                 if !matches!(
                     pb::Intent::try_from(h.intent),
-                    Ok(pb::Intent::Session | pb::Intent::Pair | pb::Intent::Setup)
+                    Ok(pb::Intent::Session
+                        | pb::Intent::Pair
+                        | pb::Intent::Setup
+                        | pb::Intent::Reinstate)
                 ) {
-                    return Err(invalid("hello.intent", "must be SESSION, PAIR or SETUP"));
+                    return Err(invalid(
+                        "hello.intent",
+                        "must be SESSION, PAIR, SETUP or REINSTATE",
+                    ));
                 }
                 check_str("hello.software", &h.software, 128)?;
                 check_str("hello.device_name", &h.device_name, 64)?;

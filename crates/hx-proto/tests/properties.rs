@@ -581,7 +581,8 @@ fn malformed_messages_are_rejected() {
     let v = Some(pb::Version { major: 1, minor: 0 });
     assert!(hello(None, 1, String::new()).validate().is_err());
     assert!(hello(v, 0, String::new()).validate().is_err());
-    assert!(hello(v, 4, String::new()).validate().is_err());
+    assert!(hello(v, 5, String::new()).validate().is_err());
+    assert!(hello(v, 4, String::new()).validate().is_ok());
     assert!(
         hello(v, 3, String::new()).validate().is_ok(),
         "INTENT_SETUP exists from 1.3"
