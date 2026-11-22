@@ -193,7 +193,8 @@ MODE (at most one):
   --pair          one-liner: token prompted on /dev/tty (hidden) right after preflight,
                   installed at stage pairing-token; the installer ends there; the
                   desktop-only options below are refused (exit 2)
-  --token <t>     unattended; weaker; warning printed; otherwise like --pair:
+  --token <t>     unattended; weaker; only together with --token-on-command-line
+                  (exit 2 without it); warning printed; otherwise like --pair:
                   installed at stage pairing-token; the installer ends there
   --ssh           secrets from stdin (ipc.md §5.4); stdin must not be a tty; --json implied
   (none)          resume or reconcile an existing install with its recorded mode and
@@ -220,7 +221,8 @@ The agent reads no environment variable; its children get a cleared environment 
 | `--image-file` | absolute path of an image file whose base name matches `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`; `images-manifest-x86_64.json` and its `.minisig` must sit in the same directory (§4.3) | none | fixed. Implies `prebuilt`; together with `--image build` it is exit 2 |
 | `--port` | 1 to 65535, not 22 or 80; free for TCP and UDP (or held by our own socket) | 443 | reconcilable: the firewall rule is moved and the socket restarted |
 | `--domain` | FQDN | none | recorded only (Phase 3 consumes it; the gateway configuration has no `domain` key yet); reconcilable |
-| `--token <t>` | `hxt1-…` pairing token | n/a | n/a; unattended and weaker (§5.1) |
+| `--token <t>` | `hxt1-…` pairing token | n/a | n/a; unattended and weaker (§5.1); needs `--token-on-command-line` |
+| `--token-on-command-line` | flag: accept that the `--token` value is in the process list, shell history and the `sudo` auth log | off | only with `--token` (exit 2 otherwise); Gate 1's "no secret in any command line" holds for every path that does not set it |
 | `--interactive`, `--pair`, `--ssh` | modes; at most one of them, and none together with `--token` | n/a | the mode may change between runs |
 | `--channel` | `stable`, `beta` | `stable` | reconcilable. Chooses the manifest `install.sh` fetches and sets `[update] channel` in `/etc/hx/privd.toml` |
 | `--allow-private-networks` | flag (interactive: a typed `yes`); the opt-in promised in §4.2 | off | reconcilable (`SetupHost` converges) |
