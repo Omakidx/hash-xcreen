@@ -65,7 +65,7 @@ jobs:
           # dpkg-dev: dpkg-shlibdeps and dpkg-deb. The FFmpeg dev packages are this distro's own:
           # ffmpeg-sys-next links them through pkg-config and generates its bindings with libclang.
           apt-get install -y --no-install-recommends ca-certificates curl git build-essential clang libclang-dev pkg-config dpkg-dev \
-            libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libx264-dev
+            libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libx264-dev libfontconfig1-dev
           # the metadata checks run on the one distro whose tools are new enough (AppStream 1.0)
           if [ "${{ matrix.distro }}" = ubuntu-24.04 ]; then
             apt-get install -y --no-install-recommends appstream desktop-file-utils
@@ -188,7 +188,7 @@ jobs:
         # The AppImage is built on 24.04, the oldest supported glibc, and bundles this FFmpeg 6.1.
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang libclang-dev pkg-config libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libx264-dev xvfb xauth
+          sudo apt-get install -y --no-install-recommends clang libclang-dev pkg-config libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libx264-dev libfontconfig1-dev xvfb xauth
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: desktop-appimage
@@ -237,7 +237,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates git xvfb xauth \
-            libegl1 libxkbcommon0 libxkbcommon-x11-0 libwayland-client0 libx11-6 libxcb1
+            libegl1 libxkbcommon0 libxkbcommon-x11-0 libwayland-client0 libx11-6 libxcb1 libfontconfig1
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Smoke test
         run: |
