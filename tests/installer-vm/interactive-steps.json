@@ -1,0 +1,21 @@
+[
+  {"expect": "Desktop distribution \\(ubuntu-24\\.04, ubuntu-26\\.04, debian-12, debian-13\\) \\[ubuntu-24\\.04\\]: ", "send": "", "timeout": 600},
+  {"expect": "Linux user name of the desktop: ", "send": "alice"},
+  {"expect": "Apps \\(basic or developer\\) \\[basic\\]: ", "send": "bogus"},
+  {"expect": "Apps \\(basic or developer\\) \\[basic\\]: ", "send": ""},
+  {"expect": "Enable Docker in the desktop\\? \\(type 'yes' to confirm, anything else is no\\): ", "send": "no"},
+  {"expect": "CPUs for the desktop \\(blank: all\\): ", "send": ""},
+  {"expect": "Memory for the desktop, MiB or NG \\(blank: automatic\\): ", "send": ""},
+  {"expect": "Disk for the desktop, GiB \\(blank: automatic\\): ", "send": ""},
+  {"expect": "Whole block device for the storage pool, e\\.g\\. /dev/sdb \\(blank: a file on this disk\\): ", "send": ""},
+  {"expect": "Public port \\[443\\]: ", "send": ""},
+  {"expect": "Allow the desktop to reach private networks\\? \\(type 'yes' to confirm, anything else is no\\): ", "send": "no"},
+  {"expect": "Hostname of the desktop \\(blank: the client's\\)( \\[[^]]*\\])?: ", "send": ""},
+  {"expect": "Time zone( \\[[^]]*\\])?: ", "send": ""},
+  {"expect": "Locale( \\[[^]]*\\])?: ", "send": ""},
+  {"expect": "Keyboard layout( \\[[^]]*\\])?: ", "send": ""},
+  {"expect": "Linux password for the desktop user \\(input hidden\\): ", "send_file": "/root/hx1e-pw"},
+  {"expect": "Repeat the password: ", "send_file": "/root/hx1e-pw"},
+  {"expect": "PIN, 6 to 16 digits \\(input hidden\\): ", "send_file": "/root/hx1e-pin"},
+  {"expect": "Repeat the PIN: ", "send_file": "/root/hx1e-pin"}
+]

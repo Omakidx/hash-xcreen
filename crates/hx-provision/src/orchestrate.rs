@@ -612,10 +612,134 @@ pub async fn finish_prebuilt<T: Transport>(
     }
     launch(client, spec, ReadyOptions::default()).await?;
     let post = run_post_stage(client, &spec.name, plan, secrets, on_progress).await?;
+    // Security updates replace libraries under running services and the user rename restarts the
+    // user manager in the middle of the run: finish with the same clean boot as the build path.
+    client
+        .set_state(
+            &spec.name,
+            StateAction::Restart,
+            false,
+            Duration::from_secs(60),
+        )
+        .await?;
+    wait_system_running(client, &spec.name, ReadyOptions::default()).await?;
     Ok(ProvisionReport {
         build: None,
         post: Some(post),
     })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Image build (image CI)
+// ---------------------------------------------------------------------------------------------
+
+/// The seal script: removes what must not be shared between desktops made from one image.
+/// Arguments: `$1` the build user (validated by the caller). Fixed text, no interpolation.
+///
+/// `/etc/machine-id` is **truncated, not removed and not `uninitialized`**: an empty file makes
+/// systemd generate a new id at the first boot without treating it as a first boot, so
+/// first-boot presets do not run. `/var/lib/dbus/machine-id` is removed only when it is a regular
+/// file (usually it is a symlink to `/etc/machine-id`).
+const SEAL_SCRIPT: &str = r#"u=$1
+# Stop the journal first, so nothing writes under /var/log while it is cleared. Its sockets are
+# stopped too, or the next log message would start it again.
+systemctl stop systemd-journald.service systemd-journald.socket systemd-journald-dev-log.socket systemd-journald-audit.socket 2>/dev/null || true
+: > /etc/machine-id
+if [ -f /var/lib/dbus/machine-id ] && [ ! -L /var/lib/dbus/machine-id ]; then rm -f /var/lib/dbus/machine-id; fi
+rm -f /var/lib/systemd/random-seed /var/lib/systemd/credential.secret
+find /var/log/journal -mindepth 1 -delete 2>/dev/null || true
+find /var/log -type f -delete 2>/dev/null || true
+rm -f /etc/ssh/ssh_host_*
+find /tmp /var/tmp -mindepth 1 -delete 2>/dev/null || true
+rm -f /root/.bash_history
+if [ -n "$u" ] && h=$(getent passwd "$u" | cut -d: -f6) && [ -n "$h" ] && [ "$h" != / ]; then
+  rm -f "$h/.bash_history"
+  rm -rf "$h/.cache"
+fi
+rm -rf /var/lib/apt/lists/*
+"#;
+
+/// Seal a built container so that desktops made from its image do not share identity or logs:
+/// machine id, random seed, journal and logs, ssh host keys, temporary files, shell history and
+/// the build user's cache, and the apt lists (see `SEAL_SCRIPT` in the source). `user` is the
+/// build user (`desk`). The container must be running; stop it afterwards and call
+/// [`verify_sealed`].
+pub async fn seal_image<T: Transport>(
+    client: &Client<T>,
+    instance: &str,
+    user: &str,
+) -> Result<(), ProvisionError> {
+    crate::user::Username::new(user)
+        .map_err(|e| ProvisionError::Invalid(format!("build user `{user}`: {e}")))?;
+    let argv: Vec<String> = ["bash", "-c", SEAL_SCRIPT, "bash", user]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let out = exec_captured(
+        client,
+        instance,
+        &argv,
+        &[],
+        None,
+        None,
+        Duration::from_secs(120),
+    )
+    .await?;
+    if out.exit_code != 0 {
+        return Err(ProvisionError::Invalid(format!(
+            "sealing the image failed (exit {}): {}",
+            out.exit_code,
+            sanitize(&out.stderr, 300)
+        )));
+    }
+    Ok(())
+}
+
+/// Check, through the file API (so it also works on a stopped container), that the image will
+/// not carry a machine id: `/etc/machine-id` must exist and be empty.
+pub async fn verify_sealed<T: Transport>(
+    client: &Client<T>,
+    instance: &str,
+) -> Result<(), ProvisionError> {
+    match client.read_file(instance, "/etc/machine-id", 256).await? {
+        Some(b) if b.is_empty() => Ok(()),
+        Some(_) => Err(ProvisionError::Invalid(
+            "the image is not sealed: /etc/machine-id is not empty".into(),
+        )),
+        None => Err(ProvisionError::Invalid(
+            "the image is not sealed: /etc/machine-id is missing (it must be an empty file)".into(),
+        )),
+    }
+}
+
+/// Image path (image CI): create the container from the recipe's base image, start it, wait for
+/// `running`, run the build stage with no secrets, [`seal_image`], stop it gracefully and
+/// [`verify_sealed`]. There is no post stage. The stopped container is left in place for
+/// `incus publish`; use [`destroy_instance`] afterwards (also on failure).
+pub async fn build_image<T: Transport>(
+    client: &Client<T>,
+    plan: &Plan,
+    spec: &DesktopSpec,
+    on_progress: &mut (dyn FnMut(&Progress) + Send),
+) -> Result<StageReport, ProvisionError> {
+    let user = plan
+        .user()
+        .map(|u| u.name.clone())
+        .unwrap_or_else(|| crate::user::DEFAULT_USERNAME.to_string());
+    launch(client, spec, ReadyOptions::default()).await?;
+    let exec = IncusExecutor::new(client, spec.name.clone());
+    let build = apply_stage(&exec, plan, Stage::Build, &Secrets::none(), on_progress).await?;
+    seal_image(client, &spec.name, &user).await?;
+    client
+        .set_state(
+            &spec.name,
+            StateAction::Stop,
+            false,
+            Duration::from_secs(120),
+        )
+        .await?;
+    verify_sealed(client, &spec.name).await?;
+    Ok(build)
 }
 
 /// Stop (forcibly) and delete an instance. Succeeds when it is already gone.

@@ -1,0 +1,11 @@
+# libFuzzer dictionary for the pwcheck_shadow target
+k0="root:"
+k1=":$6$"
+k2=":$y$"
+k3=":$5$"
+k4=":!"
+k5=":*"
+k6=":!!"
+k7="::"
+k8=":19000:0:99999:7:::"
+k9="\x0a"

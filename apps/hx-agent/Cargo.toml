@@ -39,6 +39,10 @@ release-build = []
 # harness only; the release gate rejects it.
 test-release-key = []
 
+# Entry points for the cargo-fuzz targets in `fuzz/` (module `link::fuzz`). Never enabled by a build
+# of the product: only the `fuzz` crate switches it on.
+fuzzing = []
+
 [dependencies]
 argon2 = { version = "0.6.0", features = ["zeroize"] } # wipes its memory blocks (the CLI hashes typed secrets)
 bytes.workspace = true

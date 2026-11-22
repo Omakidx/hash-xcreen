@@ -10,7 +10,9 @@ for the design.
 | `exec`, `lower` | `Executor` trait, `apply_stage`, and the exact commands each step runs (apt with timeouts and retries; the password only on stdin) |
 | `incus` | Typed REST client over the Incus unix socket (`hyper` + `serde`) |
 | `host` | Pool, bridge with ACLs, profiles (`ensure_host`) |
-| `orchestrate` | Create the container, `IncusExecutor`, readiness, `build_on_server`, `finish_prebuilt` |
+| `orchestrate` | Create the container, `IncusExecutor`, readiness, `build_on_server`, `finish_prebuilt` (ends with a restart), `build_image`, `seal_image`, `verify_sealed` |
+| `images` | The signed images manifest (schema 1): types, `validate(arch, now)`, `select(recipe, digest, agent_ver)`, size and part limits, file names; shared by `hx-privd` and `hx-imagectl` |
+| `equiv` | `collect_facts` and `compare`: the CI equivalence check between a server-built and a prebuilt-path desktop |
 | `docker` | Docker opt-in with Incus version gate and self-test |
 
 ## Tests

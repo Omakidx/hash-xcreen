@@ -367,10 +367,11 @@ async fn handle_uni(inner: &Arc<Inner>, mut rs: RecvStream) -> Result<()> {
         .await
         .map_err(|_| Error::Violation("stream did not start with a channel byte".into()))??;
     let ch = ChannelId::from_u8(b[0])?;
-    if inner.role == Role::Server && !inner.is_authorized() {
-        // Unreachable with the pre-authorization stream limit of 0; enforced anyway.
+    if inner.role == Role::Server && (!inner.is_authorized() || inner.is_control_only()) {
+        // Unreachable with the stream limit of 0 (kept for a control-only connection too);
+        // enforced anyway.
         return Err(Error::Violation(
-            "unidirectional stream before authorization".into(),
+            "unidirectional stream before authorization or on a control-only connection".into(),
         ));
     }
     match (inner.role, ch) {

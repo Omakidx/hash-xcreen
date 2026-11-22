@@ -51,13 +51,52 @@ impl RevokeReason {
     }
 }
 
-/// When and why a device lost access.
+/// Who revoked a device (protocol 1.3, §11.7). Only [`RevokedBy::Lockout`] lets the device
+/// reinstate itself with the account password.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RevokedBy {
+    /// The fifth wrong PIN.
+    Lockout,
+    /// Another paired device.
+    Device,
+    /// The operator (CLI or admin socket). Also what a record written before 1.3 reads as.
+    Operator,
+    /// The device itself.
+    SelfRevoke,
+}
+
+impl RevokedBy {
+    fn code(self) -> u32 {
+        match self {
+            Self::Lockout => 1,
+            Self::Device => 2,
+            Self::Operator => 3,
+            Self::SelfRevoke => 4,
+        }
+    }
+
+    /// 0 (absent in a pre-1.3 file) reads as `Operator`: such a device can never reinstate
+    /// itself. Unknown codes are refused.
+    fn from_code(c: u32) -> Option<Self> {
+        match c {
+            0 | 3 => Some(Self::Operator),
+            1 => Some(Self::Lockout),
+            2 => Some(Self::Device),
+            4 => Some(Self::SelfRevoke),
+            _ => None,
+        }
+    }
+}
+
+/// When, why and by whom a device lost access.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Revocation {
     /// Seconds since the Unix epoch.
     pub at_unix: u64,
     /// Why.
     pub reason: RevokeReason,
+    /// Who.
+    pub by: RevokedBy,
 }
 
 /// One paired device.
@@ -137,8 +176,30 @@ pub trait DeviceRegistry: Send + Sync + 'static {
     /// A correct PIN: reset the counter and stamp `last_seen`.
     fn record_pin_success(&self, id: &DeviceId, now_unix: u64) -> Result<()>;
 
-    /// Revoke. Returns false if the device is unknown or already revoked.
-    fn revoke(&self, id: &DeviceId, reason: RevokeReason, now_unix: u64) -> Result<bool>;
+    /// Revoke, recording `by`. Returns false if the device is unknown or already revoked.
+    fn revoke(
+        &self,
+        id: &DeviceId,
+        reason: RevokeReason,
+        by: RevokedBy,
+        now_unix: u64,
+    ) -> Result<bool>;
+
+    /// Reinstate a device **only if** it was revoked by the PIN lockout (`RevokedBy::Lockout`)
+    /// less than `max_age_secs` ago, deciding and writing in one atomic step: state active,
+    /// PIN counter reset, the revocation cleared. Returns false (and changes nothing) in every
+    /// other case. The default fails, so a registry written before this method existed never
+    /// lets a device reinstate itself.
+    fn reinstate_after_lockout(
+        &self,
+        _id: &DeviceId,
+        _now_unix: u64,
+        _max_age_secs: u64,
+    ) -> Result<bool> {
+        Err(Error::Protocol(
+            "this registry cannot reinstate after a lockout",
+        ))
+    }
 
     /// Lift a revocation and reset the counter. The caller must have verified the Linux
     /// password first (architecture §8.3). Returns false if unknown or not revoked.
@@ -255,6 +316,7 @@ impl Store {
                     rec.revoked = Some(Revocation {
                         at_unix: now,
                         reason: RevokeReason::TooManyPinFailures,
+                        by: RevokedBy::Lockout,
                     });
                     changed = true;
                 }
@@ -274,13 +336,29 @@ impl Store {
         })?
     }
 
-    fn revoke(&self, id: &DeviceId, reason: RevokeReason, now: u64) -> Result<bool> {
+    fn revoke(&self, id: &DeviceId, reason: RevokeReason, by: RevokedBy, now: u64) -> Result<bool> {
         self.mutate(|s| match s.get_mut(id) {
             Some(rec) if rec.revoked.is_none() => {
                 rec.revoked = Some(Revocation {
                     at_unix: now,
                     reason,
+                    by,
                 });
+                (true, true)
+            }
+            _ => (false, false),
+        })
+    }
+
+    fn reinstate_after_lockout(&self, id: &DeviceId, now: u64, max_age: u64) -> Result<bool> {
+        self.mutate(|s| match s.get_mut(id) {
+            Some(rec)
+                if rec.revoked.is_some_and(|v| {
+                    v.by == RevokedBy::Lockout && now.saturating_sub(v.at_unix) < max_age
+                }) =>
+            {
+                rec.revoked = None;
+                rec.failed_pins = 0;
                 (true, true)
             }
             _ => (false, false),
@@ -343,8 +421,22 @@ macro_rules! delegate_registry {
             fn record_pin_success(&self, id: &DeviceId, now_unix: u64) -> Result<()> {
                 self.0.record_pin_success(id, now_unix)
             }
-            fn revoke(&self, id: &DeviceId, reason: RevokeReason, now_unix: u64) -> Result<bool> {
-                self.0.revoke(id, reason, now_unix)
+            fn revoke(
+                &self,
+                id: &DeviceId,
+                reason: RevokeReason,
+                by: RevokedBy,
+                now_unix: u64,
+            ) -> Result<bool> {
+                self.0.revoke(id, reason, by, now_unix)
+            }
+            fn reinstate_after_lockout(
+                &self,
+                id: &DeviceId,
+                now_unix: u64,
+                max_age_secs: u64,
+            ) -> Result<bool> {
+                self.0.reinstate_after_lockout(id, now_unix, max_age_secs)
             }
             fn reinstate(&self, id: &DeviceId) -> Result<bool> {
                 self.0.reinstate(id)
@@ -414,6 +506,9 @@ struct FileDevice {
     /// 0 = not revoked, otherwise a [`RevokeReason`] code.
     #[prost(uint32, tag = "8")]
     revoke_reason: u32,
+    /// 0 (absent in a file written before 1.3) = operator, otherwise a [`RevokedBy`] code.
+    #[prost(uint32, tag = "9")]
+    revoked_by: u32,
 }
 
 impl FileRegistry {
@@ -495,7 +590,7 @@ fn take_lock(path: &Path) -> Result<fs::File> {
 
 delegate_registry!(FileRegistry);
 
-fn decode_file(bytes: &[u8]) -> Result<State> {
+pub(crate) fn decode_file(bytes: &[u8]) -> Result<State> {
     let doc =
         FileDoc::decode(bytes).map_err(|_| Error::Corrupt("registry does not parse".into()))?;
     if doc.version != FILE_VERSION {
@@ -522,6 +617,8 @@ fn decode_file(bytes: &[u8]) -> Result<State> {
             (_, Some(reason)) => Some(Revocation {
                 at_unix: d.revoked_at,
                 reason,
+                by: RevokedBy::from_code(d.revoked_by)
+                    .ok_or_else(|| Error::Corrupt("revocation cause".into()))?,
             }),
             _ => return Err(Error::Corrupt("revocation reason".into())),
         };
@@ -555,6 +652,7 @@ fn encode_file(state: &State) -> Vec<u8> {
                 failed_pins: r.failed_pins,
                 revoked_at: r.revoked.map_or(0, |v| v.at_unix),
                 revoke_reason: r.revoked.map_or(0, |v| v.reason.code()),
+                revoked_by: r.revoked.map_or(0, |v| v.by.code()),
             })
             .collect(),
     }
@@ -633,7 +731,10 @@ mod tests {
             got.revoked.unwrap().reason,
             RevokeReason::TooManyPinFailures
         );
-        assert!(!r.revoke(&rec.id, RevokeReason::User, 22).unwrap());
+        assert!(
+            !r.revoke(&rec.id, RevokeReason::User, RevokedBy::Operator, 22)
+                .unwrap()
+        );
         // A revoked device cannot be re-paired, and the record is left alone.
         assert!(matches!(
             r.upsert_paired(&k, "renamed", 30),
@@ -665,7 +766,8 @@ mod tests {
             let r = FileRegistry::open(&path).unwrap();
             r.upsert_paired(&k, "phone", 5).unwrap();
             r.begin_pin_attempt(&k.device_id()).unwrap();
-            r.revoke(&k.device_id(), RevokeReason::User, 7).unwrap();
+            r.revoke(&k.device_id(), RevokeReason::User, RevokedBy::Operator, 7)
+                .unwrap();
         }
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
@@ -705,7 +807,8 @@ mod tests {
         // It leaves last_seen and a revocation alone.
         r.record_pin_success(&id, 77).unwrap();
         r.begin_pin_attempt(&id).unwrap();
-        r.revoke(&id, RevokeReason::User, 80).unwrap();
+        r.revoke(&id, RevokeReason::User, RevokedBy::Operator, 80)
+            .unwrap();
         r.refund_pin_attempt(&id).unwrap();
         let rec = r.get(&id).unwrap().unwrap();
         assert_eq!((rec.failed_pins, rec.last_seen_unix), (0, 77));
@@ -729,7 +832,8 @@ mod tests {
         assert_eq!((rec.failed_pins, rec.last_seen_unix), (0, 55));
         // Idempotent, and a revocation stays.
         r.reset_pin_failures(&id).unwrap();
-        r.revoke(&id, RevokeReason::User, 60).unwrap();
+        r.revoke(&id, RevokeReason::User, RevokedBy::Operator, 60)
+            .unwrap();
         r.reset_pin_failures(&id).unwrap();
         assert!(r.get(&id).unwrap().unwrap().is_revoked());
         assert!(matches!(
@@ -833,7 +937,9 @@ mod tests {
         // Writes by the holder still work, and nobody else can undo them.
         let k = key();
         first.upsert_paired(&k, "a", 1).unwrap();
-        first.revoke(&k.device_id(), RevokeReason::User, 2).unwrap();
+        first
+            .revoke(&k.device_id(), RevokeReason::User, RevokedBy::Operator, 2)
+            .unwrap();
         assert!(matches!(FileRegistry::open(&path), Err(Error::Locked)));
         drop(first);
         let second = FileRegistry::open(&path).unwrap();
@@ -902,5 +1008,123 @@ mod tests {
         drop(r);
         assert_eq!(FileRegistry::open(&path).unwrap().list().unwrap().len(), 1);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_written_before_1_3_reads_every_revocation_as_operator() {
+        // The old format has no field 9: prost omits a zero field, so a record with
+        // `revoked_by = 0` encodes byte for byte like a pre-1.3 file, lockouts included.
+        let k = key();
+        let old = FileDoc {
+            version: FILE_VERSION,
+            devices: vec![FileDevice {
+                id: k.device_id().as_bytes().to_vec(),
+                name: "old".into(),
+                public_key: k.as_bytes().to_vec(),
+                created: 1,
+                last_seen: 2,
+                failed_pins: 5,
+                revoked_at: 100,
+                revoke_reason: RevokeReason::TooManyPinFailures.code(),
+                revoked_by: 0,
+            }],
+        }
+        .encode_to_vec();
+        let state = decode_file(&old).unwrap();
+        let rev = state.get(&k.device_id()).unwrap().revoked.unwrap();
+        assert_eq!(rev.by, RevokedBy::Operator);
+        assert_eq!(rev.reason, RevokeReason::TooManyPinFailures);
+        // An unknown cause is refused rather than guessed.
+        let mut bad = FileDoc::decode(old.as_slice()).unwrap();
+        bad.devices[0].revoked_by = 99;
+        assert!(matches!(
+            decode_file(&bad.encode_to_vec()),
+            Err(Error::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn revoked_by_is_recorded_persisted_and_set_by_the_lockout() {
+        let dir = tmp_dir("by");
+        let path = dir.join("devices.pb");
+        let keys: Vec<PublicKey> = (0..5).map(|_| key()).collect();
+        {
+            let r = FileRegistry::open(&path).unwrap();
+            for k in &keys {
+                r.upsert_paired(k, "d", 1).unwrap();
+            }
+            let by = [
+                RevokedBy::Device,
+                RevokedBy::Operator,
+                RevokedBy::SelfRevoke,
+            ];
+            for (k, b) in keys.iter().zip(by) {
+                assert!(
+                    r.revoke(&k.device_id(), RevokeReason::User, b, 50 + b.code() as u64)
+                        .unwrap()
+                );
+            }
+            // The lockout path records `Lockout` itself.
+            let id = keys[3].device_id();
+            for _ in 0..5 {
+                r.begin_pin_attempt(&id).unwrap();
+            }
+            assert!(r.revoke_if_failed(&id, 5, 77).unwrap());
+        }
+        let r = FileRegistry::open(&path).unwrap();
+        let by = |i: usize| {
+            r.get(&keys[i].device_id())
+                .unwrap()
+                .unwrap()
+                .revoked
+                .map(|v| (v.by, v.at_unix))
+        };
+        assert_eq!(by(0), Some((RevokedBy::Device, 52)));
+        assert_eq!(by(1), Some((RevokedBy::Operator, 53)));
+        assert_eq!(by(2), Some((RevokedBy::SelfRevoke, 54)));
+        assert_eq!(by(3), Some((RevokedBy::Lockout, 77)));
+        assert_eq!(by(4), None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reinstate_after_lockout_checks_cause_and_age_atomically() {
+        let r = MemoryRegistry::new();
+        let mk = |by: RevokedBy, at: u64| {
+            let id = r.upsert_paired(&key(), "d", 1).unwrap().id;
+            r.begin_pin_attempt(&id).unwrap();
+            r.revoke(&id, RevokeReason::User, by, at).unwrap();
+            id
+        };
+        let day = 86_400;
+        let lock = mk(RevokedBy::Lockout, 1_000);
+        let others = [
+            mk(RevokedBy::Device, 1_000),
+            mk(RevokedBy::Operator, 1_000),
+            mk(RevokedBy::SelfRevoke, 1_000),
+        ];
+        for id in others {
+            assert!(!r.reinstate_after_lockout(&id, 1_001, 30 * day).unwrap());
+            assert!(r.get(&id).unwrap().unwrap().is_revoked());
+        }
+        // Exactly at the age limit is too old; one second before is not.
+        assert!(
+            !r.reinstate_after_lockout(&lock, 1_000 + 30 * day, 30 * day)
+                .unwrap()
+        );
+        assert!(r.get(&lock).unwrap().unwrap().is_revoked());
+        assert!(
+            r.reinstate_after_lockout(&lock, 999 + 30 * day, 30 * day)
+                .unwrap()
+        );
+        let rec = r.get(&lock).unwrap().unwrap();
+        assert!(!rec.is_revoked());
+        assert_eq!(rec.failed_pins, 0);
+        // Not revoked any more, unknown: false.
+        assert!(!r.reinstate_after_lockout(&lock, 1_001, 30 * day).unwrap());
+        assert!(
+            !r.reinstate_after_lockout(&key().device_id(), 1, 30 * day)
+                .unwrap()
+        );
     }
 }

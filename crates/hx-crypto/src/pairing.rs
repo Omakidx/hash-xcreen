@@ -418,11 +418,26 @@ async fn send_pairing(conn: &Connection, body: Body) -> Result<()> {
 
 // ------------------------------------------------------------------ server side
 
+/// Which secret a device paired with. The token's public id is what the gateway compares with
+/// the token the installer created (the setup binding, protocol 1.3); a short code never binds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PairedWith {
+    /// A long token; `id` is its public 8-byte id (never the secret).
+    Token {
+        /// The token id.
+        id: [u8; TOKEN_ID_LEN],
+    },
+    /// The short code.
+    Code,
+}
+
 /// What the server learned from a successful pairing.
 #[derive(Debug)]
 pub struct PairedDevice {
     /// The new (or refreshed) registry entry.
     pub record: DeviceRecord,
+    /// The secret that was spent.
+    pub with: PairedWith,
 }
 
 /// Run the server side of the pairing exchange on an accepted `INTENT_PAIR` connection.
@@ -566,7 +581,15 @@ async fn serve_inner(
         }),
     )
     .await?;
-    Ok(PairedDevice { record })
+    // The token id was length-checked above; a code has none.
+    let with = match (
+        mode,
+        <[u8; TOKEN_ID_LEN]>::try_from(start.token_id.as_slice()),
+    ) {
+        (PairMode::Token, Ok(id)) => PairedWith::Token { id },
+        _ => PairedWith::Code,
+    };
+    Ok(PairedDevice { record, with })
 }
 
 // ------------------------------------------------------------------ client side
@@ -613,6 +636,14 @@ pub struct PairedServer {
 }
 
 impl PairedServer {
+    /// The protocol version agreed on this pairing connection (the lower of both sides'). It is
+    /// only available after the SPAKE2 confirmation succeeded, so it is trustworthy. Store it
+    /// with the server and pass it as `confirmed_server_version` to the setup and reinstate
+    /// clients: they refuse to send a 1.3 intent to a server that did not show 1.3 here.
+    pub fn server_version(&self) -> hx_proto::version::ProtocolVersion {
+        self.connection.negotiated().version
+    }
+
     /// Close the pairing connection normally.
     pub async fn finish(self) {
         self.connection.close(CloseCode::NoError, "paired").await;
