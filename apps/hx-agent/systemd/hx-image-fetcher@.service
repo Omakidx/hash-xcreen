@@ -1,0 +1,105 @@
+# hx-image-fetcher@<job>.service: the only part of the prebuilt-image path that speaks HTTP
+# (docs/ipc.md 6.12, "Prebuilt images (1D)").
+#
+# The second template of the fetcher: the SAME binary with the SAME hardening as
+# hx-update-fetcher@.service, with its own directory and limits. Started by hx-privd
+# (`systemctl start --no-block hx-image-fetcher@images-manifest.service`, `@probe-<recipe>-<build>`,
+# `@image-<recipe>-<build>-<nparts>`); the instance is the whole argument vector, which the binary
+# parses strictly. `Environment=HX_FETCH_TEMPLATE=image` is how the binary knows it runs under this
+# template: an image job under the update template, and an update job under this one, fail closed.
+# It downloads bytes into /var/lib/hx-image (privd's /var/lib/hx/imagein, bind-mounted) and exits.
+# It verifies nothing: root hx-privd treats the directory as hostile, copies it chunk by chunk and
+# verifies it (apps/hx-agent/src/privd/image). tests/privd_image_units.rs asserts that the
+# hardening below equals the update fetcher's.
+
+[Unit]
+Description=hash-xcreen image fetcher (%i)
+Documentation=https://github.com/Omakidx/hash-xcreen/blob/main/docs/ipc.md
+# Do not race the network at boot; privd only starts it on demand.
+After=network-online.target
+Wants=network-online.target
+# The directory it writes is a size-capped tmpfs (var-lib-hx-imagein.mount): the quota is the
+# kernel's, not the fetcher's own.
+RequiresMountsFor=/var/lib/hx/imagein
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/hx/current/hx-update-fetcher %i
+# Which template this is (the binary refuses jobs of the other one). Fixed by this root-owned file.
+Environment=HX_FETCH_TEMPLATE=image
+
+# Identity: a dynamic user, no groups, nothing it could keep between runs. (The names it creates
+# are mode 0644 so that root privd can read them without CAP_DAC_OVERRIDE.)
+DynamicUser=yes
+User=hx-update-fetcher
+SupplementaryGroups=
+UMask=0022
+
+# The one place it writes: privd's image directory, root-owned mode 1733 inside the 0700 state
+# directory, reachable only through this bind mount. It cannot list it, remove other users'
+# files or reach anything above it.
+BindPaths=/var/lib/hx/imagein:/var/lib/hx-image
+# Nothing else of the agent's is visible to it. (/var/lib/hx, the bind mount's source, is root 0700
+# and stays unreachable by permission; masking it here would hide the source of the bind.)
+InaccessiblePaths=/etc/hx /var/log /var/lib/hx-gatewayd /var/lib/private
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RemoveIPC=yes
+
+# No privilege at all.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+
+# The network, and nothing else: no AF_UNIX, so it cannot reach privd's, Incus's or gatewayd's
+# sockets (ipc.md 6.12). Egress is limited in the kernel as well as in the binary: loopback,
+# link-local, multicast and the private and shared ranges are denied; only systemd-resolved's
+# stubs stay reachable (allow wins over deny). A host whose resolvers are on a LAN needs a drop-in
+# written by the installer that allows them, for example
+#   /etc/systemd/system/hx-image-fetcher@.service.d/resolvers.conf
+#   [Service]
+#   IPAddressAllow=192.168.1.1/32
+# with the addresses of /etc/resolv.conf (or of systemd-resolved's upstreams). On Google Cloud the
+# metadata resolver 169.254.169.254 is link-local: it needs that drop-in too. The release hosts
+# sit behind a CDN with no stable addresses, so the public ranges are not listed. The binary also
+# connects only to the release host names and to global unicast addresses (src/fetcher).
+RestrictAddressFamilies=AF_INET AF_INET6
+IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
+IPAddressAllow=127.0.0.53/32 127.0.0.54/32
+
+# System calls: the common service set without anything privileged or resource-changing.
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @debug @module @reboot @swap @raw-io @obsolete @cpu-emulation
+# The fetcher creates files (openat with O_CREAT|O_EXCL), writes, fsyncs and unlinks; it needs no
+# directory creation, links, renames, nodes or mode changes, and a compromised one must not be
+# able to plant a directory privd cannot remove (privd has no CAP_DAC_OVERRIDE or CAP_FOWNER).
+SystemCallFilter=~mkdir mkdirat symlink symlinkat link linkat rename renameat renameat2 mknod mknodat chmod fchmod fchmodat fchmodat2
+SystemCallErrorNumber=EPERM
+
+# Bounds (ipc.md 6.12): at most 32 MiB per file (one chunk of the hand-off), the directory a tmpfs
+# of 80 MiB with 16 inodes (var-lib-hx-imagein.mount), no core files, a few descriptors and tasks,
+# a memory cap, and a hard stop a little after the 20 minute image timeout the binary enforces
+# itself.
+LimitFSIZE=33554432
+LimitCORE=0
+LimitNOFILE=64
+TasksMax=16
+MemoryMax=128M
+RuntimeMaxSec=1260
+TimeoutStartSec=1260

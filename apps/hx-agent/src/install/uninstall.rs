@@ -541,6 +541,9 @@ pub fn run(
                         "hx-privd.service",
                         "hx-privd-rescue.service",
                         "var-lib-hx-updates.mount",
+                        // The image fetcher's tmpfs under /var/lib/hx (1D): still mounted, it
+                        // makes U5's removal of /var/lib/hx fail with "resource busy".
+                        "var-lib-hx-imagein.mount",
                     ];
                     if !keep_desktop {
                         units.extend_from_slice(FIREWALL_UNITS);
@@ -554,7 +557,11 @@ pub fn run(
                     );
                     let _ = d.runner.run(&Call::new(
                         Tool::Systemctl,
-                        &["stop", "hx-update-fetcher@*.service"],
+                        &[
+                            "stop",
+                            "hx-update-fetcher@*.service",
+                            "hx-image-fetcher@*.service",
+                        ],
                     ));
                 }
             }

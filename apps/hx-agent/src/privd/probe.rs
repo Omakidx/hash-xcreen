@@ -12,6 +12,31 @@ pub const SYSCTLS: [(&str, u64); 4] = [
     ("vm.max_map_count", 262_144),
 ];
 
+/// Free space for a prebuilt image (ipc.md 6.5 step 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageSpace {
+    /// Free bytes on the file system of privd's state directory (the staging copy).
+    pub state_free: u64,
+    /// Free bytes on the file system of Incus's data directory (Incus's copy).
+    pub incus_free: u64,
+    /// Both directories are on one device, so the two copies add up.
+    pub same_device: bool,
+}
+
+/// Reads the free space and device of two directories with `statvfs` and `stat`.
+pub fn read_image_space(state_dir: &Path, incus_dir: &Path) -> Option<ImageSpace> {
+    use std::os::unix::fs::MetadataExt;
+    let (_, state_free) = fs_space(state_dir)?;
+    let (_, incus_free) = fs_space(incus_dir)?;
+    let same_device =
+        std::fs::metadata(state_dir).ok()?.dev() == std::fs::metadata(incus_dir).ok()?.dev();
+    Some(ImageSpace {
+        state_free,
+        incus_free,
+        same_device,
+    })
+}
+
 /// Host facts.
 pub trait HostProbe: Send + Sync {
     /// CPUs available to this process.
@@ -26,6 +51,11 @@ pub trait HostProbe: Send + Sync {
     fn incus_dir_free(&self) -> Option<u64>;
     /// Whether every sysctl of [`SYSCTLS`] is at least its configured value.
     fn sysctl_ok(&self) -> bool;
+    /// Free space for the staging and Incus copies of a prebuilt image; `None` when a directory
+    /// cannot be read (the disk rule then fails closed). The default reads the real file systems.
+    fn image_space(&self, state_dir: &Path, incus_dir: &Path) -> Option<ImageSpace> {
+        read_image_space(state_dir, incus_dir)
+    }
 }
 
 /// Reads the real host.

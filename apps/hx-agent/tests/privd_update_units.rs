@@ -356,6 +356,7 @@ fn the_fetchers_directory_is_a_size_capped_tmpfs() {
         assert!(
             u["Unit"]["RequiresMountsFor"]
                 .iter()
+                .flat_map(|v| v.split_whitespace())
                 .any(|v| v == "/var/lib/hx/updates"),
             "{unit}"
         );
