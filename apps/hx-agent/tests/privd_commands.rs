@@ -1283,16 +1283,9 @@ async fn reserved_and_unavailable_commands_answer_unimplemented() {
         let r = run(&h, Role::Gateway, c).await;
         assert_eq!(code(&r), ErrorCode::Unimplemented, "{r:?}");
     }
-    for c in [
-        Command::UpgradeIncus(Default::default()),
-        Command::Uninstall(pb::UninstallRequest {
-            keep_desktop: true,
-            confirm_destroy: false,
-        }),
-    ] {
-        let r = run(&h, Role::Admin, c).await;
-        assert_eq!(code(&r), ErrorCode::Unimplemented, "{r:?}");
-    }
+    // Uninstall is implemented (privd_uninstall.rs).
+    let r = run(&h, Role::Admin, Command::UpgradeIncus(Default::default())).await;
+    assert_eq!(code(&r), ErrorCode::Unimplemented, "{r:?}");
 }
 
 // ----- SetupHost through a fake runner (ipc.md 6.4) -----------------------------------------------------
@@ -1487,6 +1480,8 @@ async fn docker_user_rules_report_failure_and_set_the_attention_flag() {
     );
 }
 
+// With `privd-test-hooks` the same condition is a warning (tests/privd_test_hooks.rs).
+#[cfg(not(feature = "privd-test-hooks"))]
 #[tokio::test]
 async fn the_sysctl_step_fails_when_the_values_do_not_take_effect() {
     let probe = FakeProbe {
