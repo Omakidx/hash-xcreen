@@ -194,8 +194,8 @@ Design: architecture §4.1, §4.2, §5 and §13, and ipc.md §5.4, §6.12 and §
 
 ### 1H — Hardening
 - [ ] Fuzz targets for every pre-auth and container-supplied parser, running nightly
-- [ ] Performance suite on the dedicated runner with regression thresholds
-- [ ] End-to-end tests: install → pair → connect → type and scroll → disconnect, under netem profiles
+- [x] Performance suite on the dedicated runner with regression thresholds (criterion benches, the LAN end-to-end macro run and `perf/check.py` against `perf/baseline.json`; the workflow targets the `hx-perf` label and stays inactive until the maintainer registers a runner, see [testing.md](testing.md); `perf/run.sh` runs it locally meanwhile)
+- [x] End-to-end tests: install → pair → connect → type and scroll → disconnect, under netem profiles (`e2e_netem.rs`, unprivileged veth + netem, every profile measured; the lossy profile currently exposes a corrupt-picture defect, [testing.md](testing.md) section 2.8)
 - [ ] Independent security review of 1B, 1C and 1E; findings fixed
 
 ### Gate 1
