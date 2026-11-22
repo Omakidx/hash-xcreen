@@ -953,27 +953,73 @@ async fn check_update_is_limited_to_six_an_hour() {
     check_result(env.check().await);
 }
 
+fn gateway_apply(version: &str) -> Command {
+    Command::ApplyUpdate(pb::ApplyUpdateRequest {
+        version: version.into(),
+    })
+}
+
+fn set_ready(env: &Env) {
+    env.h
+        .daemon
+        .mutate_state(|s| s.phase.phase = hx_agent::privd::state::PhaseKind::Ready)
+        .unwrap();
+}
+
 #[tokio::test]
-async fn apply_update_is_limited_to_two_a_day() {
+async fn refused_gateway_applies_do_not_use_the_two_a_day_allowance() {
+    // M1: a Gateway that can only send refused requests must not lock the Admin out.
     let env = Env::new();
-    // Admitted requests count even when they fail: two refusals use the allowance.
-    assert_eq!(
-        err(&env.apply("1.1.0").await).0,
-        ErrorCode::FailedPrecondition
+    set_ready(&env);
+    env.publish("1.1.0", T0);
+    for _ in 0..2 {
+        let r = env.call(Role::Gateway, gateway_apply("0.0.1")).await;
+        assert_eq!(err(&r).0, ErrorCode::FailedPrecondition);
+    }
+    assert!(state(&env).apply_log.is_empty(), "refusals are not counted");
+    check_result(env.check().await);
+    ok(env.apply("1.1.0").await);
+    assert!(
+        state(&env).apply_log.is_empty(),
+        "an Admin apply is exempt from the Gateway allowance"
     );
-    assert_eq!(
-        err(&env.apply("1.1.0").await).0,
-        ErrorCode::FailedPrecondition
-    );
-    assert_eq!(
-        err(&env.apply("1.1.0").await).0,
-        ErrorCode::ResourceExhausted
-    );
-    env.h.clock.advance_secs(86_401);
-    assert_eq!(
-        err(&env.apply("1.1.0").await).0,
-        ErrorCode::FailedPrecondition
-    );
+}
+
+#[tokio::test]
+async fn gateway_refusals_have_their_own_hourly_limit() {
+    let env = Env::new();
+    set_ready(&env);
+    for _ in 0..10 {
+        let r = env.call(Role::Gateway, gateway_apply("0.0.1")).await;
+        assert_eq!(err(&r).0, ErrorCode::FailedPrecondition);
+    }
+    let r = env.call(Role::Gateway, gateway_apply("0.0.1")).await;
+    assert_eq!(err(&r).0, ErrorCode::ResourceExhausted);
+    // The Admin is not subject to it.
+    env.publish("1.1.0", T0);
+    check_result(env.check().await);
+    ok(env.apply("1.1.0").await);
+    env.h.clock.advance_secs(3_601);
+    let r = env.call(Role::Gateway, gateway_apply("0.0.1")).await;
+    assert_ne!(err(&r).0, ErrorCode::ResourceExhausted);
+}
+
+#[tokio::test]
+async fn apply_update_by_gateway_is_limited_to_two_started_a_day() {
+    let env = Env::new();
+    set_ready(&env);
+    env.publish("1.1.0", T0);
+    check_result(env.check().await);
+    ok(env.call(Role::Gateway, gateway_apply("1.1.0")).await);
+    env.new_process("1.1.0").resume_update().await;
+    env.publish("1.2.0", T0 + 1);
+    check_result(env.check().await);
+    ok(env.call(Role::Gateway, gateway_apply("1.2.0")).await);
+    assert_eq!(state(&env).apply_log.len(), 2);
+    let r = env.call(Role::Gateway, gateway_apply("1.3.0")).await;
+    let (code, msg) = err(&r);
+    assert_eq!(code, ErrorCode::ResourceExhausted);
+    assert!(msg.contains("2 a day"), "{msg}");
 }
 
 #[tokio::test]
@@ -1153,13 +1199,14 @@ async fn a_corrupt_updates_state_is_never_replaced_by_defaults() {
 #[tokio::test]
 async fn the_apply_limit_survives_a_restart_of_privd() {
     let env = Env::new();
+    set_ready(&env);
     env.publish("1.1.0", T0);
     check_result(env.check().await);
-    ok(env.apply("1.1.0").await);
+    ok(env.call(Role::Gateway, gateway_apply("1.1.0")).await);
     env.new_process("1.1.0").resume_update().await;
     env.publish("1.2.0", T0 + 1);
     check_result(env.check().await);
-    ok(env.apply("1.2.0").await);
+    ok(env.call(Role::Gateway, gateway_apply("1.2.0")).await);
     // A fresh process has fresh in-memory buckets; the persisted log still says two.
     let n = env.new_process("1.2.0");
     let r = n
@@ -1170,7 +1217,7 @@ async fn the_apply_limit_survives_a_restart_of_privd() {
                     version: "1.3.0".into(),
                 }),
             ),
-            Ctx::new(Role::Admin),
+            Ctx::new(Role::Gateway),
         )
         .await;
     let (code, msg) = err(&r);
@@ -1186,7 +1233,7 @@ async fn the_apply_limit_survives_a_restart_of_privd() {
                     version: "1.3.0".into(),
                 }),
             ),
-            Ctx::new(Role::Admin),
+            Ctx::new(Role::Gateway),
         )
         .await;
     assert_ne!(err(&r).0, ErrorCode::ResourceExhausted);

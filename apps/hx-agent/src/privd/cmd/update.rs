@@ -53,6 +53,9 @@ const MAX_MANIFEST_AGE_DAYS: u64 = 90;
 const DAY: u64 = 86_400;
 /// `ApplyUpdate` admissions per day (ipc.md 8); persisted in `updates-state`.
 const APPLY_PER_DAY: usize = 2;
+/// Refused or failed Gateway `ApplyUpdate` attempts allowed per hour.
+const REFUSED_PER_HOUR: usize = 10;
+const HOUR: u64 = 3600;
 
 fn refused(msg: impl Into<String>) -> CmdError {
     CmdError::precondition(ErrorDetail::Unspecified, msg)
@@ -307,11 +310,43 @@ async fn apply_inner<T: Transport + Clone + 'static>(
     ctx: &mut Ctx,
     version: &str,
 ) -> Result<Reply, CmdError> {
-    let deps = d.update_deps();
-    let u = &d.cfg.update;
     let _g = d.lock_host(ctx).await?;
     let mut st = load_state(d)?;
     let now = d.now();
+    // The two limits below bind Gateway only. Gateway can be driven by a paired device (the
+    // ServerMgmt forward) or by a compromised gatewayd, so what it consumes must never lock the
+    // local Admin out of `hx-agent update apply`.
+    let limited = ctx.role != Role::Admin;
+    if limited {
+        st.refused_log.retain(|t| now.saturating_sub(*t) < HOUR);
+        if st.refused_log.len() >= REFUSED_PER_HOUR {
+            let oldest = st.refused_log.iter().min().copied().unwrap_or(now);
+            let retry = (oldest + HOUR).saturating_sub(now).saturating_mul(1000);
+            return Err(CmdError::exhausted(
+                "too many refused ApplyUpdate requests; try again later",
+                u32::try_from(retry).unwrap_or(u32::MAX),
+            ));
+        }
+    }
+    let res = apply_checked(d, ctx, version, &mut st, now).await;
+    if res.is_err() && limited {
+        // A refused or failed attempt costs only the small hourly allowance, never the 2-a-day
+        // one (that counts updates that actually started).
+        st.refused_log.push(now);
+        let _ = save_state(d, &st);
+    }
+    res
+}
+
+async fn apply_checked<T: Transport + Clone + 'static>(
+    d: &Daemon<T>,
+    ctx: &mut Ctx,
+    version: &str,
+    st: &mut UpdateState,
+    now: u64,
+) -> Result<Reply, CmdError> {
+    let deps = d.update_deps();
+    let u = &d.cfg.update;
     // A release that failed its health check, or that an Admin rolled back, is not re-applied
     // by Gateway for 24 h: a loop of apply and rollback would restart units and rotate away the
     // recovery snapshot.
@@ -324,19 +359,19 @@ async fn apply_inner<T: Transport + Clone + 'static>(
             "that release was rolled back; only an Admin may re-apply it within 24 hours",
         ));
     }
-    // The 2-a-day limit, kept in updates-state so a restart (or the rollback itself) does not
-    // reset it.
-    st.apply_log.retain(|t| now.saturating_sub(*t) < DAY);
-    if st.apply_log.len() >= APPLY_PER_DAY {
-        let oldest = st.apply_log.iter().min().copied().unwrap_or(now);
-        let retry = (oldest + DAY).saturating_sub(now).saturating_mul(1000);
-        return Err(CmdError::exhausted(
-            "ApplyUpdate is limited to 2 a day",
-            u32::try_from(retry).unwrap_or(u32::MAX),
-        ));
+    // The 2-a-day limit (Gateway only), kept in updates-state so a restart (or the rollback
+    // itself) does not reset it. Only updates that actually start are counted, below.
+    if ctx.role != Role::Admin {
+        st.apply_log.retain(|t| now.saturating_sub(*t) < DAY);
+        if st.apply_log.len() >= APPLY_PER_DAY {
+            let oldest = st.apply_log.iter().min().copied().unwrap_or(now);
+            let retry = (oldest + DAY).saturating_sub(now).saturating_mul(1000);
+            return Err(CmdError::exhausted(
+                "ApplyUpdate is limited to 2 a day",
+                u32::try_from(retry).unwrap_or(u32::MAX),
+            ));
+        }
     }
-    st.apply_log.push(now);
-    save_state(d, &st)?;
     if st.pending.is_some() {
         return Err(refused(
             "an update is already being applied; its health check has not finished",
@@ -502,7 +537,10 @@ async fn apply_inner<T: Transport + Clone + 'static>(
             .filter(|p| *p != 0),
     });
     st.verified_version = None;
-    save_state(d, &st)?;
+    if ctx.role != Role::Admin {
+        st.apply_log.push(now);
+    }
+    save_state(d, st)?;
     if let Err(e) = lay.switch_to(version) {
         log::error(&format!("switch to {version}: {e}"));
         st.pending = None;
