@@ -10,7 +10,7 @@
 //! | U0 | lock, the confirmation (done by the command), the resume file |
 //! | U1 | `systemctl disable --now` the gateway units, so no gateway traffic arrives |
 //! | U2 | privd `Uninstall` (an old privd answers `UNIMPLEMENTED`: the manual steps, exit 6) |
-//! | U3 | stop and disable privd's units, the fetcher, the updates mount (destroy: the firewall units too) |
+//! | U3 | stop and disable privd's units, both fetchers, the updates and image-in mounts (destroy: the firewall units too) |
 //! | U4 | remove the port rule (ufw, nft by comment) and its unit |
 //! | U5 | remove files and directories; gatewayd's state is emptied by a child running as that user |
 //! | U6 | `userdel hx-gatewayd` |
@@ -308,6 +308,7 @@ pub fn exact_files(keep: bool) -> Vec<String> {
     for p in [
         paths::PORT_DROPIN,
         paths::RESOLVERS_DROPIN,
+        paths::IMAGE_RESOLVERS_DROPIN,
         paths::RESCUE_BIN,
         paths::GATEWAYD_TOML,
         paths::PRIVD_TOML,
@@ -326,9 +327,10 @@ pub fn exact_files(keep: bool) -> Vec<String> {
 
 /// The installer's own drop-in directories: the only directories that are `rmdir`'d (and only
 /// when empty).
-const DROPIN_DIRS: [&str; 2] = [
+const DROPIN_DIRS: [&str; 3] = [
     "/etc/systemd/system/hx-gatewayd-public.socket.d",
     "/etc/systemd/system/hx-update-fetcher@.service.d",
+    "/etc/systemd/system/hx-image-fetcher@.service.d",
 ];
 
 /// Unlinks one file (never a directory, never through a link at the last component): the parent
@@ -412,6 +414,17 @@ fn u5_files(d: &mut UninstallDeps<'_>, keep: bool) -> Result<()> {
         Err(_) => {
             return Err(InstallError::tool(
                 "/var/lib/hx/updates is not empty or still mounted; refusing to walk it as root",
+            ));
+        }
+    }
+    // The image fetcher's tmpfs mount point is the same kind of directory: rmdir only. (Its
+    // `/var/lib/hx/import` neighbour is root-only, so the walk below may remove it.)
+    match std::fs::remove_dir(p.at(paths::IMAGEIN_DIR)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => {
+            return Err(InstallError::tool(
+                "/var/lib/hx/imagein is not empty or still mounted; refusing to walk it as root",
             ));
         }
     }
@@ -730,6 +743,7 @@ mod tests {
         let all = exact_files(false);
         assert!(all.iter().any(|f| f == paths::PORT_DROPIN));
         assert!(all.iter().any(|f| f == paths::RESOLVERS_DROPIN));
+        assert!(all.iter().any(|f| f == paths::IMAGE_RESOLVERS_DROPIN));
         assert!(all.iter().any(|f| f == paths::RESCUE_BIN));
         assert!(all.iter().any(|f| f == paths::HOST_FIREWALL));
         for f in &all {

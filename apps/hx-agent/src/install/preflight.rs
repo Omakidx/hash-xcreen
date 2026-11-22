@@ -1,6 +1,6 @@
 //! Stage `preflight`: read-only checks (design C1). Nothing is changed; a failure is exit 9 with
-//! every failed check listed, except `--image prebuilt` and `--image-file`, which are exit 6
-//! ("not in this release": privd answers `UNIMPLEMENTED` for both).
+//! every failed check listed, except a failed verification of `--image-file` (its signature, its
+//! signed entry, its size or SHA-256), which is exit 10 ([`super::image_file`]).
 //!
 //! The checks are split in two because `--interactive` asks its questions between them: first
 //! what depends only on the host ([`host_checks`]), then what depends on the options the operator
@@ -221,12 +221,14 @@ fn finish(bad: Vec<String>) -> Result<()> {
 
 /// The checks that depend on the options.
 pub fn option_checks(ctx: &mut Ctx<'_>) -> Result<()> {
-    if ctx.opts.image == "prebuilt" || ctx.image_file.is_some() {
-        return Err(InstallError::unimplemented(
-            "--image prebuilt and --image-file are not in this release (privd answers UNIMPLEMENTED); use --image build or auto. Nothing was changed",
-        ));
-    }
     let mut bad: Vec<String> = Vec::new();
+    ctx.image_src = None;
+    if ctx.mode.builds_desktop()
+        && let Some(given) = ctx.image_file.clone()
+    {
+        // Exit 10 on a failed verification; exit 9 (below) for an unusable file or too little disk.
+        ctx.image_src = super::image_file::preflight(ctx, &given, &mut bad)?;
+    }
     let port = ctx.opts.port;
     let ours = ctx.state.created.socket_port == port && socket_active(ctx);
     if !ours && !ctx.probe.port_free(port) {

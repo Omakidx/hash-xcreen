@@ -20,6 +20,15 @@ use crate::session::{Desk, Wiring};
 use crate::video::Stats;
 use crate::{DetailsVm, DeviceRowData, Kv, Screen};
 
+/// An SSH target and the host key found there, as checked in the danger zone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SshCheck {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub key: HostKey,
+}
+
 /// Details state.
 #[derive(Default)]
 pub struct Ctx {
@@ -30,7 +39,10 @@ pub struct Ctx {
     pub plan: Option<RevokePlan>,
     pub overview: Option<Overview>,
     pub danger: DangerFlow,
-    pub pending_host: Option<HostKey>,
+    /// A new host key shown to the user, with the exact target it was seen for.
+    pub pending_host: Option<SshCheck>,
+    /// The host key that passed the check for exactly this host, port and user.
+    pub ssh_checked: Option<SshCheck>,
     pub pair_started: Option<(Instant, u64, u32)>,
     pub pair_timer: Option<slint::Timer>,
 }
@@ -407,12 +419,17 @@ fn submit_dialog(app: &Rc<App>) {
         return;
     }
     let (f1, f2, f3) = (
-        vm.get_f1().to_string(),
-        vm.get_f2().to_string(),
-        vm.get_f3().to_string(),
+        zeroize::Zeroizing::new(vm.get_f1().to_string()),
+        zeroize::Zeroizing::new(vm.get_f2().to_string()),
+        zeroize::Zeroizing::new(vm.get_f3().to_string()),
     );
     match vm.get_dialog() {
-        6 => unlock(app, f1),
+        6 => {
+            if !f1.is_empty() {
+                clear_dialog_fields(&vm);
+            }
+            unlock(app, f1.to_string())
+        }
         4 | 5 => {
             let pin = vm.get_dialog() == 4;
             let p = if pin {
@@ -427,6 +444,8 @@ fn submit_dialog(app: &Rc<App>) {
                 return;
             }
             let Some(ctx) = admin_ctx(app) else { return };
+            clear_dialog_fields(&vm);
+            let (f1, f2) = (f1.to_string(), f2.to_string());
             vm.set_dialog_busy(true);
             vm.set_dialog_error(ss(""));
             let control = app.be.control.clone();
@@ -476,6 +495,13 @@ fn submit_dialog(app: &Rc<App>) {
         }
         _ => {}
     }
+}
+
+/// The dialog's secret fields are emptied as soon as their values were read.
+fn clear_dialog_fields(vm: &crate::DetailsVm<'_>) {
+    vm.set_f1(ss(""));
+    vm.set_f2(ss(""));
+    vm.set_f3(ss(""));
 }
 
 fn unlock(app: &Rc<App>, pin: String) {
@@ -729,22 +755,34 @@ fn danger_continue(app: &Rc<App>) {
             return;
         }
     };
+    let user = vm.get_ssh_user().trim().to_owned();
     vm.set_danger_error(ss(""));
     let target = SshTarget {
         host: s.host.clone(),
         port,
     };
-    let pending = app.det.borrow().pending_host.clone();
-    if let Some(hk) = pending {
-        // Second press: the user saw the fingerprint and trusts it.
-        app.hosts
+    let pending = app.det.borrow_mut().pending_host.take();
+    if let Some(p) = pending
+        && p.host == target.host
+        && p.port == target.port
+        && p.user == user
+    {
+        // Second press: the user saw the fingerprint and trusts it, for this exact host:port.
+        let saved = app
+            .hosts
             .borrow_mut()
-            .trust(&target.host, target.port, &hk.fingerprint);
-        app.det.borrow_mut().pending_host = None;
-        app.det.borrow_mut().danger.ssh_given();
+            .trust(&target.host, target.port, &p.key.fingerprint);
+        if let Err(e) = saved {
+            vm.set_danger_error(ss(format!("The host key could not be saved: {e}")));
+            return;
+        }
+        let mut c = app.det.borrow_mut();
+        c.ssh_checked = Some(p);
+        c.danger.ssh_given();
         vm.set_danger(2);
         return;
     }
+    // A pending key for another host, port or user is dropped: probe again.
     let engine = app.be.install.clone();
     let epoch = app.det.borrow().epoch;
     let t2 = target.clone();
@@ -756,27 +794,89 @@ fn danger_continue(app: &Rc<App>) {
                 return;
             }
             let vm = a.ui().global::<DetailsVm>();
+            // The fields were edited while probing: this answer is for another target.
+            if vm.get_ssh_port().trim().parse::<u16>().ok() != Some(target.port)
+                || vm.get_ssh_user().trim() != user
+            {
+                return;
+            }
+            let check = |hk: HostKey| SshCheck {
+                host: target.host.clone(),
+                port: target.port,
+                user: user.clone(),
+                key: hk,
+            };
             match r {
-            Err(e) => vm.set_danger_error(ss(e.to_string())),
-            Ok(hk) => match a.hosts.borrow().check(&target.host, target.port, &hk.fingerprint) {
-                Known::Same => {
-                    a.det.borrow_mut().danger.ssh_given();
-                    vm.set_danger(2);
-                }
-                Known::Changed { .. } => vm.set_danger_error(ss(
-                    "This server's SSH host key is different from the one you trusted before. Nothing was sent. If you reinstalled the server, remove its entry from known_hosts.json in the app's config folder.",
-                )),
-                Known::New => {
-                    vm.set_danger_error(ss(format!(
-                        "Host key ({}): {}. If this matches the one your provider shows, press Continue again to trust it.",
-                        hk.algorithm, hk.fingerprint
-                    )));
-                    a.det.borrow_mut().pending_host = Some(hk);
-                }
-            },
-        }
+                Err(e) => vm.set_danger_error(ss(e.to_string())),
+                Ok(hk) => match a.hosts.borrow().check(&target.host, target.port, &hk.fingerprint) {
+                    Known::Same => {
+                        let mut c = a.det.borrow_mut();
+                        c.ssh_checked = Some(check(hk));
+                        c.danger.ssh_given();
+                        vm.set_danger(2);
+                    }
+                    Known::Changed { .. } => vm.set_danger_error(ss(
+                        "This server's SSH host key is different from the one you trusted before. Nothing was sent. If you reinstalled the server, remove its entry from known_hosts.json in the app's config folder.",
+                    )),
+                    Known::New => {
+                        vm.set_danger_error(ss(format!(
+                            "Host key ({}): {}. If this matches the one your provider shows, press Continue again to trust it.",
+                            hk.algorithm, hk.fingerprint
+                        )));
+                        a.det.borrow_mut().pending_host = Some(check(hk));
+                    }
+                },
+            }
         },
     );
+}
+
+/// The checked key, only if it was recorded for exactly this host, port and user and
+/// known_hosts still holds it. Anything else needs a new check.
+fn confirmed_target(
+    checked: Option<&SshCheck>,
+    hosts: &super::known_hosts::KnownHosts,
+    host: &str,
+    port: Option<u16>,
+    user: &str,
+) -> Option<SshCheck> {
+    checked
+        .filter(|c| {
+            Some(c.port) == port
+                && c.host == host
+                && c.user == user
+                && hosts.check(&c.host, c.port, &c.key.fingerprint) == Known::Same
+        })
+        .cloned()
+}
+
+/// Uninstalls with the recorded target and key. It never probes: the engine compares the key
+/// the server presents with `trusted.key` before it authenticates.
+async fn run_uninstall(
+    engine: &dyn crate::backend::InstallEngine,
+    trusted: SshCheck,
+    password: zeroize::Zeroizing<String>,
+    keep: bool,
+) -> Result<(), EngineError> {
+    let auth = if password.is_empty() {
+        SshAuth::DefaultKeys { user: trusted.user }
+    } else {
+        SshAuth::Password {
+            user: trusted.user,
+            password: Secret::new(password.to_string()),
+        }
+    };
+    engine
+        .uninstall(UninstallRequest {
+            target: SshTarget {
+                host: trusted.host,
+                port: trusted.port,
+            },
+            auth,
+            host_key: trusted.key,
+            keep_desktop: keep,
+        })
+        .await
 }
 
 fn danger_confirm(app: &Rc<App>) {
@@ -787,6 +887,29 @@ fn danger_confirm(app: &Rc<App>) {
     let Some(s) = app.server(&id) else { return };
     let typed = vm.get_confirm_name().to_string();
     let keep = vm.get_keep_desktop();
+    let port: Option<u16> = vm.get_ssh_port().trim().parse().ok();
+    let user = vm.get_ssh_user().trim().to_owned();
+    // There is no second probe: whatever the server presents now is verified by the engine
+    // against the recorded key before any credential is sent.
+    let trusted = confirmed_target(
+        app.det.borrow().ssh_checked.as_ref(),
+        &app.hosts.borrow(),
+        &s.host,
+        port,
+        &user,
+    );
+    let Some(trusted) = trusted else {
+        {
+            let mut c = app.det.borrow_mut();
+            c.ssh_checked = None;
+            c.danger.ssh_changed();
+        }
+        vm.set_danger(1);
+        vm.set_danger_error(ss(
+            "The SSH details changed. Check the server's host key again.",
+        ));
+        return;
+    };
     {
         let mut c = app.det.borrow_mut();
         c.danger.keep = keep;
@@ -795,40 +918,14 @@ fn danger_confirm(app: &Rc<App>) {
         }
     }
     vm.set_danger(3);
-    let port: u16 = vm.get_ssh_port().trim().parse().unwrap_or(22);
-    let user = vm.get_ssh_user().trim().to_owned();
-    let pw = vm.get_ssh_password().to_string();
+    let pw = zeroize::Zeroizing::new(vm.get_ssh_password().to_string());
     vm.set_ssh_password(ss(""));
-    let auth = if pw.is_empty() {
-        SshAuth::DefaultKeys { user }
-    } else {
-        SshAuth::Password {
-            user,
-            password: Secret::new(pw),
-        }
-    };
-    let target = SshTarget {
-        host: s.host.clone(),
-        port,
-    };
     let engine = app.be.install.clone();
     let epoch = app.det.borrow().epoch;
     let host = s.host.clone();
     spawn_ui(
         app,
-        async move {
-            // The trusted key was checked when the SSH details were given; the engine verifies it
-            // again against what the server presents now.
-            let hk = engine.probe_host_key(&target).await?;
-            engine
-                .uninstall(UninstallRequest {
-                    target,
-                    auth,
-                    host_key: hk,
-                    keep_desktop: keep,
-                })
-                .await
-        },
+        async move { run_uninstall(engine.as_ref(), trusted, pw, keep).await },
         move |a, r: Result<(), EngineError>| {
             if a.det.borrow().epoch != epoch {
                 return;
@@ -1005,6 +1102,7 @@ pub fn wire(app: &Rc<App>) {
     vm.on_uninstall(move || {
         a.det.borrow_mut().danger.start();
         a.det.borrow_mut().pending_host = None;
+        a.det.borrow_mut().ssh_checked = None;
         let vm = a.ui().global::<DetailsVm>();
         vm.set_danger_error(ss(""));
         vm.set_danger(1);
@@ -1012,9 +1110,23 @@ pub fn wire(app: &Rc<App>) {
     let a = app.clone();
     vm.on_danger_continue(move || danger_continue(&a));
     let a = app.clone();
+    vm.on_ssh_changed(move || {
+        let vm = a.ui().global::<DetailsVm>();
+        {
+            let mut c = a.det.borrow_mut();
+            c.pending_host = None;
+            c.ssh_checked = None;
+            c.danger.ssh_changed();
+        }
+        if vm.get_danger() == 2 {
+            vm.set_danger(1);
+        }
+    });
+    let a = app.clone();
     vm.on_danger_cancel(move || {
         a.det.borrow_mut().danger.cancel();
         a.det.borrow_mut().pending_host = None;
+        a.det.borrow_mut().ssh_checked = None;
         let vm = a.ui().global::<DetailsVm>();
         vm.set_danger(0);
         vm.set_confirm_name(ss(""));
@@ -1033,4 +1145,127 @@ pub fn wire(app: &Rc<App>) {
         teardown(&a);
         a.show_home();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::known_hosts::KnownHosts;
+    use crate::backend::{BoxFuture, InstallRequest, InstallRun, Preflight};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn key(fp: &str) -> HostKey {
+        HostKey {
+            algorithm: "ED25519".into(),
+            fingerprint: fp.into(),
+        }
+    }
+
+    /// A server that presents key B. Like the real engine it compares the expected key with the
+    /// presented one before it looks at the credentials.
+    struct Fake {
+        presented: HostKey,
+        probes: AtomicUsize,
+        credentials_seen: Mutex<Vec<String>>,
+        expected_seen: Mutex<Vec<HostKey>>,
+    }
+
+    impl crate::backend::InstallEngine for Fake {
+        fn probe_host_key(&self, _: &SshTarget) -> BoxFuture<'_, Result<HostKey, EngineError>> {
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            let k = self.presented.clone();
+            Box::pin(async move { Ok(k) })
+        }
+        fn preflight(
+            &self,
+            _: &SshTarget,
+            _: &SshAuth,
+            _: &HostKey,
+        ) -> BoxFuture<'_, Result<Preflight, EngineError>> {
+            Box::pin(async { Err(EngineError::Other("unused".into())) })
+        }
+        fn install(
+            &self,
+            _: InstallRequest,
+        ) -> BoxFuture<'_, Result<Box<dyn InstallRun>, EngineError>> {
+            Box::pin(async { Err(EngineError::Other("unused".into())) })
+        }
+        fn uninstall(&self, req: UninstallRequest) -> BoxFuture<'_, Result<(), EngineError>> {
+            self.expected_seen
+                .lock()
+                .unwrap()
+                .push(req.host_key.clone());
+            let r = if req.host_key == self.presented {
+                if let SshAuth::Password { password, .. } = &req.auth {
+                    self.credentials_seen
+                        .lock()
+                        .unwrap()
+                        .push(password.expose().to_owned());
+                }
+                Ok(())
+            } else {
+                Err(EngineError::HostKeyChanged {
+                    expected: req.host_key.fingerprint.clone(),
+                    actual: self.presented.fingerprint.clone(),
+                })
+            };
+            Box::pin(async move { r })
+        }
+    }
+
+    fn checked(fp: &str) -> SshCheck {
+        SshCheck {
+            host: "a.test".into(),
+            port: 22,
+            user: "root".into(),
+            key: key(fp),
+        }
+    }
+
+    #[test]
+    fn uninstall_uses_the_recorded_key_a_and_sends_nothing_when_the_server_presents_b() {
+        let fake = Fake {
+            presented: key("SHA256:B"),
+            probes: AtomicUsize::new(0),
+            credentials_seen: Mutex::default(),
+            expected_seen: Mutex::default(),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let r = rt.block_on(run_uninstall(
+            &fake,
+            checked("SHA256:A"),
+            zeroize::Zeroizing::new("pw".into()),
+            true,
+        ));
+        assert!(matches!(
+            r,
+            Err(EngineError::HostKeyChanged { ref expected, ref actual })
+                if expected == "SHA256:A" && actual == "SHA256:B"
+        ));
+        assert_eq!(*fake.expected_seen.lock().unwrap(), vec![key("SHA256:A")]);
+        assert!(
+            fake.credentials_seen.lock().unwrap().is_empty(),
+            "no credential sent"
+        );
+        assert_eq!(fake.probes.load(Ordering::SeqCst), 0, "no second probe");
+    }
+
+    #[test]
+    fn editing_the_port_or_user_after_the_check_needs_a_new_check() {
+        let mut hosts = KnownHosts::default();
+        hosts.trust("a.test", 22, "SHA256:A").unwrap();
+        let c = checked("SHA256:A");
+        assert!(confirmed_target(Some(&c), &hosts, "a.test", Some(22), "root").is_some());
+        assert!(confirmed_target(Some(&c), &hosts, "a.test", Some(2222), "root").is_none());
+        assert!(confirmed_target(Some(&c), &hosts, "a.test", None, "root").is_none());
+        assert!(confirmed_target(Some(&c), &hosts, "a.test", Some(22), "admin").is_none());
+        assert!(confirmed_target(Some(&c), &hosts, "b.test", Some(22), "root").is_none());
+        assert!(confirmed_target(None, &hosts, "a.test", Some(22), "root").is_none());
+        // known_hosts no longer holding the key also refuses.
+        let empty = KnownHosts::default();
+        assert!(confirmed_target(Some(&c), &empty, "a.test", Some(22), "root").is_none());
+    }
 }

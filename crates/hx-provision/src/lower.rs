@@ -128,6 +128,12 @@ else
   passwd -l "$n" >/dev/null
 fi
 for g in {groups}; do getent group "$g" >/dev/null || groupadd "$g"; usermod -aG "$g" "$n"; done
+# ~/.cache with the XDG base directory mode, before any session runs: otherwise its mode is that
+# of whichever program makes it first (0700 or 0755), which differs between two boots.
+h=$(getent passwd "$n" | cut -d: -f6)
+if [ -n "$h" ] && [ "$h" != / ] && [ -d "$h" ] && [ ! -L "$h/.cache" ]; then
+  mkdir -p "$h/.cache" && chown "$n:$(id -g "$n")" "$h/.cache" && chmod 0700 "$h/.cache"
+fi
 "#,
         n = sq(&u.name),
         want = sq(&want),

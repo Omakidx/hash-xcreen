@@ -9,6 +9,7 @@
 //! "Restore from backup" is Phase 2 and not offered. Backups in Phase 1 is a fixed "Off".
 
 use crate::backend::{InstallOptions, Preflight};
+use zeroize::Zeroize;
 
 /// How the server is set up.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -450,11 +451,15 @@ impl Wizard {
             &mut self.pin,
             &mut self.pin2,
         ] {
-            // Overwrite then clear, so the old bytes do not linger in the allocation.
-            // SAFETY-free: write zeros through a byte vector.
-            let mut b = std::mem::take(s).into_bytes();
-            b.iter_mut().for_each(|x| *x = 0);
+            // zeroize wipes the allocation with volatile writes the optimizer cannot drop.
+            s.zeroize();
         }
+    }
+}
+
+impl Drop for Wizard {
+    fn drop(&mut self) {
+        self.wipe_secrets();
     }
 }
 

@@ -62,8 +62,53 @@ pub struct DesktopOut {
     pub path_taken: String,
     /// Why.
     pub reason: String,
+    /// Why, as a code: the lower-case name of privd's `ImageReason` without the `IMAGE_REASON_`
+    /// prefix (`build_requested`, `prebuilt_requested`, `image_file`, `list_unavailable`,
+    /// `no_matching_image`, ...).
+    pub reason_code: String,
+    /// The prebuilt image the desktop was made from (absent for a build).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImageOut>,
     /// privd's warnings.
     pub warnings: Vec<String>,
+}
+
+/// The `desktop.image` member of the final result.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct ImageOut {
+    /// `YYYYMMDD.N`.
+    pub build_id: String,
+    /// Unix time the image was built.
+    pub created_unix: u64,
+    /// Size of the image file in bytes.
+    pub size: u64,
+    /// Release-host rate measured by the speed probe, bytes per second (0: not measured).
+    pub release_bps: u64,
+    /// Apt-mirror rate measured by the speed probe, bytes per second (0: not measured).
+    pub mirror_bps: u64,
+}
+
+impl From<&super::state::DesktopReport> for DesktopOut {
+    fn from(d: &super::state::DesktopReport) -> Self {
+        Self {
+            id: d.id.clone(),
+            path_taken: d.path_taken.clone(),
+            reason: d.reason.clone(),
+            reason_code: if d.reason_code.is_empty() {
+                "unspecified".to_owned()
+            } else {
+                d.reason_code.clone()
+            },
+            image: d.image.as_ref().map(|i| ImageOut {
+                build_id: i.build_id.clone(),
+                created_unix: i.created_unix,
+                size: i.size,
+                release_bps: i.release_bps,
+                mirror_bps: i.mirror_bps,
+            }),
+            warnings: d.warnings.clone(),
+        }
+    }
 }
 
 /// The `pairing` member of the final result.
@@ -376,6 +421,8 @@ mod tests {
                 id: "main".into(),
                 path_taken: "BUILD".into(),
                 reason: "r".into(),
+                reason_code: "build_requested".into(),
+                image: None,
                 warnings: vec![],
             }),
             pairing: PairingOut {
@@ -387,7 +434,7 @@ mod tests {
         let (o, _) = run(true, |p| p.result_ok(&r));
         assert!(o.starts_with(r#"{"v":1,"t":"result","ok":true,"exit":0,"install_id":""#));
         assert!(o.contains(
-            r#""desktop":{"id":"main","path_taken":"BUILD","reason":"r","warnings":[]}"#
+            r#""desktop":{"id":"main","path_taken":"BUILD","reason":"r","reason_code":"build_requested","warnings":[]}"#
         ));
         assert!(
             o.ends_with(

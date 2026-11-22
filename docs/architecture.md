@@ -373,13 +373,15 @@ With the global `--json`, stdout carries only JSON Lines; human text goes to std
 {"v":1,"t":"warn","id":"<stage-id>","message":"…"}
 {"v":1,"t":"result","ok":true,"exit":0,"install_id":"<32 hex>","agent_version":"x.y.z",
  "server_public_key":"<64 hex Ed25519>","addresses":["…"],"port":443,
- "desktop":{"id":"main","path_taken":"BUILD","reason_code":"build_requested","reason":"…","warnings":["…"]},
+ "desktop":{"id":"main","path_taken":"BUILD|PREBUILT","reason_code":"build_requested","reason":"…","warnings":["…"],
+            "image":{"build_id":"20261122.1","created_unix":0,"size":0,"release_bps":0,"mirror_bps":0}},
  "pairing":{"kind":"code|token|none","expires_at_unix_s":0},"port_rule":"ufw|nft|manual|none"}
 {"v":1,"t":"result","ok":false,"exit":1,"stage":"incus","code":"UNAVAILABLE|TOOL|VERIFY|PREFLIGHT|…","message":"…","retryable":true}
 ```
 
 - A `step` line is a privd `Progress` frame relayed one to one ([ipc.md](ipc.md) §4); `percent` 255 means unknown.
 - `desktop.reason_code` is the lower-case name of privd's `ImageReason` (§4.3: `build_requested`, `prebuilt_requested`, `image_file`, `no_image_key`, `list_unavailable`, `list_unverified`, `no_matching_image`, `image_stale`, `disk`, `probe_failed`, `download_too_slow`, `slower_than_mirror`, `prebuilt_faster`, `fell_back`, `existing`); `reason` stays the human sentence.
+- `desktop.image` is present only when the desktop came from a prebuilt image (online or `--image-file`): the image's `build_id` (`YYYYMMDD.N`), `created_unix`, `size` in bytes, and the speed probe's `release_bps` and `mirror_bps` (bytes per second; 0 when not measured, as with `--image-file`).
 - `install.sh` emits `stage` lines with the ids `bootstrap-preflight`, `bootstrap-download` and `bootstrap-verify`, built from constant strings only.
 - `server_public_key` is derived when the identity seed is generated and kept in the state file. It lets the SSH app cross-check, over the SSH-authenticated channel, the key it will pin while pairing.
 

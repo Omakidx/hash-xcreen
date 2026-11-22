@@ -47,6 +47,13 @@ pub const PORT_DROPIN: &str = "/etc/systemd/system/hx-gatewayd-public.socket.d/5
 /// The fetcher's resolver drop-in.
 pub const RESOLVERS_DROPIN: &str =
     "/etc/systemd/system/hx-update-fetcher@.service.d/resolvers.conf";
+/// The image fetcher's resolver drop-in (the same resolvers as the update fetcher's).
+pub const IMAGE_RESOLVERS_DROPIN: &str =
+    "/etc/systemd/system/hx-image-fetcher@.service.d/resolvers.conf";
+/// Where an offline `--image-file` and its signed manifest are placed for privd (root, 0700).
+pub const IMPORT_DIR: &str = "/var/lib/hx/import";
+/// The image fetcher's tmpfs mount point under privd's state directory.
+pub const IMAGEIN_DIR: &str = "/var/lib/hx/imagein";
 /// The Zabbly keyring file.
 pub const ZABBLY_KEY: &str = "/etc/apt/keyrings/hx-zabbly.asc";
 /// The Zabbly apt source.

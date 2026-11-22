@@ -411,10 +411,23 @@ impl Options {
             }
             o.image = v.to_owned();
         }
-        if let Some(v) = get("--image-file")
-            && !v.starts_with('/')
-        {
-            return Err(usage("--image-file must be an absolute path"));
+        if let Some(v) = get("--image-file") {
+            if !v.starts_with('/') {
+                return Err(usage("--image-file must be an absolute path"));
+            }
+            let name = v.rsplit('/').next().unwrap_or_default();
+            if !hx_ipc::privd::is_valid_image_file_name(name) {
+                return Err(usage(
+                    "--image-file: the file name must be 1 to 128 letters, digits, '.', '_' or '-', starting with a letter or digit",
+                ));
+            }
+            // An image file is a prebuilt image: it cannot be combined with building on the server.
+            if o.image == "build" {
+                return Err(usage(
+                    "--image-file installs a prebuilt image and cannot be combined with --image build",
+                ));
+            }
+            o.image = "prebuilt".to_owned();
         }
         if let Some(v) = get("--port") {
             match v.parse::<u16>() {
@@ -587,6 +600,11 @@ mod tests {
         assert!(bad(&[("--storage-device", "/dev/../etc/passwd")]).contains("/dev/"));
         assert!(bad(&[("--image", "x")]).contains("--image"));
         assert!(bad(&[("--image-file", "rel.img")]).contains("absolute"));
+        assert!(bad(&[("--image-file", "/a/.hidden")]).contains("file name"));
+        assert!(bad(&[("--image-file", "/a/")]).contains("file name"));
+        assert!(
+            bad(&[("--image-file", "/a/b.img"), ("--image", "build")]).contains("--image build")
+        );
         for p in ["0", "22", "80", "65536", "x"] {
             assert!(bad(&[("--port", p)]).contains("--port"), "{p}");
         }

@@ -27,7 +27,7 @@ use crate::install::error::{InstallError, Result};
 use crate::install::options::Mode;
 use crate::install::progress::{DesktopOut, PairingOut};
 use crate::install::runner::{Call, Tool};
-use crate::install::state::DesktopReport;
+use crate::install::state::{DesktopReport, ImageReport};
 
 /// The desktop id of v1.
 pub const DESKTOP_ID: &str = "main";
@@ -194,19 +194,26 @@ pub fn desktop_run(ctx: &mut Ctx<'_>) -> Result<Outcome> {
         }
         return Ok(Outcome::Done);
     }
-    let Some(pw) = ctx.secrets.password.as_ref() else {
-        return Err(InstallError::usage(
-            "the desktop's Linux password is needed to create it: run again with --ssh (secrets on stdin) or --interactive",
-        ));
-    };
-    if let Some(why) = crate::install::options::password_problem(pw) {
-        return Err(InstallError::usage(why));
+    {
+        let Some(pw) = ctx.secrets.password.as_ref() else {
+            return Err(InstallError::usage(
+                "the desktop's Linux password is needed to create it: run again with --ssh (secrets on stdin) or --interactive",
+            ));
+        };
+        if let Some(why) = crate::install::options::password_problem(pw) {
+            return Err(InstallError::usage(why));
+        }
     }
     let Some(user) = ctx.opts.user.clone() else {
         return Err(InstallError::usage(
             "--user is required to create the desktop",
         ));
     };
+    if ctx.image_file.is_some() && ctx.image_src.is_none() {
+        return Err(InstallError::internal(
+            "--image-file was not verified by preflight",
+        ));
+    }
     let o = &ctx.opts;
     let settings = (!o.settings_empty()).then(|| pb::DesktopSettings {
         hostname: o.hostname.clone().unwrap_or_default(),
@@ -226,13 +233,22 @@ pub fn desktop_run(ctx: &mut Ctx<'_>) -> Result<Outcome> {
         username: user,
         image_mode: match o.image.as_str() {
             "build" => pb::ImageMode::Build,
+            "prebuilt" => pb::ImageMode::Prebuilt,
             _ => pb::ImageMode::Auto,
         } as i32,
         limits: Some(wanted_limits(ctx)),
         docker: ctx.opts.docker,
         docker_isolation_acknowledged: ctx.opts.docker,
         settings,
-        image_file: None,
+        image_file: ctx.image_src.as_ref().map(|v| v.name.clone()),
+    };
+    // The offline image goes where privd reads it before privd is asked (it unlinks the three
+    // files after a successful import).
+    if let Some(v) = ctx.image_src.clone() {
+        crate::install::image_file::stage_into_import(ctx, &v)?;
+    }
+    let Some(pw) = ctx.secrets.password.as_ref() else {
+        return Err(InstallError::internal("the password disappeared"));
     };
     let res = {
         let progress = &mut ctx.progress;
@@ -258,18 +274,30 @@ pub fn desktop_run(ctx: &mut Ctx<'_>) -> Result<Outcome> {
     for w in &warnings {
         ctx.warn("desktop", w);
     }
+    let reason_code = pb::ImageReason::try_from(res.reason_code)
+        .map(|r| {
+            r.as_str_name()
+                .strip_prefix("IMAGE_REASON_")
+                .unwrap_or("UNSPECIFIED")
+                .to_ascii_lowercase()
+        })
+        .unwrap_or_else(|_| "unspecified".to_owned());
+    let image = res.image.as_ref().map(|i| ImageReport {
+        build_id: crate::cli::text::peer(&i.build_id, 24),
+        created_unix: i.created_unix,
+        size: i.size,
+        release_bps: i.release_bps,
+        mirror_bps: i.mirror_bps,
+    });
     let report = DesktopReport {
         id: crate::cli::text::peer(&res.desktop_id, 16),
         path_taken: path.to_owned(),
         reason: crate::cli::text::peer(&res.reason, 256),
+        reason_code,
+        image,
         warnings,
     };
-    ctx.report.desktop = Some(DesktopOut {
-        id: report.id.clone(),
-        path_taken: report.path_taken.clone(),
-        reason: report.reason.clone(),
-        warnings: report.warnings.clone(),
-    });
+    ctx.report.desktop = Some(DesktopOut::from(&report));
     ctx.state.desktop = Some(report);
     Ok(Outcome::Done)
 }

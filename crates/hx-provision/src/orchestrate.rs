@@ -540,14 +540,60 @@ pub struct ProvisionReport {
 /// Longest wait for image download and unpacking.
 const CREATE_DEADLINE: Duration = Duration::from_secs(20 * 60);
 
+/// The drop-in directory and file that hold the XFCE session back (see [`SESSION_HOLD`]).
+const SESSION_HOLD_DIR: &str = "/etc/systemd/user/hx-xsession.service.d";
+const SESSION_HOLD_FILE: &str = "/etc/systemd/user/hx-xsession.service.d/zz-hx-hold.conf";
+
+/// A drop-in that keeps `hx-xsession.service` from starting while it exists: the unit's
+/// condition is that this very file is absent.
+///
+/// Why the prebuilt path needs it. An image boots with its units enabled, so the build user's
+/// lingering manager starts the XFCE session at once, minutes before the post stage has applied
+/// the settings. The session writes per-user state the moment it first runs: the XDG folders and
+/// `user-dirs.*` in the language of the *image* (English), `dconf`, Thunar's `uca.xml`, and
+/// `.cache` and `.local/share` with mode 0700. A desktop built on the server first starts its
+/// session after the post stage (locale already set), so it got German folders for `de_DE`, and
+/// the two paths disagreed. With the hold the session of a prebuilt desktop also starts for the
+/// first time at the final restart, after the settings.
+const SESSION_HOLD: &str = "# Written by hx-provision while the post stage runs; removed before the final restart.\n\
+[Unit]\n\
+ConditionPathExists=!/etc/systemd/user/hx-xsession.service.d/zz-hx-hold.conf\n";
+
+/// Remove the hold again. Fixed text, no interpolation. The drop-in directory is removed too
+/// when nothing else lives in it, so the `/etc` tree is the same as after a build on the server.
+const SESSION_RELEASE_SCRIPT: &str = "rm -f /etc/systemd/user/hx-xsession.service.d/zz-hx-hold.conf\n\
+rmdir /etc/systemd/user/hx-xsession.service.d 2>/dev/null || true\n";
+
 async fn launch<T: Transport>(
     client: &Client<T>,
     spec: &DesktopSpec,
     ready: ReadyOptions,
 ) -> Result<(), ProvisionError> {
+    launch_inner(client, spec, ready, false).await
+}
+
+/// [`launch`], optionally writing the [`SESSION_HOLD`] into the created (still stopped) instance
+/// before it first boots.
+async fn launch_inner<T: Transport>(
+    client: &Client<T>,
+    spec: &DesktopSpec,
+    ready: ReadyOptions,
+    hold_session: bool,
+) -> Result<(), ProvisionError> {
     client
         .create_instance(&spec.to_create()?, CREATE_DEADLINE)
         .await?;
+    if hold_session {
+        client.push_dir(&spec.name, SESSION_HOLD_DIR, 0o755).await?;
+        client
+            .push_file(
+                &spec.name,
+                SESSION_HOLD_FILE,
+                SESSION_HOLD.as_bytes(),
+                0o644,
+            )
+            .await?;
+    }
     client
         .set_state(
             &spec.name,
@@ -596,6 +642,36 @@ pub async fn build_on_server<T: Transport>(
     })
 }
 
+/// Remove the [`SESSION_HOLD`]. Fails when it cannot, so a desktop is never handed over without
+/// its session.
+async fn release_session<T: Transport>(
+    client: &Client<T>,
+    instance: &str,
+) -> Result<(), ProvisionError> {
+    let argv: Vec<String> = ["bash", "-c", SESSION_RELEASE_SCRIPT]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let out = exec_captured(
+        client,
+        instance,
+        &argv,
+        &[],
+        None,
+        None,
+        Duration::from_secs(60),
+    )
+    .await?;
+    if out.exit_code != 0 {
+        return Err(ProvisionError::Invalid(format!(
+            "releasing the session hold failed (exit {}): {}",
+            out.exit_code,
+            sanitize(&out.stderr, 300)
+        )));
+    }
+    Ok(())
+}
+
 /// Prebuilt path: create the container from an already imported image (set with
 /// [`DesktopSpec::with_image`]), start it and run the post stage only.
 pub async fn finish_prebuilt<T: Transport>(
@@ -610,10 +686,13 @@ pub async fn finish_prebuilt<T: Transport>(
             "the prebuilt path needs a local image, not a remote alias".into(),
         ));
     }
-    launch(client, spec, ReadyOptions::default()).await?;
+    // The session is held back until the post stage is done (see SESSION_HOLD).
+    launch_inner(client, spec, ReadyOptions::default(), true).await?;
     let post = run_post_stage(client, &spec.name, plan, secrets, on_progress).await?;
+    release_session(client, &spec.name).await?;
     // Security updates replace libraries under running services and the user rename restarts the
     // user manager in the middle of the run: finish with the same clean boot as the build path.
+    // This boot is the first time the XFCE session runs, with the settings already applied.
     client
         .set_state(
             &spec.name,
@@ -655,6 +734,13 @@ rm -f /root/.bash_history
 if [ -n "$u" ] && h=$(getent passwd "$u" | cut -d: -f6) && [ -n "$h" ] && [ "$h" != / ]; then
   rm -f "$h/.bash_history"
   rm -rf "$h/.cache"
+  # Nothing of the XFCE session may be baked in: it is created for the chosen locale at the
+  # desktop's own first session. The build does not start that session, so this is normally a
+  # no-op; it keeps an image from carrying English XDG folders if a session ever did run.
+  # (rmdir removes only empty folders, so anything a recipe wrote into them stays.)
+  rm -f "$h/.config/user-dirs.dirs" "$h/.config/user-dirs.locale" "$h/.ICEauthority" "$h/.Xauthority" "$h/.local/share/recently-used.xbel"
+  rm -rf "$h/.config/dconf" "$h/.config/Thunar" "$h/.config/xfce4"
+  for d in Desktop Documents Downloads Music Pictures Public Templates Videos; do rmdir "$h/$d" 2>/dev/null || true; done
 fi
 rm -rf /var/lib/apt/lists/*
 "#;
