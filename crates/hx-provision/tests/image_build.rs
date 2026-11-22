@@ -82,7 +82,10 @@ async fn build_image_builds_seals_stops_and_verifies_without_a_post_stage() {
     let report = build_image(&fake.client(), &p, &spec(&p), &mut |_| {})
         .await
         .unwrap();
-    assert!(!report.timings.is_empty(), "the build stage reported its steps");
+    assert!(
+        !report.timings.is_empty(),
+        "the build stage reported its steps"
+    );
     let log = fake.log();
     // start, then a graceful stop; never a restart.
     assert_eq!(state_actions(&log), ["start", "stop"]);

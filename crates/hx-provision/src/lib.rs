@@ -19,6 +19,7 @@
 
 pub mod catalog;
 pub mod docker;
+pub mod equiv;
 pub mod error;
 pub mod exec;
 pub mod host;

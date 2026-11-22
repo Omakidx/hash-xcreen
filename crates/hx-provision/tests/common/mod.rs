@@ -628,23 +628,24 @@ impl State {
             cmd.clone()
         };
         let joined = inner.join(" ");
-        let (exit, out, err) = if joined.contains("systemctl is-system-running") {
-            let s = if self.running_states.len() > 1 {
-                self.running_states.pop_front().unwrap()
+        let (exit, out, err) =
+            if joined.contains("systemctl is-system-running") && !joined.contains("dpkg-query") {
+                let s = if self.running_states.len() > 1 {
+                    self.running_states.pop_front().unwrap()
+                } else {
+                    self.running_states[0].clone()
+                };
+                (
+                    if s == "running" { 0 } else { 1 },
+                    format!("{s}\n"),
+                    String::new(),
+                )
             } else {
-                self.running_states[0].clone()
+                match self.exec_rules.iter().find(|r| joined.contains(&r.needle)) {
+                    Some(r) => (r.exit, r.stdout.clone(), r.stderr.clone()),
+                    None => (0, String::new(), String::new()),
+                }
             };
-            (
-                if s == "running" { 0 } else { 1 },
-                format!("{s}\n"),
-                String::new(),
-            )
-        } else {
-            match self.exec_rules.iter().find(|r| joined.contains(&r.needle)) {
-                Some(r) => (r.exit, r.stdout.clone(), r.stderr.clone()),
-                None => (0, String::new(), String::new()),
-            }
-        };
         if wrapped {
             let base = &cmd[4];
             self.files.insert(format!("{base}.out"), out.into_bytes());
