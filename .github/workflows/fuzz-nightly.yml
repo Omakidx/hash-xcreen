@@ -150,7 +150,7 @@ jobs:
           execs=$(field number_of_executed_units); execs=${execs:-0}
           speed=$(field average_exec_per_sec); speed=${speed:-0}
           rss=$(field peak_rss_mb); rss=${rss:-0}
-          cov=$(grep -hE '^#[0-9]+.* (DONE|INITED|REDUCE|NEW) .*cov: ' "$log" 2>/dev/null | tail -1 | sed -E 's/.*cov: ([0-9]+).*/\1/'); cov=${cov:-0}
+          cov=$(grep -hE '^#[0-9]+[[:space:]]+[A-Za-z]+[[:space:]]+cov: ' "$log" 2>/dev/null | tail -1 | sed -E 's/.*cov: ([0-9]+).*/\1/'); cov=${cov:-0}
           corpus=$(find "fuzz/corpus/$TARGET" -type f 2>/dev/null | wc -l)
           crash=$(find "fuzz/artifacts/$TARGET" -type f 2>/dev/null | wc -l)
           result=pass

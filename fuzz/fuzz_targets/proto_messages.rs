@@ -34,10 +34,10 @@ fuzz_target!(|data: &[u8]| {
             }
         }
         3 => {
-            if let Some(p) = body.first_chunk::<FRAME_PREFIX_LEN>() {
-                if let Ok(n) = message::parse_frame_len(*p, 64 * 1024) {
-                    assert!(n <= 64 * 1024);
-                }
+            if let Some(p) = body.first_chunk::<FRAME_PREFIX_LEN>()
+                && let Ok(n) = message::parse_frame_len(*p, 64 * 1024)
+            {
+                assert!(n <= 64 * 1024);
             }
         }
         _ => {
