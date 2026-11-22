@@ -3,8 +3,9 @@
 //!
 //! Two halves, both here so that the checks and the copy cannot drift apart:
 //!
-//! * [`preflight`] (read-only, in stage `preflight`): the file is opened `O_NOFOLLOW|O_NONBLOCK`
-//!   and must be a regular file of at most 4 GiB with the signed manifest
+//! * [`preflight`] (read-only, in stage `preflight`): every parent directory must be root-owned
+//!   and not group/other-writable, and the file is opened with `openat2` `RESOLVE_NO_SYMLINKS`
+//!   (its type decided on an `O_PATH` descriptor before the real open) and must be a regular file of at most 4 GiB with the signed manifest
 //!   (`images-manifest-x86_64.json`) and its `.minisig` beside it. The signature, the manifest's
 //!   rules, the entry that matches this agent's recipe, and the file's size and SHA-256 are
 //!   verified with privd's own code ([`ImageKeys`], [`verify_manifest`], `ImagesManifest::select`),
@@ -64,15 +65,89 @@ pub struct Verified {
     pub build_id: String,
 }
 
+/// Why an operator-given path is not safe to open, or `None` when every parent directory is
+/// trustworthy: owned by root (or by `owner`, the effective uid, which is root in a real install
+/// and the test user in the unprivileged tests) and not writable by group or others. A sticky
+/// directory (`/tmp`) may be writable, but then the file itself must be owned the same way.
+/// Nobody else can then replace a component of the path between the check and the open.
+fn untrusted_parent(path: &Path, owner: u32) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let trusted = |uid: u32| uid == 0 || uid == owner;
+    let mut direct_parent_shared = false;
+    for (i, anc) in path.ancestors().skip(1).enumerate() {
+        let shown = peer(&anc.to_string_lossy(), 120);
+        let Ok(m) = std::fs::symlink_metadata(anc) else {
+            return Some(format!("cannot examine its parent directory {shown}"));
+        };
+        if !m.is_dir() {
+            return Some(format!(
+                "is reached through {shown}, which is a symbolic link or not a directory"
+            ));
+        }
+        if !trusted(m.uid()) {
+            return Some(format!("is in {shown}, which is not owned by root"));
+        }
+        let shared = m.mode() & 0o022 != 0;
+        if shared && m.mode() & 0o1000 == 0 {
+            return Some(format!(
+                "is in {shown}, which is writable by group or others"
+            ));
+        }
+        if i == 0 {
+            direct_parent_shared = shared;
+        }
+    }
+    if direct_parent_shared {
+        // Only reachable for a sticky directory: an entry planted by anyone else is not ours.
+        match std::fs::symlink_metadata(path) {
+            Ok(m) if trusted(m.uid()) => {}
+            _ => {
+                return Some("is in a shared sticky directory and is not owned by root".to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Opens an operator-given absolute path as a regular file without ever following a symlink
+/// (`openat2` with `RESOLVE_NO_SYMLINKS`: not on the last component and not on any parent, and no
+/// `/proc` magic links), after its parent directories were found trustworthy. The type is decided
+/// on an `O_PATH` descriptor, before the file is really opened, so a FIFO or a device is never
+/// opened at all; the real open re-opens that very descriptor through `/proc/self/fd`.
 fn open_regular(path: &Path) -> std::result::Result<(File, u64), String> {
-    let fd = rustix::fs::open(
+    use rustix::fs::{FileType, ResolveFlags, fstat, openat2};
+    use std::os::fd::AsRawFd;
+    if !path.is_absolute() {
+        return Err("must be an absolute path".into());
+    }
+    if let Some(why) = untrusted_parent(path, rustix::process::geteuid().as_raw()) {
+        return Err(why);
+    }
+    let pfd = openat2(
+        rustix::fs::CWD,
         path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        OFlags::PATH | OFlags::CLOEXEC,
         Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
     )
     .map_err(|e| match e {
         rustix::io::Errno::NOENT => "does not exist".to_owned(),
-        rustix::io::Errno::LOOP => "is a symbolic link (give the real file)".to_owned(),
+        rustix::io::Errno::LOOP | rustix::io::Errno::XDEV => {
+            "is, or is reached through, a symbolic link (give the real file)".to_owned()
+        }
+        rustix::io::Errno::ACCESS | rustix::io::Errno::PERM => "cannot be read".to_owned(),
+        other => format!("cannot be opened ({})", other.kind()),
+    })?;
+    let st = fstat(&pfd).map_err(|_| "cannot be examined".to_owned())?;
+    if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
+        return Err("is not a regular file".into());
+    }
+    let fd = rustix::fs::open(
+        format!("/proc/self/fd/{}", pfd.as_raw_fd()),
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| match e {
         rustix::io::Errno::ACCESS | rustix::io::Errno::PERM => "cannot be read".to_owned(),
         other => format!("cannot be opened ({})", other.kind()),
     })?;
@@ -430,6 +505,21 @@ pub fn stage_into_import(ctx: &mut Ctx<'_>, v: &Verified) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// A temporary directory with mode 0755 whatever the umask: the parents of the paths under
+    /// test must not be group-writable (a umask of 0002 would make `tempdir()` 0775).
+    fn private_tmp() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        d
+    }
+
+    fn mkdir755(p: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir(p).unwrap();
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     fn open_dir(p: &Path) -> rustix::fd::OwnedFd {
         rustix::fs::open(
             p,
@@ -451,8 +541,8 @@ mod tests {
 
     #[test]
     fn a_copy_is_rehashed_and_only_then_given_its_name() {
-        let src = tempfile::tempdir().unwrap();
-        let dst = tempfile::tempdir().unwrap();
+        let src = private_tmp();
+        let dst = private_tmp();
         let data = vec![7u8; 3 << 20];
         std::fs::write(src.path().join("a.img"), &data).unwrap();
         let fd = open_dir(dst.path());
@@ -494,8 +584,8 @@ mod tests {
 
     #[test]
     fn a_source_that_changed_size_or_is_not_a_regular_file_is_refused() {
-        let src = tempfile::tempdir().unwrap();
-        let dst = tempfile::tempdir().unwrap();
+        let src = private_tmp();
+        let dst = private_tmp();
         let fd = open_dir(dst.path());
         std::fs::write(src.path().join("a"), b"12345").unwrap();
         // Announced 4 bytes, the file has 5.
@@ -510,10 +600,69 @@ mod tests {
     }
 
     #[test]
+    fn a_symlinked_parent_and_a_fifo_are_refused_without_opening() {
+        let src = private_tmp();
+        mkdir755(&src.path().join("real"));
+        std::fs::write(src.path().join("real/f"), b"x").unwrap();
+        std::os::unix::fs::symlink(src.path().join("real"), src.path().join("lnk")).unwrap();
+        // A symlink in a parent position is not followed.
+        assert!(open_regular(&src.path().join("lnk/f")).is_err());
+        assert!(open_regular(&src.path().join("real/f")).is_ok());
+        // A FIFO is refused on its O_PATH descriptor: nothing opens it, nothing blocks.
+        let fifo = src.path().join("fifo");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::FileType::Fifo,
+            Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+        assert_eq!(open_regular(&fifo).unwrap_err(), "is not a regular file");
+        // A relative path is not accepted.
+        assert!(open_regular(Path::new("real/f")).is_err());
+    }
+
+    #[test]
+    fn a_parent_writable_by_group_or_others_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let me = rustix::process::geteuid().as_raw();
+        let src = private_tmp();
+        let dir = src.path().join("d");
+        mkdir755(&dir);
+        std::fs::write(dir.join("f"), b"x").unwrap();
+        assert_eq!(untrusted_parent(&dir.join("f"), me), None);
+        for mode in [0o775, 0o757, 0o777] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            let why = untrusted_parent(&dir.join("f"), me).expect("refused");
+            assert!(
+                why.contains("writable by group or others"),
+                "{mode:o}: {why}"
+            );
+            assert!(open_regular(&dir.join("f")).is_err(), "{mode:o}");
+        }
+        // A grandparent counts too.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        mkdir755(&dir.join("sub"));
+        std::fs::write(dir.join("sub/f"), b"x").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(untrusted_parent(&dir.join("sub/f"), me).is_some());
+        // A sticky shared directory is fine for a file we own.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        assert_eq!(untrusted_parent(&dir.join("f"), me), None);
+        // The expected owner is a seam: an owner that is neither root nor `owner` is refused.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if me != 0 {
+            let why = untrusted_parent(&dir.join("f"), me.wrapping_add(1)).expect("refused");
+            assert!(why.contains("not owned by root"), "{why}");
+        }
+    }
+
+    #[test]
     fn a_planted_name_is_replaced_and_a_planted_symlink_is_not_followed() {
-        let src = tempfile::tempdir().unwrap();
-        let dst = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
+        let src = private_tmp();
+        let dst = private_tmp();
+        let outside = private_tmp();
         let fd = open_dir(dst.path());
         std::fs::write(src.path().join("a"), b"new").unwrap();
         std::fs::write(outside.path().join("victim"), b"keep").unwrap();

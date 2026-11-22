@@ -42,6 +42,10 @@ jobs:
       sde: ${{ steps.meta.outputs.sde }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          # the whole history of every branch: the tag commit must be shown to be on main
+          fetch-depth: 0
       - name: Install pinned toolchain
         run: rustup toolchain install
       - name: Version, channel and mode
@@ -58,6 +62,14 @@ jobs:
           esac
           if [ "$EVENT" = push ]; then
             dry_run=false
+            # A tag can be pushed from any branch. A release is only built and signed from a commit
+            # that is on main (and so went through review): fail the gate early otherwise.
+            git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null ||
+              { echo "::error::origin/main is not available: cannot check the tag is on main"; exit 1; }
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+              echo "::error::tag $REF_NAME ($GITHUB_SHA) is not on main: refusing to build or sign it"
+              exit 1
+            fi
             sh release/gate.sh --tag "$REF_NAME"
           else
             dry_run=true
@@ -87,6 +99,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Install pinned toolchain and the musl target
         run: |
           rustup toolchain install
@@ -156,6 +170,8 @@ jobs:
           apt-get install -y --no-install-recommends ca-certificates curl git build-essential clang libclang-dev pkg-config dpkg-dev \
             libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libx264-dev libcrypt-dev
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Install rustup (pinned) and the pinned toolchain
         run: |
           set -eu
@@ -256,6 +272,8 @@ jobs:
           apt-get install -y --no-install-recommends ca-certificates curl git build-essential clang libclang-dev pkg-config dpkg-dev \
             libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libx264-dev libfontconfig1-dev
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Install rustup (pinned) and the pinned toolchain
         run: |
           set -eu
@@ -320,6 +338,8 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: apt-get install -y --no-install-recommends xvfb xauth ca-certificates git
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run the installed app headless (--version, then --demo under Xvfb)
         env:
           VERSION: ${{ needs.gate.outputs.version }}
@@ -331,6 +351,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Install pinned toolchain
         run: rustup toolchain install
       - name: Install build dependencies
@@ -366,6 +388,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: agent-bins
@@ -405,6 +429,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: agent-bins
@@ -469,6 +495,8 @@ jobs:
     environment: release-signing
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: assembled

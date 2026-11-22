@@ -129,6 +129,13 @@ impl Fixture {
         let signer = Signer::new();
         let sig = signer.sign(&manifest, &comment_for(NOW - 3600));
         let tmp = tempfile::tempdir().unwrap();
+        // the image's parent directory must not be group-writable (the agent refuses that), and a
+        // umask of 0002 would make it so
+        std::fs::set_permissions(
+            tmp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
         let dir = tmp.path().to_path_buf();
         let mut f = Self {
             _tmp: tmp,

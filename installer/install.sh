@@ -140,12 +140,13 @@ hex_of() { # file skip count
     dd if="$1" bs=1 skip="$2" count="$3" 2>/dev/null | od -An -v -tx1 | tr -d ' \n'
 }
 
-# verify_with <msg file> <minisig file> <key1> <key2> [workdir]
+# verify_with <msg file> <minisig file> <key1> <key2>
 # Returns 0 when valid; 1 not valid (VERR says why); 2 when a provisioned key is malformed;
 # 3 when no key is provisioned.
 verify_with() {
     _msg=$1 _sig=$2 _k1=$3 _k2=$4
-    _t=$(mktemp -d) || {
+    # TMPDIR is the caller's: a scratch directory is only ever made under /tmp (mktemp -d is 0700)
+    _t=$(TMPDIR=/tmp mktemp -d) || {
         VERR='cannot create a temporary directory'
         return 1
     }
@@ -272,7 +273,7 @@ verify_signature() {
 # The known-answer self-test: a valid vector must pass, a tampered one must fail for the right
 # reason. Run before any signature is trusted.
 selftest() {
-    _s=$(mktemp -d) || return 1
+    _s=$(TMPDIR=/tmp mktemp -d) || return 1
     printf '%s\n' "$KAT_MSG" >"$_s/msg"
     printf '%s\n' "${KAT_MSG}x" >"$_s/msg.bad"
     printf '%s' "$KAT_SIG" >"$_s/sig"
@@ -392,6 +393,34 @@ insecure() {
     [ -n "$(find "$1" -maxdepth 0 \( -perm -0020 -o -perm -0002 -o ! -user "$EXPECT_UID" \) 2>/dev/null)" ]
 }
 
+# parents_secure <absolute path>: every ancestor directory of <path>, up to /, is owned by root (or
+# EXPECT_UID, which is 0 on a real host) and not group- or other-writable. A sticky directory (/tmp)
+# may be writable: nobody but the owner of an entry can rename or replace it. A symlink among the
+# ancestors must itself be owned that way, and the fully resolved path (pwd -P) is checked as well,
+# so nobody who is not root can swap a component of the path between the checks and the open.
+_anc_ok() {
+    if [ -L "$1" ]; then
+        [ -z "$(find "$1" -maxdepth 0 ! -user 0 ! -user "$EXPECT_UID" 2>/dev/null)" ] || return 1
+        return 0
+    fi
+    [ -d "$1" ] || return 1
+    [ -z "$(find "$1" -maxdepth 0 \( \( ! -user 0 ! -user "$EXPECT_UID" \) -o \
+        \( \( -perm -0020 -o -perm -0002 \) ! -perm -1000 \) \) 2>/dev/null)" ]
+}
+_anc_chain() { # <path>: every proper ancestor of it
+    _c=$1
+    while :; do
+        _c=$(dirname "$_c")
+        _anc_ok "$_c" || return 1
+        [ "$_c" = / ] && return 0
+    done
+}
+parents_secure() {
+    _anc_chain "$1" || return 1
+    _ph=$(cd "$1" 2>/dev/null && pwd -P) || return 1
+    [ "$_ph" = "$1" ] || { _anc_ok "$_ph" && _anc_chain "$_ph"; }
+}
+
 # copy_capped <src> <dst> <max-bytes>: a regular file (not a FIFO, device or link; refused BEFORE it
 # is opened), owned by EXPECT_UID and not group- or other-writable, of at most <max-bytes>; the copy
 # itself is bounded too, so nothing can hang or fill /run.
@@ -436,6 +465,8 @@ main() {
     export PATH
     LC_ALL=C
     export LC_ALL
+    # an operator-controlled TMPDIR must not steer any scratch file (mktemp honours it)
+    unset TMPDIR
     IFS='
 '
     umask 077
@@ -562,6 +593,8 @@ main() {
             die 9 bootstrap-preflight PREFLIGHT 'the release directory is not a directory'
         ! insecure "$RELEASE_DIR" ||
             die 9 bootstrap-preflight PREFLIGHT 'the release directory must be owned by root and not writable by group or others'
+        parents_secure "$RELEASE_DIR" ||
+            die 9 bootstrap-preflight PREFLIGHT 'every parent directory of the release directory must be owned by root and not writable by group or others'
         for _f in manifest-x86_64.json manifest-x86_64.json.minisig; do
             [ -f "$RELEASE_DIR/$_f" ] && [ ! -L "$RELEASE_DIR/$_f" ] ||
                 die 1 bootstrap-download IO 'the release directory lacks the manifest or its signature'

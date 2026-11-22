@@ -19,9 +19,10 @@
 #      does not exist at all (a tree from before the prebuilt-image work);
 #   5. release.yml enables none of the test-hook features (test-support, install-test-hooks,
 #      privd-test-hooks, gateway-test-hooks, test-release-key, test-shadow-path);
-#   6. supply chain of release.yml: every `uses:` is pinned to a full 40-hex commit SHA, and no
-#      build cache (rust-cache, actions/cache) appears in it: a release build is never restored
-#      from a cache a pull request could have written;
+#   6. supply chain: in EVERY file of .github/workflows every `uses:` is pinned to a full 40-hex
+#      commit SHA (a docker:// image to a sha256 digest), and no build cache (rust-cache,
+#      actions/cache) appears in release.yml: a release build is never restored from a cache a
+#      pull request could have written;
 #   4. the compile-time gate exists: feature `release-build` in apps/hx-agent/Cargo.toml and its
 #      const assertion in privd/update/keys.rs (the build itself, with --features release-build,
 #      is the real enforcement and fails on an unprovisioned key).
@@ -158,17 +159,28 @@ else
     bad ".github/workflows/release.yml is missing"
 fi
 
-# ---- 6. supply chain: SHA-pinned actions, no cache ----
-if [ -f "$wf" ]; then
-    # every `uses:` (comments ignored) must end in @<40 hex>, optionally followed by a comment
-    unpinned=$(grep -v '^[[:space:]]*#' "$wf" | grep -E '^[[:space:]]*-?[[:space:]]*uses:' |
-        grep -Ev '^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*[A-Za-z0-9._/-]+@[0-9a-f]{40}([[:space:]]+#.*)?[[:space:]]*$' || true)
+# ---- 6. supply chain: SHA-pinned actions in EVERY workflow, no cache in release.yml ----
+# Every `uses:` of every file in .github/workflows (comments ignored) must end in @<40 hex> (a
+# `docker://` image: @sha256:<64 hex>), optionally followed by a comment. $wf is checked as well
+# (it is release.yml unless --workflow says otherwise).
+pinned_re='^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*(docker://)?[A-Za-z0-9._/:-]+@(sha256:[0-9a-f]{64}|[0-9a-f]{40})([[:space:]]+#.*)?[[:space:]]*$'
+pinfiles=''
+[ -f "$wf" ] && pinfiles=$wf
+for f in "$root"/.github/workflows/*.yml "$root"/.github/workflows/*.yaml; do
+    [ -f "$f" ] || continue
+    [ "$f" = "$wf" ] && continue
+    pinfiles="$pinfiles $f"
+done
+for f in $pinfiles; do
+    unpinned=$(grep -v '^[[:space:]]*#' "$f" | grep -E '^[[:space:]]*-?[[:space:]]*uses:' | grep -Ev "$pinned_re" || true)
     if [ -n "$unpinned" ]; then
-        bad "release.yml has actions not pinned to a 40-hex commit SHA:"
+        bad "$(basename "$f") has actions not pinned to a 40-hex commit SHA (or an image sha256 digest):"
         printf '%s\n' "$unpinned" >&2
     else
-        good "every action in release.yml is pinned to a commit SHA"
+        good "every action in $(basename "$f") is pinned to a commit SHA"
     fi
+done
+if [ -f "$wf" ]; then
     if grep -Eq 'rust-cache|actions/cache' "$wf"; then
         bad "release.yml uses a build cache (rust-cache or actions/cache): release builds are uncached"
     else

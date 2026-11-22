@@ -105,6 +105,43 @@ for mode in 0775 0757 0777; do
     chmod "$mode" "$tmp/m"
     case_run "a release dir of mode $mode is refused (exit 9)" 9 os-24 yes "$me" "$none" "$R/install.sh" "" 'not writable by group or others' -- --release-dir "$tmp/m"
 done
+# the PARENT directories of the release dir are checked too: a group- or other-writable parent
+# (not sticky) lets someone swap the directory between the checks and the open
+for mode in 0775 0757 0777; do
+    rm -rf "$tmp/pp"
+    mkdir "$tmp/pp"
+    cp -R "$tmp/rel" "$tmp/pp/rel"
+    chmod "$mode" "$tmp/pp"
+    case_run "a release dir under a parent of mode $mode is refused (exit 9)" 9 os-24 yes "$me" "$none" "$R/install.sh" "" 'every parent directory' -- --release-dir "$tmp/pp/rel"
+done
+# a sticky world-writable parent (like /tmp itself) is fine: only an entry's owner can replace it
+rm -rf "$tmp/pp"
+mkdir "$tmp/pp"
+cp -R "$tmp/rel" "$tmp/pp/rel"
+chmod 1777 "$tmp/pp"
+case_run "a release dir under a sticky world-writable parent is accepted" 0 os-24 yes "$me" "$none" "$R/install.sh" "" 'STUB-ARGV:' -- --release-dir "$tmp/pp/rel"
+# a symlink among the parents leads to a checked real path
+rm -rf "$tmp/pp" "$tmp/lnk"
+mkdir "$tmp/pp"
+cp -R "$tmp/rel" "$tmp/pp/rel"
+chmod 0777 "$tmp/pp"
+ln -s "$tmp/pp" "$tmp/lnk"
+case_run "a release dir reached through a symlink to an unsafe parent is refused (exit 9)" 9 os-24 yes "$me" "$none" "$R/install.sh" "" 'every parent directory' -- --release-dir "$tmp/lnk/rel"
+rm -rf "$tmp/pp" "$tmp/lnk"
+
+# a hostile TMPDIR is ignored: no scratch file is made in it, and the run is not affected
+mkdir "$tmp/hostile"
+TMPDIR=$tmp/hostile
+export TMPDIR
+case_run "a hostile TMPDIR is ignored" 0 os-24 yes "$me" "$none" "$R/install.sh" "" 'STUB-ARGV:' -- --release-dir "$R"
+unset TMPDIR
+if [ -z "$(ls -A "$tmp/hostile")" ]; then
+    echo "ok   nothing was created in the hostile TMPDIR"
+else
+    echo "FAIL the hostile TMPDIR was used: $(ls -A "$tmp/hostile")"
+    fail=1
+fi
+
 for f in manifest-x86_64.json manifest-x86_64.json.minisig hx-0.1.0-x86_64.tar.gz; do
     for mode in 0664 0646; do
         rm -rf "$tmp/m"
