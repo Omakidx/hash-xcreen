@@ -49,6 +49,10 @@ esac
 
 vmx() { $INCUS exec "$vm" --force-noninteractive -- "$@"; }
 vmsh() { $INCUS exec "$vm" --force-noninteractive -- sh -c "$1"; }
+# The VM's address on its default-route interface. Not `incus list -c 4`: once the installer has
+# made hxbr0 (and with a host Docker, docker0) the VM has several addresses, the CSV field is
+# quoted and multi-line, and the first word is not a usable address.
+vm_addr() { vmsh 'ip -4 -o addr show dev "$(ip route show default | awk "{print \$5; exit}")" | awk "{print \$4}" | cut -d/ -f1 | head -n 1'; }
 
 cleanup() {
     $INCUS exec "$vm" -- journalctl -a --no-pager -n 400 >"$OUT/vm-journal.txt" 2>&1 || true
@@ -72,7 +76,7 @@ for _ in $(seq 1 60); do
 done
 for _ in $(seq 1 40); do vmsh 'getent hosts deb.debian.org >/dev/null 2>&1 || getent hosts archive.ubuntu.com >/dev/null 2>&1' && break; sleep 3; done
 vmsh 'export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get install -y -qq curl openssl ca-certificates acl python3-minimal >/dev/null'
-vm_ip=$($INCUS list "$vm" -c 4 --format csv | cut -d' ' -f1)
+vm_ip=$(vm_addr)
 [ -n "$vm_ip" ] || die "the VM has no address"
 echo "VM $vm at $vm_ip"
 
@@ -211,10 +215,12 @@ for _ in $(seq 1 60); do
     [ "$s" = running ] || [ "$s" = degraded ] && break
     sleep 3
 done
-vm_ip=$($INCUS list "$vm" -c 4 --format csv | cut -d' ' -f1)
+vm_ip=$(vm_addr)
 vmx sh /root/vm-cell.sh reboot-check
+[ -n "$vm_ip" ] || die "the VM has no address after the reboot"
 HX1E_VM_DIR="$S" HX1E_VM_ADDR="$vm_ip:443" HX1E_VM_SERVER_KEY="$server_key" HX1E_VM_CREDS="quic:$(code)" \
-    "$CLIENT" --ignored --exact vm_login --nocapture 2>&1 | grep -E '^(PASS|thread)' || die "login after the reboot failed"
+    "$CLIENT" --ignored --exact vm_login --nocapture 2>&1 | tee "$OUT/client-reboot.log" | grep -E '^(PASS|thread)' ||
+    { tail -n 20 "$OUT/client-reboot.log" >&2; die "login after the reboot failed"; }
 
 # ---- uninstall, both modes ----
 step "uninstall --keep-desktop"
