@@ -34,6 +34,9 @@ impl Clock for SystemClock {
 #[derive(Debug)]
 pub struct ManualClock {
     base: Instant,
+    /// Wall-clock seconds at construction: the Unix time moves only with [`ManualClock::advance`]
+    /// too, so two reads cannot straddle a real second boundary.
+    unix_base: u64,
     offset: Mutex<Duration>,
 }
 
@@ -42,6 +45,7 @@ impl ManualClock {
     pub fn new() -> Self {
         Self {
             base: Instant::now(),
+            unix_base: SystemClock.unix_secs(),
             offset: Mutex::new(Duration::ZERO),
         }
     }
@@ -70,6 +74,6 @@ impl Clock for ManualClock {
     }
 
     fn unix_secs(&self) -> u64 {
-        SystemClock.unix_secs() + self.offset().as_secs()
+        self.unix_base + self.offset().as_secs()
     }
 }
