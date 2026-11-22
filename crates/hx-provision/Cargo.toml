@@ -20,7 +20,7 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["rt", "net", "time", "io-util", "macros", "sync"] }
 hyper = { version = "1", features = ["http1", "client"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-http-body-util = "0.1"
+http-body-util = { version = "0.1", features = ["channel"] }
 bytes = "1"
 zeroize.workspace = true
 

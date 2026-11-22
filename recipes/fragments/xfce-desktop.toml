@@ -176,7 +176,7 @@ WantedBy=sockets.target
 path = "/etc/systemd/system/hx-session.service"
 content = '''
 [Unit]
-Description=hash-xcreen session daemon (screen capture and streaming for {{user}})
+Description=hash-xcreen session daemon (screen capture and streaming)
 Requires=hx-session.socket
 After=hx-session.socket hx-xorg.service user@{{uid}}.service
 Wants=hx-xorg.service

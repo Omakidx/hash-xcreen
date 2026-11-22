@@ -81,7 +81,7 @@
       "path": "/etc/systemd/system/hx-session.service",
       "mode": "0644",
       "owner": "root:root",
-      "sha256": "ecf09de6a37de526457d36226cb6853b6f2c2890e89cd466488d51b95299c8d5"
+      "sha256": "50d994410d9ca1264d7182cd2ecceb4ff31afa22ed462aff7685963e9fc1d35b"
     },
     {
       "path": "/etc/systemd/system/hx-session.service.d/zzzz-hx-hardening.conf",

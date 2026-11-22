@@ -75,6 +75,24 @@ Post stage (always runs, after a prebuilt import and after a server build): wait
 ensure the user exists, set the password (secret, via stdin of `chpasswd` from a 0600 file, never
 argv), security updates, `post_step`.
 
+**Prebuilt images.** `hx-imagectl` (image CI) runs `orchestrate::build_image`: the build stage with
+no secrets, then a seal (empty `/etc/machine-id`, no random seed, journal and logs, ssh host keys,
+temporary files, shell history, the build user's cache and the apt lists) and a graceful stop. An
+image is bound to its recipe by `Plan::build_digest()`, the SHA-256 of the canonical JSON of the
+plan's name, base image, vars, instance config and **build** stage (not the post stage), so
+changing anything the build stage does invalidates published images. `tests/golden/build-digests.txt`
+pins the digests.
+
+Rules that keep a prebuilt desktop equivalent to a server build (checked by `equiv::compare` in
+image CI, see the crate README):
+
+- Anything written by the build stage must not depend on the account name: the image is built
+  with `desk` and the post stage renames it, so a `{{user}}` inside a written file or enabled unit
+  is a drift. Use the numeric `{{uid}}` or a name-free text.
+- Every file the build stage writes lives under `/etc` (the facts collect `/etc`, the apt
+  sources and keyrings, the home tree, `/var/lib/hx-session` and the linger directory).
+- The post stage ends with a restart on both paths, so both end in a clean boot.
+
 Every apt invocation is bounded: apt's own HTTP timeouts and retries, a hard `timeout` per attempt
 and several attempts. In S3, `apt-get update` hung for over nine minutes twice.
 
