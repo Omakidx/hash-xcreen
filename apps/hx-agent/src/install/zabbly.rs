@@ -7,10 +7,10 @@
 //! * The pinned fingerprint is the one the Zabbly project publishes in its own repository
 //!   (<https://github.com/zabbly/incus>, "GPG fingerprint"): `4EFC 5906 96CB 15B8 7C73 A3AD
 //!   82CC 8797 C838 DCFD`. It was checked there for this change, not typed from memory.
-//! * **The key file is not provisioned in this change** (it reads `UNPROVISIONED`): the maintainer
-//!   drops `key.asc` from <https://pkgs.zabbly.com/key.asc> into `zabbly-key.asc` and verifies the
-//!   fingerprint against the page above. Until then a host that needs Zabbly fails the `incus`
-//!   stage with a clear message and a distro-Incus host is unaffected.
+//! * The key file is `key.asc` from <https://pkgs.zabbly.com/key.asc>, fetched on 2026-11-22; its
+//!   primary key fingerprint was checked against the pinned value and the page above before it
+//!   was committed. A file that reads `UNPROVISIONED` instead makes a host that needs Zabbly fail
+//!   the `incus` stage with a clear message (a distro-Incus host is unaffected).
 //! * The source is a deb822 file with `Signed-By` pointing at this one key, so no other key can
 //!   sign for it.
 
