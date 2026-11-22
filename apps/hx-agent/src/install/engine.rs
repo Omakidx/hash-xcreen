@@ -130,12 +130,7 @@ fn finish(ctx: &mut Ctx<'_>, worked: usize) -> u8 {
             ctx.state
                 .desktop
                 .as_ref()
-                .map(|d| super::progress::DesktopOut {
-                    id: d.id.clone(),
-                    path_taken: d.path_taken.clone(),
-                    reason: d.reason.clone(),
-                    warnings: d.warnings.clone(),
-                })
+                .map(super::progress::DesktopOut::from)
         }),
         pairing: ctx.report.pairing.clone(),
         port_rule,

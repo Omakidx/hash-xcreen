@@ -124,8 +124,31 @@ pub struct DesktopReport {
     pub path_taken: String,
     /// Why.
     pub reason: String,
+    /// `CreateDesktopResult.reason_code`: the lower-case enum name without `IMAGE_REASON_`
+    /// (`build_requested`, `image_file`, `list_unavailable`, ...); empty in a state written by
+    /// an older agent.
+    #[serde(default)]
+    pub reason_code: String,
+    /// The prebuilt image the desktop was made from.
+    #[serde(default)]
+    pub image: Option<ImageReport>,
     /// Warnings of privd.
     pub warnings: Vec<String>,
+}
+
+/// `CreateDesktopResult.image`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ImageReport {
+    /// `YYYYMMDD.N`.
+    pub build_id: String,
+    /// Unix time the image was built.
+    pub created_unix: u64,
+    /// Size of the image file in bytes.
+    pub size: u64,
+    /// The speed probe's release-host rate, bytes per second (0: not measured).
+    pub release_bps: u64,
+    /// The speed probe's apt-mirror rate, bytes per second (0: not measured).
+    pub mirror_bps: u64,
 }
 
 /// The whole file.

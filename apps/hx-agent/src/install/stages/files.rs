@@ -215,13 +215,17 @@ pub fn resolver_plan(resolv_conf: &str) -> ResolverPlan {
     plan
 }
 
+/// The two fetcher templates that get the resolver drop-in (the update fetcher and, for prebuilt
+/// images, the image fetcher): both run with `IPAddressDeny` of the private ranges.
+pub const RESOLVER_DROPINS: [&str; 2] = [paths::RESOLVERS_DROPIN, paths::IMAGE_RESOLVERS_DROPIN];
+
 /// The resolver drop-in text, or `None` when no resolver needs an allowance.
 pub fn resolvers_dropin(resolvers: &[IpAddr]) -> Option<String> {
     if resolvers.is_empty() {
         return None;
     }
     let mut s = String::from(
-        "# Written by hx-agent install: the host's resolvers, so that the update fetcher can resolve names.\n[Service]\n",
+        "# Written by hx-agent install: the host's resolvers, so that the update fetcher and the image fetcher can resolve names.\n[Service]\n",
     );
     for r in resolvers {
         let bits = if r.is_ipv4() { 32 } else { 128 };
@@ -243,10 +247,10 @@ fn config_wants(ctx: &Ctx<'_>) -> (String, String, String, Option<String>) {
 /// Done-check of `config`: every file has exactly the content the options call for.
 pub fn config_check(ctx: &mut Ctx<'_>) -> Result<bool> {
     let (g, p, d, r) = config_wants(ctx);
-    let resolvers_ok = match r {
-        Some(text) => file_matches(ctx, paths::RESOLVERS_DROPIN, text.as_bytes(), 0o644),
-        None => !ctx.paths.at(paths::RESOLVERS_DROPIN).exists(),
-    };
+    let resolvers_ok = RESOLVER_DROPINS.iter().all(|d| match &r {
+        Some(text) => file_matches(ctx, d, text.as_bytes(), 0o644),
+        None => !ctx.paths.at(d).exists(),
+    });
     Ok(file_matches(ctx, paths::GATEWAYD_TOML, g.as_bytes(), 0o644)
         && file_matches(ctx, paths::PRIVD_TOML, p.as_bytes(), 0o644)
         && file_matches(ctx, paths::PORT_DROPIN, d.as_bytes(), 0o644)
@@ -276,14 +280,13 @@ pub fn config_run(ctx: &mut Ctx<'_>) -> Result<Outcome> {
     put(ctx, paths::GATEWAYD_TOML, g.as_bytes(), 0o644)?;
     put(ctx, paths::PRIVD_TOML, p.as_bytes(), 0o644)?;
     put_dropin(ctx, paths::PORT_DROPIN, d.as_bytes())?;
-    match r {
-        Some(text) => put_dropin(ctx, paths::RESOLVERS_DROPIN, text.as_bytes())?,
-        None => {
-            remove_file(&ctx.paths.at(paths::RESOLVERS_DROPIN))?;
-            ctx.state
-                .created
-                .dropins
-                .retain(|x| x != paths::RESOLVERS_DROPIN);
+    for d in RESOLVER_DROPINS {
+        match &r {
+            Some(text) => put_dropin(ctx, d, text.as_bytes())?,
+            None => {
+                remove_file(&ctx.paths.at(d))?;
+                ctx.state.created.dropins.retain(|x| x != d);
+            }
         }
     }
     Ok(Outcome::Done)

@@ -12,6 +12,10 @@
 #     reboot-check            after a VM reboot: the firewall table, unit order, the desktop
 #     leftovers <keep|destroy>  nothing the installer created may remain
 #     zabbly <min>            Incus came from the Zabbly repository, and is at least <min> (x.y.z)
+#     untouched               a refused install changed nothing: no state, no /usr/lib/hx, no
+#                             Incus package, no /var/lib/hx
+#     image-clean <sha256>    after an install from an image file: /var/lib/hx/import is empty (root
+#                             0700), no hx-img-* alias, and the image of <sha256> is not in Incus
 #     docker <user>           --docker: nesting and intercepts on hx-main, <user> in the docker
 #                             group, `docker run --rm hello-world` works inside the desktop
 #
@@ -48,6 +52,32 @@ canary-check)
     f=$(grep -r -a -F -l -f "$PAT" /var/log/hx /var/log/hx-install.log /etc/hx /var/lib/hx /var/lib/hx-gatewayd /run/hx /run/credentials /usr/lib/hx /usr/local/lib/systemd /etc/systemd 2>/dev/null || true)
     [ -z "$f" ] || fail "a secret is on disk: $f"
     pass "no secret in /proc cmdline/environ (sampled every 50 ms), the journal, /var/log/hx*, the state file, /etc/hx, /var/lib/hx*, /run/hx, /run/credentials, the units"
+    ;;
+
+untouched)
+    [ ! -e /var/lib/hx/install-state.json ] || fail "a refused install left a state file"
+    [ ! -e /usr/lib/hx ] || fail "a refused install left /usr/lib/hx"
+    [ ! -e /var/lib/hx ] || fail "a refused install left /var/lib/hx"
+    ! dpkg -s incus >/dev/null 2>&1 || fail "a refused install installed the incus package"
+    pass "nothing changed: no state file, no /usr/lib/hx, no /var/lib/hx, no incus package"
+    ;;
+
+image-clean)
+    sha=${1:?image-clean <sha256>}
+    [ -d /var/lib/hx/import ] || fail "/var/lib/hx/import does not exist"
+    [ "$(stat -c '%a %U' /var/lib/hx/import)" = "700 root" ] || fail "/var/lib/hx/import is not 0700 root: $(stat -c '%a %U' /var/lib/hx/import)"
+    left=$(ls -A /var/lib/hx/import)
+    [ -z "$left" ] || fail "/var/lib/hx/import is not empty after the import: $left"
+    ali=$(incus image alias list -f csv 2>/dev/null | cut -d, -f1 | grep '^hx-img-' || true)
+    [ -z "$ali" ] || fail "an hx-img-* alias is left: $ali"
+    fp=$(incus image list -f csv -c f 2>/dev/null | grep -F "$(echo "$sha" | cut -c1-12)" || true)
+    [ -z "$fp" ] || fail "the imported image (fingerprint $(echo "$sha" | cut -c1-12)) is still in Incus"
+    # privd's own record of imported images is empty too.
+    if [ -s /var/lib/hx/images-state ]; then
+        n=$(grep -o "\"fingerprint\"" /var/lib/hx/images-state | wc -l)
+        [ "$n" = 0 ] || fail "images-state still lists a cached image: $(cat /var/lib/hx/images-state)"
+    fi
+    pass "/var/lib/hx/import is empty (0700 root), no hx-img-* alias, the imported image is gone from Incus"
     ;;
 
 units)
@@ -168,7 +198,8 @@ leftovers)
         /usr/local/lib/systemd/system/hx-gatewayd.service /usr/local/lib/systemd/system/hx-gatewayd-admin.socket \
         /usr/local/lib/systemd/system/hx-gatewayd-public.socket /usr/local/lib/systemd/system/hx-privd-rescue.service \
         /usr/local/lib/sysusers.d/hx-gatewayd.conf /usr/local/lib/tmpfiles.d/hx.conf /etc/logrotate.d/hx-audit \
-        /etc/systemd/system/hx-gatewayd-public.socket.d /var/lib/hx-uninstall.json; do
+        /etc/systemd/system/hx-gatewayd-public.socket.d /etc/systemd/system/hx-update-fetcher@.service.d \
+        /etc/systemd/system/hx-image-fetcher@.service.d /var/lib/hx-uninstall.json; do
         if [ -e "$p" ] || [ -L "$p" ]; then left="$left $p"; fi
     done
     [ "$mode" = destroy ] && [ -e /etc/hx ] && left="$left /etc/hx"
@@ -179,10 +210,14 @@ leftovers)
         units=$(echo "$units" | grep -v '^hx-host-firewall.service$\|^hx-docker-user.service$' || true)
     fi
     [ -z "$units" ] || left="$left units:$(echo "$units" | tr '\n' ',')"
+    # The mounts of the update and image fetchers (var-lib-hx-*.mount) are units outside the hx-* glob.
+    mounts=$(systemctl list-unit-files 'var-lib-hx-*' --no-legend 2>/dev/null | awk '{print $1}')
+    [ -z "$mounts" ] || left="$left mount-units:$(echo "$mounts" | tr '\n' ',')"
+    grep -q ' /var/lib/hx/' /proc/self/mountinfo && left="$left mounted:/var/lib/hx/*"
     [ -z "$left" ] || fail "leftovers after uninstall ($mode):$left"
     if [ "$mode" = destroy ]; then
         nft list table inet hx >/dev/null 2>&1 && fail "table inet hx is still loaded"
-        ours=$(for c in "list" "profile list" "network list" "storage list" "network acl list"; do incus $c -f csv 2>/dev/null | cut -d, -f1; done | grep '^hx' || true)
+        ours=$(for c in "list" "profile list" "network list" "storage list" "network acl list" "image alias list"; do incus $c -f csv 2>/dev/null | cut -d, -f1; done | grep '^hx' || true)
         [ -z "$ours" ] || fail "inner Incus objects left: $ours"
     else
         incus list hx-main -c n --format csv | grep -q '^hx-main$' || fail "keep mode must keep the desktop"

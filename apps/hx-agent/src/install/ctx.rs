@@ -19,6 +19,7 @@ use super::progress::{DesktopOut, PairingOut, Progress};
 use super::runner::{Call, Output, Runner};
 use super::state::InstallState;
 use crate::cli::Prompter;
+use crate::privd::image::ImageKeys;
 use crate::privd::update::keys::UpdateKeys;
 
 /// The secrets of one run. Held only here, in `Zeroizing` buffers, never persisted.
@@ -111,6 +112,10 @@ pub struct Ctx<'a> {
     pub log: InstallLog,
     /// The embedded release keys.
     pub keys: UpdateKeys,
+    /// The embedded image signing keys.
+    pub image_keys: ImageKeys,
+    /// The `--image-file` that preflight verified (set by preflight, read by stage `desktop`).
+    pub image_src: Option<super::image_file::Verified>,
     /// Argon2id cost of the verifiers.
     pub verifier_params: PinParams,
     /// The mode.
@@ -123,7 +128,7 @@ pub struct Ctx<'a> {
     pub secrets: Secrets,
     /// The bootstrap directory, when `install.sh` handed one over.
     pub bootstrap_dir: Option<PathBuf>,
-    /// `--image-file`, refused at preflight.
+    /// `--image-file`, as given (checked at preflight).
     pub image_file: Option<String>,
     /// Test hooks.
     pub hooks: Hooks,

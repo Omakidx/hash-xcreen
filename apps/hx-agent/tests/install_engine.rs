@@ -336,6 +336,27 @@ fn packages_converge() {
 }
 
 #[test]
+fn zstd_is_a_prerequisite_for_the_prebuilt_images_and_converges() {
+    // Fresh host: installed with the other prerequisites and recorded as ours.
+    let (m, _d) = installed();
+    assert!(m.runner.installed.contains_key("zstd"));
+    assert!(
+        m.state()
+            .unwrap()
+            .created
+            .packages
+            .iter()
+            .any(|p| p == "zstd")
+    );
+    // Drift: removed later, put back by the next run.
+    let (mut m, _d) = installed();
+    m.runner.installed.remove("zstd");
+    assert_eq!(rerun(&mut m, &[], &[]), 0);
+    assert!(states(&m, "done").contains(&"packages".to_owned()));
+    assert!(m.runner.installed.contains_key("zstd"));
+}
+
+#[test]
 fn incus_converges() {
     let (mut m, _d) = installed();
     std::fs::remove_file(path(&m, "/var/lib/incus/unix.socket")).unwrap();
@@ -446,28 +467,38 @@ fn the_resolver_dropin_follows_resolv_conf() {
     assert_eq!(full_install(&mut m, &dir), 0);
     let d = m.read(paths::RESOLVERS_DROPIN).unwrap();
     assert!(d.contains("IPAddressAllow=10.0.0.2/32") && !d.contains("8.8.8.8"));
-    assert!(
-        m.state()
-            .unwrap()
-            .created
-            .dropins
-            .iter()
-            .any(|x| x == paths::RESOLVERS_DROPIN)
+    // The image fetcher runs under the same IPAddressDeny and gets the same allowance.
+    assert_eq!(
+        m.read(paths::IMAGE_RESOLVERS_DROPIN).as_deref(),
+        Some(d.as_str())
     );
+    for dropin in [paths::RESOLVERS_DROPIN, paths::IMAGE_RESOLVERS_DROPIN] {
+        assert!(
+            m.state()
+                .unwrap()
+                .created
+                .dropins
+                .iter()
+                .any(|x| x == dropin),
+            "{dropin}"
+        );
+    }
     std::fs::write(path(&m, "/etc/resolv.conf"), "nameserver 8.8.8.8\n").unwrap();
     assert_eq!(rerun(&mut m, &[], &[]), 0);
-    assert!(
-        !exists(&m, paths::RESOLVERS_DROPIN),
-        "removed when no resolver needs it"
-    );
-    assert!(
-        !m.state()
-            .unwrap()
-            .created
-            .dropins
-            .iter()
-            .any(|x| x == paths::RESOLVERS_DROPIN)
-    );
+    for dropin in [paths::RESOLVERS_DROPIN, paths::IMAGE_RESOLVERS_DROPIN] {
+        assert!(
+            !exists(&m, dropin),
+            "{dropin}: removed when no resolver needs it"
+        );
+        assert!(
+            !m.state()
+                .unwrap()
+                .created
+                .dropins
+                .iter()
+                .any(|x| x == dropin)
+        );
+    }
 }
 
 // ----- options on a re-run --------------------------------------------------------------------
@@ -887,33 +918,36 @@ fn preflight_checks_the_storage_device() {
 }
 
 #[test]
-fn prebuilt_images_and_image_files_are_not_in_this_release() {
-    for extra in [
-        ("--image", "prebuilt"),
-        ("--image-file", "/var/lib/hx/import/a.img"),
+fn the_image_option_reaches_privd_as_the_image_mode() {
+    use hx_ipc::privd::pb::{ImageMode, ImageReason};
+    for (opt, mode, code) in [
+        (None, ImageMode::Auto, ImageReason::NoImageKey),
+        (Some("auto"), ImageMode::Auto, ImageReason::NoImageKey),
+        (Some("build"), ImageMode::Build, ImageReason::BuildRequested),
+        (
+            Some("prebuilt"),
+            ImageMode::Prebuilt,
+            ImageReason::NoImageKey,
+        ),
     ] {
         let (mut m, dir) = fresh();
+        let extra: Vec<(&'static str, &str)> = opt.map(|o| ("--image", o)).into_iter().collect();
         assert_eq!(
-            m.install(ssh_args(&dir, &[extra], &[]), Some(frames(None, None))),
-            6,
-            "{extra:?}"
+            m.install(ssh_args(&dir, &extra, &[]), Some(frames(None, None))),
+            0,
+            "{opt:?}"
         );
-        assert_eq!(m.result()["code"], "UNIMPLEMENTED");
-        assert!(m.state().is_none());
-        assert_eq!(m.runner.mutating(), Vec::<String>::new());
+        let req = &m.daemons.create_requests[0];
+        assert_eq!(req.image_mode, mode as i32, "{opt:?}");
+        assert_eq!(req.image_file, None, "{opt:?}: no offline file");
+        // The result carries the lower-case name of privd's reason code.
+        let want = code.as_str_name().strip_prefix("IMAGE_REASON_").unwrap();
+        assert_eq!(m.result()["desktop"]["reason_code"], want.to_lowercase());
+        assert!(
+            m.result()["desktop"].get("image").is_none(),
+            "a build has no image"
+        );
     }
-    let (mut m, dir) = fresh();
-    assert_eq!(
-        m.install(
-            ssh_args(&dir, &[("--image", "build")], &[]),
-            Some(frames(None, None))
-        ),
-        0
-    );
-    assert_eq!(
-        m.daemons.create_requests[0].image_mode,
-        hx_ipc::privd::pb::ImageMode::Build as i32
-    );
 }
 
 // ----- incus ----------------------------------------------------------------------------------
@@ -1292,6 +1326,7 @@ fn not_root_is_exit_7() {
             json: true,
             now: || NOW,
             keys: m.keys.clone(),
+            image_keys: m.image_keys.clone(),
             verifier_params: hx_crypto::PinParams {
                 memory_kib: 64,
                 iterations: 1,
