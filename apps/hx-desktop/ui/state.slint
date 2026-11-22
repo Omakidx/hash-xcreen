@@ -1,0 +1,447 @@
+// The view models: plain properties and callbacks that the Rust controller (src/app) fills and
+// handles. The screens bind to these only, so they can be tested with the Slint testing backend.
+
+export enum Screen { home, wizard, progress, connect, desktop, details, settings, fatal, update }
+
+// -------------------------------------------------------------------------------------------- common
+
+export struct Kv { key: string, value: string }
+
+export global Nav {
+    in-out property <Screen> screen: Screen.home;
+    in property <string> title: "hash-xcreen";
+    // A blocking error screen (Secret Service missing, corrupt server list).
+    in property <string> fatal-title;
+    in property <string> fatal-text;
+    in property <bool> demo: false;
+    callback quit();
+}
+
+export global UpdateVm {
+    in property <string> server-name;
+    // What the app knows about the server's version.
+    in property <string> found;
+    in property <string> commands;
+    callback back();
+    callback copy-commands();
+}
+
+// -------------------------------------------------------------------------------------------- home
+
+export struct ServerCardData {
+    id: string,
+    name: string,
+    address: string,
+    status: string,
+    // 0 neutral, 1 success, 2 warning, 3 danger, 4 info
+    tone: int,
+    extra-badge: string,
+    note: string,
+    // connect, progress, finish, pair, none
+    action: string,
+    action-label: string,
+    action-enabled: bool,
+}
+
+export global HomeVm {
+    in property <[ServerCardData]> servers;
+    in property <bool> loading: false;
+    callback add-server();
+    callback enter-code();
+    callback open-settings();
+    callback primary(string, string);
+    callback details(string);
+}
+
+// -------------------------------------------------------------------------------------------- wizard
+
+export struct StepData { title: string, number: int, current: bool, done: bool }
+export struct CheckData { title: string, detail: string, status: int }
+
+export global WizardVm {
+    // method, connection, server, code, desktop, account, backups, resources, review, run
+    in-out property <string> step: "method";
+    in property <[StepData]> steps;
+    in property <string> next-label: "Next";
+    in property <bool> next-enabled: true;
+    in property <bool> show-back: true;
+    in property <string> heading;
+    in property <string> subheading;
+    in property <string> banner-title;
+    in property <string> banner-text;
+
+    // 0 ssh, 1 one-liner, 2 pairing code
+    in-out property <int> method: 0;
+
+    // connection and server
+    in-out property <string> address;
+    in-out property <string> ssh-port: "22";
+    in-out property <string> ssh-user: "root";
+    in-out property <int> auth-mode: 0;
+    in property <[string]> keys: ["Default keys from ~/.ssh and the SSH agent"];
+    in-out property <int> key-index: 0;
+    in-out property <string> ssh-password;
+    // 0 form, 1 probing, 2 host key, 3 checking, 4 checks ok, 5 checks bad, 6 error
+    in property <int> conn-phase: 0;
+    in property <string> host-algo;
+    in property <string> host-fp;
+    in property <string> connected-as;
+    in property <[CheckData]> checks;
+    in property <string> err-address;
+    in property <string> err-ssh-port;
+    in property <string> err-ssh-user;
+    in property <string> err-ssh-password;
+
+    // desktop
+    in-out property <int> distro: 0;
+    in-out property <bool> developer: true;
+    in-out property <bool> docker: false;
+    in-out property <bool> docker-ack: false;
+    in property <string> err-docker-ack;
+
+    // account
+    in-out property <string> username;
+    in-out property <string> password;
+    in-out property <string> password2;
+    in-out property <string> pin;
+    in-out property <string> pin2;
+    in property <int> strength: 0;
+    in property <string> strength-word;
+    in property <string> err-username;
+    in property <string> err-password;
+    in property <string> err-password2;
+    in property <string> err-pin;
+    in property <string> err-pin2;
+
+    // resources
+    in-out property <int> cpu: 2;
+    in-out property <int> memory: 4;
+    in-out property <int> disk: 30;
+    in property <int> cpu-max: 16;
+    in property <int> memory-max: 64;
+    in property <int> disk-max: 500;
+    in property <string> cpu-hint;
+    in property <string> memory-hint;
+    in property <string> disk-hint;
+    in-out property <string> agent-port: "443";
+    in-out property <string> domain;
+    in property <string> err-agent-port;
+    in property <string> err-domain;
+
+    // review
+    in property <[Kv]> review-server;
+    in property <[Kv]> review-desktop;
+    in property <[Kv]> review-account;
+    in property <[Kv]> review-backups;
+    in property <[Kv]> review-resources;
+
+    // run on the server (one-liner)
+    in property <string> command;
+    in property <string> token;
+    // 0 waiting, 1 expired, 2 unreachable, 3 paired, 4 sending setup
+    in property <int> run-phase: 0;
+    in property <string> run-status;
+    in property <string> copied-note;
+
+    // pairing code
+    in-out property <string> code;
+    in property <string> err-code;
+    in property <bool> pairing: false;
+
+    callback set-method(int);
+    callback changed();
+    callback next();
+    callback back();
+    callback cancel();
+    callback edit(string);
+    callback trust-host-key();
+    callback cancel-host-key();
+    callback check-again();
+    callback copy-command();
+    callback copy-token();
+    callback new-token();
+    callback try-again();
+    callback continue-to-progress();
+}
+
+// -------------------------------------------------------------------------------------------- progress
+
+export struct StageRowData {
+    title: string,
+    ids: string,
+    // 0 pending, 1 running, 2 done, 3 failed, 4 deferred
+    state: int,
+    duration: string,
+    detail: string,
+    // -1 indeterminate, otherwise 0..100; only shown while running
+    percent: int,
+}
+
+export global ProgressVm {
+    in property <string> server-name;
+    in property <string> address;
+    // 0 running, 1 failed, 2 connection lost, 3 success
+    in property <int> state: 0;
+    in property <string> headline;
+    in property <string> badge;
+    in property <int> badge-tone: 4;
+    in property <string> subline;
+    in property <[StageRowData]> rows;
+    in property <string> image-title;
+    in property <string> image-text;
+    in property <string> log;
+    in-out property <bool> log-open: true;
+    in property <string> fail-title;
+    in property <string> fail-text;
+    in property <bool> retryable: true;
+    in property <[Kv]> summary;
+    in property <string> good-to-know;
+    in property <bool> busy: false;
+    callback retry();
+    callback reconnect();
+    callback copy-log();
+    callback open-desktop();
+    callback back();
+    callback details();
+}
+
+// -------------------------------------------------------------------------------------------- connect
+
+export global ConnectVm {
+    in property <string> server-name;
+    in property <string> address;
+    // 0 entering, 1 connecting, 2 checking PIN, 3 waiting, 4 revoked, 5 pair again,
+    // 6 not available, 7 unreachable, 8 identity changed
+    in property <int> phase: 0;
+    in-out property <string> pin;
+    in-out property <bool> show-pin: false;
+    in-out property <string> password;
+    in property <string> notice-title;
+    in property <string> notice-text;
+    in property <int> notice-tone: 3;
+    in property <int> wait-secs: 0;
+    in property <string> pinned-fp;
+    in property <string> presented-fp;
+    in property <string> err-password;
+    in property <string> takeover-hint;
+    in property <bool> pairing: false;
+    in-out property <int> focus-tick: 0;
+    callback submit();
+    callback cancel();
+    callback back();
+    callback pair-again();
+    callback submit-password();
+    callback retry();
+    callback open-details();
+    callback remove-server();
+}
+
+// -------------------------------------------------------------------------------------------- desktop view
+
+export struct ActivityData { name: string, direction: string, percent: int, state: string, failed: bool }
+
+export global DesktopVm {
+    in property <string> server-name;
+    in property <image> frame;
+    in property <bool> has-frame: false;
+    in property <int> remote-w: 1920;
+    in property <int> remote-h: 1080;
+    // 0 fit, 1 actual, 2 resize
+    in-out property <int> fit: 0;
+    in-out property <bool> toolbar: false;
+    in-out property <bool> hint: true;
+    in-out property <bool> stats-on: false;
+    // 0 auto, 1 sharp, 2 smooth
+    in-out property <int> quality: 0;
+    in-out property <bool> capture-keys: true;
+    // 0 none, 1 display, 2 quality, 3 keys, 4 transfers
+    in-out property <int> menu: 0;
+    in-out property <bool> fullscreen: false;
+    // 0 none, 1 reconnecting, 2 gave up, 3 takeover, 4 unavailable
+    in property <int> overlay: 0;
+    in property <int> attempt: 0;
+    in property <int> next-secs: 0;
+    in property <string> takeover-title;
+    in property <string> takeover-text;
+    in property <bool> can-revoke: false;
+    in property <string> takeover-note;
+    in property <string> connecting-text;
+
+    // stats
+    in property <string> st-fps: "-";
+    in property <string> st-latency: "-";
+    in property <string> st-bitrate: "-";
+    in property <string> st-codec: "H.264";
+    in property <string> st-encoding: "-";
+    in property <string> st-screen: "-";
+    in property <string> st-path: "CPU upload";
+
+    // transfers and links
+    in property <[ActivityData]> activities;
+    in property <string> transfer-note;
+    in property <bool> drop-hover: false;
+    in-out property <string> file-path;
+    in property <bool> link-open: false;
+    in property <string> link-prefix;
+    in property <string> link-host;
+    in property <string> link-rest;
+
+    // pointer cursor drawn by the app
+    in property <image> cursor;
+    in property <bool> cursor-visible: false;
+    in property <length> cursor-x;
+    in property <length> cursor-y;
+    in property <length> cursor-hot-x;
+    in property <length> cursor-hot-y;
+
+    callback disconnect();
+    callback pointer-moved(length, length);
+    callback pointer-button(int, bool, length, length);
+    callback pointer-scroll(length, length);
+    callback view-resized(length, length);
+    callback view-focus(bool);
+    callback fit-changed(int);
+    callback quality-changed(int);
+    callback stats-toggled(bool);
+    callback capture-toggled(bool);
+    callback combo(int);
+    callback fullscreen-toggled();
+    callback send-file();
+    callback open-link();
+    callback cancel-link();
+    callback copy-link();
+    callback overlay-back();
+    callback overlay-retry();
+    callback overlay-details();
+    callback revoke-peer();
+    callback take-back();
+    callback toolbar-shortcut();
+}
+
+// -------------------------------------------------------------------------------------------- details
+
+export struct DeviceRowData {
+    id: string,
+    name: string,
+    last-seen: string,
+    state: string,
+    tone: int,
+    current: bool,
+    can-revoke: bool,
+}
+
+export global DetailsVm {
+    in property <string> server-name;
+    in property <string> address;
+    in property <string> status;
+    in property <int> status-tone: 1;
+    in property <bool> can-connect: true;
+    // 0 overview, 1 security, 2 desktop, 3 danger
+    in-out property <int> tab: 0;
+    in property <bool> loading: false;
+
+    // overview
+    in property <string> attention-title;
+    in property <string> attention-text;
+    in property <string> offline-text;
+    in property <bool> can-restart: false;
+    in property <[Kv]> ov-desktop;
+    in property <[Kv]> ov-agent;
+    in property <[Kv]> ov-server;
+    in property <[Kv]> ov-limits;
+    in property <string> update-text;
+
+    // security
+    in property <[DeviceRowData]> devices;
+    in property <string> devices-note;
+    // 0 none, 1 revoke, 2 revoke this, 3 pair, 4 change PIN, 5 change password, 6 unlock
+    in property <int> dialog: 0;
+    in property <string> dialog-text;
+    in property <string> dialog-error;
+    in property <bool> dialog-busy: false;
+    in property <string> pair-code;
+    in property <string> pair-expiry;
+    in property <string> pair-address;
+    in-out property <string> f1;
+    in-out property <string> f2;
+    in-out property <string> f3;
+    in property <string> e1;
+    in property <string> e2;
+    in property <string> e3;
+    in property <int> strength: 0;
+    in property <string> strength-word;
+
+    // desktop
+    in-out property <bool> docker: false;
+    in property <bool> docker-dialog: false;
+    in-out property <bool> docker-ack: false;
+    in-out property <int> cpu: 2;
+    in-out property <int> memory: 4;
+    in-out property <int> disk: 30;
+    in property <int> cpu-max: 4;
+    in property <int> memory-max: 5;
+    in property <int> disk-max: 152;
+    in property <bool> limits-dirty: false;
+    in property <bool> restart-dialog: false;
+    in property <string> agent-line;
+    in property <bool> can-update: false;
+    in property <string> notice;
+
+    // danger zone
+    in-out property <bool> keep-desktop: true;
+    // 0 none, 1 needs SSH, 2 confirm, 3 running, 4 done
+    in property <int> danger: 0;
+    in-out property <string> ssh-user: "root";
+    in-out property <string> ssh-port: "22";
+    in-out property <string> ssh-password;
+    in-out property <string> confirm-name;
+    in property <string> danger-error;
+    in property <string> done-text;
+
+    callback back();
+    callback connect();
+    callback select-tab(int);
+    callback restart-desktop();
+    callback update-agent();
+    callback revoke(string);
+    callback confirm-revoke();
+    callback pair-device();
+    callback copy-pair-code();
+    callback change-pin();
+    callback change-password();
+    callback submit-dialog();
+    callback close-dialog();
+    callback docker-toggled(bool);
+    callback confirm-docker();
+    callback cancel-docker();
+    callback limits-changed();
+    callback apply-limits();
+    callback confirm-restart();
+    callback cancel-restart();
+    callback uninstall();
+    callback danger-continue();
+    callback danger-cancel();
+    callback danger-confirm();
+    callback copy-commands();
+    callback remove-from-app();
+    callback dialog-changed();
+}
+
+// -------------------------------------------------------------------------------------------- settings
+
+export global SettingsVm {
+    // 0 system, 1 dark, 2 light
+    in-out property <int> theme: 0;
+    in-out property <int> quality: 0;
+    in-out property <int> bandwidth: 0;
+    in-out property <bool> capture-keys: true;
+    in-out property <bool> clip-send: true;
+    in-out property <bool> clip-receive: true;
+    in-out property <bool> clip-files: true;
+    in-out property <bool> start-at-login: false;
+    in-out property <string> device-name;
+    in property <string> version;
+    in property <string> chord: "Ctrl + Alt + Shift";
+    callback changed();
+    callback done();
+}

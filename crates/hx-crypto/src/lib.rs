@@ -12,6 +12,7 @@
 //!   device or an authorized session.
 //! * [`session`]: the client side of a session ([`connect_session`], PIN submission).
 //! * [`wire`]: the messages inside the pairing and auth envelopes.
+//! * [`server_admin`]: server management on an authorized session (protocol 1.3, `ServerMgmt`).
 //! * [`setup`]: the client side of the post-pairing setup connection (protocol 1.3).
 //!
 //! Everything that can be driven by a peer returns an error instead of panicking, and no
@@ -32,6 +33,7 @@ pub mod pin;
 pub mod registry;
 pub mod reinstate_client;
 pub mod secrets;
+pub mod server_admin;
 pub mod session;
 pub mod setup;
 pub mod text;

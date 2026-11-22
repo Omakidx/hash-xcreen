@@ -1,0 +1,89 @@
+// The whole visual system, one to one with design/mockups/tokens.css.
+// Theme: System follows the desktop (Palette.color-scheme); Dark and Light force one.
+
+import { Palette } from "std-widgets.slint";
+
+export enum ThemeMode { system, dark, light }
+
+export global Tokens {
+    in-out property <ThemeMode> mode: ThemeMode.system;
+    // Reduced motion: no spinner rotation, no indeterminate sweep.
+    in-out property <bool> reduced-motion: false;
+
+    out property <bool> dark: mode == ThemeMode.dark || (mode == ThemeMode.system && Palette.color-scheme != ColorScheme.light);
+
+    // Surfaces
+    out property <color> bg: dark ? #0e1116 : #f2f4f8;
+    out property <color> surface: dark ? #151a21 : #ffffff;
+    out property <color> surface-2: dark ? #1c222b : #f6f8fb;
+    out property <color> surface-3: dark ? #262d38 : #e8ecf2;
+    // Lines
+    out property <color> border: dark ? #2c3441 : #d4dae3;
+    out property <color> border-strong: dark ? #727d8f : #697384;
+    // Text
+    out property <color> text: dark ? #e8ebf0 : #151a21;
+    out property <color> text-2: dark ? #b2bac7 : #424d5e;
+    out property <color> text-3: dark ? #959fae : #566173;
+    // Accent
+    out property <color> accent: dark ? #6aa6ff : #1d5fd6;
+    out property <color> accent-hover: dark ? #8dbbff : #174fb4;
+    out property <color> on-accent: dark ? #08101d : #ffffff;
+    out property <color> accent-soft: dark ? #172a47 : #e3edfd;
+    out property <color> accent-text: dark ? #8dbbff : #1750b8;
+    // Status (always with a word or an icon)
+    out property <color> success: dark ? #5fd39a : #12683d;
+    out property <color> success-bg: dark ? #12301f : #e3f4ea;
+    out property <color> warning: dark ? #f0b84d : #805000;
+    out property <color> warning-bg: dark ? #35290f : #fcf0d9;
+    out property <color> danger: dark ? #ff8d8d : #ac2019;
+    out property <color> danger-bg: dark ? #3a1c21 : #fdebe9;
+    out property <color> danger-fill: dark ? #cf3b43 : #b3261e;
+    out property <color> on-danger-fill: #ffffff;
+    out property <color> info: dark ? #8dbbff : #1750b8;
+    out property <color> info-bg: dark ? #172a47 : #e3edfd;
+    out property <color> neutral-bg: dark ? #232a35 : #e8ecf2;
+    out property <color> focus: dark ? #8dbbff : #1d5fd6;
+    // Overlays
+    out property <color> scrim: dark ? #04070ba8 : #12182180;
+    out property <color> float-bg: dark ? #151a21f0 : #fffffff2;
+    out property <color> float-border: dark ? #3a4352 : #b9c2cf;
+
+    // Type
+    out property <length> fs-xs: 12px;
+    out property <length> fs-sm: 13px;
+    out property <length> fs-md: 14px;
+    out property <length> fs-lg: 16px;
+    out property <length> fs-xl: 20px;
+    out property <length> fs-2xl: 26px;
+    out property <length> fs-3xl: 34px;
+    out property <int> fw-regular: 400;
+    out property <int> fw-medium: 600;
+    out property <string> font-mono: "DejaVu Sans Mono";
+
+    // Spacing, 4 px base
+    out property <length> sp-1: 4px;
+    out property <length> sp-2: 8px;
+    out property <length> sp-3: 12px;
+    out property <length> sp-4: 16px;
+    out property <length> sp-5: 24px;
+    out property <length> sp-6: 32px;
+    out property <length> sp-7: 48px;
+
+    // Radii
+    out property <length> r-sm: 4px;
+    out property <length> r-md: 8px;
+    out property <length> r-lg: 12px;
+
+    // Sizes
+    out property <length> control-h: 36px;
+    out property <length> control-h-lg: 44px;
+    out property <length> appbar-h: 56px;
+
+    // Tone helpers: 0 neutral, 1 success, 2 warning, 3 danger, 4 info, 5 accent
+    pure public function tone-fg(t: int) -> color {
+        t == 1 ? success : t == 2 ? warning : t == 3 ? danger : t == 4 ? info : t == 5 ? accent-text : text-2
+    }
+    pure public function tone-bg(t: int) -> color {
+        t == 1 ? success-bg : t == 2 ? warning-bg : t == 3 ? danger-bg : t == 4 ? info-bg : t == 5 ? accent-soft : neutral-bg
+    }
+}

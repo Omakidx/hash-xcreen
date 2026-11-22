@@ -43,6 +43,7 @@ use super::desktop::DesktopLink;
 use super::devices::DeviceService;
 use super::live::LiveSessions;
 use super::privd_client::PrivdClient;
+use super::server_mgmt::{ServerMgmtService, ServerMgmtSettings};
 use super::session::{SessionManager, SessionSettings};
 use super::setup::store::{SetupStore, StoreError};
 use super::setup::{SetupCoordinator, SetupSettings};
@@ -96,6 +97,9 @@ pub struct StartOptions {
     /// The setup coordinator's tunables; `None` is the production values for
     /// `config.desktop_id` (tests lower the Argon2id cost and the retry wait).
     pub setup: Option<SetupSettings>,
+    /// The server-management tunables; `None` is the production values (tests lower the
+    /// Argon2id cost).
+    pub server_mgmt: Option<ServerMgmtSettings>,
 }
 
 impl StartOptions {
@@ -115,6 +119,7 @@ impl StartOptions {
             clock: Arc::new(SystemClock),
             server_options: ServerOptions::default(),
             setup: None,
+            server_mgmt: None,
         }
     }
 }
@@ -164,6 +169,7 @@ impl Gateway {
             clock,
             server_options,
             setup: setup_settings,
+            server_mgmt: server_mgmt_settings,
         } = opts;
 
         // State: the registry (hx-crypto's single-writer file) and the verifiers, side by side
@@ -198,10 +204,8 @@ impl Gateway {
         );
         let privd = PrivdClient::new(&config.privd_socket, Default::default());
         // The PIN check: Argon2id here, the yes/no from privd's pepper (docs/ipc.md 5.3).
-        auth.set_pin_verifier(Arc::new(PrivdPinVerifier::new(
-            verifiers.clone(),
-            privd.clone(),
-        )));
+        let pin_verifier = Arc::new(PrivdPinVerifier::new(verifiers.clone(), privd.clone()));
+        auth.set_pin_verifier(pin_verifier.clone());
         // The account password check of a device locked out by its PIN (protocol 11.7).
         auth.set_reinstate_gate(Arc::new(PrivdReinstateGate::new(
             verifiers.clone(),
@@ -223,6 +227,19 @@ impl Gateway {
             setup_settings.unwrap_or_else(|| SetupSettings::new(config.desktop_id.clone())),
         );
         auth.set_setup_gate(Arc::new(setup.clone()));
+        // Server management from the app (protocol 1.3): the PIN and password changes, the
+        // overview, restart, Docker off, limits and the agent update.
+        let server_mgmt = ServerMgmtService::new(
+            privd.clone(),
+            verifiers.clone(),
+            pin_verifier,
+            registry.clone(),
+            auth.clone(),
+            devices.clone(),
+            clock.clone(),
+            server_mgmt_settings
+                .unwrap_or_else(|| ServerMgmtSettings::new(config.desktop_id.clone())),
+        );
         let sessions = SessionManager::new(
             SessionSettings {
                 desktop_id: config.desktop_id.clone(),
@@ -233,6 +250,7 @@ impl Gateway {
             link,
             privd.clone(),
             devices.clone(),
+            server_mgmt,
             live.clone(),
             clock,
         );

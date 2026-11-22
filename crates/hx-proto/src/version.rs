@@ -75,6 +75,9 @@ impl Features {
     /// `SetupMessage` control messages on `INTENT_SETUP` connections (1.3). Never offered on a
     /// normal session.
     pub const SETUP: Self = Self(1 << 5);
+    /// `ServerMgmt` control messages on authorized sessions: overview, change PIN and password,
+    /// restart, Docker off, limits, agent update (1.3).
+    pub const SERVER_MANAGEMENT: Self = Self(1 << 6);
 
     /// Every feature defined up to and including `minor` of the current major.
     pub const fn defined_up_to(minor: u32) -> Self {
@@ -88,7 +91,7 @@ impl Features {
             bits |= Self::DEVICE_MANAGEMENT.0;
         }
         if minor >= 3 {
-            bits |= Self::SETUP.0;
+            bits |= Self::SETUP.0 | Self::SERVER_MANAGEMENT.0;
         }
         Self(bits)
     }

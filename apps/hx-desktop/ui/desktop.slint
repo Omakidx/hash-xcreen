@@ -1,0 +1,932 @@
+import { Tokens } from "tokens.slint";
+import { Btn, Badge, Banner, ButtonRow, Dialog, Field, FocusRing, Heading, Label, Mono, Muted, ProgressBar, Spinner, Toggle } from "widgets.slint";
+import { DesktopVm, ActivityData } from "state.slint";
+
+component TbButton inherits Rectangle {
+    in property <string> text;
+    in property <string> short;
+    in property <bool> icon-only: false;
+    in property <bool> active: false;
+    in property <bool> danger: false;
+    callback clicked();
+    forward-focus: fs;
+    height: 32px;
+    width: max(icon-only ? 36px : 56px, lbl.preferred-width + 2 * Tokens.sp-3);
+    border-radius: Tokens.r-md;
+    background: active ? Tokens.accent-soft : ta.has-hover ? Tokens.surface-3 : transparent;
+    accessible-role: AccessibleRole.button;
+    accessible-label: text;
+    accessible-checkable: true;
+    accessible-checked: active;
+    accessible-action-default => {
+        clicked();
+    }
+    FocusRing {
+        active: fs.has-focus;
+    }
+
+    lbl := Text {
+        text: icon-only ? short : root.text;
+        color: danger ? Tokens.danger : active ? Tokens.accent-text : Tokens.text;
+        font-size: Tokens.fs-md;
+        font-weight: Tokens.fw-medium;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    fs := FocusScope {
+        key-pressed(e) => {
+            if (e.text == Key.Return || e.text == " " || e.text == Key.DownArrow) {
+                root.clicked();
+                return accept;
+            }
+            reject
+        }
+    }
+
+    ta := TouchArea {
+        clicked => {
+            fs.focus();
+            root.clicked();
+        }
+    }
+}
+
+component MenuItem inherits Rectangle {
+    in property <string> text;
+    in property <string> note;
+    in property <bool> selected: false;
+    callback clicked();
+    height: 32px;
+    border-radius: Tokens.r-sm;
+    background: ta.has-hover || fs.has-focus ? Tokens.surface-3 : transparent;
+    accessible-role: AccessibleRole.button;
+    accessible-label: text + (note != "" ? ", " + note : "");
+    accessible-checkable: true;
+    accessible-checked: selected;
+    accessible-action-default => {
+        clicked();
+    }
+    HorizontalLayout {
+        padding-left: Tokens.sp-3;
+        padding-right: Tokens.sp-3;
+        spacing: Tokens.sp-3;
+        Text {
+            text: selected ? "✓" : "";
+            width: 14px;
+            color: Tokens.accent-text;
+            vertical-alignment: center;
+        }
+
+        Text {
+            text: root.text;
+            color: Tokens.text;
+            font-size: Tokens.fs-md;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+
+        Text {
+            text: root.note;
+            color: Tokens.text-3;
+            font-size: Tokens.fs-sm;
+            vertical-alignment: center;
+        }
+    }
+
+    fs := FocusScope {
+        key-pressed(e) => {
+            if (e.text == Key.Return || e.text == " ") {
+                root.clicked();
+                return accept;
+            }
+            reject
+        }
+    }
+
+    ta := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+component Menu inherits Rectangle {
+    in property <length> menu-width: 300px;
+    width: menu-width;
+    height: col.preferred-height + 2 * Tokens.sp-2;
+    background: Tokens.float-bg;
+    border-radius: Tokens.r-md;
+    border-width: 1px;
+    border-color: Tokens.float-border;
+    drop-shadow-blur: 20px;
+    drop-shadow-color: #00000070;
+    drop-shadow-offset-y: 6px;
+    col := VerticalLayout {
+        padding: Tokens.sp-2;
+        spacing: 2px;
+        @children
+    }
+}
+
+component Section inherits Text {
+    color: Tokens.text-3;
+    font-size: Tokens.fs-xs;
+    font-weight: Tokens.fw-medium;
+    height: 22px;
+    vertical-alignment: center;
+}
+
+component Overlay inherits Rectangle {
+    in property <string> title;
+    in property <string> text;
+    in property <bool> busy: false;
+    background: #04070bc8;
+    TouchArea { }
+
+    Rectangle {
+        width: min(480px, parent.width - 2 * Tokens.sp-5);
+        height: col.preferred-height + 2 * Tokens.sp-5;
+        background: Tokens.surface;
+        border-radius: Tokens.r-lg;
+        border-width: 1px;
+        border-color: Tokens.border;
+        col := VerticalLayout {
+            padding: Tokens.sp-5;
+            spacing: Tokens.sp-3;
+            HorizontalLayout {
+                spacing: Tokens.sp-3;
+                if root.busy: Spinner { }
+                Heading {
+                    text: root.title;
+                    level: 3;
+                }
+            }
+
+            Label {
+                text: root.text;
+                color: Tokens.text-2;
+            }
+
+            @children
+        }
+    }
+}
+
+export component DesktopScreen inherits Rectangle {
+    background: #000000;
+    clip: true;
+    property <length> vw: self.width;
+    property <length> vh: self.height;
+    property <length> pw: DesktopVm.fit == 0 ? min(vw / DesktopVm.remote-w, vh / DesktopVm.remote-h) * DesktopVm.remote-w : DesktopVm.remote-w * 1px;
+    property <length> ph: DesktopVm.fit == 0 ? min(vw / DesktopVm.remote-w, vh / DesktopVm.remote-h) * DesktopVm.remote-h : DesktopVm.remote-h * 1px;
+    property <bool> blocked: DesktopVm.overlay != 0;
+    property <bool> icons: self.width < 1000px;
+
+    changed vw => {
+        DesktopVm.view-resized(self.vw, self.vh);
+    }
+    changed vh => {
+        DesktopVm.view-resized(self.vw, self.vh);
+    }
+    init => {
+        DesktopVm.view-resized(self.vw, self.vh);
+    }
+
+    // The picture (dimmed behind overlays).
+    Image {
+        source: DesktopVm.frame;
+        visible: DesktopVm.has-frame;
+        image-fit: fill;
+        x: (root.vw - root.pw) / 2;
+        y: (root.vh - root.ph) / 2;
+        width: root.pw;
+        height: root.ph;
+        opacity: root.blocked ? 0.35 : 1;
+        accessible-role: AccessibleRole.none;
+    }
+
+    if !DesktopVm.has-frame && DesktopVm.overlay == 0: HorizontalLayout {
+        alignment: center;
+        padding-top: root.vh / 2 - 20px;
+        spacing: Tokens.sp-3;
+        Spinner { }
+
+        Text {
+            text: DesktopVm.connecting-text;
+            color: #b2bac7;
+            font-size: Tokens.fs-md;
+            vertical-alignment: center;
+            accessible-role: AccessibleRole.text;
+        }
+    }
+
+    // The remote cursor, drawn by the app.
+    if DesktopVm.cursor-visible && !root.blocked: Image {
+        source: DesktopVm.cursor;
+        x: DesktopVm.cursor-x - DesktopVm.cursor-hot-x;
+        y: DesktopVm.cursor-y - DesktopVm.cursor-hot-y;
+        width: self.source.width * 1px;
+        height: self.source.height * 1px;
+    }
+
+    // Pointer and keyboard focus.
+    fs := FocusScope {
+        enabled: !root.blocked;
+        changed has-focus => {
+            DesktopVm.view-focus(self.has-focus);
+        }
+        capture-key-pressed(e) => {
+            // Keys reach the desktop through the window system hook (physical scancodes);
+            // this scope only holds the keyboard focus.
+            reject
+        }
+        ta := TouchArea {
+            enabled: !root.blocked;
+            mouse-cursor: DesktopVm.cursor-visible ? MouseCursor.none : MouseCursor.default;
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.down) {
+                    fs.focus();
+                    DesktopVm.menu = 0;
+                }
+                if (e.kind == PointerEventKind.down || e.kind == PointerEventKind.up) {
+                    if (e.button == PointerEventButton.left) {
+                        DesktopVm.pointer-button(0, e.kind == PointerEventKind.down, self.mouse-x, self.mouse-y);
+                    } else if (e.button == PointerEventButton.right) {
+                        DesktopVm.pointer-button(1, e.kind == PointerEventKind.down, self.mouse-x, self.mouse-y);
+                    } else if (e.button == PointerEventButton.middle) {
+                        DesktopVm.pointer-button(2, e.kind == PointerEventKind.down, self.mouse-x, self.mouse-y);
+                    } else if (e.button == PointerEventButton.back) {
+                        DesktopVm.pointer-button(3, e.kind == PointerEventKind.down, self.mouse-x, self.mouse-y);
+                    } else if (e.button == PointerEventButton.forward) {
+                        DesktopVm.pointer-button(4, e.kind == PointerEventKind.down, self.mouse-x, self.mouse-y);
+                    }
+                }
+            }
+            moved => {
+                DesktopVm.pointer-moved(self.mouse-x, self.mouse-y);
+                if (self.mouse-y < 6px && !DesktopVm.toolbar) {
+                    DesktopVm.toolbar = true;
+                }
+            }
+            scroll-event(e) => {
+                DesktopVm.pointer-scroll(e.delta-x, e.delta-y);
+                accept
+            }
+        }
+    }
+
+    // Top-edge accent strip, only while the toolbar is hidden and the pointer is at the edge.
+    Rectangle {
+        y: 0px;
+        height: 3px;
+        background: Tokens.accent;
+        visible: ta.has-hover && ta.mouse-y < 6px && !DesktopVm.toolbar;
+    }
+
+    // First-time hint.
+    if DesktopVm.hint && !DesktopVm.toolbar && DesktopVm.overlay == 0: Rectangle {
+        y: 16px;
+        x: (root.vw - self.width) / 2;
+        width: min(560px, root.vw - 32px);
+        height: 48px;
+        background: Tokens.float-bg;
+        border-radius: Tokens.r-md;
+        border-width: 1px;
+        border-color: Tokens.float-border;
+        accessible-role: AccessibleRole.text;
+        accessible-label: "Move the pointer to the top edge, or press Ctrl, Alt and Shift together, to show the toolbar.";
+        HorizontalLayout {
+            padding-left: Tokens.sp-4;
+            padding-right: Tokens.sp-2;
+            spacing: Tokens.sp-3;
+            Text {
+                text: "Move the pointer to the top edge, or press Ctrl + Alt + Shift, to show the toolbar.";
+                color: Tokens.text;
+                font-size: Tokens.fs-sm;
+                wrap: word-wrap;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+
+            Btn {
+                text: "Got it";
+                kind: "ghost";
+                y: 8px;
+                clicked => {
+                    DesktopVm.hint = false;
+                }
+            }
+        }
+    }
+
+    // Stats overlay (stays after the toolbar hides).
+    if DesktopVm.stats-on: Rectangle {
+        x: 16px;
+        y: DesktopVm.toolbar ? 68px : 16px;
+        width: 250px;
+        height: stcol.preferred-height + 2 * Tokens.sp-3;
+        background: Tokens.float-bg;
+        border-radius: Tokens.r-md;
+        border-width: 1px;
+        border-color: Tokens.float-border;
+        accessible-role: AccessibleRole.text;
+        accessible-label: "Stats: " + DesktopVm.st-fps + ", latency " + DesktopVm.st-latency + ", " + DesktopVm.st-bitrate;
+        stcol := VerticalLayout {
+            padding: Tokens.sp-3;
+            spacing: 3px;
+            Text {
+                text: "Stats  ·  1 s";
+                color: Tokens.text-3;
+                font-size: Tokens.fs-xs;
+                font-weight: Tokens.fw-medium;
+            }
+
+            for kv in [
+                { k: "Frames", v: DesktopVm.st-fps },
+                { k: "Latency", v: DesktopVm.st-latency },
+                { k: "Bitrate", v: DesktopVm.st-bitrate },
+                { k: "Codec", v: DesktopVm.st-codec },
+                { k: "Encoding", v: DesktopVm.st-encoding },
+                { k: "Screen", v: DesktopVm.st-screen },
+                { k: "Display path", v: DesktopVm.st-path },
+            ]: HorizontalLayout {
+                Text {
+                    text: kv.k;
+                    color: Tokens.text-2;
+                    font-size: Tokens.fs-sm;
+                    width: 96px;
+                }
+
+                Text {
+                    text: kv.v;
+                    color: Tokens.text;
+                    font-size: Tokens.fs-sm;
+                    font-family: Tokens.font-mono;
+                }
+            }
+        }
+    }
+
+    // File drop hint.
+    if DesktopVm.drop-hover: Rectangle {
+        background: #6aa6ff30;
+        border-width: 3px;
+        border-color: Tokens.accent;
+        VerticalLayout {
+            alignment: center;
+            spacing: 4px;
+            Text {
+                text: "Drop to send to the desktop";
+                color: #ffffff;
+                font-size: Tokens.fs-xl;
+                font-weight: Tokens.fw-medium;
+                horizontal-alignment: center;
+            }
+
+            Text {
+                text: "Files land in the desktop's Downloads folder";
+                color: #e8ebf0;
+                font-size: Tokens.fs-md;
+                horizontal-alignment: center;
+            }
+        }
+    }
+
+    // Transfer note (a refusal or a result), announced once.
+    if DesktopVm.transfer-note != "": Rectangle {
+        x: (root.vw - self.width) / 2;
+        y: root.vh - 64px;
+        width: min(620px, root.vw - 32px);
+        height: 44px;
+        background: Tokens.float-bg;
+        border-radius: Tokens.r-md;
+        border-width: 1px;
+        border-color: Tokens.float-border;
+        accessible-role: AccessibleRole.text;
+        accessible-label: DesktopVm.transfer-note;
+        Text {
+            text: DesktopVm.transfer-note;
+            color: Tokens.text;
+            font-size: Tokens.fs-sm;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            wrap: word-wrap;
+            width: parent.width - 2 * Tokens.sp-3;
+        }
+    }
+
+    // ------------------------------------------------------------------------ toolbar
+    if DesktopVm.toolbar: Rectangle {
+        y: 8px;
+        x: (root.vw - self.width) / 2;
+        width: min(root.vw - 16px, tb.preferred-width + 2 * Tokens.sp-3);
+        height: 44px;
+        background: Tokens.float-bg;
+        border-radius: Tokens.r-lg;
+        border-width: 1px;
+        border-color: Tokens.float-border;
+        accessible-role: AccessibleRole.tab-list;
+        accessible-label: "Desktop toolbar";
+        tb := HorizontalLayout {
+            padding: 6px;
+            spacing: 2px;
+            if !root.icons: Text {
+                text: DesktopVm.server-name;
+                color: Tokens.text-2;
+                font-size: Tokens.fs-sm;
+                vertical-alignment: center;
+                overflow: elide;
+                max-width: 160px;
+                horizontal-stretch: 0;
+            }
+            if !root.icons: Rectangle {
+                width: Tokens.sp-2;
+            }
+            TbButton {
+                text: "Display";
+                short: "▭";
+                icon-only: root.icons;
+                active: DesktopVm.menu == 1;
+                clicked => {
+                    DesktopVm.menu = DesktopVm.menu == 1 ? 0 : 1;
+                }
+            }
+
+            TbButton {
+                text: "Quality: " + (DesktopVm.quality == 0 ? "Auto" : DesktopVm.quality == 1 ? "Sharp" : "Smooth");
+                short: "Q";
+                icon-only: root.icons;
+                active: DesktopVm.menu == 2;
+                clicked => {
+                    DesktopVm.menu = DesktopVm.menu == 2 ? 0 : 2;
+                }
+            }
+
+            TbButton {
+                text: "Stats";
+                short: "i";
+                icon-only: root.icons;
+                active: DesktopVm.stats-on;
+                clicked => {
+                    DesktopVm.stats-on = !DesktopVm.stats-on;
+                    DesktopVm.stats-toggled(DesktopVm.stats-on);
+                }
+            }
+
+            TbButton {
+                text: "Keys";
+                short: "⌨";
+                icon-only: root.icons;
+                active: DesktopVm.menu == 3;
+                clicked => {
+                    DesktopVm.menu = DesktopVm.menu == 3 ? 0 : 3;
+                }
+            }
+
+            TbButton {
+                text: "Transfers";
+                short: "⇅";
+                icon-only: root.icons;
+                active: DesktopVm.menu == 4;
+                clicked => {
+                    DesktopVm.menu = DesktopVm.menu == 4 ? 0 : 4;
+                }
+            }
+
+            TbButton {
+                text: "Fullscreen";
+                short: "⤢";
+                icon-only: root.icons;
+                active: DesktopVm.fullscreen;
+                clicked => {
+                    DesktopVm.fullscreen-toggled();
+                }
+            }
+
+            TbButton {
+                text: "Disconnect";
+                short: "✕";
+                icon-only: root.icons;
+                danger: true;
+                clicked => {
+                    DesktopVm.disconnect();
+                }
+            }
+        }
+
+        FocusScope {
+            key-pressed(e) => {
+                if (e.text == Key.Escape) {
+                    if (DesktopVm.menu != 0) {
+                        DesktopVm.menu = 0;
+                    } else {
+                        DesktopVm.toolbar = false;
+                    }
+                    return accept;
+                }
+                reject
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------ menus
+    if DesktopVm.toolbar && DesktopVm.menu == 1: Menu {
+        x: min(root.vw - self.width - 8px, max(8px, (root.vw - 300px) / 2));
+        y: 58px;
+        menu-width: 340px;
+        Section {
+            text: "SCALING";
+        }
+
+        MenuItem {
+            text: "Fit to window";
+            selected: DesktopVm.fit == 0;
+            clicked => {
+                DesktopVm.fit-changed(0);
+            }
+        }
+
+        MenuItem {
+            text: "Actual size (100%)";
+            selected: DesktopVm.fit == 1;
+            clicked => {
+                DesktopVm.fit-changed(1);
+            }
+        }
+
+        MenuItem {
+            text: "Resize the remote screen to match this window";
+            selected: DesktopVm.fit == 2;
+            clicked => {
+                DesktopVm.fit-changed(2);
+            }
+        }
+
+        Section {
+            text: "WINDOW";
+        }
+
+        MenuItem {
+            text: "Fullscreen";
+            note: "F11";
+            selected: DesktopVm.fullscreen;
+            clicked => {
+                DesktopVm.fullscreen-toggled();
+            }
+        }
+    }
+    if DesktopVm.toolbar && DesktopVm.menu == 2: Menu {
+        x: min(root.vw - self.width - 8px, max(8px, (root.vw - 300px) / 2));
+        y: 58px;
+        menu-width: 280px;
+        MenuItem {
+            text: "Auto";
+            note: "balanced";
+            selected: DesktopVm.quality == 0;
+            clicked => {
+                DesktopVm.quality-changed(0);
+            }
+        }
+
+        MenuItem {
+            text: "Sharp (text)";
+            note: "less motion";
+            selected: DesktopVm.quality == 1;
+            clicked => {
+                DesktopVm.quality-changed(1);
+            }
+        }
+
+        MenuItem {
+            text: "Smooth (motion)";
+            note: "less sharp";
+            selected: DesktopVm.quality == 2;
+            clicked => {
+                DesktopVm.quality-changed(2);
+            }
+        }
+    }
+    if DesktopVm.toolbar && DesktopVm.menu == 3: Menu {
+        x: min(root.vw - self.width - 8px, max(8px, (root.vw - 300px) / 2));
+        y: 58px;
+        menu-width: 300px;
+        Section {
+            text: "KEYBOARD";
+        }
+
+        MenuItem {
+            text: "Capture all keys";
+            note: DesktopVm.capture-keys ? "On" : "Off";
+            selected: DesktopVm.capture-keys;
+            clicked => {
+                DesktopVm.capture-keys = !DesktopVm.capture-keys;
+                DesktopVm.capture-toggled(DesktopVm.capture-keys);
+            }
+        }
+
+        Section {
+            text: "SEND TO THE DESKTOP";
+        }
+
+        MenuItem {
+            text: "Ctrl+Alt+Del";
+            clicked => {
+                DesktopVm.combo(0);
+            }
+        }
+
+        MenuItem {
+            text: "Alt+Tab";
+            clicked => {
+                DesktopVm.combo(1);
+            }
+        }
+
+        MenuItem {
+            text: "Alt+F4";
+            clicked => {
+                DesktopVm.combo(2);
+            }
+        }
+
+        MenuItem {
+            text: "Super (Windows) key";
+            clicked => {
+                DesktopVm.combo(3);
+            }
+        }
+    }
+    if DesktopVm.toolbar && DesktopVm.menu == 4: Menu {
+        x: min(root.vw - self.width - 8px, max(8px, (root.vw - 300px) / 2));
+        y: 58px;
+        menu-width: 380px;
+        Section {
+            text: "CLIPBOARD";
+        }
+
+        Text {
+            text: "Shared both ways: text. Images and files follow the clipboard settings.";
+            color: Tokens.text-2;
+            font-size: Tokens.fs-sm;
+            wrap: word-wrap;
+        }
+
+        Section {
+            text: "FILES  ·  MAX 4 GIB";
+        }
+
+        HorizontalLayout {
+            spacing: Tokens.sp-2;
+            padding-left: Tokens.sp-1;
+            padding-right: Tokens.sp-1;
+            Field {
+                text <=> DesktopVm.file-path;
+                placeholder: "Type or paste a file path";
+                horizontal-stretch: 1;
+                accepted => {
+                    DesktopVm.send-file();
+                }
+            }
+
+            Btn {
+                text: "Send";
+                kind: "primary";
+                width: 72px;
+                horizontal-stretch: 0;
+                enabled: DesktopVm.file-path != "";
+                clicked => {
+                    DesktopVm.send-file();
+                }
+            }
+        }
+
+        for a in DesktopVm.activities: VerticalLayout {
+            spacing: 2px;
+            padding-left: Tokens.sp-3;
+            padding-right: Tokens.sp-3;
+            padding-top: 4px;
+            accessible-role: AccessibleRole.text;
+            accessible-label: a.name + (a.direction == "up" ? " to desktop " : " from desktop ") + a.state;
+            HorizontalLayout {
+                Text {
+                    text: a.name + (a.direction == "up" ? "  →  desktop" : "  ←  desktop");
+                    color: a.failed ? Tokens.danger : Tokens.text;
+                    font-size: Tokens.fs-sm;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+
+                Text {
+                    text: a.state;
+                    color: Tokens.text-2;
+                    font-size: Tokens.fs-sm;
+                }
+            }
+
+            if a.percent >= 0 && a.percent < 100 && !a.failed: ProgressBar {
+                percent: a.percent;
+            }
+        }
+        if DesktopVm.activities.length == 0: Text {
+            text: "No transfers yet. Drag files into the window to send them.";
+            color: Tokens.text-3;
+            font-size: Tokens.fs-sm;
+            wrap: word-wrap;
+        }
+    }
+
+    // ------------------------------------------------------------------------ overlays
+    if DesktopVm.overlay == 1: Overlay {
+        title: "Reconnecting…";
+        text: "The connection dropped. Your desktop keeps running on the server and will be back when the network is.";
+        busy: true;
+        Muted {
+            text: "Attempt " + DesktopVm.attempt + (DesktopVm.next-secs > 0 ? " · next try in " + DesktopVm.next-secs + " s" : "");
+            accessible-role: AccessibleRole.text;
+        }
+
+        ButtonRow {
+            Btn {
+                text: "Disconnect";
+                autofocus: true;
+                clicked => {
+                    DesktopVm.overlay-back();
+                }
+            }
+        }
+    }
+    if DesktopVm.overlay == 2: Overlay {
+        title: "Cannot reconnect";
+        text: "The connection has been down for 2 minutes. Your desktop is still running on the server unless the server itself went down.";
+        ButtonRow {
+            Btn {
+                text: "Back to Home";
+                clicked => {
+                    DesktopVm.overlay-back();
+                }
+            }
+
+            Btn {
+                text: "Try again";
+                kind: "primary";
+                autofocus: true;
+                clicked => {
+                    DesktopVm.overlay-retry();
+                }
+            }
+        }
+    }
+    if DesktopVm.overlay == 3: Overlay {
+        title: DesktopVm.takeover-title;
+        text: DesktopVm.takeover-text;
+        Banner {
+            title: "Was that you?";
+            text: "If not, someone may have your device key and PIN. Revoke that device, then change your PIN under Server details, Security.";
+            tone: 2;
+        }
+
+        if DesktopVm.takeover-note != "": Muted {
+            text: DesktopVm.takeover-note;
+        }
+        if DesktopVm.can-revoke: HorizontalLayout {
+            alignment: start;
+            Btn {
+                text: "Revoke that device";
+                kind: "danger";
+                clicked => {
+                    DesktopVm.revoke-peer();
+                }
+            }
+        }
+        ButtonRow {
+            Btn {
+                text: "Back to Home";
+                autofocus: true;
+                clicked => {
+                    DesktopVm.overlay-back();
+                }
+            }
+
+            Btn {
+                text: "Take it back";
+                kind: "primary";
+                clicked => {
+                    DesktopVm.take-back();
+                }
+            }
+        }
+    }
+    if DesktopVm.overlay == 4: Overlay {
+        title: "The desktop is not available";
+        text: "The server is reachable, but the desktop session is not answering. The agent tries again every few minutes and after a restart. Your files are safe.";
+        ButtonRow {
+            Btn {
+                text: "Server details";
+                clicked => {
+                    DesktopVm.overlay-details();
+                }
+            }
+
+            Btn {
+                text: "Back to Home";
+                clicked => {
+                    DesktopVm.overlay-back();
+                }
+            }
+
+            Btn {
+                text: "Try again";
+                kind: "primary";
+                autofocus: true;
+                clicked => {
+                    DesktopVm.overlay-retry();
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------ open link
+    if DesktopVm.link-open: Dialog {
+        open: true;
+        title: "Open this link on your computer?";
+        card-width: 520px;
+        dismissed => {
+            DesktopVm.cancel-link();
+        }
+        Label {
+            text: "The remote desktop asked this computer to open a link. Nothing opens until you say so.";
+            color: Tokens.text-2;
+        }
+
+        Rectangle {
+            background: Tokens.surface-2;
+            border-radius: Tokens.r-md;
+            border-width: 1px;
+            border-color: Tokens.border;
+            height: lk.preferred-height + 2 * Tokens.sp-3;
+            accessible-role: AccessibleRole.text;
+            accessible-label: "Link " + DesktopVm.link-prefix + DesktopVm.link-host + DesktopVm.link-rest;
+            lk := VerticalLayout {
+                x: Tokens.sp-3;
+                y: Tokens.sp-3;
+                width: parent.width - 2 * Tokens.sp-3;
+                HorizontalLayout {
+                    alignment: start;
+                    Text {
+                        text: DesktopVm.link-prefix;
+                        color: Tokens.text-2;
+                        font-family: Tokens.font-mono;
+                        font-size: Tokens.fs-sm;
+                    }
+
+                    Text {
+                        text: DesktopVm.link-host;
+                        color: Tokens.text;
+                        font-family: Tokens.font-mono;
+                        font-size: Tokens.fs-sm;
+                        font-weight: 700;
+                    }
+                }
+
+                Text {
+                    text: DesktopVm.link-rest;
+                    color: Tokens.text-2;
+                    font-family: Tokens.font-mono;
+                    font-size: Tokens.fs-sm;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        Muted {
+            text: "It opens in your default browser, outside hash-xcreen. Only continue if you expected it.";
+        }
+
+        ButtonRow {
+            Btn {
+                text: "Copy link";
+                kind: "ghost";
+                clicked => {
+                    DesktopVm.copy-link();
+                }
+            }
+
+            Btn {
+                text: "Cancel";
+                autofocus: true;
+                clicked => {
+                    DesktopVm.cancel-link();
+                }
+            }
+
+            Btn {
+                text: "Open link";
+                kind: "primary";
+                clicked => {
+                    DesktopVm.open-link();
+                }
+            }
+        }
+    }
+}

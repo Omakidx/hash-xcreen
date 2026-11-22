@@ -75,10 +75,9 @@ jobs:
           cargo nextest run --release --locked -p hx-agent --test e2e_netem --run-ignored only --no-capture
           --no-tests=fail -E 'test(netem_e2e_over_all_profiles)'
       - name: The flow under the lossy profile
-        # KNOWN FAILURE, tracked in docs/testing.md section 2.8: with 1.5 % loss the decoded
-        # picture ends corrupt in most runs. The step stays so that the result is visible in the
-        # log and the artifact; remove `continue-on-error` when the defect is fixed.
-        continue-on-error: true
+        # 1.5 % loss each way at 40 ms RTT; the picture must end exact (docs/testing.md 2.8
+        # records the defect this step caught and its fix). A separate step so that its log and
+        # artifact are easy to find.
         env:
           HX_E2E_NETEM: "1"
           HX_REQUIRE_XVFB: "1"
