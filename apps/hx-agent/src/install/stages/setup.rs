@@ -246,11 +246,15 @@ pub fn desktop_run(ctx: &mut Ctx<'_>) -> Result<Outcome> {
                 .unwrap_or("UNKNOWN")
         })
         .unwrap_or("UNKNOWN");
-    let warnings: Vec<String> = res
+    let mut warnings: Vec<String> = res
         .warnings
         .iter()
         .map(|w| crate::cli::text::peer(w, 256))
         .collect();
+    // `--docker` was asked for: a Docker that did not come up must not pass silently.
+    if let Some(w) = res.docker.as_ref().and_then(docker_warning) {
+        warnings.push(w);
+    }
     for w in &warnings {
         ctx.warn("desktop", w);
     }
@@ -268,6 +272,31 @@ pub fn desktop_run(ctx: &mut Ctx<'_>) -> Result<Outcome> {
     });
     ctx.state.desktop = Some(report);
     Ok(Outcome::Done)
+}
+
+/// The warning for a Docker outcome that is not `Enabled` (`None` when Docker works).
+/// `CreateDesktop` answers a failed self-test or an unsupported Incus as a normal outcome, so the
+/// install itself succeeds; the warning is how the result line says Docker is not usable.
+pub fn docker_warning(o: &pb::DockerOutcome) -> Option<String> {
+    use pb::docker_outcome::Outcome as O;
+    let text = match o.outcome.as_ref()? {
+        O::Enabled(_) => return None,
+        O::UnsupportedIncus(u) => format!(
+            "Docker was requested but is not enabled: the Incus is too old (found {}, needs {})",
+            crate::cli::text::peer(&u.found, 24),
+            crate::cli::text::peer(&u.required, 24)
+        ),
+        O::SelfTestFailed(f) => format!(
+            "Docker was requested but its self-test failed ({}); nesting and syscall interception {} (retry: hx-agent docker enable)",
+            crate::cli::text::peer(&f.hint, 80),
+            if f.isolation_restored {
+                "are off again"
+            } else {
+                "could NOT be switched off: run hx-agent docker disable"
+            }
+        ),
+    };
+    Some(crate::cli::text::peer(&text, 256))
 }
 
 // ----- verifiers ------------------------------------------------------------------------------
@@ -463,6 +492,42 @@ mod tests {
           {"ifname":"docker0","addr_info":[{"local":"172.17.0.1","scope":"global"}]}]"#;
         assert_eq!(parse_addresses(j), ["203.0.113.5", "2001:db8::5"]);
         assert!(parse_addresses("nope").is_empty());
+    }
+
+    #[test]
+    fn a_docker_that_is_not_enabled_becomes_a_warning() {
+        use pb::docker_outcome::Outcome as O;
+        let wrap = |o| pb::DockerOutcome { outcome: Some(o) };
+        assert_eq!(docker_warning(&pb::DockerOutcome { outcome: None }), None);
+        assert_eq!(
+            docker_warning(&wrap(O::Enabled(pb::DockerEnabled {
+                docker_version: "Docker version 27".into()
+            }))),
+            None
+        );
+        let w = docker_warning(&wrap(O::UnsupportedIncus(pb::DockerUnsupportedIncus {
+            found: "6.0.4".into(),
+            required: "6.0.5".into(),
+            fallbacks: vec![],
+        })))
+        .unwrap();
+        assert!(w.contains("6.0.4") && w.contains("6.0.5") && w.contains("not enabled"));
+        let failed = |restored| {
+            docker_warning(&wrap(O::SelfTestFailed(pb::DockerSelfTestFailed {
+                isolation_restored: restored,
+                hint: "pull failed".into(),
+                output_tail: "SECRET-TAIL".into(),
+                fallbacks: vec![],
+            })))
+            .unwrap()
+        };
+        assert!(failed(true).contains("self-test failed") && failed(true).contains("off again"));
+        assert!(failed(false).contains("NOT be switched off"));
+        assert!(
+            !failed(true).contains("SECRET-TAIL"),
+            "the output tail stays out"
+        );
+        assert!(failed(true).len() <= 256);
     }
 
     #[test]

@@ -24,5 +24,10 @@ tracing = "0.1"
 rcgen = "0.14"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "io-util"] }
 
+[features]
+# Entry points for the cargo-fuzz targets in `fuzz/` (module `fuzz`). Never enabled by a build of the
+# product: only the `fuzz` crate switches it on.
+fuzzing = []
+
 [lints]
 workspace = true
