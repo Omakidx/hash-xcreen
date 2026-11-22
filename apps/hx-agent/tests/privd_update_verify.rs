@@ -29,7 +29,7 @@ fn a_valid_signature_verifies_and_anything_else_does_not() {
     assert_eq!(k.verify(&data, &sig), Err(VerifyError::SignatureMismatch));
     assert_eq!(k.verify(b"", &sig), Err(VerifyError::SignatureMismatch));
     // The trusted comment is covered by the global signature.
-    let forged = sig.replace("hx test release", "hx forged release");
+    let forged = sig.replace("hx-manifest test", "hx-manifest forged");
     assert_ne!(forged, sig);
     assert_eq!(k.verify(DATA, &forged), Err(VerifyError::SignatureMismatch));
     // Malformed signature files.
@@ -246,4 +246,60 @@ fn the_version_syntax_agrees_with_an_independent_matcher_on_many_inputs() {
         assert_eq!(hx_ipc::privd::is_valid_update_version(s), valid, "{s:?}");
         assert_eq!(reference(s), valid, "{s:?}");
     }
+}
+
+fn manifest_bytes() -> Vec<u8> {
+    use hx_agent::privd::update::manifest::Manifest;
+    serde_json::to_vec(&Manifest {
+        schema: 1,
+        channel: "stable".into(),
+        version: "1.4.2".into(),
+        arch: "x86_64".into(),
+        artifact: "hx-1.4.2-x86_64.tar.gz".into(),
+        size: 10,
+        sha256: sha256_hex(b"x"),
+        timestamp: 1,
+        min_previous: None,
+    })
+    .unwrap()
+}
+
+#[test]
+fn a_release_manifest_needs_the_trusted_comment_the_release_workflow_writes() {
+    // I2: a key that also signs install.sh (`hx-install.sh v<V>`), or anything else, must not
+    // make a release manifest out of any bytes it signed.
+    let s = Signer::new();
+    let k = keys(&[&s]);
+    let m = manifest_bytes();
+    let good = "hx-manifest v1.4.2 channel=stable arch=x86_64";
+    assert!(
+        k.verify_manifest(&m, &s.sign_with_comment(&m, good))
+            .is_ok()
+    );
+    assert!(
+        k.verify_manifest(&m, &s.sign(&m)).is_ok(),
+        "the test signer writes it"
+    );
+    for bad in [
+        "hx-install.sh v1.4.2",
+        "hx-images-manifest schema=1 arch=x86_64 timestamp=1",
+        "hx test release",
+        "",
+        "hx-manifest v1.4.3 channel=stable arch=x86_64",
+        "hx-manifest v1.4.2 channel=beta arch=x86_64",
+        "hx-manifest v1.4.2 channel=stable arch=aarch64",
+        "hx-manifest v1.4.2 channel=stable arch=x86_64 ",
+    ] {
+        assert_eq!(
+            k.verify_manifest(&m, &s.sign_with_comment(&m, bad)).err(),
+            Some(VerifyError::BadComment),
+            "{bad:?}"
+        );
+    }
+    // Signed, right comment, but not a manifest.
+    assert_eq!(
+        k.verify_manifest(b"x", &s.sign_with_comment(b"x", good))
+            .err(),
+        Some(VerifyError::BadManifest)
+    );
 }

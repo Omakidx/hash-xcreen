@@ -622,10 +622,8 @@ fn rule_7_snapshot_cap_and_rate_rules_are_the_documented_ones() {
         rule(Command::CreateSnapshot(Default::default())),
         Some((hour, 6, false))
     );
-    assert_eq!(
-        rule(Command::ApplyUpdate(Default::default())),
-        Some((86_400_000, 2, false))
-    );
+    // Persisted per-role limits in updates-state instead (M1).
+    assert_eq!(rule(Command::ApplyUpdate(Default::default())), None);
     assert_eq!(
         rule(Command::StartDesktop(Default::default())),
         Some((60_000, 6, true))

@@ -108,6 +108,8 @@ fn the_fetcher_can_reach_the_internet_and_no_unix_socket() {
         "192.168.0.0/16",
         "100.64.0.0/10",
         "fc00::/7",
+        "64:ff9b::/96",
+        "64:ff9b:1::/48",
     ] {
         assert!(deny.iter().any(|d| d == r), "{r} is denied");
     }

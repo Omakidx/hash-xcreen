@@ -300,8 +300,10 @@ pub fn network_of(cidr: &str) -> Option<String> {
 ///   to the gateway; drop everything else, IPv4 and IPv6 alike (`inet` family).
 /// - `forward` (through the host): accept established/related; drop connections that were
 ///   DNAT'd (published host ports); keep the bridge's own subnet; drop destinations in
-///   10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16, fc00::/7 and
-///   fe80::/10 unless `allow_private_networks`. Everything else (the internet, via NAT) passes.
+///   10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16, fc00::/7,
+///   fe80::/10 and the NAT64 prefixes 64:ff9b::/96 and 64:ff9b:1::/48 (an address there reaches
+///   IPv4 space, private ranges included, through a NAT64 gateway) unless
+///   `allow_private_networks`. Everything else (the internet, via NAT) passes.
 ///
 /// The text starts with a declaration and `delete table`, so `nft -f` replaces any earlier
 /// version, and it parses with `nft -c -f` (check mode, no changes).
@@ -352,7 +354,9 @@ pub fn nft_host_protection(fw: &HostFirewall) -> Result<String, IncusError> {
     }
     if !fw.allow_private_networks {
         out.push_str("    ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16 } counter drop\n");
-        out.push_str("    ip6 daddr { fc00::/7, fe80::/10 } counter drop\n");
+        out.push_str(
+            "    ip6 daddr { fc00::/7, fe80::/10, 64:ff9b::/96, 64:ff9b:1::/48 } counter drop\n",
+        );
     }
     out.push_str("  }\n}\n");
     Ok(out)

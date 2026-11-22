@@ -1348,7 +1348,7 @@ fn nft_ruleset_text() {
         "    ct status dnat drop",
         "    ip daddr 10.77.3.0/24 accept",
         "    ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16 } counter drop",
-        "    ip6 daddr { fc00::/7, fe80::/10 } counter drop",
+        "    ip6 daddr { fc00::/7, fe80::/10, 64:ff9b::/96, 64:ff9b:1::/48 } counter drop",
         "  }",
         "}",
         "",
@@ -1359,6 +1359,10 @@ fn nft_ruleset_text() {
     let open =
         nft_host_protection(&fw("hxbr0", Some("10.77.3.1"), Some("10.77.3.0/24"), true)).unwrap();
     assert!(!open.contains("10.0.0.0/8") && !open.contains("fc00::/7"));
+    assert!(
+        !open.contains("64:ff9b"),
+        "NAT64 is private-network space too"
+    );
     assert!(
         open.contains("ct status dnat drop") && open.contains("counter drop\n  }\n  chain forward")
     );

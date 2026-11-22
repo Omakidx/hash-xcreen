@@ -28,7 +28,7 @@ use crate::install::error::{InstallError, Result};
 use crate::install::fsx::ensure_dir;
 use crate::install::paths;
 use crate::privd::update::extract::{Limits, extract_tar_gz};
-use crate::privd::update::manifest::{Expect, MAX_ARTIFACT_BYTES, Manifest};
+use crate::privd::update::manifest::{Expect, MAX_ARTIFACT_BYTES};
 use crate::privd::update::switch::Layout;
 use crate::privd::update::verify::{digest_eq, hex};
 
@@ -114,16 +114,15 @@ fn install_bootstrap(ctx: &mut Ctx<'_>, dir: &Path) -> Result<()> {
     let sig = read_small(dir, MANIFEST_SIG, 8192)?;
     let sig_text = String::from_utf8(sig)
         .map_err(|_| InstallError::verify("the signature file is not text"))?;
-    ctx.keys
-        .verify(&manifest_bytes, &sig_text)
+    let signed = ctx
+        .keys
+        .verify_manifest(&manifest_bytes, &sig_text)
         .map_err(|e| InstallError::verify(format!("the manifest signature is not valid: {e}")))?;
-    let release = Manifest::parse(&manifest_bytes)
-        .and_then(|m| {
-            m.check(&Expect {
-                channel: &ctx.opts.channel,
-                arch: "x86_64",
-                now: (ctx.now)(),
-            })
+    let release = signed
+        .check(&Expect {
+            channel: &ctx.opts.channel,
+            arch: "x86_64",
+            now: (ctx.now)(),
         })
         .map_err(|e| InstallError::verify(format!("the manifest is not acceptable: {e}")))?;
     let m = &release.manifest;

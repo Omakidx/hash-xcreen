@@ -330,7 +330,7 @@ fn frames_until_quiet(p: &Pipeline, quiet: Duration, limit: Duration) -> Vec<Enc
 /// encoding the unchanged screen until the picture is back at the normal quality.
 #[test]
 fn a_starved_key_frame_is_followed_by_refinement_frames_of_the_static_screen() {
-    use hx_session::refine::{SETTLED_BYTES, STARVED_QP};
+    use hx_session::refine::STARVED_QP;
     let Some(x) = Xvfb::start(W, H) else { return };
     let p = start(&x, |cfg| cfg.encoder.bitrate_kbps = 1_000);
     next_frame(&p, Duration::from_secs(5)).expect("first frame");
@@ -340,7 +340,9 @@ fn a_starved_key_frame_is_followed_by_refinement_frames_of_the_static_screen() {
     assert!(!settled.is_empty(), "the painted screen is captured");
 
     p.control().request_idr();
-    let run = frames_until_quiet(&p, Duration::from_millis(500), Duration::from_secs(20));
+    // Passes follow each other 15 ms apart (refine::QUIET); a 2 s gap means the run is over. A
+    // 500 ms gap ended it early when one encode took that long on a loaded machine.
+    let run = frames_until_quiet(&p, Duration::from_secs(2), Duration::from_secs(30));
     let idr = run.first().expect("a frame for the request");
     assert!(idr.idr, "the request is answered with an IDR");
     assert!(
@@ -355,11 +357,17 @@ fn a_starved_key_frame_is_followed_by_refinement_frames_of_the_static_screen() {
     );
     assert!(run[1..].iter().all(|f| !f.idr), "refinements are P frames");
     let last = run.last().expect("last");
+    // The run ends at the normal quality. Whether its last frame is also "settled" (at most
+    // refine::SETTLED_BYTES) depends on the machine's pace: a capture that arrives while the
+    // encoder is busy is superseded but still uses a pass, so on a loaded machine the pass cap
+    // (refine::MAX_PASSES) can end the run before the frames get that small. The defect this
+    // guards against is a picture left at the starved quality, which this assertion catches.
     assert!(
-        last.qp.is_some_and(|q| q < STARVED_QP) && last.bytes().len() <= SETTLED_BYTES,
-        "the run ends when a pass has nothing left to add (last qp {:?}, {} B)",
+        last.qp.is_some_and(|q| q < STARVED_QP),
+        "the run ends at the normal quality (last qp {:?}, {} B, {} frames)",
         last.qp,
-        last.bytes().len()
+        last.bytes().len(),
+        run.len()
     );
     let s = p.shutdown().expect("shutdown");
     assert_eq!(s.errors, 0);

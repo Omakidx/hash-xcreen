@@ -322,6 +322,8 @@ impl<'a> Fetch<'a> {
             .map_err(|e| io_internal("preparing the image directories", &e))?;
         let dir = FetchDir::open(&cfg.fetch_dir)
             .map_err(|e| io_internal("opening the fetch directory", &e))?;
+        dir.require_tmpfs(cfg.fetch_tmpfs_cap)
+            .map_err(|e| io_internal("checking the fetch directory", &e))?;
         let me = Self {
             cfg,
             deps,
