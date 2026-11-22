@@ -56,19 +56,20 @@ If the install fails, the app shows the failing stage, the reason, and **Retry**
 
 1. **Method**: **Copy one-liner**.
 2. The user enters the server's address, then completes the same Desktop, Account, Backups and Resources steps.
-3. The app shows the command with a **Copy** button and a note that it expires in 15 minutes and works once:
+3. The app shows the command with a **Copy** button. The command holds **no token and no secret**, so it is safe in the shell history and the server's logs:
    ```bash
-   curl -fsSL https://<release-host>/install.sh | sudo sh -s -- --token hx1_… --distro ubuntu-24.04 --desktop xfce --user alex --backup 12h
+   curl -fsSL https://github.com/Omakidx/hash-xcreen/releases/download/channel-stable/install.sh | sudo sh -s -- --pair --distro ubuntu-24.04 --desktop xfce --user alex --backup 12h
    ```
-4. The user pastes it into a root shell on the server. The app shows "Waiting for the server…".
-5. As soon as the agent starts, the app pairs automatically, sends the password, PIN and Drive token over the encrypted connection, and switches to the live progress view.
-6. If the token expires first, the app offers **Generate a new command**.
+   Below it the app shows the one-time **pairing token** (`hxt1-…`) with its own **Copy** button, and a note that it expires 15 minutes after the installer takes it and works once.
+4. The user pastes the command into a root shell on the server. The installer checks the server, installs the agent and opens the port, then asks for the token; the user pastes it (nothing is echoed). The app shows "Waiting for the server…".
+5. As soon as the agent is listening, the app pairs automatically. The installer has finished at this point; what happens next (sending the password, PIN and Drive token over the encrypted connection, creating the desktop, and the live progress view) needs setup messages that are designed in workstream 1G, so until that work lands this path ends at a paired server with no desktop.
+6. If the token expires first, the app offers **Generate a new token**.
 
 ## 4. Install without the app
 
 1. The user runs `install.sh --interactive` on the server.
 2. The installer asks for each setting; the password and PIN are typed with hidden input.
-3. At the end it prints a **pairing code** and the server address.
+3. At the end it prints a **pairing code**, the server's addresses and the port. The code is valid for 15 minutes; `hx-agent pairing code` prints a new one.
 4. Later, in the app: **Add server → Enter pairing code**. The server card appears and the user connects with their PIN.
 
 ## 5. Connect to a desktop
