@@ -652,18 +652,38 @@ fn refusals(l1: &L1) {
         "a refused run must leave no state"
     );
     let port22 = out.exit;
-    // The prebuilt image path and an image file are "not in this release": exit 6, at preflight.
-    let pre = l1.install(443, &["--image", "prebuilt"]);
-    assert_eq!(
-        pre.exit, 6,
-        "--image prebuilt: {:?}\n{}",
-        pre.lines, pre.stderr
-    );
+    // `--image-file` (1D): an image that is not there is exit 9, a relative path or a combination
+    // with `--image build` is exit 2, and files that do not verify are exit 10 (the agent of this
+    // harness embeds no image key, and these are not a signed manifest anyway). All of it at
+    // preflight, before anything is changed.
     let file = l1.install(443, &["--image-file", "/root/none.img"]);
     assert_eq!(
-        file.exit, 6,
-        "--image-file: {:?}\n{}",
+        file.exit, 9,
+        "--image-file (missing): {:?}\n{}",
         file.lines, file.stderr
+    );
+    let rel = l1.install(443, &["--image-file", "none.img"]);
+    assert_eq!(rel.exit, 2, "--image-file (relative): {:?}", rel.lines);
+    let both = l1.install(443, &["--image-file", "/root/none.img", "--image", "build"]);
+    assert_eq!(
+        both.exit, 2,
+        "--image-file with --image build: {:?}",
+        both.lines
+    );
+    assert!(
+        l1.exec(
+            "mkdir -p /root/img && cd /root/img && head -c 4096 /dev/urandom > x.img \
+             && echo '{}' > images-manifest-x86_64.json \
+             && printf 'untrusted comment: x\\nAAAA\\ntrusted comment: x\\nAAAA\\n' > images-manifest-x86_64.json.minisig"
+        )
+        .ok(),
+        "the bad image files could not be made"
+    );
+    let bad = l1.install(443, &["--image-file", "/root/img/x.img"]);
+    assert_eq!(
+        bad.exit, 10,
+        "--image-file (unverifiable): {:?}\n{}",
+        bad.lines, bad.stderr
     );
     assert!(
         !l1.exec("test -e /var/lib/hx/install-state.json").ok(),
@@ -678,7 +698,7 @@ fn refusals(l1: &L1) {
         id,
         "refusals change nothing",
         format!(
-            "empty stdin exit 2, --port 22 exit {port22}, --image prebuilt exit 6, --image-file exit 6; no state file, no /usr/lib/hx, no incus package"
+            "empty stdin exit 2, --port 22 exit {port22}, --image-file missing exit 9, relative or with --image build exit 2, unverifiable exit 10; no state file, no /usr/lib/hx, no incus package"
         ),
     );
 }
