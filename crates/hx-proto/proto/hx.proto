@@ -518,6 +518,176 @@ message SetupMessage {
   }
 }
 
+// ----- 1.3: server management (protocol 5.11), feature SERVER_MANAGEMENT, authorized sessions only -----
+
+message ServerGetOverview {}
+
+// Both secrets: Debug is redacted (hand-written in hx-proto). 6..=16 ASCII digits each.
+message ServerChangePin {
+  bytes current = 1;
+  bytes new = 2;
+}
+
+// Both secrets: Debug is redacted. 1..=511 bytes of UTF-8 each, no NUL, CR or LF.
+message ServerChangePassword {
+  bytes current = 1;
+  bytes new = 2;
+}
+
+message ServerRestartDesktop {
+  bool force = 1;
+}
+
+message ServerSetDocker {
+  // Off is allowed; on is Admin-only after setup and is answered ADMIN_ONLY.
+  bool enable = 1;
+}
+
+message ServerSetLimits {
+  // Every field non-zero; the host bounds are checked by the privileged daemon.
+  SetupLimits limits = 1;
+}
+
+message ServerCheckUpdate {}
+
+message ServerApplyUpdate {
+  // At most 32 bytes; privd checks the syntax and that it is the fetched, verified release.
+  string version = 1;
+}
+
+enum ServerStatus {
+  SERVER_STATUS_UNSPECIFIED = 0;
+  SERVER_STATUS_OK = 1;
+  SERVER_STATUS_INVALID_ARGUMENT = 2;
+  SERVER_STATUS_WRONG_PIN = 3;
+  SERVER_STATUS_WRONG_PASSWORD = 4;
+  SERVER_STATUS_BACKOFF = 5;
+  SERVER_STATUS_LOCKED = 6;
+  SERVER_STATUS_RATE_LIMITED = 7;
+  SERVER_STATUS_ADMIN_ONLY = 8;
+  SERVER_STATUS_UNAVAILABLE = 9;
+  SERVER_STATUS_DESKTOP_NOT_READY = 10;
+  SERVER_STATUS_FAILED = 11;
+  SERVER_STATUS_UPDATE_REFUSED = 12;
+  SERVER_STATUS_UNSUPPORTED = 13;
+}
+
+enum ServerAttention {
+  SERVER_ATTENTION_UNSPECIFIED = 0;
+  SERVER_ATTENTION_HOST_ACCOUNT_POLICY = 1;
+  SERVER_ATTENTION_STUCK_OPERATION = 2;
+  SERVER_ATTENTION_ISOLATION_NOT_RESTORED = 3;
+  SERVER_ATTENTION_PIN_LOCKED = 4;
+  SERVER_ATTENTION_PASSWORD_LOCKED = 5;
+  SERVER_ATTENTION_UPDATE_ROLLED_BACK = 6;
+  SERVER_ATTENTION_HOST_DOCKER_FORWARDING = 7;
+}
+
+enum ServerDesktopState {
+  SERVER_DESKTOP_STATE_UNSPECIFIED = 0;
+  SERVER_DESKTOP_STATE_NONE = 1;
+  SERVER_DESKTOP_STATE_CREATING = 2;
+  SERVER_DESKTOP_STATE_READY = 3;
+  SERVER_DESKTOP_STATE_FAILED = 4;
+  SERVER_DESKTOP_STATE_STOPPED = 5;
+  SERVER_DESKTOP_STATE_RUNNING = 6;
+  SERVER_DESKTOP_STATE_STARTING = 7;
+  // The privileged daemon could not be asked.
+  SERVER_DESKTOP_STATE_UNKNOWN = 8;
+}
+
+enum ServerDockerState {
+  SERVER_DOCKER_STATE_UNSPECIFIED = 0;
+  SERVER_DOCKER_STATE_OFF = 1;
+  SERVER_DOCKER_STATE_ON = 2;
+  SERVER_DOCKER_STATE_DEGRADED = 3;
+}
+
+enum ServerUpdateChannel {
+  SERVER_UPDATE_CHANNEL_UNSPECIFIED = 0;
+  SERVER_UPDATE_CHANNEL_STABLE = 1;
+  SERVER_UPDATE_CHANNEL_BETA = 2;
+}
+
+message ServerUpdateInfo {
+  // At most 32 bytes.
+  string current = 1;
+  // At most 32 bytes; empty = no newer release.
+  string available = 2;
+  ServerUpdateChannel channel = 3;
+  bool verified = 4;
+  // At most 32 bytes; set when the last update was rolled back.
+  string rolled_back_version = 5;
+  // At most 256 bytes.
+  string rolled_back_reason = 6;
+  // 0 = never checked since the agent started.
+  uint64 checked_unix = 7;
+}
+
+message ServerDesktop {
+  ServerDesktopState state = 1;
+  // At most 32 bytes.
+  string username = 2;
+  SetupDistro distro = 3;
+  SetupPreset preset = 4;
+  SetupLimits limits = 5;
+  ServerDockerState docker = 6;
+  // At most 8.
+  repeated ServerAttention needs_attention = 7;
+  uint64 created_unix = 8;
+}
+
+message ServerOverview {
+  // At most 64 bytes.
+  string agent_version = 1;
+  // At most 64 bytes.
+  string privd_version = 2;
+  uint64 server_time_unix = 3;
+  uint64 agent_uptime_s = 4;
+  // The cached result of the last check_update; unset if there was none.
+  ServerUpdateInfo update = 5;
+  // Unset only if the server has no desktop information at all.
+  ServerDesktop desktop = 6;
+  // Unset if the privileged daemon could not be asked.
+  SetupHostFacts host = 7;
+  // At most 8.
+  repeated ServerAttention host_attention = 8;
+  // Some client holds the desktop now.
+  bool session_active = 9;
+}
+
+message ServerResult {
+  ServerStatus status = 1;
+  uint32 retry_after_s = 2;
+  // With WRONG_PIN: the wrong PINs left before the device is revoked.
+  uint32 attempts_left = 3;
+  // At most 256 bytes: a fixed or sanitized text, never a value that was sent.
+  string message = 4;
+  // set_limits: the CPU count changed on a running desktop.
+  bool restart_required = 5;
+  // check_update.
+  ServerUpdateInfo update = 6;
+  // apply_update: the version being installed (at most 32 bytes).
+  string version = 7;
+}
+
+message ServerMgmt {
+  // Non-zero in every request and in the response that answers it.
+  uint32 request_id = 1;
+  oneof body {
+    ServerGetOverview get_overview = 10;        // client to server
+    ServerOverview overview = 11;               // server to client
+    ServerChangePin change_pin = 12;            // client to server
+    ServerChangePassword change_password = 13;  // client to server
+    ServerRestartDesktop restart_desktop = 14;  // client to server
+    ServerSetDocker set_docker = 15;            // client to server
+    ServerSetLimits set_limits = 16;            // client to server
+    ServerCheckUpdate check_update = 17;        // client to server
+    ServerApplyUpdate apply_update = 18;        // client to server
+    ServerResult result = 19;                   // server to client
+  }
+}
+
 // Opaque carrier for messages owned by workstream 1B (pairing, PIN/auth).
 message Opaque {
   bytes data = 1;
@@ -540,6 +710,8 @@ message ControlMessage {
     DeviceMgmt device_mgmt = 12;
     // 1.3, feature SETUP: post-pairing setup, INTENT_SETUP connections only (protocol 5.10).
     SetupMessage setup = 13;
+    // 1.3, feature SERVER_MANAGEMENT: server management on an authorized session (protocol 5.11).
+    ServerMgmt server_mgmt = 14;
     Opaque pairing = 100;
     Opaque auth = 101;
   }

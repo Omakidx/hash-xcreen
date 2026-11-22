@@ -142,6 +142,10 @@ pub const MAX_DEVICE_LIST: usize = 128;
 pub const MAX_SETUP_PIN: usize = 16;
 /// Most bytes of the password in `SetupStart` (hard cap; the content rules are semantic).
 pub const MAX_SETUP_PASSWORD: usize = 1_024;
+/// Most bytes of a version string in `ServerApplyUpdate` and `ServerUpdateInfo` (hard cap).
+pub const MAX_SERVER_VERSION: usize = 32;
+/// Most attention flags in a `ServerDesktop` or `ServerOverview` (hard cap).
+pub const MAX_SERVER_ATTENTION: usize = 8;
 /// Most bytes of a desktop user name in `SetupOptions` (hard cap).
 pub const MAX_SETUP_USERNAME: usize = 32;
 /// Most warnings in a `SetupResult`.

@@ -416,6 +416,13 @@ enum AuditEvent {
   AUDIT_EVENT_TAKEOVER = 7;
   // 1.3: a paired device asked for a pairing code from the app (device_id = the requester).
   AUDIT_EVENT_DEVICE_PAIRING_CODE_ISSUED = 8;
+  // 1.3 server management from the app (protocol 5.11); device_id = the requesting device.
+  AUDIT_EVENT_PASSWORD_CHANGED = 9;
+  AUDIT_EVENT_DESKTOP_RESTARTED = 10;
+  AUDIT_EVENT_DOCKER_DISABLED = 11;
+  AUDIT_EVENT_LIMITS_CHANGED = 12;
+  // label = the version.
+  AUDIT_EVENT_UPDATE_APPLIED = 13;
 }
 
 message RecordEventRequest {
