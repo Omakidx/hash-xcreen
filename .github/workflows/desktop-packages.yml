@@ -186,7 +186,8 @@ jobs:
         # The AppImage is built on 24.04, the oldest supported glibc, and bundles this FFmpeg 6.1.
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang libclang-dev pkg-config libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libx264-dev libfontconfig1-dev xvfb xauth
+          sudo apt-get install -y --no-install-recommends clang libclang-dev pkg-config libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libx264-dev libfontconfig1-dev xvfb xauth \
+            libegl1 libxkbcommon0 libxkbcommon-x11-0 libwayland-client0 libx11-6 libxcb1
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: desktop-appimage
