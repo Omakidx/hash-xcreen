@@ -67,21 +67,6 @@ component Panel inherits Card {
     }
 }
 
-component UseBar inherits VerticalLayout {
-    in property <string> label;
-    in property <float> frac;
-    spacing: 3px;
-    Text {
-        text: root.label;
-        color: Tokens.text;
-        font-size: Tokens.fs-sm;
-    }
-
-    ProgressBar {
-        percent: round(max(0, min(1, root.frac)) * 100);
-    }
-}
-
 component DeviceRow inherits Rectangle {
     in property <DeviceRowData> d;
     height: 48px;
@@ -331,21 +316,10 @@ export component DetailsScreen inherits Rectangle {
                             }
                         }
 
-                        if DetailsVm.cpu-text != "": Panel {
-                            title: "Resources";
-                            UseBar {
-                                label: DetailsVm.cpu-text;
-                                frac: DetailsVm.cpu-frac;
-                            }
-
-                            UseBar {
-                                label: DetailsVm.mem-text;
-                                frac: DetailsVm.mem-frac;
-                            }
-
-                            UseBar {
-                                label: DetailsVm.disk-text;
-                                frac: DetailsVm.disk-frac;
+                        if DetailsVm.ov-limits.length > 0: Panel {
+                            title: "Limits of the desktop";
+                            KvList {
+                                rows: DetailsVm.ov-limits;
                             }
                         }
                         Panel {
@@ -784,7 +758,7 @@ export component DetailsScreen inherits Rectangle {
             DetailsVm.close-dialog();
         }
         Label {
-            text: "Listing and revoking devices needs a signed-in session. Enter the PIN you use to connect. It is checked by the server and counts as an attempt like any other.";
+            text: "Server details need a signed-in session. Enter the PIN you use to connect. It is checked by the server and counts as an attempt like any other.";
             color: Tokens.text-2;
         }
 

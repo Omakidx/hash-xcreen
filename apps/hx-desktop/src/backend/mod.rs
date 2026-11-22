@@ -11,6 +11,7 @@
 //! Listing and revoking devices, pairing with a token or code and the PIN login use the 1.2
 //! APIs directly (`crate::session`), not these traits.
 
+pub mod control_real;
 pub mod demo;
 pub mod demo_desk;
 pub mod real;
@@ -543,6 +544,13 @@ pub enum AdminError {
     /// The server is older than protocol 1.3: it must be updated first.
     #[error("the server must be updated")]
     UpdateRequired,
+    /// The call needs a PIN-signed-in session and there is none yet.
+    #[error("sign in with your PIN first")]
+    SessionRequired,
+    /// The PIN or password was wrong too often: the server ended the session and revoked this
+    /// device ("Pair again").
+    #[error("this device was removed from the server")]
+    Revoked,
 }
 
 /// Pairing codes and reinstate (protocol 1.3).
@@ -562,49 +570,60 @@ pub trait DeviceAdmin: Send + Sync {
 
 // ------------------------------------------------------------------------------------ server control
 
-/// The numbers of Server details, Overview.
+/// State of the desktop, as the server reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DesktopStatus {
+    /// Running (or ready).
+    Running,
+    /// Created but not answering (stopped, failed, or needs attention).
+    NotAnswering,
+    /// Being built.
+    Creating,
+    /// No desktop yet.
+    NotCreated,
+    /// The privileged daemon could not be asked.
+    Unknown,
+}
+
+/// What Server details, Overview shows. Only what the server reports: there are no live CPU,
+/// memory or disk usage numbers, no desktop uptime and no name of the connected device, so none
+/// are shown.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Overview {
-    /// The desktop answers.
-    pub desktop_running: bool,
-    /// Uptime in seconds.
-    pub uptime_secs: u64,
-    /// Who is connected, if anyone.
-    pub session_with: Option<String>,
+    /// The desktop.
+    pub desktop: DesktopStatus,
+    /// How long the agent has run.
+    pub agent_uptime_secs: u64,
+    /// Some client holds the desktop now.
+    pub session_active: bool,
     /// "Ubuntu 24.04 · XFCE · Developer · Docker on".
     pub setup: String,
     /// Agent version.
     pub agent_version: String,
-    /// Channel.
+    /// Privileged daemon version.
+    pub privd_version: String,
+    /// Update channel.
     pub channel: String,
-    /// A newer version, if one exists.
+    /// A newer version, if the last check found one.
     pub update_available: Option<String>,
+    /// The version of an update that was rolled back, if any.
+    pub rolled_back: Option<String>,
     /// Protocol version text.
     pub protocol: String,
-    /// CPU use in percent.
-    pub cpu_pct: u32,
-    /// Cores of the desktop.
-    pub cpu_cores: u32,
-    /// Memory used, GiB.
-    pub mem_used_gb: f32,
-    /// Memory limit, GiB.
-    pub mem_total_gb: f32,
-    /// Disk used, GiB.
-    pub disk_used_gb: u32,
-    /// Disk limit, GiB.
-    pub disk_total_gb: u32,
-    /// Host OS line.
+    /// The desktop's limits.
+    pub limits: Option<Limits>,
+    /// Host line: "Ubuntu 24.04.2 LTS, 4 vCPU, 7.8 GB".
     pub host_os: String,
-    /// Paired devices.
-    pub devices: u32,
+    /// Cores of the host (CPU slider maximum).
+    pub host_cpus: u32,
+    /// GiB the desktop may use at most (memory slider maximum).
+    pub host_mem_gb: u32,
+    /// GiB of storage pool the desktop may use at most (disk slider maximum).
+    pub host_disk_gb: u32,
     /// Docker is on.
     pub docker: bool,
-    /// Cores of the host (limit of the CPU slider).
-    pub host_cpus: u32,
-    /// GiB the desktop may use at most (host memory minus the reserve).
-    pub host_mem_gb: u32,
-    /// GiB of disk the desktop may use at most.
-    pub host_disk_gb: u32,
+    /// Things that need attention, as sentences.
+    pub attention: Vec<String>,
 }
 
 /// Resource limits of the desktop.

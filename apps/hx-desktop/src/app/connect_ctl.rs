@@ -295,6 +295,9 @@ fn submit_password(app: &Rc<App>) {
                 }
                 Err(AdminError::Unreachable) => vm.set_err_password(ss("Cannot reach the server.")),
                 Err(AdminError::UpdateRequired) => super::update_ctl::show(a, &id),
+                Err(AdminError::SessionRequired | AdminError::Revoked) => {
+                    vm.set_err_password(ss("Pairing again is not possible right now."))
+                }
                 Err(AdminError::Failed(m)) => vm.set_err_password(ss(m)),
             }
         },

@@ -14,7 +14,7 @@ cargo run -p hx-desktop -- --demo --screen connect-wrong --theme light
 
 `--screen NAME` opens one state of the mockups (list: `app/showcase.rs`, `NAMES`); the screenshots and render tests use the same names. `HX_LOG=debug` turns logging on; `HX_REDUCED_MOTION=1` stops the spinner and the indeterminate bar. The theme follows the system unless forced in App settings or with `--theme`.
 
-Without `--demo` the SSH install, pairing codes from the app, reinstate and server management answer "not part of this build yet" (`backend/real.rs`) until the integrator wires them; pairing with a token or code and the PIN session are real.
+Without `--demo` everything is real: the SSH install over `hx-sshsetup` (`backend/ssh.rs`, the bundled `installer/install.sh`), the one-liner setup over `hx_crypto::setup` (`backend/setup_real.rs`), pairing codes and "Pair again" (`backend/real.rs`), server management over protocol 1.3 (`backend/control_real.rs`), and the PIN session. A server below protocol 1.3 gets the "This server must be updated" screen (`sudo hx-agent update check`, then `sudo hx-agent update apply <version>`); the app stores the version each server showed (`server_version` in `servers.json`).
 
 ## Structure
 
@@ -35,17 +35,17 @@ Without `--demo` the SSH install, pairing codes from the app, reinstate and serv
 | `src/details/` | device rows, revoke rules, dialogs, the Danger zone flow |
 | `src/backend/` | the traits below, the demo fakes, the real-or-unavailable set |
 
-## Seams for the integrator
+## Seams
 
-All in `src/backend/mod.rs` (and `session/desk.rs`); `Backends` holds one of each. `demo::backends(pace)` fills it with fakes, `real::backends(handle, device_name)` with what exists today.
+All in `src/backend/mod.rs` (and `session/desk.rs`); `Backends` holds one of each. `demo::backends(pace)` fills it with fakes, `real::backends(handle, device_name)` with the real implementations.
 
-* `InstallEngine`: `probe_host_key(&SshTarget) -> HostKey`, `preflight(&SshTarget, &SshAuth, &HostKey) -> Preflight`, `install(InstallRequest) -> Box<dyn InstallRun>` (events: stage, step with optional percent, warn, log, image path, connection lost, failed, finished), `uninstall(UninstallRequest)`. Adapter over `hx-sshsetup`.
-* `SetupClient`: `pair(&ServerAddr, device, &Secret token or code) -> PairedInfo`, `start_setup(..., SetupRequest) -> Box<dyn InstallRun>`. The real `pair` exists; `start_setup` waits for `hx_crypto::setup`.
-* `DeviceAdmin`: `create_pairing_code(&AdminContext)`, `reinstate(&AdminContext, &Secret)`.
-* `ServerControl`: overview numbers, change PIN and password, restart, Docker, limits, agent update. No protocol message exists yet; this is the contract the Server details screens need.
-* `session::Connector`: `connect(&Link, pin, on_secure, Wiring) -> Established` (one PIN attempt per call), `probe`. Real: `RealConnector`.
+* `InstallEngine` (real: `ssh::SshInstallEngine`): `probe_host_key`, `preflight`, `install` (events through `InstallRun`), `uninstall` (runs `hx-agent uninstall --yes` over SSH).
+* `SetupClient` (real: `setup_real::RealSetupClient`): `pair` (token or code) and `start_setup` (`connect_setup`, `set_pin` or `submit_pin`, `start`, pushes mapped to the same `InstallEvent`s, `finish`).
+* `DeviceAdmin` (real: `real::RealAdmin`): `create_pairing_code` and `reinstate`.
+* `ServerControl` (real: `control_real::RealControl`): overview, change PIN and password, restart, Docker (turning it on is a server command: `sudo hx-agent docker enable`), limits, update.
+* `session::Connector` (real: `RealConnector`): `connect` (one PIN attempt per call) and `probe`.
 
-Listing and revoking devices, the PIN login, pairing, takeover and the live session use the 1.2 messages directly (`session/net.rs`).
+**One reader of control answers.** The app's session task (`session/net.rs`) is the only reader of the control channel of a live connection. List, revoke, pairing codes (`DeviceMgmt`) and server management (`ServerMgmt`) are requests on that task, matched by request id (`Desk::server_request`, `Desk::create_pairing_code`), so nothing competes with `hx_crypto::device_admin::DeviceAdmin` or `server_admin::ServerAdmin`, which would each want to own the receive side. Reinstate and setup use their own connections (there is no session yet). The overview shows only what the server reports: no live CPU, memory or disk usage numbers.
 
 ## Video
 
@@ -55,7 +55,7 @@ Software decode with FFmpeg into RGBA, shown as a Slint `Image` from a `SharedPi
 
 ```sh
 cargo nextest run -p hx-desktop                       # unit and UI tests
-cargo nextest run -p hx-desktop --run-ignored only    # the headless session test against a real gatewayd (needs Xvfb)
+cargo nextest run -p hx-desktop --run-ignored only    # session, setup and server-management tests against a real gatewayd (session needs Xvfb)
 ```
 
 Screenshots: `DISPLAY=:20 cargo run -p hx-desktop -- --demo --screen NAME` and `import -window root out.png`.

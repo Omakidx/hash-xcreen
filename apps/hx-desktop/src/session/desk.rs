@@ -45,6 +45,13 @@ pub trait Desk: Send + Sync {
     fn revoke(&self, id: [u8; 16]) -> BoxFuture<'_, Result<RevokeStatus, MgmtError>>;
     /// Ends the connection.
     fn close(&self) -> BoxFuture<'_, ()>;
+    /// One server-management request (protocol 1.3) and its answer, over this connection's own
+    /// control path (the single reader of control answers).
+    fn server_request(
+        &self,
+        body: hx_proto::pb::server_mgmt::Body,
+        wait: std::time::Duration,
+    ) -> BoxFuture<'_, Result<hx_proto::pb::server_mgmt::Body, MgmtError>>;
     /// Asks the server for a pairing code (protocol 1.3, over this connection's own control
     /// path: the one place that reads `DeviceMgmt` answers).
     fn create_pairing_code(
@@ -95,6 +102,13 @@ impl Desk for Session {
     }
     fn close(&self) -> BoxFuture<'_, ()> {
         Box::pin(Session::close(self))
+    }
+    fn server_request(
+        &self,
+        body: hx_proto::pb::server_mgmt::Body,
+        wait: std::time::Duration,
+    ) -> BoxFuture<'_, Result<hx_proto::pb::server_mgmt::Body, MgmtError>> {
+        Box::pin(Session::server_request(self, body, wait))
     }
     fn create_pairing_code(
         &self,

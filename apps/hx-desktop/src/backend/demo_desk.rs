@@ -391,6 +391,14 @@ impl Desk for DemoDesk {
         self.stop.store(true, SeqCst);
         Box::pin(async {})
     }
+    fn server_request(
+        &self,
+        _body: hx_proto::pb::server_mgmt::Body,
+        _wait: Duration,
+    ) -> BoxFuture<'_, Result<hx_proto::pb::server_mgmt::Body, MgmtError>> {
+        // The demo answers server management through `DemoServerControl`, not the wire.
+        Box::pin(async { Err(MgmtError::Unsupported) })
+    }
     fn create_pairing_code(
         &self,
         _ttl: u32,

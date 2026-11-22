@@ -466,26 +466,35 @@ impl ServerControl for DemoServerControl {
                 return Err(AdminError::Unreachable);
             }
             Ok(Overview {
-                desktop_running: !sick,
-                uptime_secs: 12 * 86_400 + 4 * 3600,
-                session_with: None,
+                desktop: if sick {
+                    DesktopStatus::NotAnswering
+                } else {
+                    DesktopStatus::Running
+                },
+                agent_uptime_secs: 12 * 86_400 + 4 * 3600,
+                session_active: false,
                 setup: "Ubuntu 24.04 · XFCE · Developer · Docker on".into(),
                 agent_version: "0.1.0".into(),
+                privd_version: "0.1.0".into(),
                 channel: "stable".into(),
                 update_available: update.then(|| "0.1.1".into()),
-                protocol: "1.2".into(),
-                cpu_pct: 12,
-                cpu_cores: 3,
-                mem_used_gb: 1.8,
-                mem_total_gb: 5.0,
-                disk_used_gb: 14,
-                disk_total_gb: 60,
+                rolled_back: None,
+                protocol: "1.3".into(),
+                limits: Some(Limits {
+                    cpu: 3,
+                    memory_gb: 5,
+                    disk_gb: 60,
+                }),
                 host_os: "Ubuntu 24.04.2 LTS, 4 vCPU, 7.8 GB".into(),
-                devices: 3,
-                docker: true,
                 host_cpus: 4,
                 host_mem_gb: 5,
                 host_disk_gb: 152,
+                docker: true,
+                attention: if sick {
+                    vec!["The desktop is not answering".into()]
+                } else {
+                    vec![]
+                },
             })
         })
     }

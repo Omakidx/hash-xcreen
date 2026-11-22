@@ -11,8 +11,8 @@ use slint::ComponentHandle;
 use super::known_hosts::Known;
 use super::{App, model, spawn_ui, ss};
 use crate::backend::{
-    AdminContext, AdminError, EngineError, HostKey, Limits, Overview, Secret, SshAuth, SshTarget,
-    UninstallRequest,
+    AdminContext, AdminError, DesktopStatus, EngineError, HostKey, Limits, Overview, Secret,
+    SshAuth, SshTarget, UninstallRequest,
 };
 use crate::details::{self, DangerFlow, DeviceRow, RevokePlan};
 use crate::servers::{Lifecycle, parse_version};
@@ -121,7 +121,7 @@ fn clear_overview(app: &Rc<App>) {
     vm.set_can_restart(false);
     vm.set_update_text(ss(""));
     vm.set_can_update(false);
-    vm.set_cpu_text(ss(""));
+    vm.set_ov_limits(model(vec![]));
     vm.set_ov_desktop(model(vec![]));
     vm.set_ov_agent(model(vec![]));
     vm.set_ov_server(model(vec![]));
@@ -159,6 +159,16 @@ fn fetch_overview(app: &Rc<App>) {
                     fill_overview(a, &s, &o);
                     a.det.borrow_mut().overview = Some(o);
                 }
+                Err(AdminError::SessionRequired) => {
+                    if vm.get_dialog() == 0 {
+                        open_dialog(a, 6);
+                    }
+                }
+                Err(AdminError::UpdateRequired) => super::update_ctl::show(a, &id),
+                Err(AdminError::Failed(m)) => {
+                    vm.set_attention_title(ss("The server's details could not be loaded"));
+                    vm.set_attention_text(ss(m));
+                }
                 Err(_) => {
                     a.reachable.borrow_mut().insert(id, false);
                     vm.set_status(ss("Offline"));
@@ -189,23 +199,22 @@ fn fetch_overview(app: &Rc<App>) {
 
 fn fill_overview(app: &Rc<App>, s: &crate::servers::Server, o: &Overview) {
     let vm = app.ui().global::<DetailsVm>();
+    let status = match o.desktop {
+        DesktopStatus::Running => "Running",
+        DesktopStatus::NotAnswering => "Not answering",
+        DesktopStatus::Creating => "Being created",
+        DesktopStatus::NotCreated => "Not created yet",
+        DesktopStatus::Unknown => "Unknown",
+    };
     vm.set_ov_desktop(model(vec![
-        kv(
-            "Status",
-            if o.desktop_running {
-                "Running"
-            } else {
-                "Not answering"
-            },
-        ),
-        kv("Uptime", uptime_text(o.uptime_secs)),
+        kv("Status", status),
         kv(
             "Session",
-            o.session_with
-                .clone()
-                .map_or("Nobody connected".to_owned(), |n| {
-                    format!("In use from {n}")
-                }),
+            if o.session_active {
+                "In use"
+            } else {
+                "Nobody connected"
+            },
         ),
         kv("Setup", o.setup.clone()),
     ]));
@@ -214,11 +223,13 @@ fn fill_overview(app: &Rc<App>, s: &crate::servers::Server, o: &Overview) {
             "Version",
             format!("{} ({} channel)", o.agent_version, o.channel),
         ),
+        kv("Running for", uptime_text(o.agent_uptime_secs)),
         kv(
             "Updates",
-            match &o.update_available {
-                Some(v) => format!("Version {v} is available"),
-                None => "Up to date".to_owned(),
+            match (&o.update_available, &o.rolled_back) {
+                (Some(v), _) => format!("Version {v} is available"),
+                (None, Some(v)) => format!("Rolled back from {v}"),
+                (None, None) => "Up to date".to_owned(),
             },
         ),
         kv("Protocol", o.protocol.clone()),
@@ -227,8 +238,15 @@ fn fill_overview(app: &Rc<App>, s: &crate::servers::Server, o: &Overview) {
         kv("Address", s.address()),
         kv("Host OS", o.host_os.clone()),
         kv("Identity", s.short_fingerprint()),
-        kv("Paired", format!("{} devices", o.devices)),
     ]));
+    vm.set_ov_limits(model(match o.limits {
+        Some(l) => vec![
+            kv("CPU", format!("{} cores", l.cpu)),
+            kv("Memory", format!("{} GB", l.memory_gb)),
+            kv("Disk", format!("{} GB", l.disk_gb)),
+        ],
+        None => vec![],
+    }));
     vm.set_update_text(ss(o
         .update_available
         .as_ref()
@@ -244,33 +262,35 @@ fn fill_overview(app: &Rc<App>, s: &crate::servers::Server, o: &Overview) {
         },
         o.channel
     )));
-    vm.set_cpu_text(ss(format!("CPU: {}% of {} cores", o.cpu_pct, o.cpu_cores)));
-    vm.set_cpu_frac(o.cpu_pct as f32 / 100.0);
-    vm.set_mem_text(ss(format!(
-        "Memory: {:.1} of {:.0} GB",
-        o.mem_used_gb, o.mem_total_gb
-    )));
-    vm.set_mem_frac(o.mem_used_gb / o.mem_total_gb.max(0.1));
-    vm.set_disk_text(ss(format!(
-        "Disk: {} of {} GB",
-        o.disk_used_gb, o.disk_total_gb
-    )));
-    vm.set_disk_frac(o.disk_used_gb as f32 / o.disk_total_gb.max(1) as f32);
-    if o.desktop_running {
+    let running = o.desktop == DesktopStatus::Running;
+    if running && o.attention.is_empty() {
         vm.set_attention_title(ss(""));
+        vm.set_attention_text(ss(""));
         vm.set_can_restart(false);
     } else {
-        vm.set_attention_title(ss("The desktop is not answering"));
-        vm.set_attention_text(ss("The agent is up but cannot reach the desktop session. It retries every 10 minutes and after a restart."));
-        vm.set_can_restart(true);
+        vm.set_attention_title(ss(if running {
+            "Needs attention"
+        } else {
+            "The desktop is not answering"
+        }));
+        vm.set_attention_text(ss(if o.attention.is_empty() {
+            "The agent is up but cannot reach the desktop session. It retries every 10 minutes and after a restart.".to_owned()
+        } else {
+            o.attention.join(" ")
+        }));
+        vm.set_can_restart(
+            o.desktop != DesktopStatus::NotCreated && o.desktop != DesktopStatus::Creating,
+        );
     }
     vm.set_docker(o.docker);
     vm.set_cpu_max(o.host_cpus.max(1) as i32);
     vm.set_memory_max(o.host_mem_gb.max(1) as i32);
     vm.set_disk_max(o.host_disk_gb.max(8) as i32);
-    vm.set_cpu(o.cpu_cores as i32);
-    vm.set_memory(o.mem_total_gb.round() as i32);
-    vm.set_disk(o.disk_total_gb as i32);
+    if let Some(l) = o.limits {
+        vm.set_cpu(l.cpu as i32);
+        vm.set_memory(l.memory_gb as i32);
+        vm.set_disk(l.disk_gb as i32);
+    }
     vm.set_limits_dirty(false);
 }
 
@@ -376,6 +396,8 @@ fn admin_error_text(e: &AdminError) -> String {
         AdminError::Failed(m) => m.clone(),
         AdminError::Unreachable => "Cannot reach the server.".into(),
         AdminError::UpdateRequired => "This server must be updated first.".into(),
+        AdminError::SessionRequired => "Sign in with your PIN first.".into(),
+        AdminError::Revoked => "This device was removed from the server. Use Pair again.".into(),
     }
 }
 
@@ -429,6 +451,23 @@ fn submit_dialog(app: &Rc<App>) {
                             } else {
                                 "Password changed"
                             }));
+                        }
+                        Err(AdminError::Revoked)
+                        | Err(AdminError::Incorrect {
+                            attempts_left: Some(0),
+                        }) => {
+                            // The fifth wrong PIN or password: the server ended the session and
+                            // revoked this device.
+                            close_dialog(a);
+                            if let Some(sid) = a.det.borrow().server_id.clone() {
+                                let _ = a.store.borrow_mut().set_lifecycle(
+                                    &sid,
+                                    Lifecycle::Revoked,
+                                    super::now_unix(),
+                                );
+                            }
+                            teardown(a);
+                            a.show_home();
                         }
                         Err(e) => vm.set_dialog_error(ss(admin_error_text(&e))),
                     }
@@ -942,9 +981,11 @@ pub fn wire(app: &Rc<App>) {
     vm.on_limits_changed(move || {
         let vm = a.ui().global::<DetailsVm>();
         let dirty = a.det.borrow().overview.as_ref().is_none_or(|o| {
-            vm.get_cpu() as u32 != o.cpu_cores
-                || vm.get_memory() != o.mem_total_gb.round() as i32
-                || vm.get_disk() as u32 != o.disk_total_gb
+            o.limits.is_none_or(|l| {
+                vm.get_cpu() as u32 != l.cpu
+                    || vm.get_memory() as u32 != l.memory_gb
+                    || vm.get_disk() as u32 != l.disk_gb
+            })
         });
         vm.set_limits_dirty(dirty);
     });

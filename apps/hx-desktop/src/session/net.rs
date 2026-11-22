@@ -18,6 +18,7 @@ use hx_crypto::{
 };
 use hx_proto::VideoCodec;
 use hx_proto::channel::CloseCode;
+use hx_proto::pb::server_mgmt::Body as SrvBody;
 use hx_proto::pb::{
     self, ControlMessage, DeviceInfo, InputEvent, RevokeStatus, TransferHeader, ViewConfig,
     control_message::Message as Ctl, device_mgmt::Body,
@@ -71,7 +72,7 @@ pub fn session_options(device_name: &str) -> SessionOptions {
         software: concat!("hx-desktop ", env!("CARGO_PKG_VERSION")).into(),
         capabilities: capabilities_with_file_limit(
             &[VideoCodec::H264],
-            Features::defined_up_to(PROTOCOL_MINOR),
+            Features::defined_up_to(PROTOCOL_MINOR).without(Features::SETUP),
             0,
         ),
         ..Default::default()
@@ -269,12 +270,14 @@ enum Out {
 }
 
 type Pending = Arc<Mutex<HashMap<u32, oneshot::Sender<Body>>>>;
+type PendingSrv = Arc<Mutex<HashMap<u32, oneshot::Sender<SrvBody>>>>;
 
 /// A live, authorized connection and the tasks that serve it.
 pub struct Session {
     conn: Connection,
     out: mpsc::UnboundedSender<Out>,
     pending: Pending,
+    pending_srv: PendingSrv,
     next_request: AtomicU32,
     next_transfer: Arc<AtomicU32>,
     handle: tokio::runtime::Handle,
@@ -298,6 +301,7 @@ impl Session {
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Out>();
         let pending: Pending = Arc::default();
+        let pending_srv: PendingSrv = Arc::default();
         let goodbye: Arc<Mutex<Option<pb::Goodbye>>> = Arc::default();
         let negotiated = conn.negotiated().clone();
 
@@ -362,10 +366,11 @@ impl Session {
         }
 
         // Control in.
-        let (c, tx, pend, gb) = (
+        let (c, tx, pend, pend_srv, gb) = (
             conn.clone(),
             ev_tx.clone(),
             pending.clone(),
+            pending_srv.clone(),
             goodbye.clone(),
         );
         handle.spawn(async move {
@@ -394,6 +399,17 @@ impl Session {
                         }
                         _ => {}
                     },
+                    Some(Ctl::ServerMgmt(s)) => {
+                        if let Some(body) = s.body {
+                            let waiter = pend_srv
+                                .lock()
+                                .ok()
+                                .and_then(|mut p| p.remove(&s.request_id));
+                            if let Some(w) = waiter {
+                                let _ = w.send(body);
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -461,6 +477,7 @@ impl Session {
                 conn,
                 out: out_tx,
                 pending,
+                pending_srv,
                 next_request: AtomicU32::new(1),
                 next_transfer: Arc::new(AtomicU32::new(1)),
                 handle,
@@ -652,6 +669,45 @@ impl Session {
             Ok(Err(_)) => Err(MgmtError::Closed),
             Err(_) => {
                 if let Ok(mut p) = self.pending.lock() {
+                    p.remove(&id);
+                }
+                Err(MgmtError::Timeout)
+            }
+        }
+    }
+
+    /// Whether server management was negotiated (protocol 1.3).
+    pub fn can_manage_server(&self) -> bool {
+        self.features.contains(Features::SERVER_MANAGEMENT)
+    }
+
+    /// One server-management request and its answer (`Overview` or `Result`), over this
+    /// connection's own control path. Waits at most `wait`.
+    pub async fn server_request(
+        &self,
+        body: SrvBody,
+        wait: Duration,
+    ) -> Result<SrvBody, MgmtError> {
+        if !self.can_manage_server() {
+            return Err(MgmtError::Unsupported);
+        }
+        let id = self.next_request.fetch_add(1, Relaxed);
+        let (tx, rx) = oneshot::channel();
+        if let Ok(mut p) = self.pending_srv.lock() {
+            p.insert(id, tx);
+        }
+        let msg = Ctl::ServerMgmt(pb::ServerMgmt {
+            request_id: id,
+            body: Some(body),
+        });
+        if self.out.send(Out::Control(msg)).is_err() {
+            return Err(MgmtError::Closed);
+        }
+        match tokio::time::timeout(wait, rx).await {
+            Ok(Ok(b)) => Ok(b),
+            Ok(Err(_)) => Err(MgmtError::Closed),
+            Err(_) => {
+                if let Ok(mut p) = self.pending_srv.lock() {
                     p.remove(&id);
                 }
                 Err(MgmtError::Timeout)

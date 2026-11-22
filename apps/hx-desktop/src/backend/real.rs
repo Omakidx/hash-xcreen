@@ -7,7 +7,8 @@
 //!   exactly one reader of the control channel exists, so list, revoke and pairing codes share
 //!   one request-id map and no two readers compete. The reinstate call uses
 //!   `hx_crypto::reinstate_client` on its own connection (there is no session yet).
-//! * `ServerControl`: not part of this build yet (its protocol messages are still being built).
+//! * `ServerControl`: [`super::control_real::RealControl`], server management (protocol 1.3)
+//!   over the same session task.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,8 +18,6 @@ use hx_crypto::setup::Password;
 use hx_proto::version::ProtocolVersion;
 
 use super::*;
-
-const MSG: &str = "This is not part of this build yet.";
 
 /// Pairing codes and "Pair again".
 pub struct RealAdmin {
@@ -86,51 +85,6 @@ impl DeviceAdmin for RealAdmin {
     }
 }
 
-/// Server management: not wired.
-pub struct UnavailableControl;
-
-impl ServerControl for UnavailableControl {
-    fn overview(&self, _c: &AdminContext) -> BoxFuture<'_, Result<Overview, AdminError>> {
-        Box::pin(async { Err(AdminError::Failed(MSG.into())) })
-    }
-    fn change_pin(
-        &self,
-        _c: &AdminContext,
-        _a: &Secret,
-        _b: &Secret,
-    ) -> BoxFuture<'_, Result<(), AdminError>> {
-        Box::pin(async {
-            Err(AdminError::Failed(
-                "Changing the PIN from this app is not part of this build yet.".into(),
-            ))
-        })
-    }
-    fn change_password(
-        &self,
-        _c: &AdminContext,
-        _a: &Secret,
-        _b: &Secret,
-    ) -> BoxFuture<'_, Result<(), AdminError>> {
-        Box::pin(async {
-            Err(AdminError::Failed(
-                "Changing the password from this app is not part of this build yet.".into(),
-            ))
-        })
-    }
-    fn restart_desktop(&self, _c: &AdminContext) -> BoxFuture<'_, Result<(), AdminError>> {
-        Box::pin(async { Err(AdminError::Failed(MSG.into())) })
-    }
-    fn set_docker(&self, _c: &AdminContext, _o: bool) -> BoxFuture<'_, Result<(), AdminError>> {
-        Box::pin(async { Err(AdminError::Failed(MSG.into())) })
-    }
-    fn set_limits(&self, _c: &AdminContext, _l: Limits) -> BoxFuture<'_, Result<(), AdminError>> {
-        Box::pin(async { Err(AdminError::Failed(MSG.into())) })
-    }
-    fn update_agent(&self, _c: &AdminContext) -> BoxFuture<'_, Result<String, AdminError>> {
-        Box::pin(async { Err(AdminError::Failed(MSG.into())) })
-    }
-}
-
 /// The backends of a real run.
 pub fn backends(handle: tokio::runtime::Handle, device_name: String) -> Backends {
     Backends {
@@ -139,7 +93,7 @@ pub fn backends(handle: tokio::runtime::Handle, device_name: String) -> Backends
             device_name: device_name.clone(),
         }),
         admin: Arc::new(RealAdmin { device_name }),
-        control: Arc::new(UnavailableControl),
+        control: Arc::new(super::control_real::RealControl),
         connector: Arc::new(crate::session::RealConnector { handle }),
     }
 }
