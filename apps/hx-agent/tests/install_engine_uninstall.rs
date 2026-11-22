@@ -117,9 +117,12 @@ fn destroy_removes_everything_in_order() {
     );
     let u3 = index_of(
         &l,
-        "systemctl disable --now hx-privd.socket hx-privd.service hx-privd-rescue.service var-lib-hx-updates.mount hx-host-firewall.service hx-docker-user.service",
+        "systemctl disable --now hx-privd.socket hx-privd.service hx-privd-rescue.service var-lib-hx-updates.mount var-lib-hx-imagein.mount hx-host-firewall.service hx-docker-user.service",
     );
-    let fetch = index_of(&l, "systemctl stop hx-update-fetcher@*.service");
+    let fetch = index_of(
+        &l,
+        "systemctl stop hx-update-fetcher@*.service hx-image-fetcher@*.service",
+    );
     let user = index_of(&l, "userdel hx-gatewayd");
     let reload = index_of(&l, "systemctl daemon-reload");
     let failed = index_of(&l, "systemctl reset-failed");

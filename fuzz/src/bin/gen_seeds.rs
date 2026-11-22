@@ -394,6 +394,36 @@ fn main() {
             })),
         ),
         (
+            "server_get_overview",
+            ctl(Ctl::ServerMgmt(pb::ServerMgmt {
+                request_id: 1,
+                body: Some(pb::server_mgmt::Body::GetOverview(pb::ServerGetOverview {})),
+            })),
+        ),
+        (
+            "server_change_pin",
+            ctl(Ctl::ServerMgmt(pb::ServerMgmt {
+                request_id: 2,
+                body: Some(pb::server_mgmt::Body::ChangePin(pb::ServerChangePin {
+                    current: b"123456".as_slice().into(),
+                    new: b"654321".as_slice().into(),
+                })),
+            })),
+        ),
+        (
+            "server_result",
+            ctl(Ctl::ServerMgmt(pb::ServerMgmt {
+                request_id: 3,
+                body: Some(pb::server_mgmt::Body::Result(pb::ServerResult {
+                    status: pb::ServerStatus::WrongPin as i32,
+                    retry_after_s: 1,
+                    attempts_left: 4,
+                    message: "wrong".into(),
+                    ..Default::default()
+                })),
+            })),
+        ),
+        (
             "goodbye",
             ctl(Ctl::Goodbye(pb::Goodbye {
                 code: 0,

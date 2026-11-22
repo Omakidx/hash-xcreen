@@ -1730,20 +1730,30 @@ async fn create_desktop_arguments_are_checked_before_anything_is_created() {
             ErrorCode::InvalidArgument,
         ),
         (
-            "prebuilt is not available",
+            // No image key is embedded in a test build: `prebuilt` cannot be served.
+            "prebuilt without an image key",
             pb::CreateDesktopRequest {
                 image_mode: pb::ImageMode::Prebuilt as i32,
                 ..base()
             },
-            ErrorCode::Unimplemented,
+            ErrorCode::FailedPrecondition,
         ),
         (
-            "offline image (Admin)",
+            "offline image (Admin) without a key or a directory",
             pb::CreateDesktopRequest {
-                image_file: Some("/var/lib/hx/import/x.img".into()),
+                image_file: Some("x.img".into()),
                 ..base()
             },
-            ErrorCode::Unimplemented,
+            ErrorCode::FailedPrecondition,
+        ),
+        (
+            "offline image with BUILD",
+            pb::CreateDesktopRequest {
+                image_file: Some("x.img".into()),
+                image_mode: pb::ImageMode::Build as i32,
+                ..base()
+            },
+            ErrorCode::InvalidArgument,
         ),
         (
             "bad hostname",

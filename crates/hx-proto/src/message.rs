@@ -4,6 +4,7 @@
 //! channel has a [`Wire`] implementation with its size limit and semantic validation, so a
 //! value returned by [`decode`] always satisfies the rules of `docs/protocol.md`.
 
+use crate::channel::{MAX_SERVER_ATTENTION, MAX_SERVER_VERSION};
 use bytes::Bytes;
 use prost::Message;
 
@@ -276,6 +277,7 @@ impl Wire for ControlMessage {
             }
             Ctl::DeviceMgmt(d) => d.validate_body()?,
             Ctl::Setup(s) => s.validate_body()?,
+            Ctl::ServerMgmt(s) => s.validate_body()?,
             Ctl::Pairing(o) | Ctl::Auth(o) => {
                 if o.data.len() > MAX_OPAQUE {
                     return Err(invalid("opaque.data", "too long"));
@@ -757,6 +759,113 @@ impl pb::SetupMessage {
         }
         Ok(())
     }
+}
+
+impl pb::ServerMgmt {
+    /// The direction this body may travel, or `None` if no body is set.
+    pub fn direction(&self) -> Option<MgmtDirection> {
+        use pb::server_mgmt::Body as B;
+        Some(match self.body.as_ref()? {
+            B::GetOverview(_)
+            | B::ChangePin(_)
+            | B::ChangePassword(_)
+            | B::RestartDesktop(_)
+            | B::SetDocker(_)
+            | B::SetLimits(_)
+            | B::CheckUpdate(_)
+            | B::ApplyUpdate(_) => MgmtDirection::ClientToServer,
+            B::Overview(_) | B::Result(_) => MgmtDirection::ServerToClient,
+        })
+    }
+
+    /// Structure and hard size caps (protocol §5.11), independent of direction. Semantic checks
+    /// (PIN digits, password rules, non-zero limits, the version syntax) are answered with a
+    /// `ServerResult`, not a protocol error.
+    fn validate_body(&self) -> Result<(), ProtoError> {
+        use pb::server_mgmt::Body as B;
+        let Some(body) = &self.body else {
+            return Err(invalid("server_mgmt", "no body set"));
+        };
+        // Every request and every answer carries a request id; there are no pushes.
+        if self.request_id == 0 {
+            return Err(invalid("server_mgmt.request_id", "must not be 0"));
+        }
+        match body {
+            B::GetOverview(_) | B::RestartDesktop(_) | B::SetDocker(_) | B::CheckUpdate(_) => {}
+            B::ChangePin(p) => {
+                if p.current.len() > MAX_SETUP_PIN || p.new.len() > MAX_SETUP_PIN {
+                    return Err(invalid("change_pin", "a PIN is too long"));
+                }
+            }
+            B::ChangePassword(p) => {
+                if p.current.len() > MAX_SETUP_PASSWORD || p.new.len() > MAX_SETUP_PASSWORD {
+                    return Err(invalid("change_password", "a password is too long"));
+                }
+            }
+            B::SetLimits(l) => {
+                if let Some(l) = &l.limits {
+                    if l.cpu > 1024 {
+                        return Err(invalid("set_limits.cpu", "above 1024"));
+                    }
+                    if l.memory_mib > 16_777_216 {
+                        return Err(invalid("set_limits.memory_mib", "above 16777216"));
+                    }
+                    if l.disk_gib > 65_536 {
+                        return Err(invalid("set_limits.disk_gib", "above 65536"));
+                    }
+                }
+            }
+            B::ApplyUpdate(a) => check_str("apply_update.version", &a.version, MAX_SERVER_VERSION)?,
+            B::Overview(o) => {
+                check_str("overview.agent_version", &o.agent_version, 64)?;
+                check_str("overview.privd_version", &o.privd_version, 64)?;
+                if o.host_attention.len() > MAX_SERVER_ATTENTION {
+                    return Err(invalid("overview.host_attention", "too many entries"));
+                }
+                if let Some(u) = &o.update {
+                    check_update_info(u)?;
+                }
+                if let Some(d) = &o.desktop {
+                    check_str("overview.desktop.username", &d.username, MAX_SETUP_USERNAME)?;
+                    if d.needs_attention.len() > MAX_SERVER_ATTENTION {
+                        return Err(invalid(
+                            "overview.desktop.needs_attention",
+                            "too many entries",
+                        ));
+                    }
+                }
+                if let Some(h) = &o.host {
+                    check_str("overview.host.os", &h.os, 64)?;
+                    check_str("overview.host.arch", &h.arch, 16)?;
+                }
+            }
+            B::Result(r) => {
+                match pb::ServerStatus::try_from(r.status) {
+                    Ok(pb::ServerStatus::Unspecified) | Err(_) => {
+                        return Err(invalid("result.status", "unknown status"));
+                    }
+                    Ok(_) => {}
+                }
+                check_str("result.message", &r.message, 256)?;
+                check_str("result.version", &r.version, MAX_SERVER_VERSION)?;
+                if let Some(u) = &r.update {
+                    check_update_info(u)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn check_update_info(u: &pb::ServerUpdateInfo) -> Result<(), ProtoError> {
+    check_str("update.current", &u.current, MAX_SERVER_VERSION)?;
+    check_str("update.available", &u.available, MAX_SERVER_VERSION)?;
+    check_str(
+        "update.rolled_back_version",
+        &u.rolled_back_version,
+        MAX_SERVER_VERSION,
+    )?;
+    check_str("update.rolled_back_reason", &u.rolled_back_reason, 256)
 }
 
 fn check_setup_options(o: &pb::SetupOptions) -> Result<(), ProtoError> {

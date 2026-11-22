@@ -16,6 +16,7 @@
 //! | [`runner`], [`probe`] | the closed set of host tools and host facts, behind traits |
 //! | [`cancel`], [`progress`] | cancellation and per-desktop locks, lossy progress frames |
 //! | [`update`] | self-update: manifest, keys, extraction, switch, health check (ipc.md 6.12) |
+//! | [`image`] | prebuilt desktop images: keys, `choose`, fetch, offline import, cache (ipc.md 6.5, 6.12) |
 
 pub mod activation;
 pub mod audit;
@@ -28,6 +29,7 @@ pub mod daemon;
 pub mod error;
 pub mod hardening;
 pub mod identity;
+pub mod image;
 pub mod limiter;
 pub mod log;
 pub mod peergroups;

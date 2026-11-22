@@ -19,7 +19,7 @@ use hx_ipc::admin::{self, pb as apb};
 use hx_ipc::privd::{self, PrivdPolicy, Side, pb as ppb};
 use hx_ipc::{Decoder, NoCmsgReader};
 
-use crate::fetcher::Job;
+use crate::fetcher::{ImageJob, Job};
 use crate::privd::runner::{CommandRunner, Program, Tool};
 
 /// A boxed future, so that the traits are usable as `dyn`.
@@ -53,6 +53,21 @@ pub struct UnitState {
     pub main_pid: u32,
 }
 
+/// How an image fetcher job stands (`systemctl start --no-block` returns at once).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobState {
+    /// Started and not finished.
+    Running,
+    /// Finished with exit status 0.
+    Succeeded,
+    /// Failed, was killed or timed out.
+    Failed,
+}
+
+fn no_image_jobs() -> String {
+    "image fetcher jobs are not available through this systemd".to_string()
+}
+
 /// Talking to systemd.
 pub trait Systemd: Send + Sync {
     /// Runs the fetcher for `job` to completion (`Ok`) or failure, bounded by the unit's own
@@ -66,6 +81,25 @@ pub trait Systemd: Send + Sync {
     fn restart<'a>(&'a self, unit: Unit) -> BoxFut<'a, Result<(), String>>;
     /// Reads a unit's state.
     fn state<'a>(&'a self, unit: Unit) -> BoxFut<'a, Result<UnitState, String>>;
+
+    /// Starts the image fetcher job without waiting for it (`systemctl start --no-block`): any
+    /// earlier run of the same instance is stopped and its failed state cleared first, and the
+    /// call returns once the new run exists, so [`Systemd::image_job_state`] cannot report the
+    /// previous run's result. The default refuses (fakes that do not run image jobs).
+    fn start_image_job<'a>(&'a self, job: &'a ImageJob) -> BoxFut<'a, Result<(), String>> {
+        let _ = job;
+        Box::pin(async { Err(no_image_jobs()) })
+    }
+    /// Where a started image job stands.
+    fn image_job_state<'a>(&'a self, job: &'a ImageJob) -> BoxFut<'a, Result<JobState, String>> {
+        let _ = job;
+        Box::pin(async { Err(no_image_jobs()) })
+    }
+    /// Stops an image job (a cancel, a timeout, a refused directory). Best effort.
+    fn stop_image_job<'a>(&'a self, job: &'a ImageJob) -> BoxFut<'a, ()> {
+        let _ = job;
+        Box::pin(async {})
+    }
 }
 
 /// Asking the daemons whether they answer.
@@ -92,6 +126,29 @@ impl SystemdCtl {
     /// The unit that runs a fetcher job.
     pub fn fetcher_unit(job: &Job) -> String {
         format!("hx-update-fetcher@{}.service", job.instance())
+    }
+
+    /// The unit that runs an image fetcher job.
+    pub fn image_unit(job: &ImageJob) -> String {
+        format!("hx-image-fetcher@{}.service", job.instance())
+    }
+
+    /// `systemctl show --property=P...` of `unit` as `(key, value)` pairs.
+    async fn show(&self, unit: &str, props: &[&str]) -> Result<Vec<(String, String)>, String> {
+        let mut args: Vec<String> = vec!["show".into()];
+        args.extend(props.iter().map(|p| format!("--property={p}")));
+        args.push(unit.to_string());
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = self.ctl(&refs, Duration::from_secs(10)).await?;
+        if !out.success() {
+            return Err(format!("systemctl show {unit} failed"));
+        }
+        Ok(out
+            .stdout
+            .lines()
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.trim().to_string()))
+            .collect())
     }
 
     async fn ctl(
@@ -138,6 +195,72 @@ impl Systemd for SystemdCtl {
         Box::pin(async move {
             let unit = Self::fetcher_unit(job);
             let _ = self.ctl(&["stop", &unit], Duration::from_secs(20)).await;
+        })
+    }
+
+    fn start_image_job<'a>(&'a self, job: &'a ImageJob) -> BoxFut<'a, Result<(), String>> {
+        Box::pin(async move {
+            let unit = Self::image_unit(job);
+            // A previous run of this instance (a cancelled request) is stopped, and a failed
+            // state cleared, so that `start` begins a new run.
+            let _ = self.ctl(&["stop", &unit], Duration::from_secs(30)).await;
+            let _ = self
+                .ctl(&["reset-failed", &unit], Duration::from_secs(10))
+                .await;
+            let invocation = |props: Vec<(String, String)>| {
+                props
+                    .into_iter()
+                    .find(|(k, _)| k == "InvocationID")
+                    .map(|(_, v)| v)
+                    .unwrap_or_default()
+            };
+            let before = invocation(
+                self.show(&unit, &["InvocationID"])
+                    .await
+                    .unwrap_or_default(),
+            );
+            let out = self
+                .ctl(&["start", "--no-block", &unit], Duration::from_secs(20))
+                .await?;
+            if !out.success() {
+                return Err(format!("systemctl start {unit} failed"));
+            }
+            // `--no-block` queues the job; the new run has a new invocation id.
+            for _ in 0..100 {
+                let now = invocation(self.show(&unit, &["InvocationID"]).await?);
+                if !now.is_empty() && now != before {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(format!("{unit} did not start"))
+        })
+    }
+
+    fn image_job_state<'a>(&'a self, job: &'a ImageJob) -> BoxFut<'a, Result<JobState, String>> {
+        Box::pin(async move {
+            let unit = Self::image_unit(job);
+            let props = self.show(&unit, &["ActiveState", "Result"]).await?;
+            let get = |k: &str| {
+                props
+                    .iter()
+                    .find(|(key, _)| key == k)
+                    .map_or("", |(_, v)| v.as_str())
+            };
+            Ok(match get("ActiveState") {
+                "activating" | "active" | "reloading" | "deactivating" => JobState::Running,
+                "failed" => JobState::Failed,
+                // A oneshot unit that ran to the end is inactive with Result=success.
+                _ if get("Result") == "success" => JobState::Succeeded,
+                _ => JobState::Failed,
+            })
+        })
+    }
+
+    fn stop_image_job<'a>(&'a self, job: &'a ImageJob) -> BoxFut<'a, ()> {
+        Box::pin(async move {
+            let unit = Self::image_unit(job);
+            let _ = self.ctl(&["stop", &unit], Duration::from_secs(30)).await;
         })
     }
 

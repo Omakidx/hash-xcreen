@@ -37,6 +37,22 @@ unused-allowed-license = "allow"
 exceptions = [
     { allow = ["WTFPL"], crate = "ffmpeg-next" },
     { allow = ["WTFPL"], crate = "ffmpeg-sys-next" },
+
+    # Slint is licensed `GPL-3.0-only OR LicenseRef-Slint-...`: hash-xcreen uses it under the
+    # GPL-3.0 option (docs/tech-stack.md), which is compatible with AGPL-3.0-or-later. Allowed for
+    # the Slint crates only, not as a general policy.
+    { allow = ["GPL-3.0-only"], crate = "slint" },
+    { allow = ["GPL-3.0-only"], crate = "slint-build" },
+    { allow = ["GPL-3.0-only"], crate = "slint-macros" },
+    { allow = ["GPL-3.0-only"], crate = "i-slint-backend-selector" },
+    { allow = ["GPL-3.0-only"], crate = "i-slint-backend-winit" },
+    { allow = ["GPL-3.0-only"], crate = "i-slint-common" },
+    { allow = ["GPL-3.0-only"], crate = "i-slint-compiler" },
+    { allow = ["GPL-3.0-only"], crate = "i-slint-core" },
+    { allow = ["GPL-3.0-only"], crate = "i-slint-core-macros" },
+    { allow = ["GPL-3.0-only"], crate = "i-slint-renderer-femtovg" },
+    { allow = ["GPL-3.0-only"], crate = "i-slint-renderer-skia" },
+    { allow = ["GPL-3.0-only"], crate = "i-slint-renderer-software" },
 ]
 
 [licenses.private]

@@ -77,6 +77,12 @@ pub const FILES: &[EmbeddedFile] = &[
         Enable::Now
     ),
     file!(
+        "var-lib-hx-imagein.mount",
+        "var-lib-hx-imagein.mount",
+        Dest::Unit,
+        Enable::Now
+    ),
+    file!(
         "hx-host-firewall.service",
         "hx-host-firewall.service",
         Dest::Unit,
@@ -91,6 +97,12 @@ pub const FILES: &[EmbeddedFile] = &[
     file!(
         "hx-update-fetcher@.service",
         "hx-update-fetcher@.service",
+        Dest::Unit,
+        Enable::No
+    ),
+    file!(
+        "hx-image-fetcher@.service",
+        "hx-image-fetcher@.service",
         Dest::Unit,
         Enable::No
     ),

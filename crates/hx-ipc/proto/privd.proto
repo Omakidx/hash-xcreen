@@ -58,6 +58,10 @@ enum ErrorDetail {
   // An Uninstall has begun (section 6.13): every Gateway command and every Admin mutation other
   // than Uninstall is refused with FAILED_PRECONDITION until the agent is removed.
   ERROR_DETAIL_UNINSTALLING = 13;
+  // A prebuilt image was required (IMAGE_MODE_PREBUILT or an offline image file) and cannot be
+  // used: no image key, the list is not verified, no matching or a stale image, or a file that
+  // fails verification (docs/ipc.md 6.5).
+  ERROR_DETAIL_IMAGE = 14;
 }
 
 message Error {
@@ -282,7 +286,9 @@ message CreateDesktopRequest {
   bool docker = 8;
   bool docker_isolation_acknowledged = 9;
   DesktopSettings settings = 10;
-  // Admin only: a path of an offline image under /var/lib/hx/import/.
+  // Admin only: a file name (`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`, not a path) in the fixed
+  // directory /var/lib/hx/import/; the signed images manifest and its .minisig sit beside it.
+  // Implies the offline prebuilt path, with no fallback.
   optional string image_file = 11;
 }
 
@@ -416,6 +422,13 @@ enum AuditEvent {
   AUDIT_EVENT_TAKEOVER = 7;
   // 1.3: a paired device asked for a pairing code from the app (device_id = the requester).
   AUDIT_EVENT_DEVICE_PAIRING_CODE_ISSUED = 8;
+  // 1.3 server management from the app (protocol 5.11); device_id = the requesting device.
+  AUDIT_EVENT_PASSWORD_CHANGED = 9;
+  AUDIT_EVENT_DESKTOP_RESTARTED = 10;
+  AUDIT_EVENT_DOCKER_DISABLED = 11;
+  AUDIT_EVENT_LIMITS_CHANGED = 12;
+  // label = the version.
+  AUDIT_EVENT_UPDATE_APPLIED = 13;
 }
 
 message RecordEventRequest {
@@ -618,6 +631,37 @@ message DockerSelfTestFailed {
   repeated DockerFallback fallbacks = 4;
 }
 
+// Why CreateDesktop took the path it took (docs/ipc.md 6.5, architecture 4.3).
+enum ImageReason {
+  IMAGE_REASON_UNSPECIFIED = 0;
+  IMAGE_REASON_BUILD_REQUESTED = 1;
+  IMAGE_REASON_PREBUILT_REQUESTED = 2;
+  IMAGE_REASON_IMAGE_FILE = 3;
+  IMAGE_REASON_NO_IMAGE_KEY = 4;
+  IMAGE_REASON_LIST_UNAVAILABLE = 5;
+  IMAGE_REASON_LIST_UNVERIFIED = 6;
+  IMAGE_REASON_NO_MATCHING_IMAGE = 7;
+  IMAGE_REASON_IMAGE_STALE = 8;
+  IMAGE_REASON_DISK = 9;
+  IMAGE_REASON_PROBE_FAILED = 10;
+  IMAGE_REASON_DOWNLOAD_TOO_SLOW = 11;
+  IMAGE_REASON_SLOWER_THAN_MIRROR = 12;
+  IMAGE_REASON_PREBUILT_FASTER = 13;
+  IMAGE_REASON_FELL_BACK = 14;
+  IMAGE_REASON_EXISTING = 15;
+}
+
+// The prebuilt image a desktop was made from.
+message ImageInfo {
+  string build_id = 1;
+  uint64 created_unix = 2;
+  // Size of the image file in bytes.
+  uint64 size = 3;
+  // Measured by the speed probe, bytes per second; 0 when not measured.
+  uint64 release_bps = 4;
+  uint64 mirror_bps = 5;
+}
+
 message CreateDesktopResult {
   string desktop_id = 1;
   PathTaken path_taken = 2;
@@ -627,6 +671,9 @@ message CreateDesktopResult {
   repeated string warnings = 5;
   // Present when Docker was requested.
   optional DockerOutcome docker = 6;
+  ImageReason reason_code = 7;
+  // Present when the desktop was made from a prebuilt image.
+  optional ImageInfo image = 8;
 }
 
 message SessionInfo {

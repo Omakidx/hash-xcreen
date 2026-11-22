@@ -480,6 +480,15 @@ impl Inner {
                 "setup message without the SETUP feature".into(),
             ));
         }
+        // Server management exists only where `SERVER_MANAGEMENT` was negotiated (and, on a
+        // server, only after authorization: the gate above already refuses it before it).
+        if matches!(variant, Ctl::ServerMgmt(_))
+            && !self.features().contains(Features::SERVER_MANAGEMENT)
+        {
+            return Err(Error::Violation(
+                "server management message without the SERVER_MANAGEMENT feature".into(),
+            ));
+        }
         self.router
             .control
             .send(m)
@@ -879,6 +888,9 @@ impl Connection {
             }
             Some(Ctl::StreamInfo(_)) => self.require_role(Role::Server, "sending StreamInfo")?,
             Some(Ctl::Setup(_)) => self.inner().require_feature(Features::SETUP, "setup")?,
+            Some(Ctl::ServerMgmt(_)) => self
+                .inner()
+                .require_feature(Features::SERVER_MANAGEMENT, "server management")?,
             _ => {}
         }
         self.inner().send_control(m).await

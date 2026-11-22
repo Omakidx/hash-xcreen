@@ -17,7 +17,7 @@
 //!   **both** `CURRENT` and `NEXT` hold a key: an `UNPROVISIONED` file is a compile error, so a
 //!   binary that could never verify an update, or that has no key to rotate to, cannot ship.
 //! - `release-build` together with any test hook (`test-support`, `test-release-key`,
-//!   `gateway-test-hooks`, `install-test-hooks`, `privd-test-hooks`) is a compile error: a release
+//!   `test-image-key`, `gateway-test-hooks`, `install-test-hooks`, `privd-test-hooks`) is a compile error: a release
 //!   binary never carries a test hook or a test key.
 //! - Feature `test-release-key` adds one more key, taken at build time from the environment
 //!   variable `HX_TEST_RELEASE_PUBKEY` (the base64 key line of a test key, for example
@@ -36,6 +36,7 @@ const NEXT: &str = include_str!("../../../release-keys/next.pub");
     any(
         feature = "test-support",
         feature = "test-release-key",
+        feature = "test-image-key",
         feature = "gateway-test-hooks",
         feature = "install-test-hooks",
         feature = "privd-test-hooks"
@@ -43,7 +44,8 @@ const NEXT: &str = include_str!("../../../release-keys/next.pub");
 ))]
 compile_error!(
     "feature `release-build` must not be combined with a test feature (`test-support`, \
-     `test-release-key`, `gateway-test-hooks`, `install-test-hooks`, `privd-test-hooks`): \
+     `test-release-key`, `test-image-key`, `gateway-test-hooks`, `install-test-hooks`, \
+     `privd-test-hooks`): \
      a release binary carries no test hook and no test key"
 );
 
@@ -75,7 +77,7 @@ const fn contains(hay: &str, needle: &str) -> bool {
 /// A key file that carries a key: no `UNPROVISIONED` marker and a minisign key line (`RW`, the
 /// base64 start of the `Ed` algorithm bytes) somewhere in it.
 #[cfg_attr(not(any(test, feature = "release-build")), allow(dead_code))]
-const fn provisioned(text: &str) -> bool {
+pub(crate) const fn provisioned(text: &str) -> bool {
     !contains(text, "UNPROVISIONED") && contains(text, "RW")
 }
 
@@ -99,7 +101,7 @@ pub struct UpdateKeys {
 
 /// The base64 key line of a minisign public key file, or `None` for `UNPROVISIONED` and anything
 /// that holds no key line.
-fn key_line(text: &str) -> Option<&str> {
+pub(crate) fn key_line(text: &str) -> Option<&str> {
     let line = text
         .lines()
         .map(str::trim)
@@ -107,7 +109,7 @@ fn key_line(text: &str) -> Option<&str> {
     (line != "UNPROVISIONED").then_some(line)
 }
 
-fn parse_key(text: &str) -> Option<PublicKey> {
+pub(crate) fn parse_key(text: &str) -> Option<PublicKey> {
     PublicKey::from_base64(key_line(text)?).ok()
 }
 

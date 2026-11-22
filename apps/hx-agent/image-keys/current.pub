@@ -1,0 +1,7 @@
+UNPROVISIONED
+# Replace this file with the minisign public key file (`minisign -G` writes it) of the CURRENT
+# desktop-image signing key before a release build (docs/ipc.md 6.12, "Images manifest"). This is a
+# SEPARATE key pair from the release keys in ../release-keys: its secret half lives in the GitHub
+# environment `image-signing` (main branch only, no per-run approval), so a leaked image key can
+# never sign an agent release. A build that embeds no image key accepts no prebuilt image: `auto`
+# builds on the server (reason NO_IMAGE_KEY) and `prebuilt` fails FAILED_PRECONDITION.

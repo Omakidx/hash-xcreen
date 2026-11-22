@@ -14,11 +14,13 @@
 
 use std::time::Instant;
 
-use hx_ipc::privd::pb::{self, ErrorDetail, ProgressStage, Role, response};
+use hx_ipc::privd::pb::{self, ErrorDetail, ImageReason, ProgressStage, Role, response};
 use hx_ipc::text::sanitize_text;
 use hx_provision::exec::{Secrets, StageReport};
-use hx_provision::incus::Transport;
-use hx_provision::orchestrate::{DesktopSpec, Limits, ProvisionError, build_on_server};
+use hx_provision::incus::{ImageSource, Transport};
+use hx_provision::orchestrate::{
+    DesktopSpec, Limits, ProvisionError, build_on_server, finish_prebuilt,
+};
 use hx_provision::{Settings, Username};
 
 use super::common::{HostBounds, host_bounds, recipe_from_pb, recipe_text, validate_limits};
@@ -26,6 +28,11 @@ use super::docker::enable_flow;
 use super::session::{install_inner, provision_link_inner};
 use crate::privd::daemon::{Ctx, Daemon, Reply};
 use crate::privd::error::CmdError;
+use crate::privd::image::cache;
+use crate::privd::image::choose::{
+    Decision, Reason, Request as ChooseRequest, Selected, Source, choose,
+};
+use crate::privd::image::fetch::Fetch;
 
 const GIB: u64 = 1 << 30;
 /// Free pool space needed to start: at least 8 GiB and 15% (ipc.md 6.5 step 1).
@@ -113,29 +120,298 @@ fn warnings_of(r: &hx_provision::orchestrate::ProvisionReport) -> Vec<String> {
     v
 }
 
+/// What the image path of one request produced (the build or the prebuilt path, whichever ran).
+struct Provisioned {
+    report: hx_provision::orchestrate::ProvisionReport,
+    path: pb::PathTaken,
+    reason: Reason,
+    image: Option<pb::ImageInfo>,
+    /// Timings of the stages before the build/post stages (`IMAGE_FETCH`, `IMAGE_IMPORT`).
+    image_timings: Vec<pb::StageTiming>,
+    warnings: Vec<String>,
+    /// The imported image to delete once the desktop is `ready`.
+    delete_after_ready: Option<String>,
+}
+
+/// A prebuilt attempt that failed: where, why, and whether the post stage (which handles the
+/// password, and which a build would run again) had begun.
+struct Fail {
+    stage: ProgressStage,
+    err: CmdError,
+    before_post: bool,
+}
+
+impl Fail {
+    fn new(stage: ProgressStage, err: CmdError) -> Self {
+        let err = if err.stage.is_some() {
+            err
+        } else {
+            err.at_stage(stage)
+        };
+        Self {
+            stage,
+            err,
+            before_post: true,
+        }
+    }
+}
+
+fn ms_since(t: Instant) -> u32 {
+    u32::try_from(t.elapsed().as_millis()).unwrap_or(u32::MAX)
+}
+
+/// The fixed name of a stage in a reason string.
+fn stage_name(s: ProgressStage) -> &'static str {
+    match s {
+        ProgressStage::ImageFetch => "IMAGE_FETCH",
+        ProgressStage::ImageImport => "IMAGE_IMPORT",
+        ProgressStage::Launch => "LAUNCH",
+        ProgressStage::Post => "POST",
+        _ => "PREFLIGHT",
+    }
+}
+
+/// Everything the two paths share.
+struct Env<'a, T: Transport + Clone + 'static> {
+    d: &'a Daemon<T>,
+    ctx: &'a Ctx,
+    client: &'a hx_provision::incus::Client<T>,
+    plan: &'a hx_provision::Plan,
+    spec: &'a DesktopSpec,
+    secrets: &'a Secrets,
+    /// Set once the post stage (the one that handles the password) has begun.
+    in_post: &'a std::sync::atomic::AtomicBool,
+    name: &'a str,
+}
+
+impl<T: Transport + Clone + 'static> Env<'_, T> {
+    fn callback<'b>(&'b self) -> Box<dyn FnMut(&hx_provision::Progress) + Send + 'b> {
+        let progress = self.ctx.progress.clone();
+        let in_post = self.in_post;
+        Box::new(move |p: &hx_provision::Progress| {
+            // From the first post-stage step on, the password is in play.
+            if let hx_provision::Progress::Started {
+                stage: hx_provision::Stage::Post,
+                ..
+            } = p
+            {
+                in_post.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            progress.from_provision(p);
+        })
+    }
+
+    /// The build path: from the recipe's base image.
+    async fn build(&self, reason: Reason) -> Result<Provisioned, CmdError> {
+        let mut cb = self.callback();
+        self.ctx
+            .progress
+            .stage(ProgressStage::Build, "building the desktop");
+        let report = build_on_server(self.client, self.plan, self.spec, self.secrets, &mut cb)
+            .await
+            .map_err(provision_err)?;
+        Ok(Provisioned {
+            report,
+            path: pb::PathTaken::Build,
+            reason,
+            image: None,
+            image_timings: Vec::new(),
+            warnings: Vec::new(),
+            delete_after_ready: None,
+        })
+    }
+
+    /// The prebuilt path: fetch (or read the offline file), import, launch, post, restart.
+    async fn prebuilt(&self, sel: &mut Selected, reason: &Reason) -> Result<Provisioned, Fail> {
+        let (d, ctx, client) = (self.d, self.ctx, self.client);
+        let cfg = &d.cfg.image;
+        let entry = sel.entry.clone();
+        let mut image_timings = Vec::new();
+        let mut warnings = std::mem::take(&mut sel.warnings);
+
+        let staged = if sel.cached {
+            None
+        } else {
+            let t = Instant::now();
+            ctx.progress
+                .stage(ProgressStage::ImageFetch, "fetching the desktop image");
+            let staged = match &sel.source {
+                Source::Online => {
+                    let _dir = tokio::select! {
+                        g = d.image_dir_lock.lock() => g,
+                        reason = ctx.cancel.cancelled() => {
+                            return Err(Fail::new(ProgressStage::ImageFetch, reason.error()));
+                        }
+                    };
+                    let fetch = Fetch::open(
+                        cfg,
+                        d.image_deps(),
+                        ctx.cancel.clone(),
+                        ctx.progress.clone(),
+                    )
+                    .map_err(|e| {
+                        Fail::new(
+                            ProgressStage::ImageFetch,
+                            e.into_cmd(ProgressStage::ImageFetch),
+                        )
+                    })?;
+                    fetch.image(&entry).await.map_err(|e| {
+                        Fail::new(
+                            ProgressStage::ImageFetch,
+                            e.into_cmd(ProgressStage::ImageFetch),
+                        )
+                    })?
+                }
+                Source::Offline { dir, name } => dir
+                    .stage(name, &entry, cfg)
+                    .await
+                    .map_err(|e| Fail::new(ProgressStage::ImageFetch, e))?,
+            };
+            image_timings.push(pb::StageTiming {
+                stage: ProgressStage::ImageFetch as i32,
+                elapsed_ms: ms_since(t),
+            });
+            Some(staged)
+        };
+        ctx.check_cancelled()
+            .map_err(|e| Fail::new(ProgressStage::ImageFetch, e))?;
+
+        if let Some(staged) = staged {
+            let t = Instant::now();
+            ctx.progress
+                .stage(ProgressStage::ImageImport, "importing the desktop image");
+            cache::import(d, client, &entry, staged, cfg.import_wait)
+                .await
+                .map_err(|e| Fail::new(ProgressStage::ImageImport, e))?;
+            image_timings.push(pb::StageTiming {
+                stage: ProgressStage::ImageImport as i32,
+                elapsed_ms: ms_since(t),
+            });
+            // The three files are not needed any more (and are never read again).
+            if let Source::Offline { dir, name } = &sel.source {
+                warnings.extend(dir.consume(name));
+            }
+        }
+        ctx.check_cancelled()
+            .map_err(|e| Fail::new(ProgressStage::ImageImport, e))?;
+
+        ctx.progress
+            .stage(ProgressStage::Launch, "starting the desktop");
+        let spec = self
+            .spec
+            .clone()
+            .with_image(ImageSource::LocalFingerprint(entry.sha256.clone()));
+        let mut cb = self.callback();
+        let report = finish_prebuilt(client, self.plan, &spec, self.secrets, &mut cb)
+            .await
+            .map_err(|e| {
+                let in_post = self.in_post.load(std::sync::atomic::Ordering::SeqCst);
+                let stage = if in_post {
+                    ProgressStage::Post
+                } else {
+                    stage_of(&e)
+                };
+                Fail {
+                    stage,
+                    err: provision_err(e),
+                    before_post: !in_post,
+                }
+            })?;
+        Ok(Provisioned {
+            report,
+            path: pb::PathTaken::Prebuilt,
+            reason: reason.clone(),
+            image: Some(pb::ImageInfo {
+                build_id: entry.build_id.clone(),
+                created_unix: entry.created,
+                size: entry.size,
+                release_bps: sel.release_bps.unwrap_or(0),
+                mirror_bps: sel.mirror_bps.unwrap_or(0),
+            }),
+            image_timings,
+            warnings,
+            delete_after_ready: Some(entry.sha256),
+        })
+    }
+
+    /// Runs what `decision` says, with the fall back of ipc.md 6.5 step 9.
+    async fn provision(
+        &self,
+        decision: Decision,
+        auto: bool,
+        request_start: Instant,
+    ) -> Result<Provisioned, CmdError> {
+        let (mut sel, reason) = match decision {
+            Decision::Build(reason) => return self.build(reason).await,
+            Decision::Prebuilt(sel, reason) => (sel, reason),
+        };
+        let offline = matches!(sel.source, Source::Offline { .. });
+        let fail = match self.prebuilt(&mut sel, &reason).await {
+            Ok(p) => return Ok(p),
+            Err(f) => f,
+        };
+        // In `AUTO`, a failure before the post stage begins falls back to a build, if enough of the
+        // request's time is left. After it began, a build would run the same post stage; an
+        // offline image and `PREBUILT` never fall back; a cancel or a deadline is not a failure.
+        let cfg = &self.d.cfg.image;
+        let remaining = cfg.create_deadline.saturating_sub(request_start.elapsed());
+        let cancelled = matches!(
+            fail.err.code,
+            pb::ErrorCode::Cancelled | pb::ErrorCode::DeadlineExceeded
+        ) || self.ctx.cancel.reason().is_some();
+        if !(auto && !offline && fail.before_post && !cancelled)
+            || remaining < cfg.fallback_min_remaining
+        {
+            return Err(fail.err);
+        }
+        let text = format!(
+            "building on the server: prebuilt image failed at {} ({})",
+            stage_name(fail.stage),
+            fail.err.message
+        );
+        self.d.audit_notice(&format!(
+            "prebuilt image failed at {}; building on the server",
+            stage_name(fail.stage)
+        ));
+        // Undo what the attempt did: the half-made instance, and the image if it was imported.
+        for op in self.client.in_flight_operations() {
+            let _ = self.client.cancel_operation(&op).await;
+        }
+        let cleanup = self.d.incus.scoped();
+        if !self.d.destroy_unfinished(&cleanup, self.name).await {
+            return Err(fail.err);
+        }
+        cache::purge(self.d, &cleanup, &sel.entry.sha256).await;
+        self.build(Reason::new(ImageReason::FellBack, &text)).await
+    }
+}
+
 /// `CreateDesktop` (class S).
 pub async fn create_desktop<T: Transport + Clone + 'static>(
     d: &Daemon<T>,
     ctx: &mut Ctx,
     r: pb::CreateDesktopRequest,
 ) -> Result<Reply, CmdError> {
+    let request_start = Instant::now();
     let id = r.desktop_id.clone();
     // Parse every argument into a typed value first.
-    if r.image_file.is_some() {
-        return Err(if ctx.role == Role::Admin {
-            CmdError::unimplemented(
-                "offline images need signature verification, which is not in this release",
-            )
-        } else {
-            CmdError::denied("create_desktop.image_file: Admin only")
-        });
-    }
     let image_mode = pb::ImageMode::try_from(r.image_mode).unwrap_or(pb::ImageMode::Unspecified);
-    if image_mode == pb::ImageMode::Prebuilt {
-        return Err(CmdError::unimplemented(
-            "prebuilt images need the update fetcher, which is not in this release",
-        ));
+    if let Some(f) = &r.image_file {
+        if ctx.role != Role::Admin {
+            return Err(CmdError::denied("create_desktop.image_file: Admin only"));
+        }
+        // The wire decoder checks this too; a name is never a path (ipc.md 6.5).
+        if !hx_ipc::privd::is_valid_image_file_name(f) {
+            return Err(CmdError::invalid("create_desktop.image_file"));
+        }
+        if image_mode == pb::ImageMode::Build {
+            return Err(CmdError::invalid(
+                "create_desktop.image_file: an offline image cannot be combined with image_mode BUILD",
+            ));
+        }
     }
+    let auto = r.image_file.is_none()
+        && matches!(image_mode, pb::ImageMode::Unspecified | pb::ImageMode::Auto);
     let recipe = recipe_from_pb(r.distro, r.desktop, r.preset)?;
     let username = Username::new(&r.username)
         .map_err(|e| CmdError::invalid(format!("create_desktop.username: {e}")))?;
@@ -185,9 +461,8 @@ pub async fn create_desktop<T: Transport + Clone + 'static>(
                         desktop_id: id,
                         path_taken: pb::PathTaken::Build as i32,
                         reason: "the desktop already exists with these arguments".into(),
-                        timings: Vec::new(),
-                        warnings: Vec::new(),
-                        docker: None,
+                        reason_code: ImageReason::Existing as i32,
+                        ..Default::default()
                     }));
                 }
                 // A desktop kept by `uninstall --keep-desktop`: the instance survived, privd's
@@ -244,33 +519,49 @@ pub async fn create_desktop<T: Transport + Clone + 'static>(
             processes: None,
         },
     );
+
+    // The path (ipc.md 6.5 step 3): before anything is registered, so that a `PREBUILT` request
+    // that cannot be served leaves nothing behind.
+    let decision = choose(
+        d,
+        ctx,
+        &client,
+        &ChooseRequest {
+            mode: image_mode,
+            image_file: r.image_file.as_deref(),
+            recipe,
+            pool: (total, free),
+        },
+    )
+    .await?;
+    // Every recorded image that is not the selected one goes.
+    let keep = match &decision {
+        Decision::Prebuilt(sel, _) => Some(sel.entry.sha256.clone()),
+        Decision::Build(_) => None,
+    };
+    cache::cleanup_unselected(d, &client, keep.as_deref()).await;
     d.register_desktop(&id)?;
 
-    let reason = match image_mode {
-        pb::ImageMode::Build => "build on the server was requested",
-        _ => "building on the server: prebuilt images are not available in this release",
-    };
     let progress = ctx.progress.clone();
     let started = Instant::now();
     // Set once the post stage (the one that handles the password) has begun.
     let in_post = std::sync::atomic::AtomicBool::new(false);
+    let shared_ctx: &Ctx = ctx;
     let work = async {
-        let mut cb = |p: &hx_provision::Progress| {
-            // From the first post-stage step on, the password is in play: see below.
-            if let hx_provision::Progress::Started {
-                stage: hx_provision::Stage::Post,
-                ..
-            } = p
-            {
-                in_post.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-            progress.from_provision(p)
+        let env = Env {
+            d,
+            ctx: shared_ctx,
+            client: &client,
+            plan: &plan,
+            spec: &spec,
+            secrets: &secrets,
+            in_post: &in_post,
+            name: &name,
         };
-        progress.stage(ProgressStage::Build, "building the desktop");
-        let report = build_on_server(&client, &plan, &spec, &secrets, &mut cb)
-            .await
-            .map_err(provision_err)?;
-        let mut warnings = warnings_of(&report);
+        let prov = env.provision(decision, auto, request_start).await?;
+        let report = &prov.report;
+        let mut warnings = warnings_of(report);
+        warnings.extend(prov.warnings.iter().cloned());
 
         let meta: std::collections::BTreeMap<String, String> = [
             ("user.hx.username", username.as_str().to_string()),
@@ -286,10 +577,10 @@ pub async fn create_desktop<T: Transport + Clone + 'static>(
             .map_err(|e| CmdError::from(e).at_stage(ProgressStage::Post))?;
 
         progress.stage(ProgressStage::Session, "linking the session");
-        provision_link_inner(d, ctx, &client, &id, &name)
+        provision_link_inner(d, shared_ctx, &client, &id, &name)
             .await
             .map_err(|e| e.at_stage(ProgressStage::Session))?;
-        match install_inner(d, ctx, &client, &id, &name, &recipe_text(recipe))
+        match install_inner(d, shared_ctx, &client, &id, &name, &recipe_text(recipe))
             .await
             .map_err(|e| e.at_stage(ProgressStage::Session))?
         {
@@ -312,7 +603,17 @@ pub async fn create_desktop<T: Transport + Clone + 'static>(
                 )
                 .await
                 .map_err(|e| CmdError::from(e).at_stage(ProgressStage::Docker))?;
-            Some(enable_flow(d, ctx, &id, &name, &recipe_text(recipe), username.as_str()).await?)
+            Some(
+                enable_flow(
+                    d,
+                    shared_ctx,
+                    &id,
+                    &name,
+                    &recipe_text(recipe),
+                    username.as_str(),
+                )
+                .await?,
+            )
         } else {
             None
         };
@@ -327,28 +628,47 @@ pub async fn create_desktop<T: Transport + Clone + 'static>(
             )
             .await
             .map_err(CmdError::from)?;
+        // The desktop no longer needs the imported image (on btrfs the instance does not depend
+        // on it): delete it, best effort.
+        if let Some(fp) = &prov.delete_after_ready {
+            cache::purge(d, &client, fp).await;
+        }
         progress.emit(ProgressStage::Done, 0, 0, "done", 100, true);
         warnings.truncate(16);
+        let mut timings = prov.image_timings.clone();
+        if report.build.is_some() {
+            timings.push(pb::StageTiming {
+                stage: ProgressStage::Build as i32,
+                elapsed_ms: sum_ms(&report.build),
+            });
+        }
+        timings.push(pb::StageTiming {
+            stage: ProgressStage::Post as i32,
+            elapsed_ms: sum_ms(&report.post),
+        });
+        timings.push(pb::StageTiming {
+            stage: ProgressStage::Done as i32,
+            elapsed_ms: ms_since(started),
+        });
+        d.audit_notice(&format!(
+            "create_desktop: path={} reason_code={} build_id={}",
+            if prov.path == pb::PathTaken::Prebuilt {
+                "prebuilt"
+            } else {
+                "build"
+            },
+            prov.reason.code.as_str_name(),
+            prov.image.as_ref().map_or("-", |i| i.build_id.as_str()),
+        ));
         Ok::<_, CmdError>(pb::CreateDesktopResult {
             desktop_id: id.clone(),
-            path_taken: pb::PathTaken::Build as i32,
-            reason: reason.to_string(),
-            timings: vec![
-                pb::StageTiming {
-                    stage: ProgressStage::Build as i32,
-                    elapsed_ms: sum_ms(&report.build),
-                },
-                pb::StageTiming {
-                    stage: ProgressStage::Post as i32,
-                    elapsed_ms: sum_ms(&report.post),
-                },
-                pb::StageTiming {
-                    stage: ProgressStage::Done as i32,
-                    elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
-                },
-            ],
+            path_taken: prov.path as i32,
+            reason: prov.reason.text.clone(),
+            timings,
             warnings,
             docker,
+            reason_code: prov.reason.code as i32,
+            image: prov.image.clone(),
         })
     };
     let mut work = Box::pin(work);
@@ -459,9 +779,11 @@ async fn adopt_kept_desktop<T: Transport + Clone + 'static>(
                 desktop_id: id.to_string(),
                 path_taken: pb::PathTaken::Build as i32,
                 reason: "adopted the existing desktop".into(),
+                reason_code: ImageReason::Existing as i32,
                 timings: Vec::new(),
                 warnings,
                 docker: None,
+                image: None,
             }))
         }
         Err(e) => {

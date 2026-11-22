@@ -28,9 +28,10 @@ install-test-hooks = ["dep:tempfile"] # install::testing builds a TempDir; a bin
 # false, instead of failing `SetupHost`. NEVER in a release build: the release gate rejects it, and
 # no crate enables it by default. The dev-dependency below deliberately does not turn it on.
 privd-test-hooks = []
-# The release gate (WS-3, installer 1E; src/privd/update/keys.rs): turns the build into a compile
-# error unless release-keys/current.pub AND next.pub are provisioned, and forbids combining it
-# with `test-support` or `test-release-key`. Only the release workflow enables it, and only for
+# The release gate (WS-3, installer 1E; src/privd/update/keys.rs and src/privd/image/keys.rs): turns
+# the build into a compile error unless release-keys/{current,next}.pub AND image-keys/{current,next}.pub
+# are provisioned, and forbids combining it with `test-support`, `test-release-key` or
+# `test-image-key`. Only the release workflow enables it, and only for
 # `cargo build -p hx-agent --bins --release --features release-build` (never --workspace or
 # --all-targets, which would pull in the dev-dependency on this crate's own test features).
 release-build = []
@@ -38,6 +39,11 @@ release-build = []
 # build time (the base64 key line made by release/make-test-release.sh). For the installer test
 # harness only; the release gate rejects it.
 test-release-key = []
+# Embeds one extra, TEST image key read from the HX_TEST_IMAGE_PUBKEY environment variable at build
+# time (the base64 key line of a test key), next to the image keys of image-keys/. For the installer
+# VM tests and the image CI, which sign a test image with a per-run key; the release gate rejects
+# it, like `test-release-key`.
+test-image-key = []
 
 # Entry points for the cargo-fuzz targets in `fuzz/` (module `link::fuzz`). Never enabled by a build
 # of the product: only the `fuzz` crate switches it on.

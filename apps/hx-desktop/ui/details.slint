@@ -1,0 +1,1090 @@
+import { Tokens } from "tokens.slint";
+import { ScrollView } from "std-widgets.slint";
+import { Btn, Badge, Banner, ButtonRow, Card, Check, Dialog, Field, FocusRing, Heading, KeyValue, Label, Mono, Muted, ProgressBar, RadioRow, SliderField, Spinner, Toggle } from "widgets.slint";
+import { AppBar } from "home.slint";
+import { DetailsVm, DeviceRowData, Kv } from "state.slint";
+
+component NavItem inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    in property <bool> danger: false;
+    callback clicked();
+    height: 36px;
+    border-radius: Tokens.r-md;
+    background: active ? Tokens.accent-soft : ta.has-hover ? Tokens.surface-3 : transparent;
+    accessible-role: AccessibleRole.tab;
+    accessible-label: text;
+    accessible-checkable: true;
+    accessible-checked: active;
+    accessible-action-default => {
+        clicked();
+    }
+    FocusRing {
+        active: fs.has-focus;
+    }
+
+    Text {
+        x: Tokens.sp-3;
+        text: root.text;
+        color: danger ? Tokens.danger : active ? Tokens.accent-text : Tokens.text;
+        font-size: Tokens.fs-md;
+        font-weight: active ? Tokens.fw-medium : Tokens.fw-regular;
+        vertical-alignment: center;
+    }
+
+    fs := FocusScope {
+        key-pressed(e) => {
+            if (e.text == Key.Return || e.text == " ") {
+                root.clicked();
+                return accept;
+            }
+            reject
+        }
+    }
+
+    ta := TouchArea {
+        clicked => {
+            fs.focus();
+            root.clicked();
+        }
+    }
+}
+
+component Panel inherits Card {
+    in property <string> title;
+    height: col.preferred-height + 2 * Tokens.sp-4;
+    col := VerticalLayout {
+        padding: Tokens.sp-4;
+        spacing: Tokens.sp-3;
+        Text {
+            text: root.title;
+            color: Tokens.text;
+            font-size: Tokens.fs-lg;
+            font-weight: Tokens.fw-medium;
+        }
+
+        @children
+    }
+}
+
+component DeviceRow inherits Rectangle {
+    in property <DeviceRowData> d;
+    height: 48px;
+    accessible-role: AccessibleRole.list-item;
+    accessible-label: d.name + (d.current ? " (this device)" : "") + ", last seen " + d.last-seen + ", " + d.state;
+    HorizontalLayout {
+        spacing: Tokens.sp-3;
+        padding-left: Tokens.sp-1;
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 2;
+            Text {
+                text: d.name;
+                color: Tokens.text;
+                font-size: Tokens.fs-md;
+                overflow: elide;
+            }
+
+            if d.current: Text {
+                text: "This device";
+                color: Tokens.accent-text;
+                font-size: Tokens.fs-xs;
+            }
+        }
+
+        Text {
+            text: d.last-seen;
+            color: Tokens.text-2;
+            font-size: Tokens.fs-sm;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+
+        HorizontalLayout {
+            horizontal-stretch: 1;
+            alignment: start;
+            Badge {
+                text: d.state;
+                tone: d.tone;
+                y: 13px;
+            }
+        }
+
+        Rectangle {
+            width: 96px;
+            if d.can-revoke: Btn {
+                text: "Revoke";
+                kind: "ghost";
+                y: 6px;
+                clicked => {
+                    DetailsVm.revoke(d.id);
+                }
+            }
+        }
+    }
+}
+
+component KvList inherits VerticalLayout {
+    in property <[Kv]> rows;
+    spacing: Tokens.sp-2;
+    for r in rows: KeyValue {
+        key: r.key;
+        value: r.value;
+    }
+}
+
+export component DetailsScreen inherits Rectangle {
+    background: Tokens.bg;
+    FocusScope {
+        key-pressed(e) => {
+            if (e.text == Key.Escape) {
+                DetailsVm.back();
+                return accept;
+            }
+            reject
+        }
+    VerticalLayout {
+        AppBar {
+            crumb: "Servers  /  " + DetailsVm.server-name;
+            Btn {
+                text: "Back to Home";
+                kind: "ghost";
+                clicked => {
+                    DetailsVm.back();
+                }
+            }
+        }
+
+        HorizontalLayout {
+            vertical-stretch: 1;
+            Rectangle {
+                width: 200px;
+                background: Tokens.surface;
+                Rectangle {
+                    x: parent.width - 1px;
+                    width: 1px;
+                    background: Tokens.border;
+                }
+
+                VerticalLayout {
+                    padding: Tokens.sp-3;
+                    spacing: Tokens.sp-1;
+                    alignment: start;
+                    accessible-role: AccessibleRole.tab-list;
+                    accessible-label: "Server details sections";
+                    NavItem {
+                        text: "Overview";
+                        active: DetailsVm.tab == 0;
+                        clicked => {
+                            DetailsVm.select-tab(0);
+                        }
+                    }
+
+                    NavItem {
+                        text: "Security";
+                        active: DetailsVm.tab == 1;
+                        clicked => {
+                            DetailsVm.select-tab(1);
+                        }
+                    }
+
+                    NavItem {
+                        text: "Desktop";
+                        active: DetailsVm.tab == 2;
+                        clicked => {
+                            DetailsVm.select-tab(2);
+                        }
+                    }
+
+                    NavItem {
+                        text: "Danger zone";
+                        danger: true;
+                        active: DetailsVm.tab == 3;
+                        clicked => {
+                            DetailsVm.select-tab(3);
+                        }
+                    }
+                }
+            }
+
+            ScrollView {
+                horizontal-stretch: 1;
+                VerticalLayout {
+                    padding: Tokens.sp-6;
+                max-width: 880px;
+                    spacing: Tokens.sp-4;
+                    alignment: start;
+                    HorizontalLayout {
+                        spacing: Tokens.sp-3;
+                        VerticalLayout {
+                            spacing: 2px;
+                            horizontal-stretch: 1;
+                            HorizontalLayout {
+                                spacing: Tokens.sp-3;
+                                Heading {
+                                    text: DetailsVm.server-name;
+                                    level: 1;
+                                }
+
+                                Badge {
+                                    text: DetailsVm.status;
+                                    tone: DetailsVm.status-tone;
+                                    y: 8px;
+                                }
+                            }
+
+                            Mono {
+                                text: DetailsVm.address;
+                                color: Tokens.text-2;
+                            }
+                        }
+
+                        Btn {
+                            text: "Connect";
+                            kind: "primary";
+                            enabled: DetailsVm.can-connect;
+                            clicked => {
+                                DetailsVm.connect();
+                            }
+                        }
+                    }
+
+                    if DetailsVm.notice != "": Banner {
+                        title: DetailsVm.notice;
+                        tone: 1;
+                    }
+                    if DetailsVm.loading: HorizontalLayout {
+                        spacing: Tokens.sp-2;
+                        alignment: start;
+                        Spinner { }
+
+                        Muted {
+                            text: "Asking the server…";
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    // ------------------------------------------------------------ overview
+                    if DetailsVm.tab == 0: VerticalLayout {
+                        spacing: Tokens.sp-4;
+                        if DetailsVm.attention-title != "": Banner {
+                            title: DetailsVm.attention-title;
+                            text: DetailsVm.attention-text;
+                            tone: 2;
+                        }
+                        if DetailsVm.attention-title != "" && DetailsVm.can-restart: HorizontalLayout {
+                            alignment: start;
+                            Btn {
+                                text: "Restart desktop";
+                                clicked => {
+                                    DetailsVm.restart-desktop();
+                                }
+                            }
+                        }
+                        if DetailsVm.offline-text != "": Banner {
+                            title: "Offline";
+                            text: DetailsVm.offline-text;
+                            tone: 0;
+                        }
+                        Panel {
+                            title: "Desktop";
+                            KvList {
+                                rows: DetailsVm.ov-desktop;
+                            }
+                        }
+
+                        Panel {
+                            title: "Agent";
+                            KvList {
+                                rows: DetailsVm.ov-agent;
+                            }
+
+                            if DetailsVm.update-text != "": HorizontalLayout {
+                                spacing: Tokens.sp-3;
+                                Badge {
+                                    text: DetailsVm.update-text;
+                                    tone: 4;
+                                    dot: false;
+                                }
+
+                                if DetailsVm.can-update: Btn {
+                                    text: "Update agent";
+                                    clicked => {
+                                        DetailsVm.update-agent();
+                                    }
+                                }
+                            }
+                        }
+
+                        if DetailsVm.ov-limits.length > 0: Panel {
+                            title: "Limits of the desktop";
+                            KvList {
+                                rows: DetailsVm.ov-limits;
+                            }
+                        }
+                        Panel {
+                            title: "Server";
+                            KvList {
+                                rows: DetailsVm.ov-server;
+                            }
+                        }
+                    }
+
+                    // ------------------------------------------------------------ security
+                    if DetailsVm.tab == 1: VerticalLayout {
+                        spacing: Tokens.sp-4;
+                        Panel {
+                            title: "Paired devices";
+                            HorizontalLayout {
+                                Muted {
+                                    text: DetailsVm.devices-note;
+                                    horizontal-stretch: 1;
+                                }
+
+                                Btn {
+                                    text: "Pair a new device";
+                                    clicked => {
+                                        DetailsVm.pair-device();
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: Tokens.sp-3;
+                                padding-left: Tokens.sp-1;
+                                Text {
+                                    text: "Device";
+                                    color: Tokens.text-3;
+                                    font-size: Tokens.fs-xs;
+                                    horizontal-stretch: 2;
+                                }
+
+                                Text {
+                                    text: "Last seen";
+                                    color: Tokens.text-3;
+                                    font-size: Tokens.fs-xs;
+                                    horizontal-stretch: 1;
+                                }
+
+                                Text {
+                                    text: "State";
+                                    color: Tokens.text-3;
+                                    font-size: Tokens.fs-xs;
+                                    horizontal-stretch: 1;
+                                }
+
+                                Rectangle {
+                                    width: 96px;
+                                }
+                            }
+
+                            VerticalLayout {
+                                accessible-role: AccessibleRole.list;
+                                accessible-label: "Paired devices";
+                                for d in DetailsVm.devices: DeviceRow {
+                                    d: d;
+                                }
+                            }
+                        }
+
+                        Panel {
+                            title: "PIN and password";
+                            HorizontalLayout {
+                                spacing: Tokens.sp-3;
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    Text {
+                                        text: "Change PIN";
+                                        color: Tokens.text;
+                                        font-weight: Tokens.fw-medium;
+                                    }
+
+                                    Muted {
+                                        text: "The PIN you type to connect. All your devices use the same PIN.";
+                                    }
+                                }
+
+                                Btn {
+                                    text: "Change PIN…";
+                                    clicked => {
+                                        DetailsVm.change-pin();
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: Tokens.sp-3;
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    Text {
+                                        text: "Change password";
+                                        color: Tokens.text;
+                                        font-weight: Tokens.fw-medium;
+                                    }
+
+                                    Muted {
+                                        text: "The Linux account password. This also changes it inside the desktop.";
+                                    }
+                                }
+
+                                Btn {
+                                    text: "Change password…";
+                                    clicked => {
+                                        DetailsVm.change-password();
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // ------------------------------------------------------------ desktop
+                    if DetailsVm.tab == 2: VerticalLayout {
+                        spacing: Tokens.sp-4;
+                        Panel {
+                            title: "Docker";
+                            Toggle {
+                                title: "Docker in the desktop";
+                                description: "Run containers inside your desktop. Turning it on restarts the desktop.";
+                                checked: DetailsVm.docker;
+                                toggled(on) => {
+                                    DetailsVm.docker-toggled(on);
+                                }
+                            }
+                        }
+
+                        Panel {
+                            title: "Resource limits";
+                            SliderField {
+                                label: "CPU";
+                                unit: "cores";
+                                minimum: 1;
+                                maximum: DetailsVm.cpu-max;
+                                value <=> DetailsVm.cpu;
+                                changed(_) => {
+                                    DetailsVm.limits-changed();
+                                }
+                            }
+
+                            SliderField {
+                                label: "Memory";
+                                unit: "GB";
+                                minimum: 1;
+                                maximum: DetailsVm.memory-max;
+                                value <=> DetailsVm.memory;
+                                changed(_) => {
+                                    DetailsVm.limits-changed();
+                                }
+                            }
+
+                            SliderField {
+                                label: "Disk";
+                                unit: "GB (can grow, not shrink)";
+                                minimum: 8;
+                                maximum: DetailsVm.disk-max;
+                                value <=> DetailsVm.disk;
+                                changed(_) => {
+                                    DetailsVm.limits-changed();
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: Tokens.sp-3;
+                                alignment: start;
+                                Btn {
+                                    text: "Apply limits";
+                                    kind: "primary";
+                                    enabled: DetailsVm.limits-dirty;
+                                    clicked => {
+                                        DetailsVm.apply-limits();
+                                    }
+                                }
+
+                                Muted {
+                                    text: "Applies without restarting the desktop.";
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+
+                        Panel {
+                            title: "Maintenance";
+                            HorizontalLayout {
+                                spacing: Tokens.sp-3;
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    Text {
+                                        text: "Restart desktop";
+                                        color: Tokens.text;
+                                        font-weight: Tokens.fw-medium;
+                                    }
+
+                                    Muted {
+                                        text: "Closes every open app and starts the desktop again. Your files stay.";
+                                    }
+                                }
+
+                                Btn {
+                                    text: "Restart desktop…";
+                                    clicked => {
+                                        DetailsVm.restart-desktop();
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: Tokens.sp-3;
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    Text {
+                                        text: "Update agent";
+                                        color: Tokens.text;
+                                        font-weight: Tokens.fw-medium;
+                                    }
+
+                                    Muted {
+                                        text: DetailsVm.agent-line;
+                                    }
+                                }
+
+                                Btn {
+                                    text: DetailsVm.can-update ? "Update now" : "Up to date";
+                                    enabled: DetailsVm.can-update;
+                                    clicked => {
+                                        DetailsVm.update-agent();
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // ------------------------------------------------------------ danger zone
+                    if DetailsVm.tab == 3: VerticalLayout {
+                        spacing: Tokens.sp-4;
+                        Panel {
+                            title: "Uninstall hash-xcreen from this server";
+                            Muted {
+                                text: "Removes the agent, its services and its firewall rules. Incus stays installed on the server (the app tells you how to remove it).";
+                            }
+
+                            Text {
+                                text: "What happens to the desktop?";
+                                color: Tokens.text;
+                                font-size: Tokens.fs-sm;
+                                font-weight: Tokens.fw-medium;
+                            }
+
+                            RadioRow {
+                                title: "Keep the desktop";
+                                description: "The desktop and all its files stay on the server. Installing again with the same distribution, preset and user brings it back.";
+                                selected: DetailsVm.keep-desktop;
+                                activated => {
+                                    DetailsVm.keep-desktop = true;
+                                }
+                            }
+
+                            RadioRow {
+                                title: "Delete the desktop";
+                                description: "Everything inside the desktop is destroyed. This cannot be undone.";
+                                selected: !DetailsVm.keep-desktop;
+                                activated => {
+                                    DetailsVm.keep-desktop = false;
+                                }
+                            }
+
+                            HorizontalLayout {
+                                alignment: start;
+                                Btn {
+                                    text: "Uninstall…";
+                                    kind: "danger";
+                                    clicked => {
+                                        DetailsVm.uninstall();
+                                    }
+                                }
+                            }
+                        }
+
+                        if DetailsVm.danger == 3: HorizontalLayout {
+                            spacing: Tokens.sp-2;
+                            alignment: start;
+                            Spinner { }
+
+                            Muted {
+                                text: "Uninstalling…";
+                                vertical-alignment: center;
+                            }
+                        }
+                        if DetailsVm.danger == 4: Panel {
+                            title: "Uninstalled";
+                            Label {
+                                text: DetailsVm.done-text;
+                            }
+
+                            ButtonRow {
+                                Btn {
+                                    text: "Copy commands";
+                                    clicked => {
+                                        DetailsVm.copy-commands();
+                                    }
+                                }
+
+                                Btn {
+                                    text: "Remove from this app";
+                                    kind: "primary";
+                                    clicked => {
+                                        DetailsVm.remove-from-app();
+                                    }
+                                }
+                            }
+
+                            Muted {
+                                text: "The server card stays until you remove it, so you can add it again later.";
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------- dialogs
+    if DetailsVm.dialog == 1 || DetailsVm.dialog == 2: Dialog {
+        open: true;
+        title: DetailsVm.dialog == 2 ? "Revoke this device?" : "Revoke " + DetailsVm.dialog-text + "?";
+        danger: true;
+        dismissed => {
+            DetailsVm.close-dialog();
+        }
+        Label {
+            text: DetailsVm.dialog == 2 ? "You are about to remove " + DetailsVm.dialog-text + ", the device you are using. You will be disconnected and need the account password to pair again." : "This device will lose access to " + DetailsVm.server-name + " immediately and must be paired again with the account password. Its session, if open, ends now.";
+        }
+
+        if DetailsVm.dialog-error != "": Banner {
+            title: DetailsVm.dialog-error;
+            tone: 3;
+        }
+        ButtonRow {
+            Btn {
+                text: "Cancel";
+                autofocus: true;
+                clicked => {
+                    DetailsVm.close-dialog();
+                }
+            }
+
+            Btn {
+                text: DetailsVm.dialog == 2 ? "Revoke this device" : "Revoke device";
+                kind: "danger";
+                enabled: !DetailsVm.dialog-busy;
+                clicked => {
+                    DetailsVm.confirm-revoke();
+                }
+            }
+        }
+    }
+    if DetailsVm.dialog == 3: Dialog {
+        open: true;
+        title: "Pair a new device";
+        dismissed => {
+            DetailsVm.close-dialog();
+        }
+        Label {
+            text: "On the new device, open hash-xcreen, choose Add server, Enter a pairing code and type this code with the address below.";
+            color: Tokens.text-2;
+        }
+
+        if DetailsVm.dialog-error != "": Banner {
+            title: DetailsVm.dialog-error;
+            tone: 3;
+        }
+        if DetailsVm.pair-code == "" && DetailsVm.dialog-error == "": HorizontalLayout {
+            spacing: Tokens.sp-2;
+            alignment: start;
+            Spinner { }
+
+            Muted {
+                text: "Asking the server for a code…";
+                vertical-alignment: center;
+            }
+        }
+        if DetailsVm.pair-code != "": VerticalLayout {
+            spacing: Tokens.sp-1;
+            Text {
+                text: "Pairing code";
+                color: Tokens.text-2;
+                font-size: Tokens.fs-sm;
+            }
+
+            Text {
+                text: DetailsVm.pair-code;
+                color: Tokens.text;
+                font-family: Tokens.font-mono;
+                font-size: Tokens.fs-3xl;
+                font-weight: Tokens.fw-medium;
+                accessible-role: AccessibleRole.text;
+                accessible-label: "Pairing code " + DetailsVm.pair-code;
+            }
+
+            Mono {
+                text: "Address " + DetailsVm.pair-address;
+            }
+
+            Muted {
+                text: DetailsVm.pair-expiry;
+            }
+        }
+        ButtonRow {
+            Btn {
+                text: "Copy code";
+                enabled: DetailsVm.pair-code != "";
+                clicked => {
+                    DetailsVm.copy-pair-code();
+                }
+            }
+
+            Btn {
+                text: "Done";
+                kind: "primary";
+                autofocus: true;
+                clicked => {
+                    DetailsVm.close-dialog();
+                }
+            }
+        }
+    }
+    if DetailsVm.dialog == 6: Dialog {
+        open: true;
+        title: "Enter your PIN";
+        dismissed => {
+            DetailsVm.close-dialog();
+        }
+        Label {
+            text: "Server details need a signed-in session. Enter the PIN you use to connect. It is checked by the server and counts as an attempt like any other.";
+            color: Tokens.text-2;
+        }
+
+        Field {
+            label: "PIN";
+            password: true;
+            autofocus: true;
+            text <=> DetailsVm.f1;
+            error: DetailsVm.e1;
+            enabled: !DetailsVm.dialog-busy;
+            accepted => {
+                DetailsVm.submit-dialog();
+            }
+        }
+
+        if DetailsVm.dialog-error != "": Banner {
+            title: DetailsVm.dialog-error;
+            tone: 3;
+        }
+        ButtonRow {
+            Btn {
+                text: "Cancel";
+                clicked => {
+                    DetailsVm.close-dialog();
+                }
+            }
+
+            Btn {
+                text: "Unlock";
+                kind: "primary";
+                enabled: !DetailsVm.dialog-busy;
+                clicked => {
+                    DetailsVm.submit-dialog();
+                }
+            }
+        }
+    }
+    if DetailsVm.dialog == 4: Dialog {
+        open: true;
+        title: "Change PIN";
+        dismissed => {
+            DetailsVm.close-dialog();
+        }
+        Field {
+            label: "Current PIN";
+            password: true;
+            text <=> DetailsVm.f1;
+            error: DetailsVm.e1;
+            enabled: !DetailsVm.dialog-busy;
+            edited(_) => {
+                DetailsVm.dialog-changed();
+            }
+        }
+
+        Field {
+            label: "New PIN";
+            password: true;
+            text <=> DetailsVm.f2;
+            hint: "6 or more digits.";
+            error: DetailsVm.e2;
+            enabled: !DetailsVm.dialog-busy;
+            edited(_) => {
+                DetailsVm.dialog-changed();
+            }
+        }
+
+        Field {
+            label: "Confirm new PIN";
+            password: true;
+            text <=> DetailsVm.f3;
+            error: DetailsVm.e3;
+            enabled: !DetailsVm.dialog-busy;
+            edited(_) => {
+                DetailsVm.dialog-changed();
+            }
+            accepted => {
+                DetailsVm.submit-dialog();
+            }
+        }
+
+        if DetailsVm.dialog-error != "": Banner {
+            title: DetailsVm.dialog-error;
+            tone: 3;
+        }
+        ButtonRow {
+            Btn {
+                text: "Cancel";
+                clicked => {
+                    DetailsVm.close-dialog();
+                }
+            }
+
+            Btn {
+                text: "Change PIN";
+                kind: "primary";
+                enabled: !DetailsVm.dialog-busy;
+                clicked => {
+                    DetailsVm.submit-dialog();
+                }
+            }
+        }
+    }
+    if DetailsVm.dialog == 5: Dialog {
+        open: true;
+        title: "Change password";
+        dismissed => {
+            DetailsVm.close-dialog();
+        }
+        Field {
+            label: "Current password";
+            password: true;
+            text <=> DetailsVm.f1;
+            error: DetailsVm.e1;
+            enabled: !DetailsVm.dialog-busy;
+            edited(_) => {
+                DetailsVm.dialog-changed();
+            }
+        }
+
+        Field {
+            label: "New password";
+            password: true;
+            text <=> DetailsVm.f2;
+            error: DetailsVm.e2;
+            hint: "At least 8 characters. Strength: " + DetailsVm.strength-word;
+            enabled: !DetailsVm.dialog-busy;
+            edited(_) => {
+                DetailsVm.dialog-changed();
+            }
+        }
+
+        Field {
+            label: "Confirm new password";
+            password: true;
+            text <=> DetailsVm.f3;
+            error: DetailsVm.e3;
+            enabled: !DetailsVm.dialog-busy;
+            edited(_) => {
+                DetailsVm.dialog-changed();
+            }
+            accepted => {
+                DetailsVm.submit-dialog();
+            }
+        }
+
+        if DetailsVm.dialog-error != "": Banner {
+            title: DetailsVm.dialog-error;
+            tone: 3;
+        }
+        ButtonRow {
+            Btn {
+                text: "Cancel";
+                clicked => {
+                    DetailsVm.close-dialog();
+                }
+            }
+
+            Btn {
+                text: "Change password";
+                kind: "primary";
+                enabled: !DetailsVm.dialog-busy;
+                clicked => {
+                    DetailsVm.submit-dialog();
+                }
+            }
+        }
+    }
+    if DetailsVm.docker-dialog: Dialog {
+        open: true;
+        title: "Turn on Docker?";
+        dismissed => {
+            DetailsVm.cancel-docker();
+        }
+        Banner {
+            title: "Docker weakens isolation";
+            text: "Anything that can run Docker commands in the desktop can reach more of the server than a normal desktop user. Turn it on only if you need containers.";
+            tone: 2;
+        }
+
+        Check {
+            title: "I understand that Docker weakens the isolation of this desktop.";
+            checked <=> DetailsVm.docker-ack;
+        }
+
+        Muted {
+            text: "The desktop restarts and Docker is installed. Open apps are closed.";
+        }
+
+        ButtonRow {
+            Btn {
+                text: "Cancel";
+                autofocus: true;
+                clicked => {
+                    DetailsVm.cancel-docker();
+                }
+            }
+
+            Btn {
+                text: "Turn on and restart";
+                kind: "primary";
+                enabled: DetailsVm.docker-ack;
+                clicked => {
+                    DetailsVm.confirm-docker();
+                }
+            }
+        }
+    }
+    if DetailsVm.restart-dialog: Dialog {
+        open: true;
+        title: "Restart the desktop?";
+        dismissed => {
+            DetailsVm.cancel-restart();
+        }
+        Label {
+            text: "Every open app closes without saving. Anyone connected is disconnected; you can reconnect in about a minute.";
+        }
+
+        ButtonRow {
+            Btn {
+                text: "Cancel";
+                autofocus: true;
+                clicked => {
+                    DetailsVm.cancel-restart();
+                }
+            }
+
+            Btn {
+                text: "Restart desktop";
+                kind: "danger";
+                clicked => {
+                    DetailsVm.confirm-restart();
+                }
+            }
+        }
+    }
+    if DetailsVm.danger == 1: Dialog {
+        open: true;
+        title: "Uninstall needs SSH access";
+        dismissed => {
+            DetailsVm.danger-cancel();
+        }
+        Label {
+            text: "Uninstalling changes the server as root, which the running agent cannot do for you. Give the app SSH access once. Nothing is stored.";
+            color: Tokens.text-2;
+        }
+
+        HorizontalLayout {
+            spacing: Tokens.sp-3;
+            Field {
+                label: "Username";
+                text <=> DetailsVm.ssh-user;
+            }
+
+            Field {
+                label: "Port";
+                text <=> DetailsVm.ssh-port;
+                width: 100px;
+            }
+        }
+
+        Field {
+            label: "SSH password (leave empty to use your SSH keys)";
+            password: true;
+            text <=> DetailsVm.ssh-password;
+        }
+
+        if DetailsVm.danger-error != "": Banner {
+            title: DetailsVm.danger-error;
+            tone: 3;
+        }
+        ButtonRow {
+            Btn {
+                text: "Cancel";
+                clicked => {
+                    DetailsVm.danger-cancel();
+                }
+            }
+
+            Btn {
+                text: "Continue";
+                kind: "primary";
+                clicked => {
+                    DetailsVm.danger-continue();
+                }
+            }
+        }
+    }
+    if DetailsVm.danger == 2: Dialog {
+        open: true;
+        title: DetailsVm.keep-desktop ? "Uninstall and keep the desktop?" : "Delete the desktop and uninstall?";
+        danger: !DetailsVm.keep-desktop;
+        dismissed => {
+            DetailsVm.danger-cancel();
+        }
+        if !DetailsVm.keep-desktop: Banner {
+            title: "This cannot be undone";
+            text: "The desktop \"" + DetailsVm.server-name + "\" and everything in it (files, settings, installed apps) will be destroyed. Backups on Google Drive, if any, are not touched.";
+            tone: 3;
+        }
+        if DetailsVm.keep-desktop: Label {
+            text: "The agent is removed; the desktop and its files stay on the server.";
+        }
+        if !DetailsVm.keep-desktop: Field {
+            label: "Type the server name to confirm";
+            text <=> DetailsVm.confirm-name;
+            hint: "Type " + DetailsVm.server-name + " to continue.";
+            error: DetailsVm.danger-error;
+        }
+        ButtonRow {
+            Btn {
+                text: "Cancel";
+                autofocus: true;
+                clicked => {
+                    DetailsVm.danger-cancel();
+                }
+            }
+
+            Btn {
+                text: DetailsVm.keep-desktop ? "Uninstall" : "Delete and uninstall";
+                kind: "danger";
+                enabled: DetailsVm.keep-desktop || DetailsVm.confirm-name == DetailsVm.server-name;
+                clicked => {
+                    DetailsVm.danger-confirm();
+                }
+            }
+        }
+    }
+    }
+}

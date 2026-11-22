@@ -1,0 +1,878 @@
+// Components built only from Tokens. Every interactive one has a visible focus ring
+// (2 px, 2 px gap), an accessible role and name, and works from the keyboard.
+
+import { Tokens } from "tokens.slint";
+
+// ---------------------------------------------------------------------------------------- focus
+
+export component FocusRing inherits Rectangle {
+    in property <bool> active;
+    in property <length> radius: Tokens.r-md;
+    Rectangle {
+        x: -4px;
+        y: -4px;
+        width: parent.width + 8px;
+        height: parent.height + 8px;
+        border-radius: radius + 4px;
+        border-width: active ? 2px : 0px;
+        border-color: Tokens.focus;
+        background: transparent;
+    }
+}
+
+// ---------------------------------------------------------------------------------------- text
+
+export component Label inherits Text {
+    color: Tokens.text;
+    font-size: Tokens.fs-md;
+    wrap: word-wrap;
+}
+
+export component Muted inherits Text {
+    color: Tokens.text-2;
+    font-size: Tokens.fs-sm;
+    wrap: word-wrap;
+}
+
+export component Heading inherits Text {
+    in property <int> level: 1;
+    color: Tokens.text;
+    font-size: level == 1 ? Tokens.fs-2xl : level == 2 ? Tokens.fs-xl : Tokens.fs-lg;
+    font-weight: Tokens.fw-medium;
+    wrap: word-wrap;
+    accessible-role: AccessibleRole.text;
+}
+
+export component Mono inherits Text {
+    color: Tokens.text;
+    font-family: Tokens.font-mono;
+    font-size: Tokens.fs-sm;
+    wrap: word-wrap;
+}
+
+// ---------------------------------------------------------------------------------------- button
+
+export component Btn inherits Rectangle {
+    in property <string> text;
+    // primary, secondary, danger, ghost
+    in property <string> kind: "secondary";
+    in property <bool> enabled: true;
+    // Takes the keyboard focus when it appears (the safe action of a dialog).
+    in property <bool> autofocus: false;
+    callback clicked();
+    forward-focus: fs;
+    init => {
+        if (autofocus) {
+            fs.focus();
+        }
+    }
+    min-width: max(88px, label.preferred-width + 2 * Tokens.sp-4);
+    height: Tokens.control-h;
+    border-radius: Tokens.r-md;
+    background: !enabled ? Tokens.surface-2
+        : kind == "primary" ? (ta.has-hover ? Tokens.accent-hover : Tokens.accent)
+        : kind == "danger" ? Tokens.danger-fill
+        : kind == "ghost" ? (ta.has-hover ? Tokens.surface-3 : transparent)
+        : (ta.has-hover ? Tokens.surface-3 : Tokens.surface-2);
+    border-width: kind == "secondary" || !enabled ? 1px : 0px;
+    border-color: enabled ? Tokens.border-strong : Tokens.border;
+    accessible-role: AccessibleRole.button;
+    accessible-label: text;
+    accessible-enabled: enabled;
+    accessible-action-default => {
+        if (enabled) {
+            clicked();
+        }
+    }
+    FocusRing {
+        active: fs.has-focus;
+    }
+
+    fs := FocusScope {
+        enabled: root.enabled;
+        key-pressed(e) => {
+            if (e.text == Key.Return || e.text == " ") {
+                root.clicked();
+                return accept;
+            }
+            reject
+        }
+    }
+
+    ta := TouchArea {
+        enabled: root.enabled;
+        clicked => {
+            fs.focus();
+            root.clicked();
+        }
+    }
+
+    label := Text {
+        text: root.text;
+        font-size: Tokens.fs-md;
+        font-weight: Tokens.fw-medium;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        color: !enabled ? Tokens.text-3
+            : kind == "primary" ? Tokens.on-accent
+            : kind == "danger" ? Tokens.on-danger-fill
+            : kind == "ghost" ? Tokens.accent-text
+            : Tokens.text;
+    }
+}
+
+// ---------------------------------------------------------------------------------------- field
+
+export component Field inherits VerticalLayout {
+    in property <string> label;
+    in-out property <string> text;
+    in property <string> placeholder;
+    in property <string> hint;
+    in property <string> error;
+    in property <bool> password: false;
+    in property <bool> mono: false;
+    in property <bool> enabled: true;
+    in property <bool> reveal: false;
+    // Takes the keyboard focus when it appears.
+    in property <bool> autofocus: false;
+    // Bump to move the focus here again (after a wrong PIN, when a wait ends).
+    in property <int> focus-request: 0;
+    changed focus-request => {
+        ti.focus();
+    }
+    init => {
+        if (autofocus) {
+            ti.focus();
+        }
+    }
+    callback edited(string);
+    callback accepted();
+    callback blurred();
+    forward-focus: ti;
+    spacing: Tokens.sp-1;
+    Text {
+        text: root.label;
+        color: Tokens.text;
+        font-size: Tokens.fs-sm;
+        font-weight: Tokens.fw-medium;
+        visible: root.label != "";
+        height: root.label != "" ? self.preferred-height : 0px;
+    }
+
+    box := Rectangle {
+        height: Tokens.control-h;
+        background: Tokens.surface-2;
+        border-radius: Tokens.r-md;
+        border-width: ti.has-focus || root.error != "" ? 2px : 1px;
+        border-color: root.error != "" ? Tokens.danger : ti.has-focus ? Tokens.focus : Tokens.border-strong;
+        opacity: root.enabled ? 1 : 0.6;
+        ti := TextInput {
+            x: Tokens.sp-3;
+            width: parent.width - 2 * Tokens.sp-3;
+            height: parent.height;
+            vertical-alignment: center;
+            single-line: true;
+            enabled: root.enabled;
+            text <=> root.text;
+            input-type: root.password && !root.reveal ? InputType.password : InputType.text;
+            font-size: Tokens.fs-lg;
+            font-family: root.mono ? Tokens.font-mono : "";
+            color: Tokens.text;
+            selection-background-color: Tokens.accent;
+            selection-foreground-color: Tokens.on-accent;
+            accessible-role: AccessibleRole.text-input;
+            accessible-label: root.label;
+            accepted => {
+                root.accepted();
+            }
+            edited => {
+                root.edited(self.text);
+            }
+            changed has-focus => {
+                if (!self.has-focus) {
+                    root.blurred();
+                }
+            }
+        }
+
+        Text {
+            x: Tokens.sp-3;
+            text: root.placeholder;
+            visible: root.text == "" && root.placeholder != "";
+            color: Tokens.text-3;
+            font-size: Tokens.fs-lg;
+            vertical-alignment: center;
+            height: parent.height;
+        }
+    }
+
+    Text {
+        text: root.error;
+        visible: root.error != "";
+        height: root.error != "" ? self.preferred-height : 0px;
+        color: Tokens.danger;
+        font-size: Tokens.fs-sm;
+        wrap: word-wrap;
+        accessible-role: AccessibleRole.text;
+        accessible-label: "Error: " + root.error;
+    }
+
+    Text {
+        text: root.hint;
+        visible: root.hint != "" && root.error == "";
+        height: root.hint != "" && root.error == "" ? self.preferred-height : 0px;
+        color: Tokens.text-3;
+        font-size: Tokens.fs-sm;
+        wrap: word-wrap;
+    }
+}
+
+// ---------------------------------------------------------------------------------------- switch and checkbox
+
+export component Toggle inherits Rectangle {
+    in-out property <bool> checked;
+    in property <string> title;
+    in property <string> description;
+    in property <bool> enabled: true;
+    callback toggled(bool);
+    height: max(36px, col.preferred-height + 8px);
+    accessible-role: AccessibleRole.switch;
+    accessible-label: title;
+    accessible-checkable: true;
+    accessible-checked: checked;
+    accessible-action-default => {
+        root.flip();
+    }
+    function flip() {
+        if (enabled) {
+            checked = !checked;
+            toggled(checked);
+        }
+    }
+    HorizontalLayout {
+        spacing: Tokens.sp-3;
+        alignment: start;
+        Rectangle {
+            width: 40px;
+            height: 22px;
+            y: 7px;
+            border-radius: 11px;
+            background: root.checked ? Tokens.accent : Tokens.surface-3;
+            border-width: 1px;
+            border-color: Tokens.border-strong;
+            opacity: root.enabled ? 1 : 0.5;
+            FocusRing {
+                active: fs.has-focus;
+                radius: 11px;
+            }
+
+            Rectangle {
+                width: 16px;
+                height: 16px;
+                y: 3px;
+                x: root.checked ? 21px : 3px;
+                border-radius: 8px;
+                background: root.checked ? Tokens.on-accent : Tokens.text-2;
+                animate x { duration: Tokens.reduced-motion ? 0ms : 120ms; }
+            }
+        }
+
+        col := VerticalLayout {
+            spacing: 2px;
+            alignment: center;
+            Text {
+                text: root.title;
+                color: Tokens.text;
+                font-size: Tokens.fs-md;
+                wrap: word-wrap;
+            }
+
+            Text {
+                text: root.description;
+                visible: root.description != "";
+                height: root.description != "" ? self.preferred-height : 0px;
+                color: Tokens.text-2;
+                font-size: Tokens.fs-sm;
+                wrap: word-wrap;
+            }
+        }
+    }
+
+    fs := FocusScope {
+        enabled: root.enabled;
+        key-pressed(e) => {
+            if (e.text == " " || e.text == Key.Return) {
+                root.flip();
+                return accept;
+            }
+            reject
+        }
+    }
+
+    TouchArea {
+        enabled: root.enabled;
+        clicked => {
+            fs.focus();
+            root.flip();
+        }
+    }
+}
+
+export component Check inherits Rectangle {
+    in-out property <bool> checked;
+    in property <string> title;
+    in property <string> error;
+    callback toggled(bool);
+    height: max(32px, lbl.preferred-height + 8px);
+    accessible-role: AccessibleRole.checkbox;
+    accessible-label: title;
+    accessible-checkable: true;
+    accessible-checked: checked;
+    accessible-action-default => {
+        root.flip();
+    }
+    function flip() {
+        checked = !checked;
+        toggled(checked);
+    }
+    HorizontalLayout {
+        spacing: Tokens.sp-3;
+        Rectangle {
+            width: 20px;
+            height: 20px;
+            y: 6px;
+            border-radius: Tokens.r-sm;
+            border-width: 2px;
+            border-color: root.error != "" ? Tokens.danger : Tokens.border-strong;
+            background: root.checked ? Tokens.accent : transparent;
+            FocusRing {
+                active: fs.has-focus;
+                radius: Tokens.r-sm;
+            }
+
+            Text {
+                text: "✓";
+                visible: root.checked;
+                color: Tokens.on-accent;
+                font-size: 14px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        lbl := Text {
+            text: root.title;
+            color: Tokens.text;
+            font-size: Tokens.fs-md;
+            wrap: word-wrap;
+            vertical-alignment: center;
+        }
+    }
+
+    fs := FocusScope {
+        key-pressed(e) => {
+            if (e.text == " ") {
+                root.flip();
+                return accept;
+            }
+            reject
+        }
+    }
+
+    TouchArea {
+        clicked => {
+            fs.focus();
+            root.flip();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------- badge, banner, card
+
+export component Badge inherits Rectangle {
+    in property <string> text;
+    // 0 neutral, 1 success, 2 warning, 3 danger, 4 info, 5 accent
+    in property <int> tone: 0;
+    in property <bool> dot: true;
+    background: Tokens.tone-bg(tone);
+    border-radius: Tokens.r-sm;
+    height: 22px;
+    width: row.preferred-width + 2 * Tokens.sp-2;
+    accessible-role: AccessibleRole.text;
+    accessible-label: text;
+    row := HorizontalLayout {
+        padding-left: Tokens.sp-2;
+        padding-right: Tokens.sp-2;
+        spacing: 6px;
+        alignment: center;
+        if root.dot: Rectangle {
+            width: 8px;
+            height: 8px;
+            y: 7px;
+            border-radius: 4px;
+            background: Tokens.tone-fg(root.tone);
+        }
+        Text {
+            text: root.text;
+            color: Tokens.tone-fg(root.tone);
+            font-size: Tokens.fs-xs;
+            font-weight: Tokens.fw-medium;
+            vertical-alignment: center;
+        }
+    }
+}
+
+export component Banner inherits Rectangle {
+    in property <string> title;
+    in property <string> text;
+    in property <int> tone: 4;
+    background: Tokens.tone-bg(tone);
+    border-radius: Tokens.r-md;
+    border-width: 1px;
+    border-color: Tokens.tone-fg(tone);
+    accessible-role: AccessibleRole.text;
+    accessible-label: title + ". " + text;
+    height: col.preferred-height + 2 * Tokens.sp-3;
+    col := VerticalLayout {
+        x: Tokens.sp-4;
+        y: Tokens.sp-3;
+        width: parent.width - 2 * Tokens.sp-4;
+        spacing: 2px;
+        Text {
+            text: root.title;
+            visible: root.title != "";
+            height: root.title != "" ? self.preferred-height : 0px;
+            color: Tokens.tone-fg(root.tone);
+            font-size: Tokens.fs-md;
+            font-weight: Tokens.fw-medium;
+            wrap: word-wrap;
+        }
+
+        Text {
+            text: root.text;
+            visible: root.text != "";
+            height: root.text != "" ? self.preferred-height : 0px;
+            color: Tokens.text;
+            font-size: Tokens.fs-sm;
+            wrap: word-wrap;
+        }
+    }
+}
+
+export component Card inherits Rectangle {
+    background: Tokens.surface;
+    border-radius: Tokens.r-lg;
+    border-width: 1px;
+    border-color: Tokens.border;
+}
+
+// A selectable option card of a radio group.
+export component RadioRow inherits Rectangle {
+    in property <string> title;
+    in property <string> description;
+    in property <string> tag;
+    in property <bool> selected;
+    in property <bool> enabled: true;
+    callback activated();
+    height: col.preferred-height + 2 * Tokens.sp-3;
+    background: selected ? Tokens.accent-soft : Tokens.surface;
+    border-radius: Tokens.r-md;
+    border-width: selected ? 2px : 1px;
+    border-color: selected ? Tokens.accent : Tokens.border-strong;
+    opacity: enabled ? 1 : 0.6;
+    accessible-role: AccessibleRole.radio-button;
+    accessible-label: title + ". " + description;
+    accessible-checkable: true;
+    accessible-checked: selected;
+    accessible-enabled: enabled;
+    accessible-action-default => {
+        if (enabled) {
+            activated();
+        }
+    }
+    FocusRing {
+        active: fs.has-focus;
+    }
+
+    HorizontalLayout {
+        padding: Tokens.sp-3;
+        spacing: Tokens.sp-3;
+        Rectangle {
+            width: 18px;
+            height: 18px;
+            y: 2px;
+            border-radius: 9px;
+            border-width: 2px;
+            border-color: root.selected ? Tokens.accent : Tokens.border-strong;
+            Rectangle {
+                width: 8px;
+                height: 8px;
+                border-radius: 4px;
+                background: Tokens.accent;
+                visible: root.selected;
+            }
+        }
+
+        col := VerticalLayout {
+            spacing: 2px;
+            HorizontalLayout {
+                spacing: Tokens.sp-2;
+                Text {
+                    text: root.title;
+                    color: Tokens.text;
+                    font-size: Tokens.fs-md;
+                    font-weight: Tokens.fw-medium;
+                }
+
+                if root.tag != "": Badge {
+                    text: root.tag;
+                    tone: 4;
+                    dot: false;
+                }
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+            }
+
+            Text {
+                text: root.description;
+                color: Tokens.text-2;
+                font-size: Tokens.fs-sm;
+                wrap: word-wrap;
+            }
+        }
+    }
+
+    fs := FocusScope {
+        enabled: root.enabled;
+        key-pressed(e) => {
+            if (e.text == " " || e.text == Key.Return) {
+                root.activated();
+                return accept;
+            }
+            reject
+        }
+    }
+
+    TouchArea {
+        enabled: root.enabled;
+        clicked => {
+            fs.focus();
+            root.activated();
+        }
+    }
+}
+
+// A segmented control (radio group in a row).
+export component Segmented inherits Rectangle {
+    in property <[string]> options;
+    in-out property <int> current;
+    in property <string> label;
+    callback changed(int);
+    height: Tokens.control-h;
+    background: Tokens.surface-2;
+    border-radius: Tokens.r-md;
+    border-width: 1px;
+    border-color: Tokens.border-strong;
+    accessible-role: AccessibleRole.tab-list;
+    accessible-label: label;
+    FocusRing {
+        active: fs.has-focus;
+    }
+
+    HorizontalLayout {
+        padding: 2px;
+        spacing: 2px;
+        for o[i] in root.options: Rectangle {
+            border-radius: 6px;
+            background: root.current == i ? Tokens.accent : transparent;
+            accessible-role: AccessibleRole.tab;
+            accessible-label: o;
+            accessible-checkable: true;
+            accessible-checked: root.current == i;
+            accessible-action-default => {
+                root.current = i;
+                root.changed(i);
+            }
+            Text {
+                text: o;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                font-size: Tokens.fs-md;
+                font-weight: Tokens.fw-medium;
+                color: root.current == i ? Tokens.on-accent : Tokens.text;
+            }
+
+            TouchArea {
+                clicked => {
+                    fs.focus();
+                    root.current = i;
+                    root.changed(i);
+                }
+            }
+        }
+    }
+
+    fs := FocusScope {
+        key-pressed(e) => {
+            if (e.text == Key.LeftArrow && root.current > 0) {
+                root.current -= 1;
+                root.changed(root.current);
+                return accept;
+            }
+            if (e.text == Key.RightArrow && root.current < root.options.length - 1) {
+                root.current += 1;
+                root.changed(root.current);
+                return accept;
+            }
+            reject
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------- slider
+
+export component SliderField inherits VerticalLayout {
+    in property <string> label;
+    in property <int> minimum;
+    in property <int> maximum;
+    in-out property <int> value;
+    in property <string> unit;
+    in property <string> hint;
+    callback changed(int);
+    spacing: Tokens.sp-1;
+    Text {
+        text: root.label + ": " + root.value + " " + root.unit;
+        color: Tokens.text;
+        font-size: Tokens.fs-sm;
+        font-weight: Tokens.fw-medium;
+    }
+
+    track := Rectangle {
+        height: 28px;
+        accessible-role: AccessibleRole.slider;
+        accessible-label: root.label;
+        accessible-value: root.value;
+        accessible-value-minimum: root.minimum;
+        accessible-value-maximum: root.maximum;
+        accessible-value-step: 1;
+        accessible-action-increment => {
+            root.step(1);
+        }
+        accessible-action-decrement => {
+            root.step(-1);
+        }
+        Rectangle {
+            y: 12px;
+            height: 4px;
+            border-radius: 2px;
+            background: Tokens.surface-3;
+        }
+
+        Rectangle {
+            y: 12px;
+            height: 4px;
+            border-radius: 2px;
+            background: Tokens.accent;
+            width: root.maximum > root.minimum ? (parent.width - 20px) * (root.value - root.minimum) / (root.maximum - root.minimum) + 10px : 10px;
+        }
+
+        thumb := Rectangle {
+            width: 20px;
+            height: 20px;
+            y: 4px;
+            border-radius: 10px;
+            background: Tokens.accent;
+            border-width: 2px;
+            border-color: Tokens.surface;
+            x: root.maximum > root.minimum ? (parent.width - 20px) * (root.value - root.minimum) / (root.maximum - root.minimum) : 0px;
+            FocusRing {
+                active: fs.has-focus;
+                radius: 10px;
+            }
+        }
+
+        fs := FocusScope {
+            key-pressed(e) => {
+                if (e.text == Key.LeftArrow || e.text == Key.DownArrow) {
+                    root.step(-1);
+                    return accept;
+                }
+                if (e.text == Key.RightArrow || e.text == Key.UpArrow) {
+                    root.step(1);
+                    return accept;
+                }
+                if (e.text == Key.Home) {
+                    root.set(root.minimum);
+                    return accept;
+                }
+                if (e.text == Key.End) {
+                    root.set(root.maximum);
+                    return accept;
+                }
+                reject
+            }
+        }
+
+        ta := TouchArea {
+            function pick() {
+                if (root.maximum > root.minimum) {
+                    root.set(root.minimum + round((root.maximum - root.minimum) * max(0, min(1, (self.mouse-x - 10px) / (track.width - 20px)))));
+                }
+            }
+            pointer-event(e) => {
+                if (e.button == PointerEventButton.left && e.kind == PointerEventKind.down) {
+                    fs.focus();
+                    self.pick();
+                }
+            }
+            moved => {
+                if (self.pressed) {
+                    self.pick();
+                }
+            }
+        }
+    }
+
+    Text {
+        text: root.hint;
+        visible: root.hint != "";
+        height: root.hint != "" ? self.preferred-height : 0px;
+        color: Tokens.text-3;
+        font-size: Tokens.fs-sm;
+        wrap: word-wrap;
+    }
+
+    function step(d: int) {
+        root.set(root.value + d);
+    }
+    function set(v: int) {
+        root.value = max(root.minimum, min(root.maximum, v));
+        root.changed(root.value);
+    }
+}
+
+// ---------------------------------------------------------------------------------------- progress
+
+export component Spinner inherits Rectangle {
+    in property <length> size: 18px;
+    width: size;
+    height: size;
+    accessible-role: AccessibleRole.progress-indicator;
+    accessible-label: "Working";
+    Rectangle {
+        border-radius: size / 2;
+        border-width: 2px;
+        border-color: Tokens.surface-3;
+    }
+
+    // A dot orbiting the ring (a still dot with reduced motion).
+    Rectangle {
+        property <angle> a: Tokens.reduced-motion ? 0deg : 360deg * mod(animation-tick() / 1s, 1);
+        width: size / 4 + 2px;
+        height: size / 4 + 2px;
+        border-radius: self.width / 2;
+        background: Tokens.accent;
+        x: size / 2 - self.width / 2 + (size / 2 - 1px) * cos(a);
+        y: size / 2 - self.height / 2 + (size / 2 - 1px) * sin(a);
+    }
+}
+
+// percent: 0..100 determinate, negative: indeterminate.
+export component ProgressBar inherits Rectangle {
+    in property <int> percent: -1;
+    height: 6px;
+    border-radius: 3px;
+    background: Tokens.surface-3;
+    clip: true;
+    accessible-role: AccessibleRole.progress-indicator;
+    accessible-value: percent >= 0 ? percent : 0;
+    accessible-value-minimum: 0;
+    accessible-value-maximum: 100;
+    Rectangle {
+        height: parent.height;
+        border-radius: 3px;
+        background: Tokens.accent;
+        width: root.percent >= 0 ? parent.width * root.percent / 100 : parent.width * 0.3;
+        x: root.percent >= 0 || Tokens.reduced-motion ? 0px : (parent.width + self.width) * mod(animation-tick() / 1.4s, 1) - self.width;
+    }
+}
+
+// ---------------------------------------------------------------------------------------- dialog
+
+// A scrim and a card. `open` shows it; Escape asks to dismiss. Content goes inside.
+export component Dialog inherits Rectangle {
+    in property <bool> open;
+    in property <string> title;
+    in property <length> card-width: 480px;
+    in property <bool> danger: false;
+    callback dismissed();
+    visible: open;
+    background: Tokens.scrim;
+    accessible-role: AccessibleRole.groupbox;
+    accessible-label: title;
+
+    // Swallow pointer events below the dialog.
+    TouchArea { }
+
+    FocusScope {
+        key-pressed(e) => {
+            if (e.text == Key.Escape) {
+                root.dismissed();
+                return accept;
+            }
+            reject
+        }
+        Rectangle {
+            width: min(root.card-width, parent.width - 2 * Tokens.sp-5);
+            height: min(col.preferred-height + 2 * Tokens.sp-5, parent.height - 2 * Tokens.sp-5);
+            background: Tokens.surface;
+            border-radius: Tokens.r-lg;
+            border-width: 1px;
+            border-color: root.danger ? Tokens.danger : Tokens.border;
+            drop-shadow-blur: 28px;
+            drop-shadow-color: #00000080;
+            drop-shadow-offset-y: 8px;
+            col := VerticalLayout {
+                padding: Tokens.sp-5;
+                spacing: Tokens.sp-3;
+                Heading {
+                    text: root.title;
+                    level: 3;
+                }
+
+                @children
+            }
+        }
+    }
+}
+
+// A row of buttons, right aligned.
+export component ButtonRow inherits HorizontalLayout {
+    alignment: end;
+    spacing: Tokens.sp-2;
+}
+
+// A labelled value row (key on the left, value on the right).
+export component KeyValue inherits HorizontalLayout {
+    in property <string> key;
+    in property <string> value;
+    in property <bool> mono: false;
+    spacing: Tokens.sp-4;
+    Text {
+        text: root.key;
+        color: Tokens.text-2;
+        font-size: Tokens.fs-sm;
+        width: 140px;
+        wrap: word-wrap;
+    }
+
+    Text {
+        text: root.value;
+        color: Tokens.text;
+        font-size: Tokens.fs-sm;
+        font-family: root.mono ? Tokens.font-mono : "";
+        wrap: word-wrap;
+        horizontal-stretch: 1;
+    }
+}
