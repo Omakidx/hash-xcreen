@@ -272,3 +272,95 @@ fn starting_against_a_missing_display_fails_without_threads_left_behind() {
         Err(PipelineError::Encode(_))
     ));
 }
+
+/// Paint the root window with a grid of random colours: far more detail than a one frame
+/// budget at a low rate holds.
+fn paint_dense(display: &str) {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{ChangeGCAux, ConnectionExt as _, CreateGCAux, Rectangle};
+    use x11rb::rust_connection::RustConnection;
+    let (conn, n) = RustConnection::connect(Some(display)).expect("connect");
+    let root = conn.setup().roots[n].root;
+    let gc = conn.generate_id().expect("id");
+    conn.create_gc(gc, root, &CreateGCAux::new()).expect("gc");
+    let mut s = 0x9e37_79b9u32;
+    for cy in 0..H / 16 {
+        for cx in 0..W / 16 {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            conn.change_gc(gc, &ChangeGCAux::new().foreground(s & 0x00ff_ffff))
+                .expect("colour");
+            conn.poly_fill_rectangle(
+                root,
+                gc,
+                &[Rectangle {
+                    x: (cx * 16) as i16,
+                    y: (cy * 16) as i16,
+                    width: 16,
+                    height: 16,
+                }],
+            )
+            .expect("fill");
+        }
+    }
+    conn.flush().expect("flush");
+    conn.get_input_focus()
+        .expect("sync")
+        .reply()
+        .expect("reply");
+}
+
+/// Every frame until the pipeline has been quiet for `quiet`.
+fn frames_until_quiet(p: &Pipeline, quiet: Duration, limit: Duration) -> Vec<EncodedFrame> {
+    let end = Instant::now() + limit;
+    let mut out = Vec::new();
+    while Instant::now() < end {
+        match p.frames().recv_timeout(quiet) {
+            Ok(f) => out.push(f),
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+/// The lossy-link defect (testing.md 2.8): a key frame requested on a busy screen at a low rate
+/// is starved by the rate control (a very high QP, a coarse picture), and the screen then stays
+/// still, so without more frames the client keeps that picture for good. The pipeline keeps
+/// encoding the unchanged screen until the picture is back at the normal quality.
+#[test]
+fn a_starved_key_frame_is_followed_by_refinement_frames_of_the_static_screen() {
+    use hx_session::refine::{SETTLED_BYTES, STARVED_QP};
+    let Some(x) = Xvfb::start(W, H) else { return };
+    let p = start(&x, |cfg| cfg.encoder.bitrate_kbps = 1_000);
+    next_frame(&p, Duration::from_secs(5)).expect("first frame");
+    paint_dense(&x.display);
+    // The painted screen is sent (and refined) first; wait until the pipeline is quiet.
+    let settled = frames_until_quiet(&p, Duration::from_millis(500), Duration::from_secs(20));
+    assert!(!settled.is_empty(), "the painted screen is captured");
+
+    p.control().request_idr();
+    let run = frames_until_quiet(&p, Duration::from_millis(500), Duration::from_secs(20));
+    let idr = run.first().expect("a frame for the request");
+    assert!(idr.idr, "the request is answered with an IDR");
+    assert!(
+        idr.qp.is_some_and(|q| q >= STARVED_QP),
+        "the premise: the key frame of this screen at 1 Mbit/s is starved (qp {:?})",
+        idr.qp
+    );
+    assert!(
+        run.len() >= 3,
+        "a starved key frame needs refinement frames of the unchanged screen, got {} frame(s)",
+        run.len() - 1
+    );
+    assert!(run[1..].iter().all(|f| !f.idr), "refinements are P frames");
+    let last = run.last().expect("last");
+    assert!(
+        last.qp.is_some_and(|q| q < STARVED_QP) && last.bytes().len() <= SETTLED_BYTES,
+        "the run ends when a pass has nothing left to add (last qp {:?}, {} B)",
+        last.qp,
+        last.bytes().len()
+    );
+    let s = p.shutdown().expect("shutdown");
+    assert_eq!(s.errors, 0);
+}

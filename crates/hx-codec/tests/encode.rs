@@ -351,3 +351,123 @@ fn output_buffers_are_pooled_and_timing_is_recorded() {
         seen.len()
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Key frames under a tight VBV (the lossy-link defect, docs/testing.md 2.8)
+// ---------------------------------------------------------------------------------------------
+
+/// A text-dense BGRX picture (black glyph-like marks on white) that needs far more than a one
+/// frame budget at a few Mbit/s, like a desktop full of text. `seed` moves the marks.
+fn text_picture(w: u32, h: u32, seed: u32) -> Vec<u8> {
+    let mut out = vec![255u8; (w * h * 4) as usize];
+    let mut s = seed.wrapping_mul(2_654_435_761).wrapping_add(7);
+    for cy in 0..h / 24 {
+        for cx in 0..w / 12 {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            for bit in 0..12u32 {
+                if s >> bit & 1 == 1 {
+                    let (gx, gy) = (bit % 3, bit / 3);
+                    for y in 0..4 {
+                        for x in 0..3 {
+                            let (px, py) = (cx * 12 + gx * 3 + x, cy * 24 + 2 + gy * 5 + y);
+                            let i = ((py * w + px) * 4) as usize;
+                            out[i..i + 3].copy_from_slice(&[0, 0, 0]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Luma samples that differ from the encoder's input by more than 40 (marks are black on white).
+fn wrong_pixels(dec: &ffmpeg::frame::Video, src: &YuvFrame) -> usize {
+    let (y, stride) = (dec.data(0), dec.stride(0));
+    let p = src.plane(0);
+    let mut bad = 0;
+    for row in 0..p.rows {
+        for col in 0..p.row_bytes {
+            let a = i32::from(y[row * stride + col]);
+            let b = i32::from(p.data[row * p.stride + col]);
+            bad += usize::from((a - b).abs() > 40);
+        }
+    }
+    bad
+}
+
+fn decode_frame(dec: &mut ffmpeg::decoder::Video, data: &[u8]) -> ffmpeg::frame::Video {
+    dec.send_packet(&ffmpeg::Packet::copy(data)).expect("send");
+    let mut f = ffmpeg::frame::Video::empty();
+    dec.receive_frame(&mut f).expect("a picture per packet");
+    f
+}
+
+/// A key frame requested while the VBV is empty (a busy screen, a link at a low rung of the
+/// ladder) is a complete IDR with SPS and PPS that decodes alone, but its picture is far from the
+/// screen: the rate control spends what the buffer allows. Repeating the *unchanged* picture
+/// refines it to the picture (under 0.5 % of the pixels wrong) within a bounded number of frames. A session that sends the
+/// key frame and then, the screen being static, nothing, leaves the client with that blurry
+/// picture for good: the end state of the lossy end-to-end run.
+#[test]
+fn a_starved_key_frame_is_refined_by_repeating_the_unchanged_picture() {
+    ffmpeg::init().expect("init");
+    let mut cfg = config();
+    cfg.bitrate_kbps = 2_000;
+    cfg.vbv_frames = 2.0;
+    let mut enc = X264Encoder::new(cfg).expect("encoder");
+    let mut yuv = YuvFrame::new(YuvFormat::I420, W, H).expect("yuv");
+    let mut t = 1_000u64;
+    let mut encode = |enc: &mut X264Encoder, yuv: &mut YuvFrame, seed: u32| {
+        convert_bgrx(&text_picture(W, H, seed), (W * 4) as usize, yuv).expect("convert");
+        t += 16_666_667;
+        enc.encode(
+            yuv,
+            &FrameMeta {
+                t_damage_ns: t - 500,
+                t_capture_ns: t,
+                t_convert_ns: t + 100,
+            },
+        )
+        .expect("encode")
+        .expect("one packet per frame")
+    };
+    // Busy: every frame is new, so the buffer is empty when the key frame is requested.
+    for n in 0..30 {
+        encode(&mut enc, &mut yuv, n);
+    }
+    enc.request_idr();
+    let idr = encode(&mut enc, &mut yuv, 99);
+    eprintln!("IDR qp {:?} bytes {}", idr.qp, idr.bytes().len());
+    assert!(idr.idr && h264::starts_with_idr(idr.bytes()));
+    // Alone, a decoder that joins at this frame gets a picture (SPS and PPS are in band).
+    let codec = ffmpeg::decoder::find(ffmpeg::codec::Id::H264).expect("h264");
+    let mut dec = ffmpeg::codec::context::Context::new_with_codec(codec)
+        .decoder()
+        .video()
+        .expect("decoder");
+    let first = decode_frame(&mut dec, idr.bytes());
+    let total = (W * H) as usize;
+    let wrong_first = wrong_pixels(&first, &yuv);
+    assert!(
+        wrong_first * 100 > total,
+        "the key frame is expected to be starved ({wrong_first} of {total} pixels wrong); \
+         if this stops holding the refinement may no longer be needed"
+    );
+    // The screen is now static: the same picture again, as a refinement pass sends it.
+    let mut wrong = wrong_first;
+    let mut passes = 0;
+    while wrong * 200 > total && passes < 60 {
+        let f = encode(&mut enc, &mut yuv, 99);
+        assert!(!f.idr, "a refinement is a P frame");
+        wrong = wrong_pixels(&decode_frame(&mut dec, f.bytes()), &yuv);
+        passes += 1;
+    }
+    assert!(
+        wrong * 200 <= total,
+        "still {wrong} of {total} pixels wrong after {passes} refinement frames"
+    );
+    eprintln!("starved key frame: {wrong_first} wrong, exact after {passes} refinement frames");
+}

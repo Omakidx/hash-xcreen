@@ -99,6 +99,9 @@ struct Shared {
     tracker: Mutex<Tracker>,
     last_luma: Mutex<Option<Arc<Vec<u8>>>>,
     want_idr: AtomicBool,
+    /// The frame loop dropped a gap's frames and has not yet seen the key frame that repairs it:
+    /// the request is repeated until it does (a request or its answer can be lost or late).
+    awaiting_key: AtomicBool,
     decoded: AtomicU64,
     /// The newest scroll counter read from a picture (diagnostics).
     last_code: AtomicU64,
@@ -329,6 +332,7 @@ async fn run_inner(p: &Params, rep: &mut ClientReport) -> Result<(), String> {
         }),
         last_luma: Mutex::new(None),
         want_idr: AtomicBool::new(false),
+        awaiting_key: AtomicBool::new(false),
         decoded: AtomicU64::new(0),
         last_code: AtomicU64::new(0),
         started: Instant::now(),
@@ -415,6 +419,7 @@ async fn run_inner(p: &Params, rep: &mut ClientReport) -> Result<(), String> {
                             .push(now.duration_since(t).as_secs_f64() * 1000.0);
                     }
                 }
+                s.awaiting_key.store(awaiting.is_some(), SeqCst);
                 // After a gap the picture is wrong whatever is decoded: nothing but a key frame
                 // goes to the decoder until one arrives.
                 if awaiting.is_some() && !f.header.is_key() {
@@ -456,7 +461,7 @@ async fn run_inner(p: &Params, rep: &mut ClientReport) -> Result<(), String> {
         let idr = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(500)).await;
-                if s.want_idr.swap(false, SeqCst) {
+                if s.want_idr.swap(false, SeqCst) || s.awaiting_key.load(SeqCst) {
                     let _ = c
                         .send_control(&ControlMessage::new(Ctl::RequestKeyframe(
                             RequestKeyframe {
