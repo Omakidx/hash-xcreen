@@ -4,7 +4,7 @@
 //! the identity key is **not** in it but in a systemd credential (`docs/ipc.md` section 2).
 //!
 //! ```toml
-//! listen = "[::]:4433"            # QUIC (UDP) and WebSocket (TCP), same port number
+//! listen = "[::]:443"             # QUIC (UDP) and WebSocket (TCP), same port number
 //! takeover = "allow"              # or "deny" (docs/ipc.md section 18)
 //! desktop_id = "main"
 //! server_name = "my server"       # shown to a client while pairing (at most 64 bytes)
@@ -20,9 +20,14 @@
 //! mlock = true                    # mlockall at start (docs/ipc.md section 5.2); fatal on failure
 //! ```
 //!
-//! `listen` is required: the unit runs with an empty capability bounding set, so it can only
-//! bind ports of 1024 and above; the installer maps port 443 to it (a firewall redirect, or the
-//! `net.ipv4.ip_unprivileged_port_start` sysctl) when the user asks for 443.
+//! `listen` is required. Under systemd the public sockets are created by
+//! `hx-gatewayd-public.socket` (socket activation, so the unit keeps an empty capability
+//! bounding set and still serves port 443): the installer writes `listen = "[::]:<port>"` here
+//! **and** a socket drop-in (`hx-gatewayd-public.socket.d`) resetting `ListenStream=` and
+//! `ListenDatagram=` to the same `[::]:<port>`. When the process is activated it uses those
+//! sockets and refuses to start if their port differs from the port of `listen`; the address
+//! part of `listen` is then not used. Without activation (a development run, tests) it binds
+//! `listen` itself, which as an unprivileged process means a port of 1024 or above.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};

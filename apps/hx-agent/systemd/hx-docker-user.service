@@ -1,7 +1,8 @@
 # Re-applies the DOCKER-USER accept rules for the desktop bridge after Docker (re)creates its
 # chains (docs/ipc.md 6.4 step 5). On a host that runs Docker, forwarded traffic from our bridge is
 # dropped by Docker's FORWARD policy unless DOCKER-USER accepts it. Only constants appear here;
-# nothing is taken from a caller. hx-privd applies the same two rules when SetupHost runs.
+# nothing is taken from a caller. hx-privd applies the same two rules when SetupHost runs, but it
+# does not install this unit: the installer (1E) does, on a host that runs Docker.
 
 [Unit]
 Description=hash-xcreen DOCKER-USER rules for the desktop bridge

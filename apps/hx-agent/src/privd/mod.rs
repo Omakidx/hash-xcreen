@@ -34,6 +34,7 @@ pub mod peergroups;
 pub mod pepper;
 pub mod probe;
 pub mod progress;
+pub mod rescue;
 pub mod runner;
 pub mod server;
 pub mod state;

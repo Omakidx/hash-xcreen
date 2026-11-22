@@ -223,7 +223,7 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
             .await?;
 
         self.load_firewall(&report.host_firewall).await?;
-        self.apply_sysctl().await?;
+        let sysctl_applied = self.apply_sysctl().await?;
         let docker_user = self.apply_docker_user_rules().await;
         Ok(pb::SetupHostResult {
             pool: pb_ensured(report.pool) as i32,
@@ -233,7 +233,7 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
             compat_profile: pb_ensured(report.compat_profile) as i32,
             gateway_ip: report.gateway.map(|g| g.to_string()).unwrap_or_default(),
             firewall_loaded: true,
-            sysctl_applied: true,
+            sysctl_applied,
             docker_user_rules: docker_user as i32,
         })
     }
@@ -269,9 +269,15 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
         Ok(())
     }
 
-    /// Writes the sysctl drop-in, applies it with `sysctl --system` and reads the values back.
-    pub async fn apply_sysctl(&self) -> Result<(), CmdError> {
-        let err = |m: &str| CmdError::internal(m.to_string()).with_detail(ErrorDetail::Sysctl);
+    /// Writes the sysctl drop-in, applies it with `sysctl -p` of that one file and reads the values
+    /// back. `Ok(true)` when the values are in effect.
+    ///
+    /// With the test-only feature `privd-test-hooks` (never in a release build), a failure of
+    /// `sysctl -p` (for example EPERM in a nested VM or an unprivileged container, where
+    /// `/proc/sys` is read-only) or values that did not take effect is logged and audited as a
+    /// warning and the answer is `Ok(false)`; the drop-in stays on disk so that it applies at the
+    /// next boot of a real host.
+    pub async fn apply_sysctl(&self) -> Result<bool, CmdError> {
         write_atomic(&self.cfg.sysctl_file, sysctl_text().as_bytes(), 0o644)
             .map_err(CmdError::from)?;
         // Only the file privd just wrote: `sysctl --system` would also apply every other file
@@ -282,13 +288,24 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
             .run(Program::new(Tool::Sysctl, &["-p", &file]).with_timeout(Duration::from_secs(30)))
             .await
             .map_err(CmdError::from)?;
-        if !out.success() {
-            return Err(err("`sysctl -p` of the drop-in failed"));
+        let failure = if !out.success() {
+            Some("`sysctl -p` of the drop-in failed")
+        } else if !self.probe.sysctl_ok() {
+            Some("the sysctl values did not take effect")
+        } else {
+            None
+        };
+        match failure {
+            None => Ok(true),
+            #[cfg(feature = "privd-test-hooks")]
+            Some(why) => {
+                crate::privd::log::warn(&format!("privd-test-hooks: {why}; continuing"));
+                self.audit_notice(&format!("warning (privd-test-hooks): {why}"));
+                Ok(false)
+            }
+            #[cfg(not(feature = "privd-test-hooks"))]
+            Some(why) => Err(CmdError::internal(why.to_string()).with_detail(ErrorDetail::Sysctl)),
         }
-        if !self.probe.sysctl_ok() {
-            return Err(err("the sysctl values did not take effect"));
-        }
-        Ok(())
     }
 
     /// Step 5: if a host Docker is present (`DOCKER-USER` exists), ensure the two accept rules for

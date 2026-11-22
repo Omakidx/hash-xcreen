@@ -1,0 +1,65 @@
+# hx-privd-rescue: the rollback helper that hx-privd.service names in OnFailure=.
+#
+# When hx-privd.service gives up (its start limit is reached), this oneshot runs once. If an update
+# is pending in /var/lib/hx/updates-state it restores `current` to the version recorded as the
+# update's predecessor and starts privd again, so the old privd can finish the rollback
+# (docs/ipc.md 6.12; apps/hx-agent/src/privd/rescue.rs). With no pending update it does nothing.
+# It never writes updates-state.
+#
+# The binary lives OUTSIDE /usr/lib/hx (the installer puts it at /usr/lib/hx-rescue/), so pruning
+# old versions or an update can never remove or replace it. It takes no arguments and reads no
+# environment. Nothing starts this unit except OnFailure= (an administrator may start it by hand).
+#
+# It is root because it changes the links in /usr/lib/hx and talks to the service manager, and it
+# needs no capability for that: the files are owned by root, and root's own connection to
+# systemd's private socket is authorised by uid. Everything else is taken away. The start limit
+# stops a loop if privd keeps failing for a reason a rollback does not fix.
+
+[Unit]
+Description=hash-xcreen privileged helper rollback (hx-privd-rescue)
+Documentation=https://github.com/Omakidx/hash-xcreen/blob/main/docs/ipc.md
+# At most 3 runs an hour: a privd that still fails after a rollback needs an administrator.
+StartLimitIntervalSec=3600
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/hx-rescue/hx-privd-rescue
+User=root
+Group=root
+TimeoutStartSec=180s
+UMask=0077
+LimitCORE=0
+
+# Read-only system, except the release directory whose `current` and `previous` links it moves.
+# /var/lib/hx (updates-state) is only read.
+ProtectSystem=strict
+ReadWritePaths=/usr/lib/hx
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+
+# No capability, no network (systemctl uses a unix socket path, which a private network
+# namespace does not hide), no IP packets, no new privileges.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+PrivateNetwork=yes
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible

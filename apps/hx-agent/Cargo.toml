@@ -28,6 +28,12 @@ release-build = []
 # build time (the base64 key line made by release/make-test-release.sh). For the installer test
 # harness only; the release gate rejects it.
 test-release-key = []
+# Test-only hook of hx-privd for hosts where /proc/sys is not writable (a nested VM or an
+# unprivileged container in the installer's tests): a failed `sysctl -p` of the Incus drop-in, or
+# sysctl values that did not take effect, become a warning and `SetupHostResult.sysctl_applied` is
+# false, instead of failing `SetupHost`. NEVER in a release build: the release gate rejects it, and
+# no crate enables it by default. The dev-dependency below deliberately does not turn it on.
+privd-test-hooks = []
 
 [dependencies]
 argon2 = { version = "0.6.0", features = ["zeroize"] } # wipes its memory blocks (the CLI hashes typed secrets)

@@ -117,7 +117,7 @@ These needed hardware or accounts the spike machine didn't have. They ran on 202
 | 1B | Crypto and pairing | `hx-crypto` | 1A (handshake messages) | M |
 | 1C | Agent core | `apps/hx-agent` (`hx-gatewayd`, `hx-privd`, CLI), systemd units, privd command set | 1A, 1B | L |
 | 1D | Provisioning | `hx-provision`, `recipes/`, image CI | Gate 0 | L |
-| 1E | Installer | `installer/install.sh`, preflight, stages | 1C, 1D | M |
+| 1E | Installer | `installer/install.sh`, the installer engine `apps/hx-agent/src/install/` (`hx-agent install`, `hx-agent uninstall`), `.github/workflows/release.yml` and `installer-vm.yml`, `packaging/`, `release/`, `apps/hx-pwcheck`, preflight, stages | 1C, 1D | M |
 | 1F | Session streaming | `hx-capture`, `hx-codec` (encode), `apps/hx-session` | 1A | L |
 | 1G | Desktop client | `apps/hx-desktop`, `hx-codec` (decode) | 1A, 1B, design mockups | L |
 | 1H | Hardening | fuzz targets, perf suite, security review | 1A–1G | M |
@@ -152,7 +152,7 @@ flowchart LR
 - [x] `hx-privd` command set specified and reviewed before implementation ([ipc.md](ipc.md) v0.3; the session link too)
 - [x] `hx-gatewayd` unprivileged with systemd hardening and seccomp allowlist
 - [x] Unix-socket IPC: gateway ↔ privd, gateway ↔ session
-- [ ] Device list and revocation; `hx-agent` CLI (status, devices, logs, uninstall)
+- [ ] Device list and revocation; `hx-agent` CLI (status, devices, logs, uninstall; `uninstall` closes with the 1E work, split between the CLI and a narrowed privd `Uninstall`, ipc.md §6.13)
 - [x] Self-update with signature check and rollback
 
 ### 1D — Provisioning
@@ -168,6 +168,14 @@ flowchart LR
 - [ ] Idempotent stages with resume; `hx-agent uninstall`
 - [ ] Installer CI: fresh VM per host OS × both image paths
 
+Design: architecture §4.1, §4.2, §5 and §13, and ipc.md §5.4, §6.12 and §6.13 (written before the code, as AGENTS.md requires). Notes:
+
+- Host OSes are Ubuntu 24.04, 26.04, Debian 12 and 13; Ubuntu 22.04 is dropped (systemd 249 has no `systemd-creds`).
+- **The one-liner stops after pairing in 1E.** `--pair` installs the agent, opens the port and installs the pairing token typed at a hidden prompt, then ends. The post-pairing setup protocol (password, PIN and `CreateDesktop` from the app over gatewayd) does not exist yet and is designed in 1G (box below), so Gate 1's "via the one-liner" cannot pass before it. 1E delivers `--ssh` and `--interactive` in full.
+- **Prebuilt in the CI box.** 1E can deliver the `build` cells for every host OS, and `prebuilt` cells that assert the clean refusal (exit 6, nothing changed; privd answers `UNIMPLEMENTED`). The "both image paths" part of the box stays open until 1D's prebuilt image CI lands, or the box is split then.
+- The release needs the maintainer's minisign keys: `release-keys/*.pub` stay `UNPROVISIONED`, and the release gate refuses a release, until the maintainer generates both keys and sets the `release-signing` environment secrets.
+- The desktop recipes must pre-install the FFmpeg runtime libraries per distro (a recipe variable), because privd installs `hx-session` with `dpkg -i`, which resolves no dependencies.
+
 ### 1F — Session streaming
 - [x] X11 capture backend (XDamage, XShm, XFixes cursor, RandR resize)
 - [x] Encode pipeline on dedicated threads with buffer pools; x264 settings from S2
@@ -177,6 +185,7 @@ flowchart LR
 ### 1G — Desktop client
 - [ ] S1 GPU run done (deferred from Phase 0, §0.4) and the rendering path confirmed or switched to the fallback
 - [ ] Design mockups (dark-first + light) approved before UI implementation
+- [ ] Post-pairing setup protocol for the one-liner path (password, PIN and `CreateDesktop` from the app over gatewayd during `SETUP_OPEN`), specified in protocol.md and ipc.md; 1E's `--pair` ends before it
 - [ ] Home, Add server wizard (SSH and one-liner paths), live progress, connect with PIN
 - [ ] SSH setup via `russh` with host-key confirmation
 - [ ] Desktop view with the rendering path from S1; toolbar, stats overlay, reconnect overlay

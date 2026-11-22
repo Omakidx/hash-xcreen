@@ -53,10 +53,10 @@ Everything is written in Rust. The desktop client uses Slint.
 | `hx-privd` | root | A narrow, typed command set: create/start/stop container, snapshot, mount snapshot read-only, restore, resource limits, Docker toggle. Owns the Incus socket. Command set and authorization in [ipc.md](ipc.md) Part 1. |
 | backup worker | Spawned by `hx-privd`, sandboxed | Reads a mounted snapshot read-only and uploads to Google Drive with `rustic_core`. Holds the Drive token and backup key only while running. |
 | `hx-session` | The desktop user, inside the container | Screen capture, encoding, cursor, audio, clipboard, input injection. Holds no secrets. Talks only to `hx-gatewayd`, over the session link ([ipc.md](ipc.md) Part 2). |
-| `hx-agent` CLI | root, on demand | Local administration: status, devices list/revoke, uninstall, logs. |
+| `hx-agent` CLI | root, on demand | Local administration: status, devices list/revoke, logs, and the installer (`hx-agent install`, `hx-agent uninstall`, §5). |
 | `hx-desktop` | User, client machine | Slint app: servers, setup wizard over SSH, streaming view, backups, security. |
 | `hx-web` | Browser | Served by `hx-gatewayd`; login plus streaming and server settings for that one server. |
-| `install.sh` | root, server | Bootstrap only: preflight checks, download and verify the agent, start it. Everything after that is done by the agent. |
+| `install.sh` | root, server | Bootstrap only: preflight, download, openssl minisign check, hand-off to `hx-agent install` (§5.6). Everything after that is done by `hx-agent install`, which calls `hx-privd` for the privileged desktop work. |
 
 ## 3. Repository layout
 
@@ -71,11 +71,14 @@ crates/
   hx-provision  declarative desktop recipe, Incus orchestration, image import/build
   hx-backup     rustic_core + Google Drive backend, scheduling, retention, verification
 apps/
-  hx-agent      hx-gatewayd, hx-privd, backup worker and the hx-agent CLI
+  hx-agent      hx-gatewayd, hx-privd, backup worker, the hx-agent CLI and the installer engine (`hx-agent install`, `hx-privd-rescue`)
   hx-session    in-container session daemon
+  hx-pwcheck    in-container current-password checker (dynamically linked, ships in the `hx-session` package)
   hx-desktop    Slint client
   hx-web        browser client (Rust to WASM + small TypeScript shell)
 installer/      install.sh
+packaging/      the `hx-session` .deb assembly (§13)
+release/        release assembly: tarball, canonical manifest (§13)
 recipes/        desktop recipes (distro × desktop × preset)
 docs/           this document, decisions, spikes, protocol spec
 ```
@@ -86,15 +89,21 @@ One Cargo workspace; one semver version for every component.
 
 ### 4.1 Supported hosts and guests
 
-- Host OS: Ubuntu 22.04 / 24.04 / 26.04, Debian 12 / 13; x86_64; systemd. arm64 later.
+- Host OS: Ubuntu 24.04 / 26.04, Debian 12 / 13; x86_64; systemd 250 or newer. arm64 later.
+  - **Ubuntu 22.04 is not supported.** It ships systemd 249, which has neither `systemd-creds` nor `LoadCredentialEncrypted=` (both arrived in 250), and every secret in §8.6 is sealed with them. Preflight refuses it with a message saying so. It also has no Incus in its repositories.
 - Guest distros (inside the desktop): Ubuntu 24.04 / 26.04 LTS, Debian 12 / 13.
-- Minimum: 2 vCPU, 4 GB RAM, 30 GB disk (enforced by preflight). Recommended: 4 vCPU, 8 GB.
+- Minimum: 2 vCPU, 4 GB RAM, 30 GB disk. Recommended: 4 vCPU, 8 GB. Preflight enforces `MemTotal` of at least 3584 MiB, at least 2 CPUs and at least 30 GiB free where the pool will live (§5.2). It also refuses to run **inside a container** (`systemd-detect-virt -c`): nested Incus hosts are not a supported target.
 - One desktop per server in v1. The data model (desktop IDs, per-desktop settings and backup repositories) allows several.
 
 ### 4.2 Incus and storage
 
-- Incus from the distro repositories where new enough (Debian 13, Ubuntu 24.04+), otherwise the Zabbly repository.
-- Storage pool on btrfs by default (ZFS when the host already uses it), on a spare disk (`--storage-device`) or a sparse loop file sized at about 60% of free disk, bounded to 12–200 GiB. Copy-on-write snapshots are what make backups consistent and cheap: S3 measured 0.2–0.5 s per snapshot, with space growing only by data that changes afterwards.
+- **Incus source** (the installer's `incus` stage, §5.3):
+  - An Incus already on the host, version 6.0.0 or newer, is adopted and **never upgraded**. With `--docker`, an existing Incus older than 6.0.5 fails preflight with the reason (§4.3).
+  - Otherwise the distro package, if its candidate (`apt-cache policy incus`, after `apt-get update`) is 6.0.0 or newer, and 6.0.5 or newer when `--docker` is given.
+  - Otherwise the Zabbly `lts-6.0` repository: its armored key is embedded in `hx-agent` with a pinned fingerprint, written to `/etc/apt/keyrings/hx-zabbly.asc`, and referenced from a deb822 source file with `Signed-By`.
+  - Expected results (to be verified in the installer matrix, §12): Debian 12 uses Zabbly (bookworm has Incus only in backports); Ubuntu 24.04 and Debian 13 use the distro package, or Zabbly with `--docker`; Ubuntu 26.04 uses the distro package, subject to its version and to whether Zabbly publishes a 26.04 suite.
+  - `incus admin init` is never run: `hx-provision` creates its own profiles and never uses `default`.
+- Storage pool on btrfs only in v1 (`hx_provision::HostSpec` always creates a btrfs pool; ZFS is not implemented), on a spare disk (`--storage-device`) or a sparse loop file sized at about 60% of free disk, bounded to 12–200 GiB. Copy-on-write snapshots are what make backups consistent and cheap: S3 measured 0.2–0.5 s per snapshot, with space growing only by data that changes afterwards.
 - The desktop is an **unprivileged** system container. Privileged containers are never used.
 - Resource limits on CPU, memory and disk from the setup wizard, plus `limits.processes` (default 8192, never unlimited, so a fork bomb cannot exhaust the host). Every desktop also gets `security.guestapi=false` (no `/dev/incus` socket inside), `security.idmap.isolated=true` (its own uid/gid range on the host) and `boot.autostart=true`. Isolated idmaps mean file ids on the host are shifted per desktop; see the restore note in §9.8.
 - Container networking: the desktop joins a dedicated hash-xcreen bridge network (IPv4 only, NAT; an existing bridge with IPv6 or NAT differing is reconciled). Incus 6.0 rejects ACLs on the container's own network interface, which is why the bridge is ours. Isolation has two layers:
@@ -153,49 +162,114 @@ S3 evidence: on the VPS (Ubuntu 26.04 host, Incus 6.0.5), `hello-world` and a Co
 
 ### 5.1 Entry points
 
-- **From the app over SSH** (main path): address, port, user, SSH key (preferred) or a one-time password that is never stored; confirm the SSH host-key fingerprint; fill in the wizard; the app runs the installer over SSH and shows progress.
-- **Copy the one-liner**: the wizard produces a command containing a one-time token and non-secret options; the app waits for the agent to come up at the given address and pairs.
+- **From the app over SSH** (main path): address, port, user, SSH key (preferred) or a one-time password that is never stored; confirm the SSH host-key fingerprint; fill in the wizard; the app runs `install.sh --ssh` over SSH, **as a file, not through `curl | sh`**, and shows progress. The secrets (password, PIN, optionally the app's own pairing token) go to the installer on its stdin in the framing of [ipc.md](ipc.md) §5.4, never in argv; progress comes back as JSON Lines (§5.8).
+- **Copy the one-liner**: the wizard produces a command containing **no token** and only non-secret options. The installer asks for the one-time token at a hidden `/dev/tty` prompt, installs the agent, opens the port and installs the token, then **stops**. The app shows the token separately (with **Copy**), waits for the agent at the given address and pairs. Everything after pairing (password, PIN, creating the desktop from the app) needs post-pairing setup messages that are not specified yet; they are designed in 1G (execution-phase.md), so in 1E the one-liner ends at pairing (§5.3).
 - **Interactive** (`--interactive`): no app needed; the installer prompts for settings (hidden input for secrets) and prints a pairing code.
 - **Restore from backup**: like the SSH path, but restores a backup instead of creating a fresh desktop (see 9.8).
 
 ```bash
-curl -fsSL https://<release-host>/install.sh | sudo sh -s -- --token hx1_… --distro ubuntu-24.04 --desktop xfce --user alex --backup 12h --docker
+curl -fsSL https://github.com/Omakidx/hash-xcreen/releases/download/channel-stable/install.sh | sudo sh -s -- --pair --distro ubuntu-24.04 --desktop xfce --user alex --backup 12h --docker
 ```
 
-Passwords and PINs are never in the command. The wizard collects them and the app sends them over the encrypted channel immediately after pairing, so the user still enters them once.
+Passwords and PINs are never in the command, and neither is the token (decision 14, [ipc.md](ipc.md) §22): `sudo` writes argv to the auth log and the journal and the shell keeps it in its history. The token is typed at the installer's own prompt, which reads `/dev/tty` because stdin is the pipe. `--token <t>` exists for unattended use only and prints a warning that it is weaker.
 
 ### 5.2 Installer options
 
-| Option | Values |
+`install.sh` consumes `--channel`, `--release-dir`, `--allow-old-release` (accept a manifest older than 90 days, with a warning; never forwarded) and `--progress text|json` (forwarded to the agent as the global `--json`) and passes every other argument to `hx-agent install` unchanged. The interface of `hx-agent install`:
+
+```
+hx-agent [--json] install [MODE] [OPTIONS] [--bootstrap-dir <abs>] [--lock-fd <n>]
+MODE (at most one):
+  --interactive   prompts on /dev/tty; ends with a pairing code
+  --pair          one-liner: token prompted on /dev/tty (hidden) right after preflight,
+                  installed at stage pairing-token; the installer ends there
+  --token <t>     unattended; weaker; warning printed; otherwise like --pair:
+                  installed at stage pairing-token; the installer ends there
+  --ssh           secrets from stdin (ipc.md §5.4); stdin must not be a tty; --json implied
+  (none)          resume or reconcile an existing install with its recorded mode and
+                  options; refused on a fresh host (exit 2)
+```
+
+The agent reads no environment variable; its children get a cleared environment and a fixed `PATH`. It runs with `umask 0077`, `PR_SET_DUMPABLE=0` and `mlockall`, and refuses to run unless both real and effective uid are 0.
+
+| Option | Values and validation | Default | On a re-run |
+|---|---|---|---|
+| `--distro` | `ubuntu-24.04`, `ubuntu-26.04`, `debian-12`, `debian-13` | `ubuntu-24.04` | fixed once the desktop is ready |
+| `--desktop` | `xfce` | `xfce` | fixed |
+| `--user` | `hx_provision::Username` | required (prompted in `--interactive`) | fixed |
+| `--hostname` | RFC 1123 label | unset (the app passes the client's) | fixed |
+| `--timezone` | a name present in `/usr/share/zoneinfo` | unset; `--interactive` defaults to the host's | fixed |
+| `--locale` | privd's pattern and allowlist | unset; interactive: the host's | fixed |
+| `--keyboard` | `^[a-z]{2}(\+[a-z0-9_-]{1,16})?$` | unset; interactive: the host's | fixed |
+| `--apps` | `basic`, `developer` | `basic` | fixed |
+| `--docker` | flag; counts as the isolation acknowledgement (interactive: a typed `yes` after the §4.3 warning); also decides the Incus source (§4.2) | off | after the desktop is ready: refused, use `hx-agent docker enable` or `disable` |
+| `--backup`, `--backup-keep` | `off`, `12h`, `24h`; integer 1 to 1000 | `off` | recorded only: stage `backup` is `deferred` (Phase 2, `SetBackupSchedule` is `UNIMPLEMENTED`); reconcilable |
+| `--cpu`, `--memory`, `--disk` | cpu 1 to the host's CPUs; memory in MiB or `NG`/`NM`, at least 1024 and at most RAM − max(1536 MiB, 25%); disk in GiB, at least 8 | privd defaults | reconcilable (`SetLimits` once the desktop is ready) |
+| `--storage-device` | whole, unmounted block device with no signature (read-only pre-check; privd checks again) | loop file | fixed once stage `host` is done |
+| `--image` | `auto`, `build`, `prebuilt` | `auto` (privd then builds and says why) | fixed. `prebuilt` and `--image-file`: exit 6 at preflight, "not in this release" (privd answers `UNIMPLEMENTED`; prebuilt images wait for 1D's image CI) |
+| `--port` | 1 to 65535, not 22 or 80; free for TCP and UDP (or held by our own socket) | 443 | reconcilable: the firewall rule is moved and the socket restarted |
+| `--domain` | FQDN | none | recorded only (Phase 3 consumes it; the gateway configuration has no `domain` key yet); reconcilable |
+| `--token <t>` | `hxt1-…` pairing token | n/a | n/a; unattended and weaker (§5.1) |
+| `--interactive`, `--pair`, `--ssh` | modes; at most one of them, and none together with `--token` | n/a | the mode may change between runs |
+| `--channel` | `stable`, `beta` | `stable` | reconcilable. Chooses the manifest `install.sh` fetches and sets `[update] channel` in `/etc/hx/privd.toml` |
+| `--allow-private-networks` | flag (interactive: a typed `yes`); the opt-in promised in §4.2 | off | reconcilable (`SetupHost` converges) |
+| `--release-dir` (`install.sh` only) | absolute, root-owned directory holding a manifest, signature and tarball, **still verified** | none | n/a |
+| `--allow-old-release` (`install.sh` only) | flag: accept a signed manifest older than 90 days, with a warning | off | n/a |
+| `--progress` (`install.sh` only) | `text`, `json` | `text` | n/a |
+
+Fixed options may change freely while the desktop is not ready: `CreateDesktop` destroys a `creating` or `failed` instance and starts again ([ipc.md](ipc.md) §6.5).
+
+**Exit codes** (0 to 8 are the CLI's own):
+
+| Exit | Meaning |
 |---|---|
-| `--distro` | `ubuntu-24.04`, `ubuntu-26.04`, `debian-12`, `debian-13` |
-| `--desktop` | `xfce` |
-| `--user` | Linux username inside the desktop |
-| `--hostname`, `--timezone`, `--locale`, `--keyboard` | Defaults from the client machine |
-| `--apps` | `basic`, `developer` |
-| `--docker` | Opt-in Docker |
-| `--backup`, `--backup-keep` | `off`, `12h`, `24h`; retention override |
-| `--cpu`, `--memory`, `--disk` | Container limits |
-| `--storage-device` | Spare disk for the pool |
-| `--image` | `auto`, `prebuilt`, `build`; `--image-file` |
-| `--port` | QUIC/HTTPS port, default 443 |
-| `--domain` | Domain for the web certificate (otherwise an IP certificate) |
-| `--token` | One-time pairing token |
-| `--interactive` | Prompt for everything |
+| 0 | ok |
+| 1 | a stage failed; run the same command again to resume |
+| 2 | usage, or missing secrets |
+| 3 | daemon unavailable |
+| 4 | refused by privd or gatewayd |
+| 6 | not in this release |
+| 7 | not root |
+| 8 | declined |
+| 9 | preflight failed (nothing changed) |
+| 10 | verification failed (signature, digest, version) |
+| 11 | another install or uninstall is running |
+| 12 | options conflict with the existing install |
+
+**Preflight** (read-only; `install.sh` runs a reduced form first, §5.6): `ID` and `VERSION_ID` in the supported set (§4.1); `x86_64`; `/run/systemd/system` exists and systemd is 250 or newer; cgroup2 mounted; `user.max_user_namespaces` above 0; not inside a container (the test-hook build excepted, §12); `MemTotal` at least 3584 MiB and at least 2 CPUs; at least 30 GiB free on the filesystem of `/var/lib/incus` (or `/var/lib`), and with `--storage-device` the device at least 30 GiB and the root filesystem at least 5 GiB free; the port free for TCP and UDP; the Incus rules of §4.2; `--image prebuilt` and `--image-file` refused (exit 6). A host Docker is reported, for information only.
 
 ### 5.3 Stages
 
-1. Preflight: host OS, arch, systemd, RAM, disk, port free, unprivileged-container kernel support, inotify limits, a host Docker install. Fail with a clear message before changing anything.
-2. Download the agent, verify its minisign signature against keys embedded in the script, install the systemd units.
-3. Pair with the app (SPAKE2, see 8.2). From here the app shows progress over the encrypted channel.
-4. Install Incus and write the kernel limits (`/etc/sysctl.d/90-hx-incus.conf`, applied with `sysctl --system`).
-5. Create the storage pool and the hash-xcreen bridge network with its ACLs; add `DOCKER-USER` rules if Docker runs on the host.
-6. Open the agent port in ufw or nftables, whichever is present.
-7. Create the desktop (4.3), including Docker if chosen.
-8. Receive secrets: set the Linux password, store the PIN hash, store the Drive token (5.4).
-9. Schedule backups, start the first one in the background, open the desktop in the app.
+Every stage has a `check()` and a `run()`. It is skipped only when it is recorded as done **and** `check()` still passes; otherwise it converges. Who does the work:
 
-Every stage is idempotent; re-running the command resumes a failed install. `hx-agent uninstall` removes everything, asking whether to keep the desktop.
+| # | Stage | Owner | What it does |
+|---|---|---|---|
+| 1 | `preflight` | installer | Read-only checks (§5.2). Fails with a clear message before anything changes. `install.sh` has already done the bootstrap checks (§5.6). |
+| 2 | `packages` | installer | `btrfs-progs`, `nftables`, `ca-certificates` |
+| 3 | `incus` | installer | Install or adopt Incus (§4.2), `systemctl enable --now incus.socket`, wait for its socket |
+| 4 | `release` | installer | Unpack the verified release into `/usr/lib/hx/<version>` and create `current` (§5.6) |
+| 5 | `system-files` | installer | sysusers, tmpfiles, logrotate, the rescue helper (§5.5, §5.7) |
+| 6 | `credentials` | installer | Seal `pepper.cred` and `identity.cred` with `systemd-creds` (§5.7) |
+| 7 | `config` | installer | `gatewayd.toml`, `privd.toml`, unit drop-ins (port, resolvers) |
+| 8 | `units` | installer | Install the units, enable and start them |
+| 9 | `setup-window` | privd | `BeginSetup`, called by the installer |
+| 10 | `host` | privd | `SetupHost`: pool, bridge, ACL, profiles, `inet hx` ruleset, sysctl file, `DOCKER-USER` rules ([ipc.md](ipc.md) §6.4) |
+| 11 | `firewall-port` | installer | Open the agent port before pairing (below) |
+| 12 | `pairing-token` | installer, gatewayd | `--pair` and `--token` only: install the pairing token through the gatewayd admin socket |
+| 13 | `desktop` | privd | `CreateDesktop` ([ipc.md](ipc.md) §6.5) |
+| 14 | `verifiers` | installer, gatewayd, privd | Argon2id in the installer, the pepper step through privd's `PepperEnrol`, stored by gatewayd (`SetPasswordVerifier`, `SetPinVerifier`) |
+| 15 | `owner-key` | privd | `EnrolOwnerKey` when the app supplied a key (Phase 2 shape) |
+| 16 | `backup` | n/a | Phase 2: recorded only, state `deferred` |
+| 17 | `pairing` | installer, gatewayd | `--interactive`: `CreatePairingCode` with a 15-minute life, printed with the global addresses, the port and the expiry. `--ssh`: the app's own token, if sent |
+| 18 | `finish` | privd, gatewayd | `FinishSetup` and `SetupWindow{close}` |
+| 19 | `done` | installer | Mark the install complete |
+
+- **The port is opened before pairing** (stage 11 comes before every pairing step), because in the one-liner path the app must reach the agent before anything else exists. In the `--pair` and `--token` paths the installer **ends after `pairing-token`** (neither carries a password or PIN) (stages 13 to 18 do not run in 1E): the setup window stays open, and the app creates the desktop through gatewayd during `SETUP_OPEN` once the post-pairing setup messages exist (1G; the dependency is noted in execution-phase.md). In the `--ssh` and `--interactive` paths every stage runs, as `Admin`; the token or code is issued **last**, so its 15-minute life starts after the desktop build.
+- **How port 443 reaches gatewayd.** A socket unit, `hx-gatewayd-public.socket`, listens on `[::]:<port>` for TCP and UDP (`BindIPv6Only=both`) and hands both sockets to gatewayd by socket activation; the port comes from an installer drop-in (`--port`). The unprivileged gatewayd binds nothing and keeps an empty capability set, no sysctl is changed and no NAT is added ([ipc.md](ipc.md) §6.12).
+- **The port rule** (stage 11): if ufw is active, `ufw allow <p>/tcp` and `/udp` with the comment `hash-xcreen`. Otherwise, if native nftables has an input base chain that drops (policy drop, or a drop or reject rule without an interface qualifier, ignoring tables `inet hx`, `inet incus` and Docker's), the rule `meta l4proto { tcp, udp } th dport <p> accept comment "hx-agent-port"` is inserted at the top of that chain, so it is evaluated before the administrator's own rules for that port (a fail2ban or crowdsec drop set on the same port does not apply to it), and re-applied at boot by `hx-agent-port.service` (ordered after `nftables.service`); a ruleset **reload** drops the rule, and the installer says so. The planned rule is recorded in the install state **before** it is inserted, so a partial failure is still removed; uninstall looks for the comment `hx-agent-port` in **every** input-hook chain, not only those that still drop, and with an unreadable state it falls back to that search and warns. A ufw rule that already existed before the install is recorded as adopted and left in place at uninstall. (Security review L4, 1E.) Otherwise, if iptables-legacy or firewalld is blocking, the stage state is `manual`: the exact command is printed and the result carries a warning. Otherwise `none`.
+- **Re-runs.** The same command resumes; a complete install is re-verified and drift repaired, and the output says "already installed". Different options are classified by the table in §5.2: reconcilable ones are applied, and a fixed option changed after its stage is done ends with exit 12, naming each option and the command that changes it (`hx-agent desktop limits`, `hx-agent docker enable`, `hx-agent uninstall --destroy-desktop`). Concurrent runs fail with exit 11 (§5.6).
+- **State and failures.** One state file, `/var/lib/hx/install-state.json` (§5.7), and one lock shared by install and uninstall. A failure records the stage, a code, a sanitized message and `retryable`; the installer prints `stage 'X' failed: …; run the same command again; completed stages are skipped`, emits a `result` line in `--json` mode (§5.8) and logs tool argv and exit codes, never secrets, to `/var/log/hx-install.log` (0600). **Secrets are never persisted**: a resumed run that needs the password must receive it again.
+- **Uninstall.** `hx-agent uninstall` removes everything, asking whether to keep the desktop. It is split between the CLI and privd's narrowed `Uninstall`, because privd's own sandbox cannot remove units, binaries or `/var/lib/hx-gatewayd` (order and rules in [ipc.md](ipc.md) §6.13). Incus and the Zabbly repository stay installed; the CLI says so and prints how to remove the repository.
 
 ### 5.4 Google Drive during setup
 
@@ -210,8 +284,90 @@ hash-xcreen ships **one fixed OAuth client** for every install. With `drive.file
   - **Fetch.** `hx-privd` never speaks HTTP. A sandboxed `hx-update-fetcher@<job>.service` (dynamic user, no capabilities, IP sockets only, release hosts only) downloads bytes into a directory privd treats as hostile: read once through a directory descriptor with `openat2`, digest and signature checked over the copy, manifest timestamp never older than the highest seen, version strictly newer than the running one.
   - **Layout.** `/usr/lib/hx/<version>/` per release, with `current` and `previous` symlinks that privd switches atomically (`symlinkat` + `renameat`); the units run `/usr/lib/hx/current/<binary>`; two versions are kept. A `preupdate` snapshot of the desktop is taken first.
   - **Switch and check.** privd records the pending update, switches `current`, answers, restarts gatewayd and re-execs itself (the socket unit keeps the socket). The new process judges within 90 s: privd answers, gatewayd has a stable `MainPID` for 30 s, gatewayd's admin socket answers `Status`. Failure restores the version recorded before the switch (explicitly, never a blind flip) and flags `UPDATE_ROLLED_BACK`; the release is offered again but never re-applied automatically, and Gateway may not re-apply it for 24 h. The fetch directory is a size-capped tmpfs and the fetcher unit denies directory creation, links and renames, so a compromised fetcher can neither fill the disk nor plant what root cannot remove. What the installer and release pipeline owe this mechanism is listed in the privd README ("What 1E must provide").
+  - **Rescue.** A new `hx-privd` that cannot start at all (a missing library, a bad ELF) never reaches its own health check, and systemd would retry the same binary. `hx-privd.service` therefore has `OnFailure=hx-privd-rescue.service`, a oneshot that runs `/usr/lib/hx-rescue/hx-privd-rescue`. The helper lives **outside** `/usr/lib/hx`, so pruning never touches it. If an update is `pending`, it restores the recorded previous version and restarts privd, which then rolls back through its normal path and flags `UPDATE_ROLLED_BACK`; with nothing pending it does nothing ([ipc.md](ipc.md) §6.12).
+  - **Units are not part of a release.** They are embedded in `hx-agent` and written by the installer (§5.7); a self-update replaces binaries only.
 - `hx-session`: pushed into the container by the agent; only the streaming process restarts, user apps keep running.
 - The desktop's own packages are the user's responsibility (`apt upgrade`).
+
+### 5.6 Bootstrap and hand-off
+
+`install.sh` is POSIX `sh`, wrapped in `main "$@"` on its last line so a truncated download never runs, and reads no environment variable (curl honours the `*_proxy` variables on its own). It needs `curl`, `openssl` 3 or newer, `sha256sum`, `tar`, `gzip`, `flock`, `base64`, `od` and `dd`. In order:
+
+1. **Bootstrap preflight:** root, `x86_64`, systemd, a supported `os-release`, the tools above, and a self-test of the signature check against embedded known answers (a valid vector must pass, a tampered one must fail; otherwise exit 9).
+2. **Lock:** `exec 9>>/run/hx-install.lock; flock -n 9 || exit 11`.
+3. **Manifest and signature:** fetched over HTTPS only (or read from `--release-dir`) and verified against the two embedded keys with `openssl` (Ed25519 over the BLAKE2b-512 of the manifest, then the global signature). The exact rules are in [ipc.md](ipc.md) §6.12 ("Installer verification").
+4. **Artifact:** downloaded, size and SHA-256 checked, and only `./hx-agent` extracted into a root-only `mktemp -d /run/hx-bootstrap.XXXXXX` that also holds the manifest, signature and tarball.
+5. **Hand-off:** `exec "$dir/hx-agent" [--json] install --bootstrap-dir "$dir" --lock-fd 9 "$@"`. If `/usr/lib/hx/current/hx-agent` already exists, the download is skipped and that binary is exec'd with `--lock-fd 9`: `install.sh` never upgrades or downgrades an installed agent, because updates go through privd.
+
+`hx-agent install` takes the handed-over lock after checking that the descriptor is the regular, root-owned `/run/hx-install.lock` (without `--lock-fd` it opens and locks the file itself). Given `--bootstrap-dir` (a root-only directory, not a symlink, files opened `O_NOFOLLOW`), it **verifies everything again** with the keys compiled into the agent (signature, manifest fields, size, SHA-256, and `version == CARGO_PKG_VERSION`), reusing privd's own update code (`privd::update::{keys, manifest, extract}` and `switch::Layout`): it unpacks into `/usr/lib/hx/.incoming-*`, renames to `/usr/lib/hx/<version>`, creates the relative `current` link (there is no `previous` yet) and removes the bootstrap directory. The first install thus uses the same verification and extraction as an update. The shell script is only the first, replaceable link in the chain.
+
+### 5.7 Installer state, files and credentials
+
+```json
+{"schema":1,"install_id":"…","agent_version":"…","mode":"ssh|pair|token|interactive",
+ "options":{"…":"normalized §5.2 values, no secrets"},"server_public_key":"…",
+ "stages":{"<id>":{"state":"done|failed|deferred|manual","at":0,
+                   "error":{"code":"…","message":"…","retryable":true}}},
+ "created":{"files":[],"dropins":[],"packages":[],
+            "incus":{"by_installer":true,"source":"distro|zabbly","version":"…"},
+            "apt":["/etc/apt/keyrings/hx-zabbly.asc","/etc/apt/sources.list.d/hx-zabbly-incus.sources"],
+            "port_rule":{"backend":"ufw|nft|manual|none","port":443},"user":true},
+ "complete":false,"updated_unix":0}
+```
+
+The file is root 0600, written atomically (`privd::state::write_atomic`). The installer never writes privd's own state files, and uninstall needs `created` to know what the installer made. A separate resume file for uninstall, `/var/lib/hx-uninstall.json`, lives outside `/var/lib/hx` because uninstall removes that directory.
+
+**Where the installer puts things** (the full list of paths is in [ipc.md](ipc.md) §2):
+
+- Units: `/usr/local/lib/systemd/system/`, outside the namespace dpkg manages. Installer drop-ins: `/etc/systemd/system/<unit>.d/50-hx-*.conf`, plus `hx-update-fetcher@.service.d/resolvers.conf`.
+- `/usr/local/lib/sysusers.d/hx-gatewayd.conf`, `/usr/local/lib/tmpfiles.d/hx.conf`, `/etc/logrotate.d/hx-audit`, `/usr/lib/hx-rescue/hx-privd-rescue`.
+- The units are embedded in `hx-agent` with `include_str!`; a test asserts that every file under `apps/hx-agent/systemd/` is embedded.
+- **Not installed by the installer:** `hx-session`'s own units. They stay in the desktop recipe (`recipes/fragments/xfce-desktop.toml`) and reach the container with the rest of the recipe; the `hx-session` `.deb` carries binaries only (§13).
+
+**Done-checks** (what `check()` verifies before a recorded stage is skipped):
+
+| Stage | Done when |
+|---|---|
+| `packages` | `dpkg-query` reports the packages installed |
+| `release` | `current` resolves to a complete directory whose `VERSION` equals the agent's version |
+| `system-files`, `config` | content hashes equal |
+| `credentials` | both `.cred` files exist and decrypt to 32 bytes (decrypted into a pipe that is read and zeroized), and no `pepper.key` remains |
+| `units` | `is-enabled`, `is-active`, and privd answers `Hello` and `GetHostInfo` |
+| `incus` | the version reported by `GetHostInfo` |
+| `setup-window`, `host` | always called (they converge), then `GetHostInfo` (`pool`, `host_firewall_loaded`, `sysctl_ok`) |
+| `desktop` | `GetDesktop` reports `ready` |
+| `pairing-token`, `pairing`, `finish` | never skipped on resume: a code or token must be fresh, so a re-run of `--pair` asks for a new token |
+
+**Credentials.** The installer generates each secret with `getrandom`, pipes it to `systemd-creds encrypt --name=<name> - <tmp>` and renames the result to 0600; `pepper.cred` and `identity.cred` are made this way, so every supported host has sealed credentials. A host that ran privd on the plaintext `/var/lib/hx/pepper.key` fallback is **migrated without invalidating its verifiers**:
+
+1. `PepperEnrol(PIN, a fixed test input)` as Admin gives `mac1`.
+2. `systemd-creds encrypt --name=pepper /var/lib/hx/pepper.key …` seals the existing key.
+3. privd is restarted.
+4. `PepperEnrol` again gives `mac2`.
+5. If they are equal, `pepper.key` is overwritten with zeros, synced and unlinked. If not, the new `.cred` is removed, the key is kept and the stage fails.
+
+If both files exist and the decrypted value equals the key, the key is deleted; if it differs, the key is renamed `pepper.key.orphaned-<ts>` with a warning.
+
+**Resolvers drop-in.** The update fetcher's kernel egress filter denies local and private ranges ([ipc.md](ipc.md) §6.12), and `IPAddressAllow=` cannot be limited to a port, so an allowed address is open to the fetcher on every port. For every `nameserver` in `/etc/resolv.conf`, other than 127.0.0.53 and 127.0.0.54 (already allowed by the unit), that falls inside a **private** range (RFC 1918, `100.64.0.0/10`, `fc00::/7`), the installer writes `IPAddressAllow=<addr>/32` (or `/128`) into `hx-update-fetcher@.service.d/resolvers.conf`, and removes the drop-in when the list is empty; the accepted cost is that a compromised fetcher can reach that resolver host on any port. It **never** allows loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`, `fe80::/10`, which includes the cloud metadata service at 169.254.169.254 used as a resolver on Google Cloud and Oracle Cloud) or multicast: such a nameserver is skipped with a warning that updates need systemd-resolved (whose stub forwards to it) or a private resolver. The install does not fail. (Security review M2, 1E.)
+
+### 5.8 Machine-readable progress
+
+With the global `--json`, stdout carries only JSON Lines; human text goes to stderr, and every string is sanitized with `hx_ipc::text::sanitize_text`.
+
+```
+{"v":1,"t":"stage","id":"<stage-id>","n":7,"of":19,"state":"start|done|skip|fail|deferred|manual","ms":123}
+{"v":1,"t":"step","id":"desktop","privd_stage":"BUILD","index":3,"total":12,"step":"…","percent":255}
+{"v":1,"t":"warn","id":"<stage-id>","message":"…"}
+{"v":1,"t":"result","ok":true,"exit":0,"install_id":"<32 hex>","agent_version":"x.y.z",
+ "server_public_key":"<64 hex Ed25519>","addresses":["…"],"port":443,
+ "desktop":{"id":"main","path_taken":"BUILD","reason":"…","warnings":["…"]},
+ "pairing":{"kind":"code|token|none","expires_at_unix_s":0},"port_rule":"ufw|nft|manual|none"}
+{"v":1,"t":"result","ok":false,"exit":1,"stage":"incus","code":"UNAVAILABLE|TOOL|VERIFY|PREFLIGHT|…","message":"…","retryable":true}
+```
+
+- A `step` line is a privd `Progress` frame relayed one to one ([ipc.md](ipc.md) §4); `percent` 255 means unknown.
+- `install.sh` emits `stage` lines with the ids `bootstrap-preflight`, `bootstrap-download` and `bootstrap-verify`, built from constant strings only.
+- `server_public_key` is derived when the identity seed is generated and kept in the state file. It lets the SSH app cross-check, over the SSH-authenticated channel, the key it will pin while pairing.
 
 ## 6. Streaming
 
@@ -314,7 +470,7 @@ Sent separately as shape (cached by hash) and position, and drawn by the client,
 | Stolen client device | Device key alone is not enough: the server checks the PIN, revoking the device after 5 failures. Devices can be revoked from any other device or the CLI. |
 | Malware inside the desktop | Unprivileged container; `hx-session` holds no secrets; the agent treats all container input as untrusted; metadata endpoint and agent ports blocked. |
 | Google or a compromised Google account | Backups are encrypted and authenticated before upload. |
-| Tampered installer or update | minisign signatures verified against embedded keys; build provenance attestations. |
+| Tampered installer or update | minisign signatures verified against embedded keys: by `install.sh` with `openssl`, then again by `hx-agent install` and later by `hx-privd` (§5.6). Build provenance attestations are for audit only: no server verifies them, because a host has no `gh` or Sigstore client. |
 
 Out of scope: the VPS provider, or anyone with root on the host.
 
@@ -488,7 +644,7 @@ Login (passkey + PIN; password + PIN the first time), desktop view with the same
 | Unit and property | `cargo nextest`; `proptest` for protocol round-trips, exclude/protected-path rules, retention (never deletes the two latest successes) |
 | Fuzzing | `cargo-fuzz` on all pre-auth parsers and all container-supplied input; nightly; OSS-Fuzz later |
 | Provisioning | Incus on GitHub Linux runners; matrix of guest distros; prebuilt vs built equivalence check |
-| Installer | Fresh Incus VM per host OS (KVM on GitHub runners); both image paths |
+| Installer | CI: a fresh Incus VM per host OS (KVM on GitHub runners) running the real `install.sh --release-dir` with a per-run test key, for the `build` image path in 1E (`prebuilt` cells assert the clean refusal until 1D's image CI lands), plus a reboot, canary scans for the password, PIN and token in `/proc` and the journal, failure injection with resume, and uninstall in both modes. Locally: a nested-Incus harness (an unprivileged container with its own Incus, every object named `hx1e-*`) that covers the units, credentials, firewall rules in the container's own network namespace, pairing, resume, lock contention, the rescue path and uninstall, but not desktop creation, TPM sealing or real reboots. Both use only compile-time test hooks (`install-test-hooks`, `privd-test-hooks`, `test-release-key`), which the release gate forbids in release builds (§13) |
 | Backup | In-memory/local backend on every PR; real Google Drive test account nightly, including the chat-app history restore test |
 | Streaming end to end | Agent + desktop container + headless test client under `tc netem` profiles |
 | UI | Slint testing backend and screenshot comparisons; Playwright for the web client (Chromium, Firefox) |
@@ -500,9 +656,21 @@ Login (passkey + PIN; password + PIN the first time), desktop view with the same
 
 - One semver version for all components; protocol version separate.
 - Channels: stable and beta; nightly builds for testers.
-- `hx-agent`: static musl binary and `.deb`. `hx-session`: `.deb` per guest distro. Desktop app: `.deb` and AppImage (Flatpak later). Desktop images: weekly, signed.
-- `dist` for GitHub Releases; conventional commits and `git-cliff` for changelogs; `--locked` builds.
-- minisign signing (current and next key embedded in `install.sh`); signing key in a protected GitHub environment; GitHub build provenance attestations.
+- `hx-agent`: static musl binaries in one release tarball, **no `.deb`** in v1 (dpkg would own files that privd rewrites in `/usr/lib/hx`). `hx-session`: one `.deb` per guest distro, carried inside that tarball. Desktop app: `.deb` and AppImage (Flatpak later). Desktop images: weekly, signed.
+- Conventional commits and `git-cliff` for changelogs; `--locked` builds. A release is built by `.github/workflows/release.yml` on tags `v*` (the version rule of [ipc.md](ipc.md) §6.12), not by `dist`: its archive layouts and installers and its lack of a signed manifest conflict with §5.5.
+- minisign signing: **both** the current and the next public key are required for a release and are embedded in `install.sh` and in `hx-agent` (`apps/hx-agent/release-keys/{current,next}.pub`, `UNPROVISIONED` until the maintainer supplies them). The secret key lives in the protected GitHub environment `release-signing` (manual approval per run, secrets `MINISIGN_SECRET_KEY` and `MINISIGN_KEY_PASSWORD`); no agent generates or sees it. GitHub build provenance attestations.
+
+**Release pipeline** (jobs, in order):
+
+1. `gate`: the tag equals `v` plus the workspace version; both key files are provisioned and parse; the keys embedded in `install.sh` equal those files (also a normal CI test); `cargo deny` and `cargo audit`; the `release-build` feature is on and cannot be combined with `test-support`, `test-release-key` or the other test-hook features (a compile-time assertion that `CURRENT` is not `UNPROVISIONED`).
+2. `agent`: `cargo build -p hx-agent --bins --release --locked --target x86_64-unknown-linux-musl --features release-build` (never `--workspace`), then a check that every output is statically linked. All binaries are bins of one crate, so they share one version by construction.
+3. `session`: a matrix over `ubuntu:24.04`, `ubuntu:26.04`, `debian:12` and `debian:13` job containers builds `hx-session` and `hx-pwcheck` against that distro's FFmpeg, assembles the `.deb`, computes `Depends` with `dpkg-shlibdeps`, asserts the expected `libavcodec`/`libavutil` packages are listed, and smoke-tests `apt-get install ./hx-session.deb` followed by `ldd` showing no unresolved library.
+4. `assemble`: the deterministic ustar tarball and the canonical manifest ([ipc.md](ipc.md) §6.12), at most 256 MiB.
+5. `sign` (environment `release-signing`): a prehashed signature over `manifest-x86_64.json` with the trusted comment `hx-manifest v<ver> channel=<c> arch=x86_64`, and one over `install.sh` for manual checks; then `install.sh`'s own verification function must accept the result, which proves the shipped script accepts the shipped signature.
+6. `attest`: `actions/attest-build-provenance` for the tarball, the `.deb`s, the manifest and `install.sh` (audit only, §8.1).
+7. `publish`: first the release `v<ver>` with the tarball, `install.sh` and the signatures; then, with `--clobber`, the manifest, its signature and `install.sh` on the moving release `channel-stable` (or `channel-beta` for `-alpha`, `-beta` and `-rc` versions). The version release goes first so a manifest never points at a missing artifact. The one-liner URL (§5.1) is the `channel-stable` copy of `install.sh`, on a host the update fetcher already allows.
+
+**The `hx-session` package** (`packaging/hx-session/`): package `hx-session`, architecture `amd64`, version equal to the release version with `-` replaced by `~` (so `1.4.2~rc.1` sorts before `1.4.2`). It holds `/usr/lib/hx-session/{hx-session,hx-pwcheck}` (0755), `/usr/share/doc/hx-session/copyright`, **no units and no maintainer scripts**, and `Depends` computed by `dpkg-shlibdeps` plus `libc6`, `libgcc-s1` and `libcrypt1`. Expected FFmpeg dependencies: Ubuntu 24.04 `libavcodec60` and `libavutil58` (verified in the spike); Debian 12 `libavcodec59` and `libavutil57`; Debian 13 `libavcodec61` and `libavutil59` (both from memory); Ubuntu 26.04 `libavcodec61`/`libavutil59` or `libavcodec62`/`libavutil60`, **to be verified** (FFmpeg 8 needs a newer `ffmpeg-next`, tech-stack.md). Because privd installs the package with `dpkg -i`, which resolves no dependencies, the desktop recipes must pre-install the FFmpeg runtime libraries per distro (a recipe variable such as `ffmpeg_runtime`, owned by the release packaging work), and CI checks that the variable covers the `.deb`'s `Depends`.
 - `cargo-deny`, `cargo-audit`, Renovate; `SECURITY.md` with private vulnerability reporting.
 - Hosting: GitHub only for now (releases, install script, docs).
 - Licence: AGPL-3.0. Contributions under the DCO (`Signed-off-by`).
