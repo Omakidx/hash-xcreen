@@ -1,15 +1,16 @@
 # Release tooling
 
-Scripts behind `.github/workflows/release.yml` (design D7 of the 1E installer). Each runs locally.
+Scripts behind `.github/workflows/release.yml` (design D7 of the 1E installer). Each runs locally. The desktop images have their own workflow, `images.yml`, described at the end.
 
 | Script | Purpose |
 |---|---|
-| `gate.sh [--tag vX] [--dry-run] [--workflow FILE]` | The release gate: tag equals the workspace version, both release keys provisioned and embedded in `installer/install.sh`, no test-hook feature in the workflow, every action pinned to a commit SHA, no build cache. |
+| `gate.sh [--tag vX] [--dry-run] [--workflow FILE]` | The release gate: tag equals the workspace version, both release keys provisioned and embedded in `installer/install.sh`, **both image keys (`apps/hx-agent/image-keys/{current,next}.pub`) provisioned, valid, different from each other and from the release keys** (skipped only while that directory does not exist), no test-hook feature in the workflow, every action pinned to a commit SHA, no build cache. |
 | `assemble.sh` | Deterministic ustar release tarball. |
 | `manifest.sh` | Canonical one-line manifest. |
 | `make-test-release.sh` | A TEST-keyed release directory for local and CI tests (never a real release). |
 | `openssl-minisign.sh` | minisign-compatible test keys and signatures with openssl only (test use). |
 | `verify-with-installer.sh` | Verifies a signature with a shipped `install.sh`'s own function. |
+| `tests/gate-image-keys.sh` | Test of the image-key check of `gate.sh` on a synthetic tree with per-run test keys (`sh release/tests/gate-image-keys.sh`). |
 
 ## Supply-chain rules of `release.yml` (enforced by `gate.sh`)
 
@@ -70,3 +71,74 @@ sudo sh install.sh --pair ...
   `--max-filesize` without a Content-Length;
 - with `--release-dir`, refuses a directory or file that is group- or other-writable or not owned by
   root, and copies only regular files, bounded by those caps (a FIFO or a huge file is refused).
+
+## Desktop images (`images.yml`)
+
+`.github/workflows/images.yml` builds the eight prebuilt desktop images (4 distros, xfce, basic and
+developer), proves each one equivalent to a desktop built on the server, then signs and publishes.
+Design: docs/architecture.md 4.3, 12 and 13; the manifest rules: docs/ipc.md 6.12 "Images
+manifest". The tool is `apps/hx-imagectl`; it shares `hx_provision::images` with `hx-privd`.
+
+Jobs: `plan` (which cells are missing or at least 7 days old, from the published manifest) ->
+`image` (one cell each: build, seal, `incus publish --compression zstd`, export, then the
+equivalence check; any drift fails the cell) -> `rehearse` (pull requests and non-publish runs: a
+manifest signed with a per-run test key, which `hx-imagectl verify` must accept and must refuse
+when tampered) or `sign` (environment `image-signing`) -> `attest` -> `publish` (`contents: write`
+only here). The same supply-chain rules as `release.yml` hold: every action is pinned to a commit
+SHA (`gh api repos/<owner>/<repo>/commits/<tag> --jq .sha`), and no build cache is used anywhere.
+
+What is published: the release `images-<build_id>` first (the image files and a `SHA256SUMS`), then
+`images-manifest-x86_64.json` and its `.minisig` on the moving release `images`, so a manifest never
+points at a missing asset. The newest 4 `images-*` releases are kept, and never one the current
+manifest references. Images are never overwritten; the manifest is replaced.
+
+**Publishing stays off until the maintainer provisions the image keys.** While
+`apps/hx-agent/image-keys/{current,next}.pub` are `UNPROVISIONED` (or missing), `sign`, `attest` and
+`publish` are skipped; `plan` and `image` still run, so the recipes and the equivalence are checked
+every day. `gate.sh` also refuses a release while those files are `UNPROVISIONED`, so no shipped
+agent is stuck without prebuilt images until it updates.
+
+### Maintainer checklist (not expressible in the repository)
+
+Once, before the first publish:
+
+- [ ] **Generate a separate image key pair, offline.** Two minisign pairs (`minisign -G` twice):
+      `current` and `next`. They must not be the release keys: a leaked image key must not be able
+      to sign agent releases (`gate.sh` checks that they differ). Commit only the two public halves
+      as `apps/hx-agent/image-keys/current.pub` and `next.pub`; they are embedded in `hx-privd`
+      and checked by the release gate and the `release-build` compile gate.
+- [ ] **Environment `image-signing`** (Settings, Environments): **deployment branches: selected,
+      allow only `main`**; **no required reviewers** (the daily and weekly runs cannot wait for an
+      approval); secrets `IMAGE_MINISIGN_SECRET_KEY` (the secret key file text) and
+      `IMAGE_MINISIGN_KEY_PASSWORD` live in this environment only, never as repository or
+      organisation secrets. Use a password-protected secret key.
+- [ ] **Anything that can change `images.yml` on `main` can publish images**: require a pull
+      request and a review for `main`, and add `.github/workflows/images.yml`, `apps/hx-imagectl/`
+      and `crates/hx-provision/` to CODEOWNERS (or a ruleset with the same effect).
+- [ ] **Do not enable repository-wide "immutable releases"**: `images` (and `channel-*`) are moving
+      releases whose assets are replaced. The `images-<build_id>` releases are immutable by
+      convention (the workflow only adds to them).
+- [ ] **Actions permissions**: the default `GITHUB_TOKEN` stays read-only (each job asks for what it
+      needs; `contents: write` is in `publish` only).
+- [ ] **Rehearse** on a pull request first: the `image` cells and `rehearse` run with test keys and
+      publish nothing. Then, after the keys are in, run the workflow on `main` with the `publish`
+      input once and check the release `images` (a manifest and its `.minisig`) and an
+      `images-<build_id>` release.
+
+Rotation: like the release keys. The next release embeds the old `next` as `current` and a fresh
+`next`; sign with the key that every shipped agent still embeds until that release is out.
+
+### Rollback and withdrawal
+
+- Images are never replaced, so a bad build is withdrawn, not overwritten. Run the workflow on
+  `main` with `publish` and `drop` set to the images to remove (space-separated `recipe/build_id`,
+  for example `debian-13-xfce-basic/20261123.2`): `sign` then re-signs the published manifest
+  without them (and with a newer timestamp, which agents require; re-publishing an old manifest
+  would be refused by every agent that already saw a newer one). A name that is not in the
+  published manifest fails the run.
+- Agents fall back to building on the server whenever no usable entry matches (`--image auto`), so
+  withdrawing every image of a recipe is safe.
+- To stop publishing altogether, disable the workflow or delete the `image-signing` secrets: the
+  existing manifest stays valid for 30 days of image age, then agents stop using it.
+- The first run on a pull request is the real test of this workflow (it could not be run where it
+  was written); watch the `image` cells (Incus on the runner, the btrfs pool on `/mnt`) first.
