@@ -104,7 +104,7 @@ jobs:
         run: >
           shellcheck -s sh -x --severity=warning
           installer/install.sh installer/tests/*.sh
-          release/*.sh packaging/hx-session/*.sh
+          release/*.sh packaging/hx-session/*.sh packaging/hx-desktop/*.sh
 
   installer-kat:
     name: install.sh known-answer tests (dash, posh)

@@ -76,6 +76,47 @@ sudo sh install.sh --pair ...
   caps (a FIFO or a huge file is refused);
 - ignores `TMPDIR` (`unset` in `main`; the self-test makes its scratch directory under `/tmp`).
 
+## Desktop packages (`hx-desktop`)
+
+The version release `v<version>` carries the desktop app next to the agent tarball. Build scripts,
+package layout and the AppImage decisions are in [`packaging/hx-desktop/README.md`](../packaging/hx-desktop/README.md).
+
+| File | What |
+|---|---|
+| `hx-desktop_<version>_<distro>_amd64.deb` | `<distro>` is `ubuntu-24.04`, `debian-12` or `debian-13` (`ubuntu-26.04` is a known gap, below). `Depends` are the distro's own library packages. |
+| `hx-desktop-<version>-x86_64.AppImage` | One file for every x86_64 Linux desktop with glibc 2.39 or newer; FFmpeg is bundled. |
+| `<file>.minisig` | A minisign signature of each file above, made in the `sign` job with the same `release-signing` key as `install.sh` (`-t "hx-desktop v<version> <file name>"`). |
+
+How the release workflow handles them:
+
+- Jobs `desktop-deb` (one per distro, in a job container of that distro, so `dpkg-shlibdeps` sees the
+  right sonames), `desktop-deb-smoke` (clean-container install, `ldd`, `--version`, `--demo` under Xvfb) and
+  `desktop-appimage` (builds and smoke-tests on `ubuntu-24.04`) run for a tag **and** for the dry run, so the
+  rehearsal proves they build. They are uncached, use only actions pinned by SHA and enable no features; the
+  AppImage tools are downloaded from their official releases and verified against the SHA-256 recorded
+  in `packaging/hx-desktop/appimage-tools.lock` before they run.
+- `assemble` collects them into `desktop/`; `sign` signs every file there; `attest` attests every
+  `.deb` and the AppImage (audit only, like the other subjects); `publish` attaches the files and their
+  signatures to `v<version>`, in the same `gh release create` as the agent tarball. The moving
+  `channel-*` release does not carry them: nothing on a server reads the desktop app from a channel.
+- The release fails if the `ubuntu-24.04`, `debian-12` or `debian-13` `.deb` or the AppImage is missing.
+  **Known gap:** Ubuntu 26.04 ships FFmpeg 8 and the workspace pins `ffmpeg-next` 7.1, so its cells run with
+  `continue-on-error`, and the `assemble` job prints a warning when the release has no 26.04 package.
+  The pull-request workflow `desktop-packages.yml` has no 26.04 cell. Once the pin moves, remove
+  `known_gap` here and add the cell back there.
+
+Verify a download (the public key is the one of `apps/hx-agent/release-keys/current.pub`):
+
+```sh
+minisign -Vm hx-desktop_0.1.0_ubuntu-24.04_amd64.deb -P <the public key line of current.pub>
+gh attestation verify hx-desktop_0.1.0_ubuntu-24.04_amd64.deb --repo Omakidx/hash-xcreen
+sudo apt install ./hx-desktop_0.1.0_ubuntu-24.04_amd64.deb      # or: chmod +x the AppImage and run it
+```
+
+Nothing installs or updates these packages automatically: there is no apt repository and the
+AppImage carries no update information. The maintainer needs no setup beyond the `release-signing`
+environment that the agent release already uses.
+
 ## Desktop images (`images.yml`)
 
 `.github/workflows/images.yml` builds the eight prebuilt desktop images (4 distros, xfce, basic and

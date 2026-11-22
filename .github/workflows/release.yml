@@ -246,10 +246,139 @@ jobs:
           done
           test "$(stat -c '%U:%G %a' /usr/lib/hx-session/hx-session)" = "root:root 755"
 
+  desktop-deb:
+    name: hx-desktop .deb (${{ matrix.distro }})
+    needs: gate
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
+    # ubuntu-26.04 ships FFmpeg 8 and the workspace pins ffmpeg-next 7.1 (FFmpeg up to 7.1): a KNOWN
+    # GAP (packaging/hx-desktop/README.md). The cell stays visible; the release goes out without a
+    # 26.04 desktop package until ffmpeg-next supports FFmpeg 8, and the assemble job says so.
+    continue-on-error: ${{ matrix.known_gap }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { distro: ubuntu-24.04, image: "ubuntu:24.04", known_gap: false }
+          - { distro: ubuntu-26.04, image: "ubuntu:26.04", known_gap: true }
+          - { distro: debian-12, image: "debian:12", known_gap: false }
+          - { distro: debian-13, image: "debian:13", known_gap: false }
+    steps:
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git build-essential clang libclang-dev pkg-config dpkg-dev \
+            libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libx264-dev libfontconfig1-dev
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install rustup (pinned) and the pinned toolchain
+        run: |
+          set -eu
+          curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/rustup-init \
+            "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init"
+          echo "${RUSTUP_SHA256}  /tmp/rustup-init" | sha256sum -c -
+          chmod +x /tmp/rustup-init
+          /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain none
+          . "$HOME/.cargo/env"
+          rustup toolchain install
+          echo "$HOME/.cargo/bin" >>"$GITHUB_PATH"
+      - name: Build hx-desktop
+        # Only the app's bin, no features, no --all-targets: its dev-dependency on hx-agent's own
+        # test features is never built.
+        run: cargo build --release --locked -p hx-desktop --bin hx-desktop
+      - name: Build the .deb
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+          SDE: ${{ needs.gate.outputs.sde }}
+          DISTRO: ${{ matrix.distro }}
+        run: |
+          sh packaging/hx-desktop/build-deb.sh --version "$VERSION" --distro "$DISTRO" \
+            --bin target/release/hx-desktop --out "out/$DISTRO" --source-date-epoch "$SDE"
+          dpkg-deb -I "out/$DISTRO/hx-desktop.deb"
+          dpkg-deb -c "out/$DISTRO/hx-desktop.deb"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: desktop-deb-${{ matrix.distro }}
+          path: out/${{ matrix.distro }}/hx-desktop.deb
+          if-no-files-found: error
+
+  desktop-deb-smoke:
+    name: hx-desktop .deb smoke test (${{ matrix.distro }})
+    needs: [gate, desktop-deb]
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
+    continue-on-error: ${{ matrix.known_gap }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { distro: ubuntu-24.04, image: "ubuntu:24.04", known_gap: false }
+          - { distro: ubuntu-26.04, image: "ubuntu:26.04", known_gap: true }
+          - { distro: debian-12, image: "debian:12", known_gap: false }
+          - { distro: debian-13, image: "debian:13", known_gap: false }
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: desktop-deb-${{ matrix.distro }}
+      - name: Install in a clean container and resolve every library
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -eu
+          apt-get update
+          apt-get install -y --no-install-recommends ./hx-desktop.deb
+          ldd /usr/bin/hx-desktop
+          if ldd /usr/bin/hx-desktop | grep -q 'not found'; then echo "::error::unresolved library in hx-desktop"; exit 1; fi
+          test "$(stat -c '%U:%G %a' /usr/bin/hx-desktop)" = "root:root 755"
+      - name: Install Xvfb and git, check out the smoke scripts
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: apt-get install -y --no-install-recommends xvfb xauth ca-certificates git
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run the installed app headless (--version, then --demo under Xvfb)
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: sh packaging/hx-desktop/smoke-run.sh "$VERSION" hx-desktop
+
+  desktop-appimage:
+    name: hx-desktop AppImage
+    needs: gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - name: Install build dependencies
+        # Built on 24.04, the oldest supported glibc; it bundles this FFmpeg 6.1.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev pkg-config libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libx264-dev libfontconfig1-dev xvfb xauth \
+            libegl1 libxkbcommon0 libxkbcommon-x11-0 libwayland-client0 libx11-6 libxcb1
+      - name: Build hx-desktop
+        run: cargo build --release --locked -p hx-desktop --bin hx-desktop
+      - name: Build the AppImage (tools downloaded and verified against appimage-tools.lock)
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+          SDE: ${{ needs.gate.outputs.sde }}
+        run: |
+          sh packaging/hx-desktop/build-appimage.sh --version "$VERSION" --bin target/release/hx-desktop \
+            --out out --tools-dir "$RUNNER_TEMP/appimage-tools" --source-date-epoch "$SDE"
+          ls -l out
+      - name: Smoke test (extract, files, libraries, --version, --demo under Xvfb)
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: sh packaging/hx-desktop/smoke-appimage.sh "out/hx-desktop-$VERSION-x86_64.AppImage" "$VERSION"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: desktop-appimage
+          path: out/*.AppImage
+          if-no-files-found: error
+
   dry-run:
     name: Dry run (test key, nothing published)
     if: needs.gate.outputs.dry_run == 'true'
-    needs: [gate, agent, session-smoke]
+    needs: [gate, agent, session-smoke, desktop-deb-smoke, desktop-appimage]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -290,7 +419,7 @@ jobs:
   assemble:
     name: Assemble the tarball
     if: needs.gate.outputs.dry_run != 'true'
-    needs: [gate, agent, session-smoke]
+    needs: [gate, agent, session-smoke, desktop-deb-smoke, desktop-appimage]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -304,6 +433,30 @@ jobs:
         with:
           pattern: session-*
           path: in/session
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: desktop-*
+          path: in/desktop
+      - name: Collect the desktop packages
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -eu
+          mkdir desktop
+          for d in in/desktop/desktop-deb-*; do
+            [ -d "$d" ] || continue
+            n=${d#in/desktop/desktop-deb-}
+            cp "$d/hx-desktop.deb" "desktop/hx-desktop_${VERSION}_${n}_amd64.deb"
+          done
+          cp in/desktop/desktop-appimage/*.AppImage desktop/
+          # the known gap: say so instead of silently shipping fewer packages
+          [ -f "desktop/hx-desktop_${VERSION}_ubuntu-26.04_amd64.deb" ] ||
+            echo "::warning::no Ubuntu 26.04 hx-desktop .deb in this release (known gap: FFmpeg 8 vs ffmpeg-next 7.1)"
+          for n in ubuntu-24.04 debian-12 debian-13; do
+            [ -f "desktop/hx-desktop_${VERSION}_${n}_amd64.deb" ] || { echo "::error::the $n hx-desktop .deb is missing"; exit 1; }
+          done
+          [ -f "desktop/hx-desktop-${VERSION}-x86_64.AppImage" ] || { echo "::error::the AppImage is missing"; exit 1; }
+          ls -l desktop
       - name: Assemble (deterministic ustar tarball, at most 256 MiB)
         env:
           VERSION: ${{ needs.gate.outputs.version }}
@@ -326,6 +479,7 @@ jobs:
           path: |
             dist
             debs
+            desktop
           if-no-files-found: error
 
   sign:
@@ -377,6 +531,22 @@ jobs:
             -m assembled/dist/install.sh \
             -x assembled/dist/install.sh.minisig \
             -t "hx-install.sh v$VERSION"
+      - name: Sign the desktop packages
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_KEY_PASSWORD: ${{ secrets.MINISIGN_KEY_PASSWORD }}
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -eu
+          umask 077
+          key="$RUNNER_TEMP/minisign-desktop.key"
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$MINISIGN_SECRET_KEY" >"$key"
+          for f in assembled/desktop/*; do
+            printf '%s\n' "$MINISIGN_KEY_PASSWORD" | minisign -S -s "$key" -m "$f" -x "$f.minisig" \
+              -t "hx-desktop v$VERSION $(basename "$f")"
+          done
+          ls -l assembled/desktop
       - name: The shipped install.sh must accept the shipped signature
         run: |
           sh release/verify-with-installer.sh assembled/dist/install.sh \
@@ -388,6 +558,7 @@ jobs:
           path: |
             assembled/dist
             assembled/debs
+            assembled/desktop
           if-no-files-found: error
 
   attest:
@@ -411,6 +582,8 @@ jobs:
             signed/dist/manifest-x86_64.json
             signed/dist/install.sh
             signed/debs/*.deb
+            signed/desktop/*.deb
+            signed/desktop/*.AppImage
 
   publish:
     name: Publish
@@ -436,10 +609,12 @@ jobs:
           pre=''
           [ "$CHANNEL" = beta ] && pre='--prerelease'
           # The version release goes first, so the manifest never points at a missing artifact.
-          gh release create "v$VERSION" --repo "$REPO" --target "$SHA" --title "v$VERSION" \
-            --notes "hash-xcreen $VERSION ($CHANNEL channel). Install: see the README." $pre \
-            "$d/hx-$VERSION-x86_64.tar.gz" "$d/install.sh" "$d/install.sh.minisig" \
+          # the desktop packages (.deb per distro, AppImage) and their .minisig files ride along
+          set -- "$d/hx-$VERSION-x86_64.tar.gz" "$d/install.sh" "$d/install.sh.minisig" \
             "$d/manifest-x86_64.json" "$d/manifest-x86_64.json.minisig"
+          for f in signed/desktop/*; do set -- "$@" "$f"; done
+          gh release create "v$VERSION" --repo "$REPO" --target "$SHA" --title "v$VERSION" \
+            --notes "hash-xcreen $VERSION ($CHANNEL channel). Install: see the README." $pre "$@"
           # The moving channel release: what the one-liner and privd's fetcher read.
           if ! gh release view "channel-$CHANNEL" --repo "$REPO" >/dev/null 2>&1; then
             gh release create "channel-$CHANNEL" --repo "$REPO" --target "$SHA" --prerelease --latest=false \

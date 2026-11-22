@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metainfo template. The build scripts replace @VERSION@ (the workspace version) and
+     @DATE@ (the build's SOURCE_DATE_EPOCH day) and install the result as
+     io.github.omakidx.hashxcreen.metainfo.xml. -->
+<component type="desktop-application">
+  <id>io.github.omakidx.hashxcreen</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>AGPL-3.0-or-later</project_license>
+  <name>hash-xcreen</name>
+  <summary>Your own remote desktop, on a server you control</summary>
+  <description>
+    <p>
+      hash-xcreen sets up a desktop on your server, streams it to this app and keeps it backed
+      up. Nothing runs in anyone else's cloud.
+    </p>
+    <p>
+      Add a server over SSH or with one command, protect each device with a PIN, and open the
+      remote desktop in a window with clipboard and file transfer.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.omakidx.hashxcreen.desktop</launchable>
+  <provides>
+    <binary>hx-desktop</binary>
+  </provides>
+  <url type="homepage">https://github.com/Omakidx/hash-xcreen</url>
+  <url type="bugtracker">https://github.com/Omakidx/hash-xcreen/issues</url>
+  <developer id="io.github.omakidx">
+    <name>hash-xcreen contributors</name>
+  </developer>
+  <content_rating type="oars-1.1"/>
+  <categories>
+    <category>Network</category>
+    <category>RemoteAccess</category>
+  </categories>
+  <requires>
+    <display_length compare="ge">900</display_length>
+  </requires>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+  <releases>
+    <release version="@VERSION@" date="@DATE@"/>
+  </releases>
+</component>

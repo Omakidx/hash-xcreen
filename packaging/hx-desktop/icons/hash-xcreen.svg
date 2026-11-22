@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The app icon: the brand mark of the design mockups (design/mockups/mock.css, class logo),
+     the accent square with a hash sign. Colours are the dark theme's accent and on-accent
+     tokens of design/mockups/tokens.css. Paths only, no text, so it renders the same without
+     fonts. Installed as the app id's icon (io.github.omakidx.hashxcreen). -->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <rect width="128" height="128" rx="30" fill="#6aa6ff"/>
+  <g fill="none" stroke="#08101d" stroke-width="10" stroke-linecap="round">
+    <path d="M50 28 L42 100"/>
+    <path d="M86 28 L78 100"/>
+    <path d="M28 52 H102"/>
+    <path d="M26 78 H100"/>
+  </g>
+</svg>
