@@ -121,6 +121,7 @@ impl TestServer {
             artifact_timeout: Duration::from_secs(3),
             max_manifest: 1024,
             max_artifact: 4096,
+            image: hx_agent::fetcher::ImageLimits::production(),
         }
     }
 }
