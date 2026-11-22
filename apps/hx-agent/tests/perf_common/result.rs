@@ -158,11 +158,12 @@ pub fn limits(p: &Profile, strict: bool) -> Limits {
     limits_for(p, strict, true)
 }
 
-/// The Gate 1 CPU numbers are for release builds. A debug build runs the Rust parts of the
-/// pipeline 2 to 3 times slower, so its CPU limits are doubled (it is a functional run, not a
-/// measurement).
+/// The Gate 1 numbers are for release builds. A debug build runs the Rust parts of the pipeline
+/// (colour conversion, framing, the relay) 3 to 10 times slower, so its CPU limits are doubled
+/// and its latency bounds are four times as wide: it is a functional run, not a measurement.
 pub fn limits_for(p: &Profile, strict: bool, release: bool) -> Limits {
     let cpu = if release { 1.0 } else { 2.0 };
+    let slow = if release { 1.0 } else { 4.0 };
     let rtt = f64::from(p.rtt_ms);
     let lan = p.name == "lan";
     let latency = match p.name {
@@ -174,7 +175,7 @@ pub fn limits_for(p: &Profile, strict: bool, release: bool) -> Limits {
         _ => rtt * 4.0 + 600.0,
     };
     Limits {
-        latency_p95_ms: latency,
+        latency_p95_ms: latency * slow,
         active_cores: GATE1_ACTIVE_CORES * cpu,
         idle_cores: GATE1_IDLE_CORES * cpu,
         idle_bytes_s: GATE1_IDLE_BYTES_S,
@@ -496,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn a_debug_build_gets_twice_the_cpu_but_the_same_latency_gate() {
+    fn a_debug_build_gets_twice_the_cpu_and_four_times_the_latency_bound() {
         let mut r = good();
         r.release_build = false;
         r.client.scroll.session_cores = 1.6;
@@ -508,6 +509,12 @@ mod tests {
         r.client.scroll.session_cores = 3.0;
         assert!(!evaluate(&r, &LAN, true).is_empty());
         r.client.scroll.session_cores = 0.4;
+        r.client.typing.latency.as_mut().unwrap().p95 = 150.0;
+        assert!(evaluate(&r, &LAN, true).is_empty());
+        r.client.typing.latency.as_mut().unwrap().p95 = 170.0;
+        assert!(!evaluate(&r, &LAN, true).is_empty());
+        // The same figure fails a release build, where the gate is 40 ms.
+        r.release_build = true;
         r.client.typing.latency.as_mut().unwrap().p95 = 41.0;
         assert!(!evaluate(&r, &LAN, true).is_empty());
     }

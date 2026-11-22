@@ -85,7 +85,7 @@ Defined in `perf_common/result.rs` (`limits_for`, `evaluate`) and unit-tested th
 
 | Check | lan | broadband | lossy | mobile | Why |
 |---|---|---|---|---|---|
-| input-to-picture latency p95 | **40 ms** (Gate 1); 160 ms on a loaded host or without `HX_PERF_STRICT=1` | RTT + 120 ms | 4 x RTT + 600 ms | 4 x RTT + 600 ms | Gate 1 is a LAN number. The others are bounds that separate "slow" from "stalled": the network, the pipeline, and one or two retransmission rounds |
+| input-to-picture latency p95 | **40 ms** (Gate 1); 160 ms on a loaded host or without `HX_PERF_STRICT=1` (x4 again for a debug build) | RTT + 120 ms | 4 x RTT + 600 ms | 4 x RTT + 600 ms | Gate 1 is a LAN number. The others are bounds that separate "slow" from "stalled": the network, the pipeline, and one or two retransmission rounds |
 | every input event shows up on screen | all | all | all | all | a lost event or a stuck picture |
 | cores (session + gateway) while typing or scrolling | **1.5** (Gate 1), doubled for a debug build | same | same | same | the CPU budget does not depend on the network |
 | idle cores | **0.05** (about 0), doubled for a debug build | same | same | same | Gate 1: idle is about 0 |
@@ -113,7 +113,7 @@ cargo nextest run --release -p hx-agent --run-ignored only --test e2e_netem --no
 
 Useful variables: `HX_NETEM_PROFILES=lan,lossy` (a subset), `HX_NETEM_OUT=<dir>` (one JSON per profile), `HX_PERF_RES=1920x1080` (default 1280x720), `HX_NETEM_LOGS=1` and `HX_NETEM_GW_LOG=debug` (the gateway and session logs after the run), `HX_PERF_KEYS`, `HX_PERF_SCROLL_TICKS`, `HX_PERF_IDLE_S`. The pure parts (thresholds, parsers, mark geometry) are ordinary unit tests and run with the workspace.
 
-In CI, `.github/workflows/e2e-netem.yml` runs both tests on every change to the streaming path on a hosted runner (a debug build on a shared machine: functional thresholds, not the strict ones).
+In CI, `.github/workflows/e2e-netem.yml` runs both tests on every change to the streaming path on a hosted runner (a release build on a shared machine: the functional thresholds, not the strict ones). A debug build (the default of the commands above without `--release`) is for a quick functional check: its CPU limits are doubled and its latency bounds are four times as wide.
 
 ### 2.7 Results
 

@@ -4,9 +4,8 @@ name: End-to-end under netem
 # network profile: LAN, broadband, lossy, mobile-ish. The network is two network namespaces joined
 # by a veth pair with `tc netem` on both ends, made unprivileged with `unshare -rn`, and each
 # profile is measured (ping RTT, ping loss, UDP rate) before the flow runs. A hosted runner is a
-# shared machine and a debug build: the thresholds are the functional ones (it works, it
-# recovers, it does not stall, the CPU limits doubled for a debug build, LAN latency at 4x the
-# Gate 1 number). The strict Gate 1 numbers are checked by perf.yml on the dedicated runner.
+# shared machine: the thresholds are the functional ones (it works, it recovers, it does not
+# stall, LAN latency at 4x the Gate 1 number). The strict Gate 1 numbers are checked by perf.yml on the dedicated runner.
 
 on:
   push:
@@ -58,13 +57,13 @@ jobs:
         with:
           tool: cargo-nextest
       - name: Build hx-session next to the gateway binary
-        run: cargo build --locked -p hx-session --bin hx-session
+        run: cargo build --release --locked -p hx-session --bin hx-session
       - name: The impairment is real (ping RTT, loss, jitter, UDP rate on the veth)
         env:
           HX_E2E_NETEM: "1"
           HX_REQUIRE_XVFB: "1"
         run: >
-          cargo nextest run --locked -p hx-agent --test e2e_netem --run-ignored only --no-capture
+          cargo nextest run --release --locked -p hx-agent --test e2e_netem --run-ignored only --no-capture
           --no-tests=fail -E 'test(netem_control_proves_the_impairment_applies)'
       - name: The flow under LAN, broadband and mobile
         env:
@@ -73,7 +72,7 @@ jobs:
           HX_NETEM_PROFILES: lan,broadband,mobile
           HX_NETEM_OUT: ${{ runner.temp }}/netem
         run: >
-          cargo nextest run --locked -p hx-agent --test e2e_netem --run-ignored only --no-capture
+          cargo nextest run --release --locked -p hx-agent --test e2e_netem --run-ignored only --no-capture
           --no-tests=fail -E 'test(netem_e2e_over_all_profiles)'
       - name: The flow under the lossy profile
         # KNOWN FAILURE, tracked in docs/testing.md section 2.8: with 1.5 % loss the decoded
@@ -87,7 +86,7 @@ jobs:
           HX_NETEM_LOGS: "1"
           HX_NETEM_OUT: ${{ runner.temp }}/netem-lossy
         run: >
-          cargo nextest run --locked -p hx-agent --test e2e_netem --run-ignored only --no-capture
+          cargo nextest run --release --locked -p hx-agent --test e2e_netem --run-ignored only --no-capture
           --no-tests=fail -E 'test(netem_e2e_over_all_profiles)'
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: ${{ always() }}
