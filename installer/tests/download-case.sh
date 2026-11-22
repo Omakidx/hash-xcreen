@@ -13,7 +13,7 @@ set -- --hx-lib
 # shellcheck source=../install.sh
 . "$inst"
 LOCK_FILE=$fake/run/hx-install.lock
-BOOT_BASE=$fake/run
+BOOT_BASE=$fake/var/lib
 AGENT_CURRENT=$fake/no-agent
 OS_RELEASE=$fake/os-24
 SYSTEMD_DIR=$fake/sd

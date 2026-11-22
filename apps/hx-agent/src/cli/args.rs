@@ -14,6 +14,8 @@ use hx_ipc::privd::pb::LockoutPurpose;
 use zeroize::Zeroize;
 
 use super::error::CliError;
+use crate::install::InstallArgs;
+use crate::install::options::{FLAGS, Mode, RawOptions, SecretString, VALUED};
 
 /// Where `pairing token` gets the token from.
 #[derive(Debug, PartialEq, Eq)]
@@ -98,6 +100,12 @@ pub enum Cmd {
         keep_desktop: Option<bool>,
         yes: bool,
     },
+    /// `install` (the installer engine, `crate::install`).
+    Install(Box<InstallArgs>),
+    /// `port-rule apply`: re-applies the nftables accept rule (run by `hx-agent-port.service`).
+    PortRuleApply,
+    /// `__empty-dir <path>`: the child of uninstall that empties gatewayd's state as its owner.
+    InternalEmptyDir { path: String },
 }
 
 /// `desktop start|stop|restart`.
@@ -306,6 +314,8 @@ pub fn parse(all: &[String]) -> Result<Parsed, CliError> {
     let args = Scrubbed(all.iter().filter(|a| *a != "--json").cloned().collect());
     let help = args.iter().any(|a| a == "-h" || a == "--help");
     let cmd = parse_cmd(&args, help)?;
+    // `install --ssh` talks to an app: its output is JSON Lines, always.
+    let json = json || matches!(&cmd, Cmd::Install(a) if a.mode == Some(Mode::Ssh));
     Ok(Parsed { json, cmd })
 }
 
@@ -617,8 +627,159 @@ fn parse_cmd(args: &[String], help: bool) -> Result<Cmd, CliError> {
                 yes: o.flag("--yes"),
             })
         }
+        "install" => parse_install(rest),
+        "port-rule" => {
+            let (_, r) = group(&["apply"])?;
+            opts(&r, &[], &[])?.positionals(0, "")?;
+            Ok(Cmd::PortRuleApply)
+        }
+        "__empty-dir" => {
+            let o = opts(rest, &[], &[])?;
+            let p = o.positionals(1, "the directory")?[0].clone();
+            if !p.starts_with('/') {
+                return Err(usage("the directory must be an absolute path"));
+            }
+            Ok(Cmd::InternalEmptyDir { path: p })
+        }
         _ => Err(usage("unknown command (try: hx-agent help)")),
     }
+}
+
+/// Flags of `install` (the booleans of [`FLAGS`] are among them).
+#[cfg(not(feature = "install-test-hooks"))]
+const INSTALL_FLAGS: &[&str] = &[
+    "--interactive",
+    "--pair",
+    "--ssh",
+    "--docker",
+    "--allow-private-networks",
+];
+#[cfg(feature = "install-test-hooks")]
+const INSTALL_FLAGS: &[&str] = &[
+    "--interactive",
+    "--pair",
+    "--ssh",
+    "--docker",
+    "--allow-private-networks",
+    "--test-allow-container",
+];
+
+/// Valued options of `install`: [`VALUED`] and the extras (a test checks that they agree).
+#[cfg(not(feature = "install-test-hooks"))]
+const INSTALL_VALUED: &[&str] = &[
+    "--distro",
+    "--desktop",
+    "--user",
+    "--hostname",
+    "--timezone",
+    "--locale",
+    "--keyboard",
+    "--apps",
+    "--backup",
+    "--backup-keep",
+    "--cpu",
+    "--memory",
+    "--disk",
+    "--storage-device",
+    "--image",
+    "--image-file",
+    "--port",
+    "--domain",
+    "--channel",
+    "--token",
+    "--bootstrap-dir",
+    "--lock-fd",
+];
+#[cfg(feature = "install-test-hooks")]
+const INSTALL_VALUED: &[&str] = &[
+    "--distro",
+    "--desktop",
+    "--user",
+    "--hostname",
+    "--timezone",
+    "--locale",
+    "--keyboard",
+    "--apps",
+    "--backup",
+    "--backup-keep",
+    "--cpu",
+    "--memory",
+    "--disk",
+    "--storage-device",
+    "--image",
+    "--image-file",
+    "--port",
+    "--domain",
+    "--channel",
+    "--token",
+    "--bootstrap-dir",
+    "--lock-fd",
+    "--test-fail-after",
+];
+
+fn parse_install(rest: &[String]) -> Result<Cmd, CliError> {
+    let o = opts(rest, INSTALL_FLAGS, INSTALL_VALUED)?;
+    o.positionals(0, "")?;
+    let modes = [
+        (o.flag("--interactive"), Mode::Interactive),
+        (o.flag("--pair"), Mode::Pair),
+        (o.flag("--ssh"), Mode::Ssh),
+        (o.value("--token").is_some(), Mode::Token),
+    ];
+    let given: Vec<Mode> = modes
+        .iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, m)| *m)
+        .collect();
+    if given.len() > 1 {
+        return Err(usage(
+            "at most one of --interactive, --pair, --ssh and --token can be given",
+        ));
+    }
+    let mut raw = RawOptions::default();
+    for name in VALUED {
+        if let Some(v) = o.value(name) {
+            raw.values.insert(name, v.to_owned());
+        }
+    }
+    for name in FLAGS {
+        if o.flag(name) {
+            raw.flags.insert(name);
+        }
+    }
+    let bootstrap_dir = match o.value("--bootstrap-dir") {
+        Some(d) if d.starts_with('/') => Some(d.to_owned()),
+        Some(_) => return Err(usage("--bootstrap-dir must be an absolute path")),
+        None => None,
+    };
+    let lock_fd = match o.value("--lock-fd") {
+        Some(v) => match v.parse::<i32>() {
+            Ok(n) if n >= 3 => Some(n),
+            _ => return Err(usage("--lock-fd must be a descriptor number of 3 or more")),
+        },
+        None => None,
+    };
+    #[cfg(feature = "install-test-hooks")]
+    let (test_allow_container, test_fail_after) = {
+        let f = o.value("--test-fail-after").map(str::to_owned);
+        if let Some(id) = &f
+            && !crate::install::state::STAGES.contains(&id.as_str())
+        {
+            return Err(usage("--test-fail-after must name a stage id"));
+        }
+        (o.flag("--test-allow-container"), f)
+    };
+    #[cfg(not(feature = "install-test-hooks"))]
+    let (test_allow_container, test_fail_after) = (false, None);
+    Ok(Cmd::Install(Box::new(InstallArgs {
+        mode: given.first().copied(),
+        token: o.value("--token").map(|t| SecretString::new(t.to_owned())),
+        raw,
+        bootstrap_dir,
+        lock_fd,
+        test_allow_container,
+        test_fail_after,
+    })))
 }
 
 #[cfg(test)]
@@ -719,6 +880,56 @@ mod tests {
         };
         assert!(audit && !journal);
         assert!(p(&["logs", "-n", "0"]).is_err());
+    }
+
+    #[test]
+    fn install_accepts_exactly_the_documented_options() {
+        for v in VALUED {
+            assert!(INSTALL_VALUED.contains(v), "{v}");
+        }
+        for f in FLAGS {
+            assert!(INSTALL_FLAGS.contains(f), "{f}");
+        }
+        let extra: Vec<&&str> = INSTALL_VALUED
+            .iter()
+            .filter(|v| !VALUED.contains(v))
+            .collect();
+        assert_eq!(extra[..3], [&"--token", &"--bootstrap-dir", &"--lock-fd"]);
+    }
+
+    #[test]
+    fn install_modes_are_exclusive_and_token_is_a_mode() {
+        let Cmd::Install(a) = p(&[
+            "install", "--ssh", "--user", "alice", "--port", "8443", "--docker",
+        ])
+        .unwrap()
+        .cmd
+        else {
+            panic!()
+        };
+        assert_eq!(a.mode, Some(Mode::Ssh));
+        assert_eq!(a.raw.values["--user"], "alice");
+        assert!(a.raw.flags.contains("--docker"));
+        assert!(
+            p(&["install", "--ssh"]).unwrap().json,
+            "--ssh implies --json"
+        );
+        assert!(!p(&["install", "--pair"]).unwrap().json);
+        let Cmd::Install(t) = p(&["install", "--token", "hxt1-abc"]).unwrap().cmd else {
+            panic!()
+        };
+        assert_eq!(t.mode, Some(Mode::Token));
+        assert!(
+            !format!("{t:?}").contains("hxt1-abc"),
+            "the token never prints"
+        );
+        let Cmd::Install(n) = p(&["install"]).unwrap().cmd else {
+            panic!()
+        };
+        assert_eq!(n.mode, None, "no mode: resume the recorded one");
+        assert!(p(&["install", "--interactive", "--token", "x"]).is_err());
+        assert!(p(&["install", "--user", "a", "--user", "b"]).is_err());
+        assert!(p(&["install", "--password", "x"]).is_err());
     }
 
     #[test]

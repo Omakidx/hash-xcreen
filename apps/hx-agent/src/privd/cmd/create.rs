@@ -178,14 +178,22 @@ pub async fn create_desktop<T: Transport + Clone + 'static>(
         let meta = crate::privd::daemon::DesktopMeta::from_config(&inst);
         if meta.state == "ready" {
             if meta.recipe == recipe_text(recipe) && meta.username == username.as_str() {
-                return Ok(response::Result::CreateDesktop(pb::CreateDesktopResult {
-                    desktop_id: id,
-                    path_taken: pb::PathTaken::Build as i32,
-                    reason: "the desktop already exists with these arguments".into(),
-                    timings: Vec::new(),
-                    warnings: Vec::new(),
-                    docker: None,
-                }));
+                let registered = d.read_state(|s| s.desktops.contains_key(&id));
+                if registered {
+                    // A resume: nothing to do, and the password stays as it is.
+                    return Ok(response::Result::CreateDesktop(pb::CreateDesktopResult {
+                        desktop_id: id,
+                        path_taken: pb::PathTaken::Build as i32,
+                        reason: "the desktop already exists with these arguments".into(),
+                        timings: Vec::new(),
+                        warnings: Vec::new(),
+                        docker: None,
+                    }));
+                }
+                // A desktop kept by `uninstall --keep-desktop`: the instance survived, privd's
+                // registry and the session link did not. Adopt it.
+                return adopt_kept_desktop(d, ctx, &client, &id, &name, recipe, &username, secrets)
+                    .await;
             }
             return Err(CmdError::precondition(
                 ErrorDetail::DesktopExists,
@@ -373,6 +381,91 @@ pub async fn create_desktop<T: Transport + Clone + 'static>(
                 let _ = d.unregister_desktop(&id);
             }
             ended?;
+            Err(e)
+        }
+    }
+}
+
+/// Adopts a ready desktop that `uninstall --keep-desktop` left behind: registers it again,
+/// **sets the password given in this request** (so that the verifier the installer writes next
+/// matches the Linux account), and provisions the session link and the session again.
+///
+/// The password change is shielded like `SetUserPassword` (`change_user_password` runs as one
+/// detached task that is always awaited to the end). On a failure the desktop is unregistered
+/// again, so a retry adopts it afresh.
+#[allow(clippy::too_many_arguments)]
+async fn adopt_kept_desktop<T: Transport + Clone + 'static>(
+    d: &Daemon<T>,
+    ctx: &mut Ctx,
+    client: &hx_provision::incus::Client<T>,
+    id: &str,
+    name: &str,
+    recipe: hx_provision::RecipeId,
+    username: &hx_provision::Username,
+    secrets: Secrets,
+) -> Result<response::Result, CmdError> {
+    let others = d.read_state(|s| s.desktops.keys().filter(|k| *k != id).count());
+    if others >= d.cfg.max_desktops {
+        return Err(CmdError::precondition(
+            ErrorDetail::DesktopExists,
+            "the desktop limit is reached",
+        ));
+    }
+    d.register_desktop(id)?;
+    let progress = ctx.progress.clone();
+    let result: Result<Vec<String>, CmdError> = async {
+        progress.stage(
+            ProgressStage::Post,
+            "setting the password of the kept desktop",
+        );
+        match hx_provision::password::change_user_password(&d.incus, name, username, secrets, false)
+            .await
+            .map_err(|e| CmdError::from(e).at_stage(ProgressStage::Post))?
+        {
+            hx_provision::password::PasswordChange::Changed => {}
+            _ => {
+                return Err(CmdError::internal(
+                    "the password of the kept desktop could not be set",
+                )
+                .at_stage(ProgressStage::Post));
+            }
+        }
+        let mut warnings = Vec::new();
+        progress.stage(ProgressStage::Session, "linking the session");
+        provision_link_inner(d, ctx, client, id, name)
+            .await
+            .map_err(|e| e.at_stage(ProgressStage::Session))?;
+        if install_inner(d, ctx, client, id, name, &recipe_text(recipe))
+            .await
+            .map_err(|e| e.at_stage(ProgressStage::Session))?
+            .is_none()
+        {
+            warnings.push(
+                "the hx-session package is not installed on the host; run InstallSession once it is"
+                    .to_string(),
+            );
+        }
+        Ok(warnings)
+    }
+    .await;
+    // Only now may the request end as cancelled; a completed password change stands.
+    if let Some(reason) = ctx.cancel.reason() {
+        return Err(reason.error());
+    }
+    match result {
+        Ok(warnings) => {
+            progress.emit(ProgressStage::Done, 0, 0, "done", 100, true);
+            Ok(response::Result::CreateDesktop(pb::CreateDesktopResult {
+                desktop_id: id.to_string(),
+                path_taken: pb::PathTaken::Build as i32,
+                reason: "adopted the existing desktop".into(),
+                timings: Vec::new(),
+                warnings,
+                docker: None,
+            }))
+        }
+        Err(e) => {
+            let _ = d.unregister_desktop(id);
             Err(e)
         }
     }

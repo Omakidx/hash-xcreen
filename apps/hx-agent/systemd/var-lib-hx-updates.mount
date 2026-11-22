@@ -14,9 +14,19 @@
 [Unit]
 Description=hash-xcreen update fetcher directory (size-capped tmpfs)
 Documentation=https://github.com/Omakidx/hash-xcreen/blob/main/docs/ipc.md
+# NOT a local-fs mount. The mount point is created by tmpfiles (tmpfiles.d/hx.conf), so this unit
+# has to start after systemd-tmpfiles-setup.service, which itself starts after local-fs.target.
+# A mount unit with default dependencies is ordered Before=local-fs.target (and was WantedBy= it):
+# that closed the cycle tmpfiles-setup -> local-fs.target -> this mount -> tmpfiles-setup, and
+# systemd broke it at every boot by DELETING the start job of systemd-tmpfiles-setup.service, so
+# no tmpfiles.d entry of the host (the /run/hx directories, the sockets' parent) existed after a
+# reboot. Found by the nested-Incus installer run (`systemd-analyze verify default.target`).
+# hx-privd.service and the fetcher pull the mount in with RequiresMountsFor=.
+DefaultDependencies=no
 After=systemd-tmpfiles-setup.service
 Requires=systemd-tmpfiles-setup.service
-# The mount point is created by tmpfiles (tmpfiles.d/hx.conf).
+Before=umount.target
+Conflicts=umount.target
 ConditionPathIsDirectory=/var/lib/hx/updates
 
 [Mount]
@@ -26,4 +36,4 @@ Type=tmpfs
 Options=size=300M,nr_inodes=64,mode=1733,uid=0,gid=0,nosuid,nodev,noexec
 
 [Install]
-WantedBy=local-fs.target
+WantedBy=multi-user.target

@@ -166,6 +166,10 @@ pub async fn setup_host<T: Transport + Clone + 'static>(
             extra_host_addresses: params.extra.iter().map(ToString::to_string).collect(),
         });
     })?;
+    // SetupHost just changed what `GetHostInfo` probes (the `inet hx` table, the DOCKER-USER
+    // rules): drop the cached probe so the next GetHostInfo looks again instead of answering
+    // with what it saw before the firewall was loaded (up to 5 s ago).
+    *d.host_probe.lock().unwrap_or_else(|e| e.into_inner()) = None;
     ctx.progress
         .emit(ProgressStage::Host, 0, 0, "host ready", 100, true);
     Ok(response::Result::SetupHost(result))

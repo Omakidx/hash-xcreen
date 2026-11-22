@@ -1,0 +1,46 @@
+# Re-applies the nftables accept rule for the agent's public port after nftables loads its ruleset
+# (docs/architecture.md 5.3, design D-Port). Installed and enabled by `hx-agent install` only when
+# the host runs a native nftables firewall that drops inbound traffic; a host with ufw or without
+# a blocking firewall never gets it.
+#
+# The rule itself is added by `hx-agent port-rule apply`, which reads the port from the install
+# state, finds the input chain that drops, and inserts one rule with the comment "hx-agent-port"
+# (idempotent: it removes a rule of ours for another port and does nothing if the rule exists).
+# A ruleset *reload* (`nft -f /etc/nftables.conf` with `flush ruleset`) removes the rule; this unit
+# is PartOf=nftables.service, so a restart of that service brings the rule back.
+
+[Unit]
+Description=hash-xcreen agent port rule (nftables)
+Documentation=https://github.com/Omakidx/hash-xcreen/blob/main/docs/architecture.md
+After=nftables.service
+PartOf=nftables.service
+ConditionPathExists=/var/lib/hx/install-state.json
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/hx/current/hx-agent port-rule apply
+User=root
+UMask=0077
+LimitMEMLOCK=infinity
+LimitCORE=0
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_IPC_LOCK
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+[Install]
+WantedBy=multi-user.target nftables.service

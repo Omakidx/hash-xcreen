@@ -105,9 +105,9 @@ else
 fi
 
 # ---- 5. no test-hook feature in a release build ----
-# The compile-time gate (keys.rs) rejects `test-support` and `test-release-key` next to
-# `release-build`; the features of the other workstreams are checked here, textually, on the
-# workflow that builds the release. `test-shadow-path` is hx-pwcheck's HX_PWCHECK_SHADOW override.
+# The compile-time gate (keys.rs) rejects every hx-agent test feature next to `release-build`;
+# this textual check on the workflow that builds the release is a second line, and the only one
+# for `test-shadow-path` (hx-pwcheck's HX_PWCHECK_SHADOW override, another crate).
 FORBIDDEN='test-support install-test-hooks privd-test-hooks gateway-test-hooks test-release-key test-shadow-path'
 [ -n "$wf" ] || wf="$root/.github/workflows/release.yml"
 if [ -f "$wf" ]; then

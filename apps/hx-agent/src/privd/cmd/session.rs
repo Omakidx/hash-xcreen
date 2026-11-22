@@ -107,7 +107,7 @@ pub fn read_package(root: &std::path::Path, rel: &str) -> Result<Option<Vec<u8>>
         rustix::io::Errno::NOENT => CmdError::internal("the release directory is missing"),
         e => CmdError::from(std::io::Error::from(e)),
     })?;
-    let f = match rustix::fs::openat2(
+    let f = match crate::privd::update::beneath::open_beneath(
         &dir,
         rel,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
@@ -212,6 +212,13 @@ pub async fn install_inner<T: Transport + Clone + 'static>(
     let env = vec![("DEBIAN_FRONTEND".to_string(), "noninteractive".to_string())];
     let version = d
         .run_cancellable(ctx, client, Some(id), async {
+            // Incus makes one directory per call (mkdir, not mkdir -p): `/var/lib/hx` does not
+            // exist in a desktop, and pushing the child alone is `404 Not Found`.
+            if let Some(parent) = std::path::Path::new(CONTAINER_DIR).parent() {
+                client
+                    .push_dir(instance, &parent.to_string_lossy(), 0o700)
+                    .await?;
+            }
             client.push_dir(instance, CONTAINER_DIR, 0o700).await?;
             client.push_file(instance, &target, &bytes, 0o600).await?;
             let out = run_in(

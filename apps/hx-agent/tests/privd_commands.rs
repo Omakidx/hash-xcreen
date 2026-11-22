@@ -1312,6 +1312,61 @@ fn host_runner() -> Arc<FakeRunner> {
     })
 }
 
+/// Found by the nested-Incus installer run: the installer's `units` stage calls `GetHostInfo`
+/// (the probe is cached for 5 s), then `SetupHost` loads the firewall, and the `GetHostInfo`
+/// right after answered the cached `host_firewall_loaded = false`, so the first install on a
+/// clean host failed at stage `host`.
+#[tokio::test]
+async fn host_info_right_after_setup_host_sees_the_firewall_that_setup_host_loaded() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let loaded = Arc::new(AtomicBool::new(false));
+    let l = loaded.clone();
+    let runner = FakeRunner::with(move |p| {
+        let code = match (p.tool, p.args.first().map(String::as_str)) {
+            (Tool::Nft, Some("-f")) => {
+                l.store(true, Ordering::SeqCst);
+                0
+            }
+            (Tool::Nft, Some("list")) if !l.load(Ordering::SeqCst) => 1,
+            (Tool::Iptables, Some("-C")) => 1,
+            _ => 0,
+        };
+        let stdout = if p.tool == Tool::Ip {
+            r#"[{"ifname":"eth0","addr_info":[{"family":"inet","local":"203.0.113.9"}]},
+                {"ifname":"hxbr0","addr_info":[{"family":"inet","local":"10.99.0.1"}]}]"#
+        } else {
+            ""
+        };
+        RunOutput {
+            code: Some(code),
+            stdout: stdout.into(),
+            ..Default::default()
+        }
+    });
+    let h = Harness::start_with(GW, FakeProbe::default(), FakeIncus::new(), runner);
+    h.incus.with(|s| s.pool_exists = false);
+    let R::GetHostInfo(before) =
+        ok(run(&h, Role::Admin, Command::GetHostInfo(Default::default())).await)
+    else {
+        panic!()
+    };
+    assert!(!before.host_firewall_loaded, "nothing is loaded yet");
+    let R::SetupHost(r) = ok(run(&h, Role::Admin, Command::SetupHost(Default::default())).await)
+    else {
+        panic!()
+    };
+    assert!(r.firewall_loaded);
+    let R::GetHostInfo(after) =
+        ok(run(&h, Role::Admin, Command::GetHostInfo(Default::default())).await)
+    else {
+        panic!()
+    };
+    assert!(
+        after.host_firewall_loaded,
+        "the 5 s probe cache must not hide what SetupHost just loaded"
+    );
+}
+
 #[tokio::test]
 async fn setup_host_loads_and_persists_the_generated_ruleset_through_the_runner() {
     let runner = host_runner();
@@ -2470,4 +2525,122 @@ async fn n9_any_admitted_desktop_command_enforces_it_and_a_docker_desktop_is_lef
         "Running"
     );
     assert!(h.daemon.flags_for("main").is_empty());
+}
+
+// ----- a desktop kept by `uninstall --keep-desktop` is adopted on reinstall ----------------------
+
+fn create_cmd(user: &str) -> Command {
+    Command::CreateDesktop(pb::CreateDesktopRequest {
+        desktop_id: "main".into(),
+        distro: pb::Distro::Ubuntu2404 as i32,
+        desktop: pb::DesktopKind::Xfce as i32,
+        preset: pb::Preset::Basic as i32,
+        username: user.into(),
+        ..Default::default()
+    })
+}
+
+fn chpasswd_count(h: &Harness) -> usize {
+    h.incus
+        .with(|s| s.execs.iter().filter(|e| e.contains("chpasswd")).count())
+}
+
+#[tokio::test]
+async fn create_desktop_adopts_a_ready_desktop_that_privd_forgot() {
+    let h = Harness::start(GW);
+    // The instance survived an `uninstall --keep-desktop`; privd's registry and the link did not.
+    h.incus
+        .add_desktop("hx-main", "ubuntu-24.04-xfce-basic", "alice", true);
+    assert!(!h.daemon.read_state(|s| s.desktops.contains_key("main")));
+    open_window(&h).await;
+    // Without adoption FinishSetup finds no ready desktop.
+    let r = run(
+        &h,
+        Role::Admin,
+        Command::FinishSetup(pb::FinishSetupRequest::default()),
+    )
+    .await;
+    assert_eq!(
+        err(&r),
+        (ErrorCode::FailedPrecondition, ErrorDetail::DesktopNotReady)
+    );
+    let kinds = [pb::SecretKind::UserPassword];
+    let pw: &[&[u8]] = &[b"New-Password-For-The-Kept-One-3"];
+    let before = chpasswd_count(&h);
+    let R::CreateDesktop(c) =
+        ok(run_with(&h.daemon, Role::Admin, create_cmd("alice"), &kinds, pw).await)
+    else {
+        panic!()
+    };
+    assert_eq!(c.reason, "adopted the existing desktop");
+    assert!(
+        h.daemon.read_state(|s| s.desktops.contains_key("main")),
+        "registered again"
+    );
+    // The password of this request was set in the kept desktop (and never in an argv).
+    assert_eq!(chpasswd_count(&h), before + 1);
+    assert!(
+        h.incus
+            .with(|s| s.execs.iter().all(|e| !e.contains("New-Password-For")))
+    );
+    // The session link is provisioned again; a missing package is a warning, not a failure.
+    assert!(
+        h.incus
+            .with(|s| s.instances["hx-main"].devices.contains_key("hx-link"))
+    );
+    assert!(
+        c.warnings.iter().any(|w| w.contains("hx-session package")),
+        "{:?}",
+        c.warnings
+    );
+    // FinishSetup now succeeds.
+    ok(run(
+        &h,
+        Role::Admin,
+        Command::FinishSetup(pb::FinishSetupRequest::default()),
+    )
+    .await);
+    // A resume (already registered) changes nothing and sets no second password.
+    let R::CreateDesktop(c2) =
+        ok(run_with(&h.daemon, Role::Admin, create_cmd("alice"), &kinds, pw).await)
+    else {
+        panic!()
+    };
+    assert!(c2.reason.contains("already exists"));
+    assert_eq!(chpasswd_count(&h), before + 1);
+}
+
+#[tokio::test]
+async fn adoption_needs_the_same_arguments_and_is_undone_when_it_fails() {
+    let h = Harness::start(GW);
+    h.incus
+        .add_desktop("hx-main", "ubuntu-24.04-xfce-basic", "alice", true);
+    open_window(&h).await;
+    let kinds = [pb::SecretKind::UserPassword];
+    let pw: &[&[u8]] = &[b"Some-Password-1234"];
+    // Other arguments: still a refusal, and nothing is registered.
+    let r = run_with(&h.daemon, Role::Admin, create_cmd("bob"), &kinds, pw).await;
+    assert_eq!(
+        err(&r),
+        (ErrorCode::FailedPrecondition, ErrorDetail::DesktopExists)
+    );
+    assert!(!h.daemon.read_state(|s| s.desktops.contains_key("main")));
+    // The password cannot be set: the adoption fails and the desktop is unregistered again.
+    h.incus.with(|s| {
+        s.exec_rules.push(ExecRule {
+            needle: "chpasswd".into(),
+            exit: 1,
+            stdout: "boom".into(),
+            delay: Some(std::time::Duration::ZERO),
+        });
+    });
+    let r = run_with(&h.daemon, Role::Admin, create_cmd("alice"), &kinds, pw).await;
+    assert!(
+        matches!(
+            r.result,
+            Some(hx_ipc::privd::pb::response::Result::Error(_))
+        ),
+        "{r:?}"
+    );
+    assert!(!h.daemon.read_state(|s| s.desktops.contains_key("main")));
 }

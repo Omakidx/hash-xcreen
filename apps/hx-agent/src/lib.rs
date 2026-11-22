@@ -13,5 +13,6 @@
 pub mod cli;
 pub mod fetcher;
 pub mod gateway;
+pub mod install;
 pub mod link;
 pub mod privd;

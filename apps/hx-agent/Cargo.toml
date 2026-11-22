@@ -18,6 +18,16 @@ test-support = ["dep:tempfile"]
 # Test-only hooks of the hx-gatewayd binary (`--admin-allow-uid`). Never enabled in a release
 # build: the crate's own tests turn it on through the dev-dependency on itself below.
 gateway-test-hooks = []
+# Test-only hooks of `hx-agent install` (`--test-allow-container`, `--test-fail-after <stage>`) and
+# the fakes of `install::testing`. Never enabled in a release build: the crate's own tests turn it
+# on through the dev-dependency on itself below, and the release gate forbids it (design C12).
+install-test-hooks = ["dep:tempfile"] # install::testing builds a TempDir; a bin build with only this feature must compile
+# Test-only hook of hx-privd for hosts where /proc/sys is not writable (a nested VM or an
+# unprivileged container in the installer's tests): a failed `sysctl -p` of the Incus drop-in, or
+# sysctl values that did not take effect, become a warning and `SetupHostResult.sysctl_applied` is
+# false, instead of failing `SetupHost`. NEVER in a release build: the release gate rejects it, and
+# no crate enables it by default. The dev-dependency below deliberately does not turn it on.
+privd-test-hooks = []
 # The release gate (WS-3, installer 1E; src/privd/update/keys.rs): turns the build into a compile
 # error unless release-keys/current.pub AND next.pub are provisioned, and forbids combining it
 # with `test-support` or `test-release-key`. Only the release workflow enables it, and only for
@@ -28,12 +38,6 @@ release-build = []
 # build time (the base64 key line made by release/make-test-release.sh). For the installer test
 # harness only; the release gate rejects it.
 test-release-key = []
-# Test-only hook of hx-privd for hosts where /proc/sys is not writable (a nested VM or an
-# unprivileged container in the installer's tests): a failed `sysctl -p` of the Incus drop-in, or
-# sysctl values that did not take effect, become a warning and `SetupHostResult.sysctl_applied` is
-# false, instead of failing `SetupHost`. NEVER in a release build: the release gate rejects it, and
-# no crate enables it by default. The dev-dependency below deliberately does not turn it on.
-privd-test-hooks = []
 
 [dependencies]
 argon2 = { version = "0.6.0", features = ["zeroize"] } # wipes its memory blocks (the CLI hashes typed secrets)
@@ -51,7 +55,7 @@ libc = "0.2" # seccomp numbers (gateway) and SO_PEERGROUPS (privd::peergroups)
 listenfd = "1.0.2"
 minisign-verify = "0.3.0"
 prost.workspace = true
-rustix = { workspace = true, features = ["fs", "mm", "process", "net", "rand", "termios"] }
+rustix = { workspace = true, features = ["fs", "mm", "process", "net", "rand", "termios", "event", "stdio", "system"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-native-certs = "0.8.5"
 seccompiler = "0.5"
@@ -75,7 +79,7 @@ ffmpeg-next.workspace = true # the end-to-end test decodes the frames it receive
 hx-capture.workspace = true
 hx-session.workspace = true
 x11rb = { workspace = true, features = ["xtest"] }
-hx-agent = { path = ".", features = ["test-support", "gateway-test-hooks"] }
+hx-agent = { path = ".", features = ["test-support", "gateway-test-hooks", "install-test-hooks"] }
 hyper = "1" # the real-Incus test builds one raw `Request`
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

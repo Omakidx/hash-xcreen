@@ -26,7 +26,7 @@ sh "$root/release/make-test-release.sh" --out "$tmp/rel-other" >/dev/null 2>&1
 sh "$root/release/make-test-release.sh" --out "$tmp/rel-old" --timestamp "$(($(date +%s) - 100 * 86400))" >/dev/null 2>&1
 
 fake=$tmp/fake
-mkdir -p "$fake/run" "$fake/sd"
+mkdir -p "$fake/run" "$fake/var/lib" "$fake/sd"
 printf 'ID=ubuntu\nVERSION_ID="24.04"\n' >"$fake/os-24"
 printf 'ID=ubuntu\nVERSION_ID="22.04"\n' >"$fake/os-22"
 printf 'ID=fedora\nVERSION_ID=41\n' >"$fake/os-fedora"

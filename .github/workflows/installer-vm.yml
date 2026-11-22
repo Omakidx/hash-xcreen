@@ -1,0 +1,184 @@
+name: Installer VM
+
+# The real installer on fresh KVM VMs (design D8 b, docs/spikes/1e-installer-nested-incus.md).
+#
+# Each cell launches a VM of one host OS under Incus on a GitHub runner, runs the real install.sh
+# (test-keyed copy, --release-dir) and hx-agent install with secrets on stdin, and checks the units
+# under real systemd, pairing and PIN login from the runner, the first frame of the desktop built
+# inside the VM, the secrets canary, the hx-provision host-ruleset checklist, failure injection and
+# resume, idempotence, a pending update whose privd fails, a VM reboot, and uninstall in both modes
+# with an empty-leftovers check. The `prebuilt` cells assert the clean refusal of `--image prebuilt`
+# (exit 6, nothing changed): the prebuilt path is not in this release (privd answers
+# UNIMPLEMENTED). The box "installer CI: both image paths" stays open until 1D's prebuilt CI lands.
+#
+# Triggers: nightly, workflow_dispatch, and pull requests that carry the `installer-vm` label or
+# touch the installer (see the gate job).
+#
+# Known limit: the Zabbly apt key (src/install/zabbly-key.asc) is still UNPROVISIONED, so a host
+# whose own Incus is too old cannot install it. Debian 12 has no Incus in its main archive, so its
+# build cell skips itself with a warning annotation until the key is provisioned (run-cell.sh); its prebuilt
+# cell still runs (the refusal comes before Incus). No cell uses --docker, which needs Incus 6.0.5
+# or newer: on the distros whose own Incus is 6.0.0 that means Zabbly as well.
+#
+# This workflow could not be run where it was written (no /dev/kvm there); the local nested
+# container run (apps/hx-agent/tests/install_nested_incus.rs) covers the same installer flow.
+
+on:
+  schedule:
+    - cron: "23 2 * * *"
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: installer-vm-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: Gate
+    runs-on: ubuntu-24.04
+    outputs:
+      run: ${{ steps.g.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: g
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.base_ref }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          run=true
+          if [ "$EVENT" = pull_request ]; then
+            run=false
+            if echo "$LABELS" | grep -q '"installer-vm"'; then
+              run=true
+            elif git diff --name-only "origin/$BASE...HEAD" |
+              grep -Eq '^(installer/|apps/hx-agent/src/install/|apps/hx-agent/systemd/|tests/installer-vm/|\.github/workflows/installer-vm\.yml)'; then
+              run=true
+            fi
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "installer-vm cells will run: $run"
+
+  artifacts:
+    name: Test-keyed release and client
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - name: Install system libraries
+        # The same FFmpeg, libx264 and libclang set as the CI jobs (hx-session and the test client
+        # link the system FFmpeg), plus dpkg-dev for dpkg-shlibdeps (the hx-session package).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev pkg-config libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libx264-dev dpkg-dev jq
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the test-keyed release directory and the client
+        run: tests/installer-vm/build-artifacts.sh "$RUNNER_TEMP/artifacts"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-vm-artifacts
+          path: ${{ runner.temp }}/artifacts
+          retention-days: 3
+          if-no-files-found: error
+
+  cell:
+    name: ${{ matrix.os }} / ${{ matrix.image }}${{ matrix.variant != 'none' && format(' / {0}', matrix.variant) || '' }}
+    needs: [gate, artifacts]
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    # Debian 12 needs Zabbly for Incus, whose key is not provisioned yet (see the header).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04, debian-12, debian-13]
+        image: [build, prebuilt]
+        variant: [none]
+        include:
+          # ufw active on the host: the port rule must open 443 through ufw.
+          - os: ubuntu-24.04
+            image: build
+            variant: ufw
+          # Docker on the host with a published port: DOCKER-USER rules and the DNAT drop.
+          - os: debian-13
+            image: build
+            variant: docker-host
+          # --allow-private-networks: the private-range probes succeed (checklist item 5).
+          - os: ubuntu-24.04
+            image: build
+            variant: private
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: installer-vm-artifacts
+          path: ${{ runner.temp }}/artifacts
+      - name: Runtime libraries of the client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libx264-dev jq
+          chmod +x "$RUNNER_TEMP/artifacts/client"
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+      - name: Install and initialise Incus
+        run: |
+          # With recommends: incus only recommends dnsmasq-base (its managed bridge needs it), and
+          # Ubuntu's qemu-system-x86 only recommends the SPICE module that Incus VMs need. This is
+          # the CI runner, not a host under test: the installer installs its own minimal set.
+          sudo apt-get update -q
+          sudo apt-get install -y incus incus-client dnsmasq-base qemu-system-x86 qemu-system-modules-spice ovmf qemu-utils
+          sudo incus admin init --minimal
+          # VM disks (40 GiB each) live on /mnt, the big disk of the runner.
+          sudo mkdir -p /mnt/incus
+          sudo incus storage create ci dir source=/mnt/incus
+          sudo incus profile device remove default root
+          sudo incus profile device add default root disk path=/ pool=ci
+          # Docker on the runner drops forwarded traffic of the Incus bridge.
+          sudo iptables -I DOCKER-USER -i incusbr0 -j ACCEPT || true
+          sudo iptables -I DOCKER-USER -o incusbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT || true
+          sudo incus version
+      - name: Run the cell
+        env:
+          CELL_OS: ${{ matrix.os }}
+          CELL_IMAGE: ${{ matrix.image }}
+          CELL_VARIANT: ${{ matrix.variant }}
+          ART: ${{ runner.temp }}/artifacts
+          OUT: ${{ runner.temp }}/out
+        run: tests/installer-vm/run-cell.sh
+      - name: Stage timings
+        if: always()
+        run: |
+          f="$RUNNER_TEMP/out/stages.tsv"
+          if [ -s "$f" ]; then
+            {
+              echo "### ${{ matrix.os }} / ${{ matrix.image }} / ${{ matrix.variant }}: install duration per stage (ms)"
+              echo
+              echo "| stage | ms |"
+              echo "|---|---|"
+              awk -F'\t' '{print "| " $1 " | " $2 " |"}' "$f"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cell-${{ matrix.os }}-${{ matrix.image }}-${{ matrix.variant }}
+          path: ${{ runner.temp }}/out
+          retention-days: 7
+          if-no-files-found: ignore
