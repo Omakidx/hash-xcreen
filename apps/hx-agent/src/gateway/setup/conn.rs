@@ -249,7 +249,7 @@ impl SetupCoordinator {
                 // Copied into zeroizing memory at once; the message is dropped here.
                 let pin = Zeroizing::new(p.pin.to_vec());
                 drop(p);
-                let a = self.set_pin(pin).await;
+                let a = self.set_pin(me, pin).await;
                 if a.status == S::Ok as i32 {
                     *authorized = true;
                 }
@@ -258,8 +258,8 @@ impl SetupCoordinator {
             // KeyOnly: everything but `set_pin` waits for a PIN.
             B::Start(_) | B::Cancel(_) | B::Finish(_) if !*authorized => ack(S::PinRequired),
             B::Start(s) => self.start(me, s),
-            B::Cancel(_) => self.cancel(),
-            B::Finish(_) => self.finish().await,
+            B::Cancel(_) => self.cancel(me),
+            B::Finish(_) => self.finish(me).await,
             _ => return violation("unexpected setup body"),
         };
         // `set_pin` after the PIN exists is `PIN_ALREADY_SET` even when authorized, which

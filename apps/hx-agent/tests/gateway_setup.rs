@@ -882,3 +882,41 @@ async fn finish_needs_a_usable_desktop_and_then_ends_the_setup() {
         Err(Error::SetupClosed)
     ));
 }
+
+/// Security review I4: every mutating setup request re-checks the binding, not only `start`.
+/// The connection stays open for up to a second after the window ends (the tick), and a
+/// request that arrives in that gap must not be served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn set_pin_cancel_and_finish_are_refused_once_the_binding_is_gone() {
+    let e = SetupEnv::start().await;
+    e.open_window(7200).await;
+    let version = e.pair_app().await;
+    let mut s = e.key_only(version).await;
+    // The window ends while the connection is still open.
+    e.clock.advance(Duration::from_secs(7201));
+    let ack = s
+        .set_pin(&Pin::new("123456").unwrap())
+        .await
+        .expect("answered");
+    assert_eq!(status_of(&ack), A::Failed, "set_pin after the window");
+    assert!(
+        !e.gw().verifiers().has_pin(),
+        "no PIN was stored through a connection whose window had ended"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_and_finish_are_refused_for_a_device_that_lost_the_binding() {
+    let e = SetupEnv::start().await;
+    e.open_window(7200).await;
+    let version = e.pair_app().await;
+    let mut s = e.key_only(version).await;
+    assert_eq!(
+        status_of(&s.set_pin(&Pin::new("123456").unwrap()).await.unwrap()),
+        A::Ok
+    );
+    e.clock.advance(Duration::from_secs(7201));
+    for (name, ack) in [("cancel", s.cancel().await), ("finish", s.finish().await)] {
+        assert_eq!(status_of(&ack.expect("answered")), A::Failed, "{name}");
+    }
+}

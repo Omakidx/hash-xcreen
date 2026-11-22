@@ -362,6 +362,7 @@ impl SetupCoordinator {
         store: SetupStore,
         persisted: Persisted,
         privd: PrivdClient,
+        lane: PrivdLane,
         verifiers: Arc<VerifierStore>,
         devices: Arc<DeviceService>,
         auth: &Authenticator,
@@ -369,7 +370,6 @@ impl SetupCoordinator {
         settings: SetupSettings,
     ) -> Self {
         let (events, _) = broadcast::channel(256);
-        let lane = privd.dedicated();
         let sh = Arc::new(Shared {
             store,
             st: Mutex::new(State {
@@ -572,10 +572,15 @@ impl SetupCoordinator {
 
     /// `set_pin`: succeeds once, while no PIN exists. Argon2id here, `PepperEnrol(PIN)` in
     /// privd, the store with target `all`, then the audit event.
-    pub(super) async fn set_pin(&self, pin: Zeroizing<Vec<u8>>) -> pb::SetupAck {
+    pub(super) async fn set_pin(&self, device: &DeviceId, pin: Zeroizing<Vec<u8>>) -> pb::SetupAck {
         use pb::SetupAckStatus as S;
         if pin_problem(&pin).is_some() {
             return ack_field(S::InvalidArgument, "pin");
+        }
+        // Every request re-checks the binding: the window and its device can change while a
+        // connection stays open (it is closed by the 1 s tick or a kick, a moment later).
+        if !self.sh.is_bound(device) {
+            return ack_msg(S::Failed, "setup is closed for this device");
         }
         let _one = self.sh.pin_lock.lock().await;
         if self.sh.verifiers.has_pin() {
@@ -686,8 +691,11 @@ impl SetupCoordinator {
     }
 
     /// `cancel`: takes effect while a privd command runs; otherwise just acknowledged.
-    pub(super) fn cancel(&self) -> pb::SetupAck {
+    pub(super) fn cancel(&self, device: &DeviceId) -> pb::SetupAck {
         use pb::SetupAckStatus as S;
+        if !self.sh.is_bound(device) {
+            return ack_msg(S::Failed, "setup is closed for this device");
+        }
         let st = self.sh.lock();
         if st.job.state != pb::SetupJobState::Running {
             return ack(S::NotRunning);
@@ -704,13 +712,18 @@ impl SetupCoordinator {
     }
 
     /// `finish`: retries finishing setup after a transient failure. Idempotent.
-    pub(super) async fn finish(&self) -> pb::SetupAck {
+    pub(super) async fn finish(&self, device: &DeviceId) -> pb::SetupAck {
         use pb::SetupAckStatus as S;
         {
             let st = self.sh.lock();
             if st.finished {
                 return ack(S::AlreadyFinished);
             }
+            drop(st);
+            if !self.sh.is_bound(device) {
+                return ack_msg(S::Failed, "setup is closed for this device");
+            }
+            let st = self.sh.lock();
             if st.job.state == pb::SetupJobState::Running {
                 return ack(S::Busy);
             }

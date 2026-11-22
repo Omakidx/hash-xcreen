@@ -300,6 +300,16 @@ impl VerifierStore {
         s.pin_devices.get(id).or(s.pin_all.as_ref()).cloned()
     }
 
+    /// True if `id` has a PIN of its own (an operator set one for it), as opposed to using the
+    /// shared PIN.
+    pub fn has_own_pin(&self, id: &DeviceId) -> bool {
+        self.state
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .pin_devices
+            .contains_key(id)
+    }
+
     /// True if any PIN verifier exists (a server without one refuses sessions).
     pub fn has_pin(&self) -> bool {
         let s = self.state.read().unwrap_or_else(|p| p.into_inner());

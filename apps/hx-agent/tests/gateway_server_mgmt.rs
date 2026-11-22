@@ -178,6 +178,8 @@ async fn a_wrong_current_pin_counts_toward_the_lockout_that_a_login_uses() {
     let r = within(a.change_pin(&wrong, &new)).await.unwrap();
     assert_eq!((status(&r), r.attempts_left), (S::WrongPin, 3));
     assert_eq!(failed_pins(&e, &phone), 2);
+    // (The backoff is the login's too: wait it out first.)
+    e.clock.advance(Duration::from_secs(3));
     let _ = e.login(&phone, PIN).await.unwrap();
     assert_eq!(
         failed_pins(&e, &phone),
@@ -202,10 +204,13 @@ async fn the_fifth_wrong_current_pin_revokes_the_device_and_ends_its_session() {
         assert_eq!((status(&r), r.attempts_left), (S::WrongPin, 5 - n));
     }
     e.clock.advance(Duration::from_secs(40));
-    let r = within(a.change_pin(&wrong, &new)).await.unwrap();
-    assert_eq!((status(&r), r.attempts_left), (S::WrongPin, 0));
-    // The answer came first; then the device is revoked by the lockout (as at login) and its
-    // session ends.
+    // The revocation is persisted before the answer is built, so the answer is best effort:
+    // the authenticator closes the device's connections as it revokes, and the client sees
+    // either the answer or the close.
+    if let Ok(r) = within(a.change_pin(&wrong, &new)).await {
+        assert_eq!((status(&r), r.attempts_left), (S::WrongPin, 0));
+    }
+    // The device is revoked by the lockout (as at login) and its session ends.
     let id = phone.public().device_id();
     let mut revoked = false;
     for _ in 0..200 {
@@ -459,4 +464,144 @@ async fn only_an_authorized_session_with_the_feature_can_manage_the_server() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+/// Security review F2: while another request holds the device's lockout in flight (counter at
+/// the limit, revocation parked on the revocation lock), a correct `change_pin` on a second
+/// session of the same device must neither be verified nor reset the counter: the device ends
+/// revoked and the PIN is unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_pin_racing_the_fifth_wrong_login_cannot_reset_the_counter() {
+    let (e, phone, tablet) = env().await;
+    let mut a2 = mgmt(&e, &phone, PIN).await;
+    let id = phone.public().device_id();
+    let mut c = within(hx_crypto::connect_session(
+        &e.target(hx_transport::TransportPreference::Quic),
+        &phone,
+        e.server_public(),
+        &hx_crypto::SessionOptions::default(),
+    ))
+    .await
+    .expect("connect");
+    let wrong = Pin::new("111111").unwrap();
+    for _ in 0..4 {
+        e.clock.advance(Duration::from_secs(40));
+        let _ = within(c.submit(&wrong)).await.unwrap();
+    }
+    e.clock.advance(Duration::from_secs(40));
+    // The 5th wrong PIN is counted but its revocation waits for the revocation lock.
+    let held = e.gw().devices().revoke_gate().lock_owned().await;
+    let fifth = async { within(c.submit(&wrong)).await };
+    let racer = async {
+        for _ in 0..200 {
+            if failed_pins_of(&e, &id) >= 5 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // A correct current PIN on the other session, while the lockout is pending. It queues
+        // behind the login's per-device guard instead of being checked beside it.
+        let (right, new) = (Pin::new(PIN).unwrap(), Pin::new(NEW_PIN).unwrap());
+        let change = within(a2.change_pin(&right, &new));
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            drop(held);
+        };
+        let (r, ()) = tokio::join!(change, release);
+        r
+    };
+    let (_fifth, change) = tokio::join!(fifth, racer);
+    // Whatever the racer got (a refusal or the close), it did not change the PIN ...
+    if let Ok(r) = change {
+        assert_ne!(status(&r), S::Ok, "{r:?}");
+    }
+    assert_eq!(audit(&e, "PIN_CHANGED"), 0);
+    // ... and the device ends revoked.
+    let mut revoked = false;
+    for _ in 0..200 {
+        if e.gw()
+            .authenticator()
+            .registry()
+            .get(&id)
+            .unwrap()
+            .unwrap()
+            .is_revoked()
+        {
+            revoked = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(revoked, "the 5th wrong PIN still revoked the device");
+    assert!(
+        e.login(&tablet, PIN).await.is_ok(),
+        "the shared PIN is unchanged"
+    );
+}
+
+fn failed_pins_of(e: &SetupEnv, id: &hx_crypto::DeviceId) -> u32 {
+    e.gw()
+        .authenticator()
+        .registry()
+        .get(id)
+        .unwrap()
+        .unwrap()
+        .failed_pins
+}
+
+/// Security review F2: `change_pin` and a PIN login share one backoff: a wrong PIN at login
+/// makes the next `change_pin` wait without being checked or counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn change_pin_shares_the_logins_backoff() {
+    let (e, phone, _) = env().await;
+    let mut a = mgmt(&e, &phone, PIN).await;
+    let mut c = within(hx_crypto::connect_session(
+        &e.target(hx_transport::TransportPreference::Quic),
+        &phone,
+        e.server_public(),
+        &hx_crypto::SessionOptions::default(),
+    ))
+    .await
+    .expect("connect");
+    let _ = within(c.submit(&Pin::new("111111").unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(failed_pins(&e, &phone), 1);
+    let r = within(a.change_pin(&Pin::new(PIN).unwrap(), &Pin::new(NEW_PIN).unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(status(&r), S::Backoff, "{r:?}");
+    assert_eq!(failed_pins(&e, &phone), 1, "not counted");
+    assert_eq!(audit(&e, "PIN_CHANGED"), 0);
+}
+
+/// Security review F5: a device that authenticates with a PIN of its own changes that PIN
+/// only; the shared PIN and the other devices are untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_with_its_own_pin_changes_only_its_own_pin() {
+    let (e, phone, tablet) = env().await;
+    let own = "246810";
+    let record = hx_agent::gateway::verifier::enrol(
+        e.gw().privd(),
+        hx_ipc::privd::pb::LockoutPurpose::Pin,
+        own.as_bytes(),
+        gateway_common::CHEAP,
+    )
+    .await
+    .unwrap();
+    e.gw()
+        .verifiers()
+        .set_pin(Some(phone.public().device_id()), record)
+        .unwrap();
+    let mut a = mgmt(&e, &phone, own).await;
+    let r = within(a.change_pin(&Pin::new(own).unwrap(), &Pin::new(NEW_PIN).unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(status(&r), S::Ok, "{r:?}");
+    drop(a);
+    assert!(e.gw().verifiers().has_own_pin(&phone.public().device_id()));
+    // The phone's own PIN changed; the tablet still uses the shared one, unchanged.
+    assert!(e.login(&phone, NEW_PIN).await.is_ok());
+    assert!(e.login(&tablet, PIN).await.is_ok());
+    assert!(e.login(&tablet, NEW_PIN).await.is_err());
 }

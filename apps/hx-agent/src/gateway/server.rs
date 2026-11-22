@@ -216,10 +216,15 @@ impl Gateway {
         devices.set_pairing_ttl_s(config.pairing_ttl_s);
         // The post-pairing setup: its own persisted state next to the registry.
         let (setup_store, persisted) = SetupStore::open(config.state_dir.join("setup"))?;
+        // One dedicated privd lane, shared by the setup job and server management (calls are
+        // serialized on it): the pool (2) plus this lane (1) are 3 of privd's 4 Gateway
+        // connections (ipc.md 5.5).
+        let lane = privd.dedicated();
         let setup = SetupCoordinator::new(
             setup_store,
             persisted,
             privd.clone(),
+            lane.clone(),
             verifiers.clone(),
             devices.clone(),
             &auth,
@@ -232,8 +237,7 @@ impl Gateway {
         let server_mgmt = ServerMgmtService::new(
             privd.clone(),
             verifiers.clone(),
-            pin_verifier,
-            registry.clone(),
+            lane,
             auth.clone(),
             devices.clone(),
             clock.clone(),
@@ -432,11 +436,12 @@ async fn handle_pending(sh: Arc<Shared>, pending: PendingSession) {
             tracing::info!(device = %device.id, pin_verified, "setup connection authorized");
             sh.setup.serve(connection, device, pin_verified).await;
         }
-        // The password was proven and the registry already holds the device as active again;
-        // announce it and audit it (cause `password`, never the password). No session exists.
+        // The password was proven and the registry already holds the device as active again.
+        // It is audited and announced (cause `password`, never the password) by the device
+        // service from the authenticator's reinstatement broadcast, which fires from the commit
+        // itself, so a deadline that drops this outcome cannot leave it unrecorded.
         Ok(Outcome::Reinstated { device }) => {
             tracing::info!(device = %device.id, "device reinstated with the account password");
-            sh.devices.announce_reinstated_with_password(&device);
         }
         Ok(Outcome::Refused(_)) => {}
         Err(e) => tracing::debug!(error = %e, "authentication ended without success"),

@@ -1558,3 +1558,38 @@ async fn the_revoke_limit_holds_across_a_devices_connections() {
         pb::RevokeStatus::NotFound
     );
 }
+
+/// Security review F4: the cooling-off rule undoes a revocation that a *device* made, not one
+/// that an operator made later with the same reason. Thief revokes the phone, the operator
+/// reinstates it and revokes it again, then the laptop revokes the thief within a minute: the
+/// phone stays revoked.
+#[tokio::test]
+async fn the_cooling_off_undo_never_lifts_an_operator_revocation_that_replaced_a_devices() {
+    let env = Env::start().await;
+    let (phone, laptop, thief) = (new_key(), new_key(), new_key());
+    env.pair(&phone, "phone").await;
+    env.pair(&laptop, "laptop").await;
+    env.pair(&thief, "thief").await;
+    env.set_pin(PIN).await;
+    let cl = env.login(&laptop, "laptop", PIN).await;
+    let ct = env.login(&thief, "thief", PIN).await;
+    let phone_id = Env::id_of(&phone);
+    assert_eq!(
+        revoke(&ct, 1, phone_id.as_bytes()).await,
+        pb::RevokeStatus::Ok
+    );
+    env.gw.devices().reinstate(phone_id).await.unwrap();
+    assert!(env.gw.devices().is_active(&phone_id));
+    env.gw.devices().revoke_by_operator(phone_id).await.unwrap();
+    assert!(!env.gw.devices().is_active(&phone_id));
+    env.clock.advance(Duration::from_secs(20));
+    assert_eq!(
+        revoke(&cl, 2, Env::id_of(&thief).as_bytes()).await,
+        pb::RevokeStatus::Ok
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !env.gw.devices().is_active(&phone_id),
+        "the operator's revocation stands"
+    );
+}
