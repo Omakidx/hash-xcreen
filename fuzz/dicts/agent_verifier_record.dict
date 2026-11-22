@@ -1,0 +1,8 @@
+# libFuzzer dictionary for the agent_verifier_record target
+k0="hx-pv1$"
+k1="m="
+k2=",t="
+k3=",p="
+k4="$"
+k5="19456"
+k6="65536"

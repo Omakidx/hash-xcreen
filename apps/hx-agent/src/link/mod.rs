@@ -87,6 +87,8 @@ pub mod annexb;
 mod client;
 mod config;
 mod connect;
+#[cfg(feature = "fuzzing")]
+pub mod fuzz;
 mod lane;
 mod policy;
 mod shared;

@@ -1,0 +1,202 @@
+[package]
+name = "hx-fuzz"
+description = "cargo-fuzz targets for the pre-authentication and container-supplied parsers. Not part of the product."
+version = "0.0.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace: cargo-fuzz builds with a nightly toolchain and sanitizer flags that the
+# product workspace must never see. The root workspace lists this directory under `exclude`.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+flate2 = { version = "1.1.11", default-features = false, features = ["rust_backend"] }
+hx-agent = { path = "../apps/hx-agent", features = ["fuzzing", "test-support"] }
+hx-crypto = { path = "../crates/hx-crypto", features = ["fuzzing"] }
+hx-ipc = { path = "../crates/hx-ipc" }
+hx-proto = { path = "../crates/hx-proto" }
+hx-pwcheck = { path = "../apps/hx-pwcheck" }
+hx-transport = { path = "../crates/hx-transport", features = ["fuzzing"] }
+prost = "0.14"
+tempfile = "3"
+
+# Seed generation (`cargo run --bin gen-seeds`).
+spake2 = "0.4"
+tar = { version = "0.4.46", default-features = false }
+
+[[bin]]
+name = "gen-seeds"
+path = "src/bin/gen_seeds.rs"
+test = false
+doc = false
+
+[profile.release]
+debug = 1
+
+# One entry per file of fuzz_targets/.
+[[bin]]
+name = "proto_control"
+path = "fuzz_targets/proto_control.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto_messages"
+path = "fuzz_targets/proto_messages.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto_media"
+path = "fuzz_targets/proto_media.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transport_hello"
+path = "fuzz_targets/transport_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transport_ws_first"
+path = "fuzz_targets/transport_ws_first.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transport_ws_session"
+path = "fuzz_targets/transport_ws_session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "crypto_pairing"
+path = "fuzz_targets/crypto_pairing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "crypto_secrets"
+path = "fuzz_targets/crypto_secrets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "crypto_registry"
+path = "fuzz_targets/crypto_registry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "crypto_pin_record"
+path = "fuzz_targets/crypto_pin_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipc_frame"
+path = "fuzz_targets/ipc_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipc_privd_admin"
+path = "fuzz_targets/ipc_privd_admin.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipc_link"
+path = "fuzz_targets/ipc_link.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipc_text"
+path = "fuzz_targets/ipc_text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "agent_link_session"
+path = "fuzz_targets/agent_link_session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "agent_annexb"
+path = "fuzz_targets/agent_annexb.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "agent_update_manifest"
+path = "fuzz_targets/agent_update_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "agent_update_sig"
+path = "fuzz_targets/agent_update_sig.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "agent_update_extract"
+path = "fuzz_targets/agent_update_extract.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "agent_install_stdin"
+path = "fuzz_targets/agent_install_stdin.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "agent_verifier_record"
+path = "fuzz_targets/agent_verifier_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "agent_fetcher_url"
+path = "fuzz_targets/agent_fetcher_url.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pwcheck_shadow"
+path = "fuzz_targets/pwcheck_shadow.rs"
+test = false
+doc = false
+bench = false

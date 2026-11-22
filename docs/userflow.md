@@ -1,6 +1,8 @@
 # User flows
 
-What the user sees and does, step by step. Technical detail lives in [architecture.md](architecture.md); this document is about the experience.
+What the user sees and does, step by step. Technical detail lives in [architecture.md](architecture.md); this document is about the experience. The screens are drawn in [`design/mockups/`](../design/mockups/README.md), which the maintainer approved as they are (2026-11-22); the mockups are the visual reference for the app, and this document is the behaviour.
+
+**Phases.** Backups, web access, passkeys and alerts belong to Phases 2 and 3. Their flows are written below and tagged *(Phase 2)* or *(Phase 3)*, but the **Phase 1 app hides them** (no disabled controls, no "coming soon"); they appear when their phase is built. The window has a system title bar and a 900 x 600 minimum size.
 
 ## Map of flows
 
@@ -28,7 +30,7 @@ flowchart TD
 
 1. The user opens **hx-desktop**.
 2. With no servers yet, the app shows a short welcome: what hash-xcreen does and an **Add server** button.
-3. The theme follows the system (dark-first design, light theme available).
+3. The theme follows the system theme by default (dark is the designed-first look; a light theme is available, and **App settings** can force either).
 
 ## 2. Add a server over SSH (main path)
 
@@ -36,34 +38,54 @@ flowchart TD
 2. **Connection**: server address, SSH port, username, and either an SSH key (default: the user's existing keys) or a password.
    - The password is used for this install only and never stored.
    - The app shows the server's **host-key fingerprint**; the user confirms it the first time.
-   - The app checks the server meets the minimum (2 vCPU, 4 GB RAM, 30 GB disk, supported OS). If not, it says exactly what is missing and stops.
+   - The app checks the server meets the minimum (2 vCPU, 4 GB RAM, 30 GB disk, supported OS). If not, it says exactly what is missing and stops. Each check shows **what the server reports and the threshold**: a "4 GB" server never reports 4096 MiB, so the memory check passes at 3584 MiB (3.5 GB) and says so, instead of looking short.
 3. **Desktop**: distro (Ubuntu 24.04 / 26.04, Debian 12 / 13), desktop (XFCE), preset (**basic** or **developer**), Docker switch (with a short warning about weaker isolation).
-4. **Account**: Linux username, password (strength meter), PIN (6+ digits, entered twice).
-5. **Backups**:
+4. **Account**: Linux username, password (at least 8 characters, entered twice; the strength meter is advisory and never blocks), PIN (6 to 16 digits, entered twice). Continue is disabled until the username is valid, the passwords match and the PIN rule holds.
+5. **Backups** *(Phase 2; the Phase 1 app has no Backups step and records backups as off)*:
    - **Connect Google Drive** opens the user's normal browser for Google sign-in; the app returns to the wizard when done. Can be skipped.
    - Schedule: every 12h, every 24h, or off; backup times (for example 03:00 and 15:00).
-   - Retention: defaults shown, editable.
+   - Retention: defaults shown, editable (every 12h keeps the latest 14, 4 weekly and 6 monthly; every 24h keeps 7 daily, 4 weekly and 6 monthly, architecture §9.7).
    - Estimated size: "About 6.2 GB first backup, then about 50–300 MB per backup", with a warning if Drive does not have room.
    - **Recovery key**: shown once. The user saves it and re-types a few of its words to continue.
-6. **Resources**: CPU, memory and disk sliders limited to what the server has. Advanced: port, domain, enable web access.
+6. **Resources**: CPU, memory and disk sliders limited to what the server has. Advanced: port, and a domain (recorded only for now). *Enable web access* is a Phase 3 control and is hidden in Phase 1.
 7. **Review**: a summary of every choice; **Install**.
-8. **Progress**: a checklist of stages with the current one animated, an expandable log, and the image path chosen and why ("Using prebuilt image (about 4 min)" or "Building on the server: release host unreachable (about 12 min)").
-9. **Done**: the desktop opens in the app. The first backup runs in the background; its progress shows on the server card.
+8. **Progress**: a checklist of **ten grouped rows** (the installer's 19 stages grouped, the real stage ids in small grey text) with the current one animated, a step with no percentage shown as an indeterminate bar, an expandable log, and the image path chosen and why ("Using prebuilt image (about 4 min)" or "Building on the server: release host unreachable (about 12 min)"; the reason comes from the server's reason code, architecture §4.3). The window can be closed: the install continues on the server.
+9. **Done**: the desktop opens in the app (**Open desktop** asks for the PIN). *(Phase 2)* The first backup runs in the background; its progress shows on the server card.
 
-If the install fails, the app shows the failing stage, the reason, and **Retry**, which resumes from that stage.
+If the install fails, the app shows the failing stage, the reason, and **Retry**, which resumes from that stage. If the failure is not retryable (for example a verification failure) the primary button becomes **Copy log**.
+
+**SSH connection lost during the install.** The app shows "Connection to the server was lost" with the stage reached; finished stages are kept on the server. Secrets are never stored (architecture §5.3), so **Retry asks again** for the SSH password (or key passphrase), the account password and the PIN, then runs the same installer command, which skips finished stages and carries on.
 
 ## 3. Add a server with the one-liner
 
+The one-liner installs only the **agent**. Everything about the desktop (distro, preset, username, password, PIN, Docker, limits) is chosen in the app and sent after pairing, over the encrypted connection, so the command carries no desktop option and no secret.
+
 1. **Method**: **Copy one-liner**.
-2. The user enters the server's address, then completes the same Desktop, Account, Backups and Resources steps.
-3. The app shows the command with a **Copy** button. The command holds **no token and no secret**, so it is safe in the shell history and the server's logs:
+2. The user enters the server's address, then completes the same Desktop, Account and Resources steps as over SSH (and Backups *(Phase 2)*). Nothing is sent yet; the choices wait in the app.
+3. The app shows the command with a **Copy** button. It holds **no token and no secret** and only host options, so it is safe in the shell history and the server's logs:
    ```bash
-   curl -fsSL https://github.com/Omakidx/hash-xcreen/releases/download/channel-stable/install.sh | sudo sh -s -- --pair --distro ubuntu-24.04 --desktop xfce --user alex --backup 12h
+   curl -fsSL https://github.com/Omakidx/hash-xcreen/releases/download/channel-stable/install.sh | sudo sh -s -- --pair --port 443 --channel stable
    ```
    Below it the app shows the one-time **pairing token** (`hxt1-…`) with its own **Copy** button, and a note that it expires 15 minutes after the installer takes it and works once.
 4. The user pastes the command into a root shell on the server. The installer checks the server, installs the agent and opens the port, then asks for the token; the user pastes it (nothing is echoed). The app shows "Waiting for the server…".
-5. As soon as the agent is listening, the app pairs automatically. The installer has finished at this point; what happens next (sending the password, PIN and Drive token over the encrypted connection, creating the desktop, and the live progress view) needs setup messages that are designed in workstream 1G, so until that work lands this path ends at a paired server with no desktop.
+5. As soon as the agent is listening, the app pairs automatically ("Paired"). The installer has finished. The app then **continues the setup itself**:
+   1. It reconnects to the agent on a separate setup connection and sets the **PIN** the user chose (the first connection is key-only: it can do nothing but set the PIN).
+   2. It sends the desktop options and the account password in one request and shows the **same live progress screen** as the SSH path (ten grouped rows, the image path and why, an expandable log). The user can close the window or lose the network: the build runs on the server, and reopening the app resumes the view after the PIN, without re-sending the password.
+   3. When it ends, the result shows the path taken, any warnings, and the Docker outcome. If Docker was requested and its self-test failed, the desktop still works without Docker and the app says Docker can be retried afterwards on the server with `sudo hx-agent docker enable`.
+   4. **Open desktop** asks for the PIN and connects as in flow 5.
 6. If the token expires first, the app offers **Generate a new token**.
+
+**When something is different:**
+
+| Situation | What the user sees |
+|---|---|
+| The agent is not reachable after the one-liner (for example a cloud firewall blocks the port the installer opened) | "Cannot reach the agent" with the address and port and "check your provider's firewall", and **Try again** *(approved 2026-11-22)* |
+| Pairing fails (wrong, expired or already used token) | "Wrong or expired token, or the connection is being intercepted" and **Generate a new token** |
+| Setup fails (for example not enough disk, a build step, the rate limit) | The failing stage, the reason and **Retry**. Retry starts a new job and sends the password again; if the app was closed since, it asks for the account password again (the PIN is already set and is kept) |
+| Not enough setup time left (less than 50 minutes in the server's 2-hour setup window) | "The setup window on the server is nearly over" and the command to run on the server, `sudo hx-agent setup extend`, then **Try again** |
+| The server's agent is too old to be set up from the app | "This server must be updated before the app can set it up", and the commands to run on the server: `sudo hx-agent update check`, then `sudo hx-agent update apply <version>` |
+| The setup window has closed, or setup was already finished | The app does not offer setup and goes to the normal **PIN** screen |
+| Another device paired first with the same token | The app's pairing fails as above; the user reruns the one-liner for a fresh token. The device that won is listed by `hx-agent devices` |
 
 ## 4. Install without the app
 
@@ -75,11 +97,17 @@ If the install fails, the app shows the failing stage, the reason, and **Retry**
 ## 5. Connect to a desktop
 
 1. On the home screen, the user clicks **Connect** on a server card.
-2. The app asks for the **PIN**.
-   - Wrong PIN: "Incorrect PIN, 4 attempts left".
-   - Fifth wrong PIN: the server revokes this device. The app explains that it must be paired again, which needs the account password.
-3. The desktop appears, sized to the window.
-4. If the network drops: a "Reconnecting…" overlay; the desktop keeps running on the server and the view returns when the connection does.
+2. The app asks for the **PIN** (masked, with a Show PIN toggle). Connecting is two steps, a secure connection and then the PIN, and the form is disabled while the server checks it.
+   - Wrong PIN: "Incorrect PIN, 4 attempts left". After each wrong PIN the server makes the device wait (1, 2, 4, 8 up to 30 seconds): the app shows "Wait 8 seconds before trying again", and waiting does not use up an attempt.
+   - The last attempt is called out in plain words ("The next wrong PIN removes this device from the server. Pairing it again needs the account password").
+   - Fifth wrong PIN: the server revokes this device. The app says "This device was removed from the server" and offers **Pair again**, a one-field form for the account password (sent once over the encrypted connection, not kept), then the PIN. *(Approved 2026-11-22.)* **Back to Home** is the other choice.
+   - The server cannot check PINs right now (its checker is down or locked): "This is not a wrong PIN and nothing was counted. Try again in about a minute."
+   - **Server identity changed**: if the server presents a different key than the one pinned at pairing, the app stops before sending any PIN: "This server's identity changed", with the pinned and presented fingerprints, and no way to continue. If the user reinstalled the server themselves, the way forward is to remove the server in the app and pair it again. *(Approved 2026-11-22.)*
+   - The server cannot be reached: "Cannot reach `address:port`", with the likely causes (off, address changed, firewall).
+3. The desktop appears, sized to the window, with nothing on top of it; the first time, a dismissible hint says how to show the toolbar.
+4. If the network drops: a "Reconnecting…" overlay over the dimmed last frame; the desktop keeps running on the server and the view returns when the connection does. After about 2 minutes the overlay stops trying and offers **Try again** and **Back to Home** (the desktop is still running on the server). *(Approved 2026-11-22.)*
+5. **Taken over.** The desktop has one active viewer. If another paired device connects and takes over, this app shows "This desktop was opened on another device" with that device's name, says nothing on the desktop was closed, and offers **Revoke that device** (it signs in with the PIN without taking the desktop back), **Take it back** and **Back to Home**. It never reconnects by itself. *(Approved 2026-11-22.)*
+6. **Desktop not available.** If the server is reachable but the desktop session is not answering (the agent retries every few minutes and after a restart), the app says so and that the files are safe; the server card and Server details show the same state. *(Approved 2026-11-22.)*
 
 ## 6. Using the desktop
 
@@ -91,9 +119,10 @@ If the install fails, the app shows the failing stage, the reason, and **Retry**
   - Transfers: clipboard and file activity.
   - Disconnect.
 - **Clipboard**: copying text, images or files on one side and pasting on the other just works, in both directions.
-- **Files**: drag files from the local machine into the desktop window; a progress bar shows large transfers.
+- **Links**: when the desktop asks the local computer to open a link, nothing opens until the user agrees. The dialog shows the full address with the host in bold, **Cancel** is the default, there is no "always allow", and only `http` and `https` links are offered; other kinds are refused without a prompt. *(Approved 2026-11-22.)*
+- **Files**: drag files from the local machine into the desktop window; a progress bar shows large transfers. A file above the 4 GiB limit is refused before sending, with the reason.
 
-## 7. Backups
+## 7. Backups *(Phase 2: hidden in the Phase 1 app)*
 
 ### See backup status
 
@@ -123,12 +152,13 @@ The user clicks **Back up now**; progress shows on the timeline.
 
 **Server details → Security**:
 
-- **Paired devices**: name, last seen; **Revoke** any device.
-- **Change PIN** and **Change password** (the password change also updates the Linux account).
-- **Web access**: off by default. Turning it on shows the web address and explains the first login.
-- **Passkeys**: list and remove passkeys registered from browsers.
+- **Paired devices**: name, state (active, revoked or locked), last seen; **Revoke** any device. Revoking the device in use says so ("You will be disconnected and need the account password to pair again"). A locked device has PIN failures that no good login has cleared; the app does not reinstate it (that is an administrator action on the server).
+- **Pair a new device**: shows a short pairing code (like `K7QM-4XD2`) with its remaining time, to type on the new device under **Add server → Enter pairing code** (flow 4). The code works once, expires within 15 minutes, and a new code replaces the old one; the server allows 3 codes per hour and records each one. The new device is an ordinary device: it needs the PIN. If the limit is reached the app says when to try again. This replaces running `hx-agent pairing code` on the server. *(Approved 2026-11-22.)*
+- **Change PIN** and **Change password** (the password change also updates the Linux account). All devices share one PIN.
+- **Web access** *(Phase 3)*: off by default. Turning it on shows the web address and explains the first login.
+- **Passkeys** *(Phase 3)*: list and remove passkeys registered from browsers.
 
-## 9. Web client
+## 9. Web client *(Phase 3: not in the Phase 1 app)*
 
 1. The user enables web access in the desktop app and opens the shown address in a browser.
 2. **First login**: password + PIN; then the browser offers to register a **passkey**.
@@ -140,12 +170,14 @@ The user clicks **Back up now**; progress shows on the timeline.
 
 **Server details → Desktop**:
 
-- **Docker** switch: turning it on shows the isolation warning, then restarts the desktop with Docker installed. Backup mode: **Complete** (default) or **Light**.
+- **Docker** switch: turning it on shows the isolation warning, then restarts the desktop with Docker installed. Backup mode *(Phase 2)*: **Complete** (default) or **Light**.
 - Resource limits; **Restart desktop**; **Update agent** (also automatic on the chosen channel).
 
-**Server details → Danger zone**: **Uninstall**, with a choice to keep or delete the desktop.
+**Server details → Danger zone**: **Uninstall**, with a choice to keep or delete the desktop. **Uninstall needs SSH access**: removing the agent is a root action that the agent's own connection cannot perform (architecture §5.3, §8.5), so the app asks for SSH credentials (as in flow 2, a password is not stored), confirms the choice (deleting the desktop is permanent) and runs the uninstall over SSH. Afterwards the server can be removed from the app. A server can also be removed from the app at any time from its card menu, which only forgets it on this device.
 
 ## 11. Alerts and problems
+
+Rows about backups and Drive are *Phase 2* and hidden in the Phase 1 app.
 
 | Situation | What the user sees |
 |---|---|
@@ -155,11 +187,12 @@ The user clicks **Back up now**; progress shows on the timeline.
 | Drive full | Old backups pruned automatically (never below the two latest); if still full, backups stop and the user is told why |
 | Backups missing from Drive | Red warning: backups were deleted outside the app |
 | No successful backup for twice the interval | Red badge regardless of cause |
-| Server offline | Grey card with "Last seen …" |
-| Update available | Small badge; updates apply automatically on the chosen channel |
+| Server offline | Grey card with "Last seen …"; details stay readable but are marked stale, and Connect is disabled |
+| Desktop not available | "The desktop is not answering" on the card and in Server details; the agent retries by itself |
+| Update available | Small badge; updates apply automatically on the chosen channel; after a failed update that rolled back, "Rolled back to x.y.z" |
 
-Optional server-side alerts for when the app is closed: **ntfy** push and **webhooks**, set in **Server details → Backups → Alerts**.
+*(Phase 2)* Optional server-side alerts for when the app is closed: **ntfy** push and **webhooks**, set in **Server details → Backups → Alerts**.
 
 ## 12. App settings
 
-Theme, keyboard shortcuts, default quality, start at login, clipboard settings for this device, and bandwidth cap (Auto, 5, 10, 25, 50 Mbps).
+Theme (System by default, or Dark or Light), keyboard shortcuts, default quality, start at login, clipboard settings for this device, bandwidth cap (Auto, 5, 10, 25, 50 Mbps), and a **name for this device** (for example "Alex's desktop"), which the paired-devices list shows.
