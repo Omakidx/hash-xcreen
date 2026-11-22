@@ -201,6 +201,28 @@ async fn the_binary_runs_a_full_session_under_its_seccomp_allowlist() {
         panic!()
     };
     assert!(s.listening);
+    // The setup store's atomic write (temporary file, fsync, rename, directory fsync) is inside
+    // the allowlist: opening the window writes it, and the process survives.
+    let R::SetupWindow(w) = adm
+        .call(
+            C::SetupWindow(pb::SetupWindowRequest {
+                action: pb::SetupWindowAction::Open as i32,
+                expires_in_s: 600,
+            }),
+            None,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(w.state.unwrap().open);
+    let store = g._dir.path().join("state").join("setup");
+    assert!(store.exists(), "the setup store was written under seccomp");
+    assert_eq!(
+        std::fs::metadata(&store).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     // Pair with the code the socket prints, over QUIC.
     let R::CreatePairingCode(code) = adm
         .call(

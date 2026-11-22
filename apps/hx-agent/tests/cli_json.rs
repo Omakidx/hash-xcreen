@@ -162,8 +162,8 @@ fn canned_admin() -> AdminHandler {
                         expires_at_unix_s: 1_900_007_200,
                     }),
                     session_link: apb::LinkState::Up as i32,
-                    link_faults_10min: 0,
                     registry_version: 5,
+                    ..Default::default()
                 }),
                 C::ListDevices(_) => A::ListDevices(apb::ListDevicesResult {
                     devices: vec![
