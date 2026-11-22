@@ -285,6 +285,36 @@ impl Plan {
         Manifest::from_plan(self)
     }
 
+    /// Digest binding a prebuilt image to the recipe it was built from: the lower-case hex
+    /// SHA-256 of the canonical (compact, field-ordered, map-sorted) JSON of
+    /// `{schema:1, name, base_image, vars, incus_config, build}`. The post stage is excluded on
+    /// purpose: it runs on the host after import, so it may change without invalidating images.
+    ///
+    /// Callers compute it for the embedded, default-resolved plan
+    /// (`Catalog::embedded().resolve(id, &[])`), so that image CI and the agent agree.
+    pub fn build_digest(&self) -> String {
+        #[derive(Serialize)]
+        struct Canonical<'a> {
+            schema: u32,
+            name: &'a str,
+            base_image: &'a ImageRef,
+            vars: &'a BTreeMap<String, String>,
+            incus_config: &'a BTreeMap<String, String>,
+            build: &'a [Step],
+        }
+        let canonical = Canonical {
+            schema: 1,
+            name: &self.name,
+            base_image: &self.base_image,
+            vars: &self.vars,
+            incus_config: &self.incus_config,
+            build: &self.build,
+        };
+        // Serializing plain strings, maps and enums cannot fail.
+        let json = serde_json::to_vec(&canonical).unwrap_or_default();
+        hex(&Sha256::digest(&json))
+    }
+
     /// Deterministic text rendering of the whole plan (used by golden tests and `--dry-run`
     /// style tooling). Scripts and file contents are summarised by hash, never printed.
     pub fn render(&self) -> String {
