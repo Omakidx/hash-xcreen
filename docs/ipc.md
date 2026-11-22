@@ -830,7 +830,7 @@ Repeated fields are **counted on the wire before the message is decoded** (`info
 |---|---|
 | Strings (`software`, event `message`, `goodbye` `message`) | 128, 256, 256 bytes; control and ANSI characters removed before display or logging |
 | `stats` | 4 per second; every counter a bounded integer |
-| Cursor shape | at most 256 × 256, `rgba.len == width * height * 4`, hotspot inside the image (protocol.md §5.9); at most 20 shapes per second and 4 MiB of shape data per second |
+| Cursor shape | at most 256 × 256, `rgba.len == width * height * 4`, hotspot inside the image (protocol.md §5.4); at most 20 shapes per second and 4 MiB of shape data per second |
 | Cursor position | coalesced by the gateway to at most one per 1 ms (latest wins); never queued unboundedly |
 | `event` | 10 per second |
 | Video frame payload | at most `max_frame_bytes` (default 4 MiB, configurable up to the protocol's 16 MiB; deliberately below the protocol limit, because the link carries one frame at a time from a hostile source and an IDR at 20 Mbps is far smaller; the session's encoder must stay under it); at most 2 × the negotiated `max_fps` frames in any one-second window (the excess is dropped); at most 4 IDR frames per second (the excess is dropped); more than 4 × the frame limit in attempts within one second is a flood and a violation, because dropping costs CPU per frame |
