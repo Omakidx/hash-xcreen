@@ -74,6 +74,10 @@ pub struct PortRule {
     /// are the administrator's and uninstall leaves them.
     #[serde(default)]
     pub adopted: Vec<String>,
+    /// The rules that let the desktop's bridge through (DHCP, DNS, forwarding) are part of this
+    /// record. Adopted bridge rules are listed in `adopted` as `bridge:<kind>`.
+    #[serde(default)]
+    pub bridge: bool,
 }
 
 /// Incus as the installer found or installed it.

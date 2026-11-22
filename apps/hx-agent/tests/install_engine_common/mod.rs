@@ -240,3 +240,26 @@ pub fn unit_dir(m: &Machine) -> PathBuf {
 pub fn json_has(v: &Value, key: &str) -> bool {
     v.get(key).is_some()
 }
+
+/// The ufw rules for the agent's port (`allow 443/tcp`), without the bridge rules.
+pub fn port_rules(m: &Machine) -> Vec<String> {
+    m.runner
+        .ufw_rules
+        .iter()
+        .filter(|r| {
+            let w: Vec<&str> = r.split(' ').collect();
+            w.len() == 2 && w[0] == "allow"
+        })
+        .cloned()
+        .collect()
+}
+
+/// The bridge rules of ufw (`... on hxbr0 ...`).
+pub fn bridge_rules(m: &Machine) -> Vec<String> {
+    m.runner
+        .ufw_rules
+        .iter()
+        .filter(|r| r.contains(" hxbr0"))
+        .cloned()
+        .collect()
+}

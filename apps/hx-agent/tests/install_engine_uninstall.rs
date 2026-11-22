@@ -202,7 +202,11 @@ fn the_port_rule_is_removed_by_backend() {
     m.runner.ufw = Some(true);
     let dir = release(&mut m, &Tamper::default());
     assert_eq!(full_install(&mut m, &dir), 0);
-    assert_eq!(m.runner.ufw_rules.len(), 2);
+    assert_eq!(
+        m.runner.ufw_rules.len(),
+        7,
+        "two port rules and five bridge rules"
+    );
     ok(uninstall(&mut m, true, 0).0);
     assert!(m.runner.ufw_rules.is_empty());
     // nft
@@ -698,7 +702,7 @@ fn a_ufw_rule_that_was_already_there_is_adopted_and_survives_uninstall() {
         ["tcp"],
         "the existing tcp rule is the administrator's"
     );
-    assert_eq!(m.runner.ufw_rules, ["allow 443/tcp", "allow 443/udp"]);
+    assert_eq!(port_rules(&m), ["allow 443/tcp", "allow 443/udp"]);
     // A re-run does not turn it into ours, and keeps what is ours.
     assert_eq!(rerun_ssh(&mut m, &[]), 0);
     assert_eq!(
@@ -723,7 +727,7 @@ fn moving_the_port_leaves_an_adopted_rule_alone() {
     assert_eq!(full_install(&mut m, &dir), 0);
     assert_eq!(rerun_ssh(&mut m, &[("--port", "8443")]), 0);
     assert_eq!(
-        m.runner.ufw_rules,
+        port_rules(&m),
         ["allow 443/tcp", "allow 8443/tcp", "allow 8443/udp"]
     );
     assert!(
@@ -737,4 +741,122 @@ fn moving_the_port_leaves_an_adopted_rule_alone() {
     );
     ok(uninstall(&mut m, false, 0).0);
     assert_eq!(m.runner.ufw_rules, ["allow 443/tcp"]);
+}
+
+// ----- the bridge rules at uninstall ---------------------------------------------------------------
+
+fn forward_drop() -> serde_json::Value {
+    serde_json::json!({"chain": {"family": "inet", "table": "filter", "name": "forward", "handle": 2,
+        "type": "filter", "hook": "forward", "prio": 0, "policy": "drop"}})
+}
+
+fn nft_rule_count(m: &Machine) -> usize {
+    m.runner
+        .nft_items
+        .iter()
+        .filter(|i| i.get("rule").is_some())
+        .count()
+}
+
+#[test]
+fn uninstall_removes_the_ufw_bridge_rules_except_an_adopted_one() {
+    let mut m = Machine::new();
+    m.runner.ufw = Some(true);
+    // The administrator already allowed DNS over udp on the bridge.
+    let theirs = "allow in on hxbr0 to any port 53 proto udp".to_owned();
+    m.runner.ufw_rules.push(theirs.clone());
+    m.runner.ufw_foreign.insert(theirs.clone());
+    let dir = release(&mut m, &Tamper::default());
+    assert_eq!(full_install(&mut m, &dir), 0);
+    let rec = m.state().unwrap().created.port_rule.unwrap();
+    assert_eq!(rec.adopted, ["bridge:dns-udp"]);
+    assert_eq!(bridge_rules(&m).len(), 5);
+    // A re-run keeps the adoption.
+    assert_eq!(rerun_ssh(&mut m, &[]), 0);
+    assert_eq!(
+        m.state().unwrap().created.port_rule.unwrap().adopted,
+        ["bridge:dns-udp"]
+    );
+    ok(uninstall(&mut m, false, 0).0);
+    assert_eq!(
+        m.runner.ufw_rules,
+        [theirs],
+        "only the adopted rule is left"
+    );
+}
+
+#[test]
+fn uninstall_removes_every_ufw_bridge_rule_when_the_state_is_unreadable_or_the_install_half_done() {
+    // Unreadable state: found by the hash-xcreen comment, the administrator's rules stay.
+    let mut m = Machine::new();
+    m.runner.ufw = Some(true);
+    m.runner
+        .ufw_rules
+        .push("allow in on eth0 to any port 53 proto udp".into());
+    m.runner
+        .ufw_foreign
+        .insert("allow in on eth0 to any port 53 proto udp".into());
+    let dir = release(&mut m, &Tamper::default());
+    assert_eq!(full_install(&mut m, &dir), 0);
+    std::fs::write(path(&m, paths::STATE_FILE), b"{ not json").unwrap();
+    ok(uninstall(&mut m, false, 0).0);
+    assert_eq!(
+        m.runner.ufw_rules,
+        ["allow in on eth0 to any port 53 proto udp"]
+    );
+    // Half done: the third bridge rule failed; uninstall removes the ones that went in.
+    let mut m = Machine::new();
+    m.runner.ufw = Some(true);
+    m.runner.fail_on(Tool::Ufw, "port 53 proto tcp", 1, Some(1));
+    let dir = release(&mut m, &Tamper::default());
+    assert_eq!(full_install(&mut m, &dir), 1);
+    assert!(!m.runner.ufw_rules.is_empty());
+    ok(uninstall(&mut m, false, 0).0);
+    assert!(m.runner.ufw_rules.is_empty(), "{:?}", m.runner.ufw_rules);
+}
+
+#[test]
+fn uninstall_removes_the_nft_bridge_rules_in_input_and_forward_chains_even_if_they_stopped_dropping()
+ {
+    let mut m = Machine::new();
+    m.runner
+        .nft_items
+        .push(drop_chain("inet", "filter", "input"));
+    m.runner.nft_items.push(forward_drop());
+    let dir = release(&mut m, &Tamper::default());
+    assert_eq!(full_install(&mut m, &dir), 0);
+    assert_eq!(nft_rule_count(&m), 5, "port + 2 input + 2 forward");
+    // The forward chain no longer drops.
+    m.runner.nft_items[1]["chain"]["policy"] = serde_json::json!("accept");
+    ok(uninstall(&mut m, false, 0).0);
+    assert_eq!(nft_rule_count(&m), 0);
+    // And with an unreadable state.
+    let mut m = Machine::new();
+    m.runner
+        .nft_items
+        .push(drop_chain("inet", "filter", "input"));
+    m.runner.nft_items.push(forward_drop());
+    let dir = release(&mut m, &Tamper::default());
+    assert_eq!(full_install(&mut m, &dir), 0);
+    std::fs::write(path(&m, paths::STATE_FILE), b"\xff").unwrap();
+    ok(uninstall(&mut m, false, 0).0);
+    assert_eq!(nft_rule_count(&m), 0);
+}
+
+#[test]
+fn stale_nft_bridge_rules_are_cleaned_when_a_chain_stops_dropping() {
+    let mut m = Machine::new();
+    m.runner
+        .nft_items
+        .push(drop_chain("inet", "filter", "input"));
+    m.runner.nft_items.push(forward_drop());
+    let dir = release(&mut m, &Tamper::default());
+    assert_eq!(full_install(&mut m, &dir), 0);
+    m.runner.nft_items[1]["chain"]["policy"] = serde_json::json!("accept");
+    assert_eq!(rerun_ssh(&mut m, &[]), 0);
+    assert_eq!(
+        nft_rule_count(&m),
+        3,
+        "only the input chain keeps its rules"
+    );
 }

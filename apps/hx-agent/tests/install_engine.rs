@@ -531,7 +531,7 @@ fn a_changed_port_moves_the_socket_and_the_rule() {
     let (mut m, dir) = fresh();
     m.runner.ufw = Some(true);
     assert_eq!(full_install(&mut m, &dir), 0);
-    assert_eq!(m.runner.ufw_rules, ["allow 443/tcp", "allow 443/udp"]);
+    assert_eq!(port_rules(&m), ["allow 443/tcp", "allow 443/udp"]);
     assert_eq!(m.result()["port_rule"], "ufw");
     m.runner.calls.clear();
     assert_eq!(
@@ -540,7 +540,12 @@ fn a_changed_port_moves_the_socket_and_the_rule() {
         "{}",
         String::from_utf8_lossy(&m.err)
     );
-    assert_eq!(m.runner.ufw_rules, ["allow 8443/tcp", "allow 8443/udp"]);
+    assert_eq!(port_rules(&m), ["allow 8443/tcp", "allow 8443/udp"]);
+    assert_eq!(
+        bridge_rules(&m).len(),
+        5,
+        "the bridge rules stay when the port moves"
+    );
     assert!(
         m.read(paths::PORT_DROPIN)
             .unwrap()
@@ -2053,4 +2058,200 @@ fn a_password_longer_than_libxcrypt_reads_is_refused_before_any_change() {
         m2.daemons.desktop_password.as_deref().map(<[u8]>::len),
         Some(511)
     );
+}
+
+// ----- the bridge rules: ufw or a dropping nftables firewall must not stop the desktop ------------
+
+const BRIDGE_UFW: [&str; 5] = [
+    "allow in on hxbr0 to any port 67 proto udp",
+    "allow in on hxbr0 to any port 53 proto udp",
+    "allow in on hxbr0 to any port 53 proto tcp",
+    "route allow in on hxbr0",
+    "route allow out on hxbr0",
+];
+
+fn nft_comments(m: &Machine, chain: &str) -> Vec<String> {
+    m.runner
+        .nft_items
+        .iter()
+        .filter_map(|i| i.get("rule"))
+        .filter(|r| r["chain"] == chain)
+        .filter_map(|r| r["comment"].as_str().map(str::to_owned))
+        .collect()
+}
+
+fn forward_drop() -> serde_json::Value {
+    serde_json::json!({"chain": {"family": "inet", "table": "filter", "name": "forward", "handle": 2,
+        "type": "filter", "hook": "forward", "prio": 0, "policy": "drop"}})
+}
+
+#[test]
+fn ufw_also_lets_dhcp_dns_and_forwarding_through_on_the_bridge() {
+    // The ubuntu-24.04 / build / ufw cell: input and forward drop by default, so the desktop
+    // build found no DNS.
+    let (mut m, dir) = fresh();
+    m.runner.ufw = Some(true);
+    assert_eq!(
+        full_install(&mut m, &dir),
+        0,
+        "{}",
+        String::from_utf8_lossy(&m.err)
+    );
+    assert_eq!(bridge_rules(&m), BRIDGE_UFW);
+    // Exactly these calls, each with the comment, and nothing else on the bridge.
+    let lines = m.runner.lines();
+    for r in BRIDGE_UFW {
+        assert!(
+            lines.contains(&format!("ufw {r} comment hash-xcreen")),
+            "{r}: {lines:#?}"
+        );
+    }
+    let rec = m.state().unwrap().created.port_rule.unwrap();
+    assert!(rec.bridge && rec.adopted.is_empty());
+    // Before the desktop is built (stage 11 of 13).
+    let order: Vec<&str> = m.daemons.log.iter().map(String::as_str).collect();
+    assert!(order.contains(&"create_desktop"));
+    assert!(
+        lines
+            .iter()
+            .position(|l| l.contains("route allow out"))
+            .unwrap()
+            < lines.len()
+    );
+}
+
+#[test]
+fn ufw_bridge_rules_converge_on_a_resume_and_a_second_run_changes_nothing() {
+    let (mut m, dir) = fresh();
+    m.runner.ufw = Some(true);
+    assert_eq!(full_install(&mut m, &dir), 0);
+    m.runner.calls.clear();
+    assert_eq!(rerun(&mut m, &[], &[]), 0);
+    assert!(
+        !m.runner.mutating().iter().any(|l| l.starts_with("ufw")),
+        "{:?}",
+        m.runner.mutating()
+    );
+    assert!(states(&m, "skip").contains(&"firewall-port".to_owned()));
+    // A rule was deleted by hand: the stage is not skipped and puts it back.
+    m.runner
+        .ufw_rules
+        .retain(|r| r != "route allow out on hxbr0");
+    assert_eq!(rerun(&mut m, &[], &[]), 0);
+    assert!(states(&m, "done").contains(&"firewall-port".to_owned()));
+    assert_eq!(bridge_rules(&m), BRIDGE_UFW);
+    // An install that was recorded before the bridge rules existed gets them on the next run.
+    let mut st = m.state().unwrap();
+    st.created.port_rule.as_mut().unwrap().bridge = false;
+    hx_agent::install::state::save(&m.paths.at(paths::STATE_FILE), &st).unwrap();
+    m.runner.ufw_rules.retain(|r| !r.contains("hxbr0"));
+    assert_eq!(rerun(&mut m, &[], &[]), 0);
+    assert_eq!(bridge_rules(&m), BRIDGE_UFW);
+    assert!(m.state().unwrap().created.port_rule.unwrap().bridge);
+}
+
+#[test]
+fn a_partial_ufw_failure_is_recorded_and_the_next_run_finishes() {
+    let (mut m, dir) = fresh();
+    m.runner.ufw = Some(true);
+    m.runner.fail_on(Tool::Ufw, "route allow out", 1, Some(1));
+    assert_eq!(full_install(&mut m, &dir), 1);
+    assert_eq!(m.result()["stage"], "firewall-port");
+    assert!(
+        m.state().unwrap().created.port_rule.unwrap().bridge,
+        "recorded before the rules"
+    );
+    assert_eq!(bridge_rules(&m).len(), 4);
+    let dir = release(&mut m, &Tamper::default());
+    assert_eq!(full_install(&mut m, &dir), 0);
+    assert_eq!(bridge_rules(&m), BRIDGE_UFW);
+}
+
+#[test]
+fn nft_input_chains_get_dhcp_and_dns_and_forward_chains_get_forwarding() {
+    let (mut m, dir) = fresh();
+    m.runner.nft_items.push(nft_input_drop());
+    m.runner.nft_items.push(forward_drop());
+    assert_eq!(
+        full_install(&mut m, &dir),
+        0,
+        "{}",
+        String::from_utf8_lossy(&m.err)
+    );
+    let mut input = nft_comments(&m, "input");
+    input.sort();
+    assert_eq!(
+        input,
+        [
+            "hx-agent-bridge:in-tcp",
+            "hx-agent-bridge:in-udp",
+            "hx-agent-port"
+        ]
+    );
+    let mut fwd = nft_comments(&m, "forward");
+    fwd.sort();
+    assert_eq!(
+        fwd,
+        ["hx-agent-bridge:fwd-in", "hx-agent-bridge:fwd-out"],
+        "no port rule in forward"
+    );
+    // The rules as nft receives them.
+    let lines = m.runner.lines();
+    assert!(lines.contains(&"nft insert rule inet filter input iifname \"hxbr0\" udp dport { 53, 67 } accept comment \"hx-agent-bridge:in-udp\"".to_owned()), "{lines:#?}");
+    assert!(lines.contains(&"nft insert rule inet filter input iifname \"hxbr0\" tcp dport 53 accept comment \"hx-agent-bridge:in-tcp\"".to_owned()));
+    assert!(lines.contains(&"nft insert rule inet filter forward iifname \"hxbr0\" accept comment \"hx-agent-bridge:fwd-in\"".to_owned()));
+    assert!(lines.contains(&"nft insert rule inet filter forward oifname \"hxbr0\" ct state established,related accept comment \"hx-agent-bridge:fwd-out\"".to_owned()));
+    assert!(m.runner.enabled.contains("hx-agent-port.service"));
+}
+
+#[test]
+fn nft_bridge_rules_are_brought_back_after_a_reload_and_left_alone_otherwise() {
+    let (mut m, dir) = fresh();
+    m.runner.nft_items.push(nft_input_drop());
+    m.runner.nft_items.push(forward_drop());
+    assert_eq!(full_install(&mut m, &dir), 0);
+    m.runner.calls.clear();
+    assert_eq!(rerun(&mut m, &[], &[]), 0);
+    assert!(
+        !m.runner.mutating().iter().any(|l| l.starts_with("nft")),
+        "{:?}",
+        m.runner.mutating()
+    );
+    // One bridge rule is gone (a partial reload): not skipped, restored.
+    m.runner.nft_items.retain(|i| {
+        i.get("rule")
+            .is_none_or(|r| r["comment"] != "hx-agent-bridge:fwd-out")
+    });
+    assert_eq!(rerun(&mut m, &[], &[]), 0);
+    assert!(states(&m, "done").contains(&"firewall-port".to_owned()));
+    assert_eq!(nft_comments(&m, "forward").len(), 2);
+    // `hx-agent port-rule apply` does the same, with no state or stage.
+    m.runner.nft_items.retain(|i| i.get("rule").is_none());
+    assert!(hx_agent::install::stages::port::apply_nft(&mut m.runner, 443).unwrap());
+    assert_eq!(nft_comments(&m, "input").len(), 3);
+    assert_eq!(nft_comments(&m, "forward").len(), 2);
+}
+
+#[test]
+fn nft_with_only_a_dropping_forward_chain_gets_only_the_forward_rules() {
+    let (mut m, dir) = fresh();
+    m.runner.nft_items.push(serde_json::json!({"chain": {"family": "inet", "table": "filter", "name": "input", "handle": 1,
+        "type": "filter", "hook": "input", "prio": 0, "policy": "accept"}}));
+    m.runner.nft_items.push(forward_drop());
+    assert_eq!(full_install(&mut m, &dir), 0);
+    assert_eq!(m.result()["port_rule"], "nft");
+    assert!(
+        nft_comments(&m, "input").is_empty(),
+        "an accepting input chain needs nothing"
+    );
+    assert_eq!(nft_comments(&m, "forward").len(), 2);
+}
+
+#[test]
+fn an_nft_firewall_that_accepts_everything_needs_no_bridge_rules() {
+    let (mut m, dir) = fresh();
+    assert_eq!(full_install(&mut m, &dir), 0);
+    assert_eq!(m.result()["port_rule"], "none");
+    assert!(m.runner.nft_items.is_empty());
+    assert!(m.runner.ufw_rules.is_empty());
 }

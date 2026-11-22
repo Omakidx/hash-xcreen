@@ -19,6 +19,26 @@
 //! accepted ahead of them. That is the intended meaning of "open the agent's port"; an operator who
 //! wants source restrictions uses `--port` with their own rules, or the `manual` path.
 //!
+//! **The bridge.** With ufw or a dropping nftables firewall the desktop cannot start without more
+//! than the agent's port: the host's input chain drops the container's DHCP and DNS to the host's
+//! dnsmasq on our bridge (`hxbr0`, `Naming::production()`), and a dropping forward chain stops its
+//! traffic. Besides the port, the stage therefore also allows on the bridge, and nothing else:
+//!
+//! * input: udp 67 (DHCP), udp 53 and tcp 53 (DNS). The `inet hx` table already restricts input
+//!   from the bridge to exactly these;
+//! * forward: in on the bridge, and out on the bridge (nft: established and related only; ufw has
+//!   no such qualifier in a route rule). The `inet hx` forward chain still blocks private ranges and
+//!   DNAT, and a packet must pass **both** our table and the host's chains: allowing here does not
+//!   open anything that `inet hx` closes.
+//!
+//! ufw: `ufw allow in on hxbr0 to any port 67 proto udp` (then 53 udp and tcp) and
+//! `ufw route allow in on hxbr0` / `ufw route allow out on hxbr0`, comment `hash-xcreen`. nft:
+//! rules with the comments `hx-agent-bridge:<kind>` at the top of each dropping input chain
+//! (`iifname "hxbr0" udp dport { 53, 67 } accept`, `iifname "hxbr0" tcp dport 53 accept`) and
+//! forward chain (`iifname "hxbr0" accept`, `oifname "hxbr0" ct state established,related accept`),
+//! re-applied by `hx-agent-port.service` like the port rule. They are recorded, adopted and removed
+//! exactly like the port rule.
+//!
 //! **Bookkeeping.** The planned rule is recorded in the state before it is inserted, so that a
 //! failure half way is still removed by uninstall. At removal our comment is searched in EVERY input
 //! chain (not only the chains that still drop), and an unreadable state falls back to searching nft
@@ -41,7 +61,51 @@ pub const COMMENT: &str = "hx-agent-port";
 /// The ufw rule comment.
 pub const UFW_COMMENT: &str = "hash-xcreen";
 
-/// One input chain that blocks, and our rules in it.
+/// The nft comment prefix of the bridge rules (`hx-agent-bridge:in-udp`, ...).
+pub const BRIDGE_COMMENT: &str = "hx-agent-bridge:";
+
+/// The nft bridge rules a chain needs: (kind, tokens after the chain name and before the verb).
+fn bridge_nft_kinds(hook: &str, bridge: &str) -> Vec<(&'static str, Vec<String>)> {
+    let q = format!("\"{bridge}\"");
+    let t = |v: &[&str]| v.iter().map(|x| (*x).to_owned()).collect::<Vec<_>>();
+    if hook == "input" {
+        vec![
+            (
+                "in-udp",
+                [
+                    t(&["iifname"]),
+                    vec![q.clone()],
+                    t(&["udp", "dport", "{", "53,", "67", "}"]),
+                ]
+                .concat(),
+            ),
+            (
+                "in-tcp",
+                [t(&["iifname"]), vec![q], t(&["tcp", "dport", "53"])].concat(),
+            ),
+        ]
+    } else {
+        vec![
+            ("fwd-in", [t(&["iifname"]), vec![q.clone()]].concat()),
+            (
+                "fwd-out",
+                [
+                    t(&["oifname"]),
+                    vec![q],
+                    t(&["ct", "state", "established,related"]),
+                ]
+                .concat(),
+            ),
+        ]
+    }
+}
+
+/// The bridge of the desktops (`Naming::production()`).
+pub fn bridge_name() -> String {
+    hx_provision::host::Naming::production().bridge
+}
+
+/// One input or forward chain, and our rules in it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropChain {
     /// `inet`, `ip`, `ip6`.
@@ -50,8 +114,12 @@ pub struct DropChain {
     pub table: String,
     /// The chain.
     pub chain: String,
-    /// Our rules: handle and the port they accept.
+    /// `input` or `forward`.
+    pub hook: String,
+    /// Our port rules: handle and the port they accept.
     pub ours: Vec<(u64, Option<u16>)>,
+    /// Our bridge rules: handle and kind (`in-udp`, `in-tcp`, `fwd-in`, `fwd-out`).
+    pub bridge_ours: Vec<(u64, String)>,
 }
 
 fn name_ok(s: &str) -> bool {
@@ -107,7 +175,8 @@ fn analyze_all(json: &str) -> Vec<(DropChain, bool)> {
             let fam = c.get("family").and_then(Value::as_str).unwrap_or("");
             let tab = c.get("table").and_then(Value::as_str).unwrap_or("");
             let name = c.get("name").and_then(Value::as_str).unwrap_or("");
-            if c.get("hook").and_then(Value::as_str) != Some("input") || ignored_table(fam, tab) {
+            let hook = c.get("hook").and_then(Value::as_str).unwrap_or("");
+            if !matches!(hook, "input" | "forward") || ignored_table(fam, tab) {
                 continue;
             }
             if !(name_ok(fam) && name_ok(tab) && name_ok(name)) {
@@ -119,7 +188,9 @@ fn analyze_all(json: &str) -> Vec<(DropChain, bool)> {
                     family: fam.into(),
                     table: tab.into(),
                     chain: name.into(),
+                    hook: hook.into(),
                     ours: Vec::new(),
+                    bridge_ours: Vec::new(),
                 },
                 policy_drop,
             ));
@@ -147,6 +218,16 @@ fn analyze_all(json: &str) -> Vec<(DropChain, bool)> {
             }
             continue;
         }
+        if let Some(kind) = r
+            .get("comment")
+            .and_then(Value::as_str)
+            .and_then(|c| c.strip_prefix(BRIDGE_COMMENT))
+        {
+            if let Some(h) = r.get("handle").and_then(Value::as_u64) {
+                chain.bridge_ours.push((h, kind.to_owned()));
+            }
+            continue;
+        }
         if is_drop(&expr) && !has_iface_match(&expr) {
             *blocks = true;
         }
@@ -154,7 +235,7 @@ fn analyze_all(json: &str) -> Vec<(DropChain, bool)> {
     chains
 }
 
-/// The input base chains that block inbound traffic.
+/// The input and forward base chains that block traffic.
 pub fn analyze_nft(json: &str) -> Vec<DropChain> {
     analyze_all(json)
         .into_iter()
@@ -163,11 +244,11 @@ pub fn analyze_nft(json: &str) -> Vec<DropChain> {
         .collect()
 }
 
-/// Every input base chain that holds a rule of ours, blocking or not.
+/// Every input or forward base chain that holds a rule of ours, blocking or not.
 pub fn analyze_ours(json: &str) -> Vec<DropChain> {
     analyze_all(json)
         .into_iter()
-        .filter(|(c, _)| !c.ours.is_empty())
+        .filter(|(c, _)| !c.ours.is_empty() || !c.bridge_ours.is_empty())
         .map(|(c, _)| c)
         .collect()
 }
@@ -213,9 +294,34 @@ fn delete_rule(r: &mut dyn Runner, c: &DropChain, handle: u64) -> Result<()> {
     }
 }
 
-/// Inserts (or keeps) the accept rule at the top of every blocking input chain and removes our rule
-/// for another port, and our rules in chains that no longer block. Returns whether a blocking
-/// chain exists.
+fn insert_rule(
+    r: &mut dyn Runner,
+    c: &DropChain,
+    matches: Vec<String>,
+    comment: &str,
+) -> Result<()> {
+    let mut args: Vec<String> = ["insert", "rule", &c.family, &c.table, &c.chain]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    args.extend(matches);
+    args.extend([
+        "accept".to_owned(),
+        "comment".to_owned(),
+        format!("\"{comment}\""),
+    ]);
+    let o = run(r, &Call::owned(Tool::Nft, args));
+    if o.as_ref().is_some_and(Output::ok) {
+        Ok(())
+    } else {
+        Err(fail("adding the nftables rule", o))
+    }
+}
+
+/// At the top of every blocking input chain: the port rule, and the bridge rules (DHCP and DNS
+/// from the bridge); at the top of every blocking forward chain: the bridge forward rules. Our
+/// rule for another port, and every rule of ours in a chain that stopped blocking, is removed.
+/// Returns whether a blocking chain exists.
 pub fn apply_nft(r: &mut dyn Runner, port: u16) -> Result<bool> {
     let Some(list) = run(r, &Call::new(Tool::Nft, &["-j", "list", "ruleset"])).filter(Output::ok)
     else {
@@ -223,6 +329,7 @@ pub fn apply_nft(r: &mut dyn Runner, port: u16) -> Result<bool> {
     };
     let chains = analyze_all(&list.out_text());
     let p = port.to_string();
+    let bridge = bridge_name();
     let mut any_blocking = false;
     for (c, blocks) in &chains {
         if !*blocks {
@@ -230,52 +337,39 @@ pub fn apply_nft(r: &mut dyn Runner, port: u16) -> Result<bool> {
             for (handle, _) in &c.ours {
                 delete_rule(r, c, *handle)?;
             }
+            for (handle, _) in &c.bridge_ours {
+                delete_rule(r, c, *handle)?;
+            }
             continue;
         }
         any_blocking = true;
-        for (handle, rule_port) in &c.ours {
-            if *rule_port != Some(port) {
-                delete_rule(r, c, *handle)?;
+        if c.hook == "input" {
+            for (handle, rule_port) in &c.ours {
+                if *rule_port != Some(port) {
+                    delete_rule(r, c, *handle)?;
+                }
+            }
+            if !c.ours.iter().any(|(_, rp)| *rp == Some(port)) {
+                let m = [
+                    "meta", "l4proto", "{", "tcp,", "udp", "}", "th", "dport", &p,
+                ]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect();
+                insert_rule(r, c, m, COMMENT)?;
             }
         }
-        if !c.ours.iter().any(|(_, rp)| *rp == Some(port)) {
-            let o = run(
-                r,
-                &Call::owned(
-                    Tool::Nft,
-                    [
-                        "insert",
-                        "rule",
-                        &c.family,
-                        &c.table,
-                        &c.chain,
-                        "meta",
-                        "l4proto",
-                        "{",
-                        "tcp,",
-                        "udp",
-                        "}",
-                        "th",
-                        "dport",
-                        &p,
-                        "accept",
-                        "comment",
-                        "\"hx-agent-port\"",
-                    ]
-                    .iter()
-                    .map(|s| (*s).to_owned())
-                    .collect(),
-                ),
-            );
-            if !o.as_ref().is_some_and(Output::ok) {
-                return Err(fail("adding the nftables port rule", o));
+        for (kind, m) in bridge_nft_kinds(&c.hook, &bridge) {
+            if !c.bridge_ours.iter().any(|(_, k)| k == kind) {
+                insert_rule(r, c, m, &format!("{BRIDGE_COMMENT}{kind}"))?;
             }
         }
     }
     Ok(any_blocking)
 }
 
-/// Removes every nft rule of ours, in every input chain whether it still drops or not.
+/// Removes every nft rule of ours (port and bridge), in every input and forward chain whether it
+/// still drops or not.
 pub fn remove_nft(r: &mut dyn Runner) -> Result<()> {
     let Some(list) = run(r, &Call::new(Tool::Nft, &["-j", "list", "ruleset"])).filter(Output::ok)
     else {
@@ -285,41 +379,69 @@ pub fn remove_nft(r: &mut dyn Runner) -> Result<()> {
         for (handle, _) in &c.ours {
             delete_rule(r, &c, *handle)?;
         }
+        for (handle, _) in &c.bridge_ours {
+            delete_rule(r, &c, *handle)?;
+        }
     }
     Ok(())
 }
 
+/// The nft bridge rules a blocking chain still lacks (empty: complete).
+fn bridge_missing(c: &DropChain) -> bool {
+    bridge_nft_kinds(&c.hook, &bridge_name())
+        .iter()
+        .any(|(kind, _)| !c.bridge_ours.iter().any(|(_, k)| k == kind))
+}
+
 const PROTOS: [&str; 2] = ["tcp", "udp"];
 
-/// `ufw allow <port>/<proto> comment hash-xcreen`. Returns true when the rule already existed
-/// ("Skipping adding existing rule").
-fn ufw_add(r: &mut dyn Runner, port: u16, proto: &str) -> Result<bool> {
-    let o = run(
-        r,
-        &Call::owned(
-            Tool::Ufw,
-            vec![
-                "allow".into(),
-                format!("{port}/{proto}"),
-                "comment".into(),
-                UFW_COMMENT.into(),
-            ],
+/// The ufw bridge rules: the key recorded when one is adopted, and the words of the rule.
+fn ufw_bridge_rules(bridge: &str) -> Vec<(&'static str, Vec<String>)> {
+    let w = |v: Vec<&str>| v.into_iter().map(str::to_owned).collect::<Vec<_>>();
+    let allow_in = |port: &str, proto: &str| {
+        w(vec![
+            "allow", "in", "on", bridge, "to", "any", "port", port, "proto", proto,
+        ])
+    };
+    vec![
+        ("bridge:dhcp", allow_in("67", "udp")),
+        ("bridge:dns-udp", allow_in("53", "udp")),
+        ("bridge:dns-tcp", allow_in("53", "tcp")),
+        (
+            "bridge:route-in",
+            w(vec!["route", "allow", "in", "on", bridge]),
         ),
-    );
-    match o {
+        (
+            "bridge:route-out",
+            w(vec!["route", "allow", "out", "on", bridge]),
+        ),
+    ]
+}
+
+/// `ufw ... comment hash-xcreen`. Returns true when the rule already existed ("Skipping adding
+/// existing rule").
+fn ufw_add_words(r: &mut dyn Runner, words: &[String]) -> Result<bool> {
+    let mut args = words.to_vec();
+    args.push("comment".into());
+    args.push(UFW_COMMENT.into());
+    match run(r, &Call::owned(Tool::Ufw, args)) {
         Some(o) if o.ok() => Ok(o.out_text().contains("Skipping adding existing rule")),
         o => Err(fail("ufw", o)),
     }
 }
 
-fn ufw_delete(r: &mut dyn Runner, port: u16, proto: &str) -> Result<()> {
-    let o = run(
-        r,
-        &Call::owned(
-            Tool::Ufw,
-            vec!["delete".into(), "allow".into(), format!("{port}/{proto}")],
-        ),
-    );
+/// `ufw delete <rule>` (`ufw route delete <rule>` for a route rule).
+fn ufw_delete_words(r: &mut dyn Runner, words: &[String]) -> Result<()> {
+    let mut args: Vec<String> = Vec::new();
+    if words.first().map(String::as_str) == Some("route") {
+        args.push("route".into());
+        args.push("delete".into());
+        args.extend(words[1..].iter().cloned());
+    } else {
+        args.push("delete".into());
+        args.extend(words.iter().cloned());
+    }
+    let o = run(r, &Call::owned(Tool::Ufw, args));
     if o.as_ref().is_some_and(Output::ok) {
         Ok(())
     } else {
@@ -327,17 +449,60 @@ fn ufw_delete(r: &mut dyn Runner, port: u16, proto: &str) -> Result<()> {
     }
 }
 
-/// Removes the port rule recorded in the state (uninstall U4). A ufw protocol that was `adopted`
-/// is left alone: it was the administrator's rule.
+fn ufw_port_words(port: u16, proto: &str) -> Vec<String> {
+    vec!["allow".into(), format!("{port}/{proto}")]
+}
+
+/// The rules ufw lists as added, normalised to the rule words (`ufw show added` prints
+/// `ufw allow 443/tcp comment 'hash-xcreen'`).
+fn ufw_added(r: &mut dyn Runner) -> Vec<String> {
+    let Some(o) = run(r, &Call::new(Tool::Ufw, &["show", "added"])).filter(Output::ok) else {
+        return Vec::new();
+    };
+    o.out_text()
+        .lines()
+        .filter_map(|l| {
+            let rest = l.trim().strip_prefix("ufw ")?;
+            Some(
+                rest.split(" comment ")
+                    .next()
+                    .unwrap_or(rest)
+                    .trim()
+                    .to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// Removes the port rules recorded in the state (an `adopted` protocol is left alone).
+fn remove_ufw_ports(r: &mut dyn Runner, rec: &PortRule) -> Result<()> {
+    for proto in PROTOS {
+        if !rec.adopted.iter().any(|a| a == proto) {
+            ufw_delete_words(r, &ufw_port_words(rec.port, proto))?;
+        }
+    }
+    Ok(())
+}
+
+/// Removes the bridge rules of a ufw record (an adopted one is left alone).
+fn remove_ufw_bridge(r: &mut dyn Runner, rec: &PortRule) -> Result<()> {
+    if !rec.bridge {
+        return Ok(());
+    }
+    for (key, words) in ufw_bridge_rules(&bridge_name()) {
+        if !rec.adopted.iter().any(|a| a == key) {
+            ufw_delete_words(r, &words)?;
+        }
+    }
+    Ok(())
+}
+
+/// Removes everything the record names (uninstall U4): the port rules and the bridge rules.
 pub fn remove(r: &mut dyn Runner, rec: &PortRule) -> Result<()> {
     match rec.backend.as_str() {
         "ufw" => {
-            for proto in PROTOS {
-                if !rec.adopted.iter().any(|a| a == proto) {
-                    ufw_delete(r, rec.port, proto)?;
-                }
-            }
-            Ok(())
+            remove_ufw_ports(r, rec)?;
+            remove_ufw_bridge(r, rec)
         }
         "nft" => remove_nft(r),
         _ => Ok(()),
@@ -345,16 +510,19 @@ pub fn remove(r: &mut dyn Runner, rec: &PortRule) -> Result<()> {
 }
 
 /// With no readable state: our nft rules by their comment, and the ufw rules that carry our
-/// comment (`ufw show added` lists them as `ufw allow 443/tcp comment 'hash-xcreen'`). A ufw rule
-/// without our comment is never touched.
+/// comment (`ufw show added`). A ufw rule without our comment is never touched, and only a plain
+/// port rule or one of the known bridge rules is deleted.
 pub fn remove_fallback(r: &mut dyn Runner) -> Result<()> {
     remove_nft(r)?;
     let Some(o) = run(r, &Call::new(Tool::Ufw, &["show", "added"])).filter(Output::ok) else {
         return Ok(());
     };
+    let known: Vec<Vec<String>> = ufw_bridge_rules(&bridge_name())
+        .into_iter()
+        .map(|(_, w)| w)
+        .collect();
     for line in o.out_text().lines() {
-        let l = line.trim();
-        let Some(rest) = l.strip_prefix("ufw ") else {
+        let Some(rest) = line.trim().strip_prefix("ufw ") else {
             continue;
         };
         let Some((spec, tail)) = rest.split_once(" comment ") else {
@@ -363,23 +531,14 @@ pub fn remove_fallback(r: &mut dyn Runner) -> Result<()> {
         if tail.trim().trim_matches('\'') != UFW_COMMENT {
             continue;
         }
-        let words: Vec<&str> = spec.split_whitespace().collect();
-        let plain = words.len() == 2
+        let words: Vec<String> = spec.split_whitespace().map(str::to_owned).collect();
+        let plain_port = words.len() == 2
             && words[0] == "allow"
             && words[1]
                 .bytes()
                 .all(|b| b.is_ascii_digit() || b == b'/' || b.is_ascii_lowercase());
-        if plain {
-            let o = run(
-                r,
-                &Call::owned(
-                    Tool::Ufw,
-                    vec!["delete".into(), "allow".into(), words[1].to_owned()],
-                ),
-            );
-            if !o.as_ref().is_some_and(Output::ok) {
-                return Err(fail("ufw", o));
-            }
+        if plain_port || known.contains(&words) {
+            ufw_delete_words(r, &words)?;
         }
     }
     Ok(())
@@ -439,6 +598,7 @@ pub fn plan(r: &mut dyn Runner, port: u16) -> Plan {
     if ufw_active(r) {
         return Plan::Ufw;
     }
+    // An input chain that drops, or a forward chain that drops (the desktop's traffic).
     let blocking = run(r, &Call::new(Tool::Nft, &["-j", "list", "ruleset"]))
         .filter(Output::ok)
         .is_some_and(|l| !analyze_nft(&l.out_text()).is_empty());
@@ -472,18 +632,23 @@ pub fn execute(
     previous: Option<&PortRule>,
     checkpoint: &mut dyn FnMut(&PortRule),
 ) -> Result<PortOutcome> {
-    // A rule of another backend or port is ours to move, never an adopted one.
-    if let Some(p) = previous
-        && (p.backend != plan.backend() || p.port != port)
-    {
-        remove(r, p)?;
+    // A rule of another backend is ours to move; another port moves only the port rules (the
+    // bridge rules do not depend on it). An adopted rule is never removed.
+    if let Some(p) = previous {
+        if p.backend != plan.backend() {
+            remove(r, p)?;
+        } else if p.port != port && p.backend == "ufw" {
+            remove_ufw_ports(r, p)?;
+        }
     }
     let same = previous.filter(|p| p.backend == plan.backend() && p.port == port);
     let mut adopted = same.map(|p| p.adopted.clone()).unwrap_or_default();
+    // Existing bridge rules are the administrator's unless an earlier run of ours added them.
+    let bridge_known = previous.is_some_and(|p| p.backend == plan.backend() && p.bridge);
     match plan {
         Plan::Ufw => {
             for proto in PROTOS {
-                let existed = ufw_add(r, port, proto)?;
+                let existed = ufw_add_words(r, &ufw_port_words(port, proto))?;
                 // First sight of a rule that was already there: the administrator's.
                 if existed && same.is_none() && !adopted.iter().any(|a| a == proto) {
                     adopted.push(proto.to_owned());
@@ -492,6 +657,19 @@ pub fn execute(
                     backend: "ufw".into(),
                     port,
                     adopted: adopted.clone(),
+                    bridge: bridge_known,
+                });
+            }
+            for (key, words) in ufw_bridge_rules(&bridge_name()) {
+                let existed = ufw_add_words(r, &words)?;
+                if existed && !bridge_known && !adopted.iter().any(|a| a == key) {
+                    adopted.push(key.to_owned());
+                }
+                checkpoint(&PortRule {
+                    backend: "ufw".into(),
+                    port,
+                    adopted: adopted.clone(),
+                    bridge: true,
                 });
             }
         }
@@ -512,7 +690,8 @@ pub fn execute(
 
 // ----- the stage ------------------------------------------------------------------------------
 
-/// Done-check: the recorded rule is for this port and still in place (nft re-checked live).
+/// Done-check: the recorded rule is for this port, includes the bridge rules, and is still in
+/// place (re-checked live: a reload of the nft ruleset drops it, and ufw rules can be deleted).
 pub fn check(ctx: &mut Ctx<'_>) -> Result<bool> {
     let Some(rec) = ctx.state.created.port_rule.clone() else {
         return Ok(false);
@@ -521,9 +700,16 @@ pub fn check(ctx: &mut Ctx<'_>) -> Result<bool> {
         return Ok(false);
     }
     Ok(match rec.backend.as_str() {
-        "ufw" => ufw_active(ctx.runner),
+        "ufw" => {
+            if !rec.bridge || !ufw_active(ctx.runner) {
+                return Ok(false);
+            }
+            let added = ufw_added(ctx.runner);
+            let has = |words: &[String]| added.iter().any(|a| *a == words.join(" "));
+            PROTOS.iter().all(|p| has(&ufw_port_words(rec.port, p)))
+                && ufw_bridge_rules(&bridge_name()).iter().all(|(_, w)| has(w))
+        }
         "nft" => {
-            // Still there? A reload of the ruleset drops it.
             let Some(list) = run(
                 ctx.runner,
                 &Call::new(Tool::Nft, &["-j", "list", "ruleset"]),
@@ -531,11 +717,24 @@ pub fn check(ctx: &mut Ctx<'_>) -> Result<bool> {
             .filter(Output::ok) else {
                 return Ok(false);
             };
-            let chains = analyze_nft(&list.out_text());
+            let all = analyze_all(&list.out_text());
+            // A rule of ours in a chain that stopped dropping is stale: not done.
+            if all
+                .iter()
+                .any(|(c, blocks)| !*blocks && (!c.ours.is_empty() || !c.bridge_ours.is_empty()))
+            {
+                return Ok(false);
+            }
+            let chains: Vec<DropChain> = all
+                .into_iter()
+                .filter(|(_, blocks)| *blocks)
+                .map(|(c, _)| c)
+                .collect();
             !chains.is_empty()
-                && chains
-                    .iter()
-                    .all(|c| c.ours.iter().any(|(_, p)| *p == Some(rec.port)))
+                && chains.iter().all(|c| {
+                    !bridge_missing(c)
+                        && (c.hook != "input" || c.ours.iter().any(|(_, p)| *p == Some(rec.port)))
+                })
         }
         // Nothing to verify for these.
         _ => true,
@@ -556,6 +755,10 @@ pub fn run_stage(ctx: &mut Ctx<'_>) -> Result<Outcome> {
         backend: plan.backend().to_owned(),
         port,
         adopted: same.map(|p| p.adopted.clone()).unwrap_or_default(),
+        // The bridge rules are part of the plan for these two backends, recorded before they are
+        // added (an uninstall after a partial failure removes them; an earlier record's
+        // adoption is kept).
+        bridge: matches!(plan, Plan::Ufw | Plan::Nft),
     });
     ctx.save_state()?;
     let out = {
@@ -572,6 +775,7 @@ pub fn run_stage(ctx: &mut Ctx<'_>) -> Result<Outcome> {
         backend: out.backend.clone(),
         port,
         adopted: out.adopted.clone(),
+        bridge: matches!(plan, Plan::Ufw | Plan::Nft),
     });
     ctx.log
         .line((ctx.now)(), &format!("port rule: {}", out.backend));
@@ -705,7 +909,6 @@ mod tests {
             chain("inet", "hx", "input", "input", "drop"),
             chain("inet", "incus", "in.hxbr0", "input", "drop"),
             chain("ip", "docker-bridges", "x", "input", "drop"),
-            chain("inet", "filter", "forward", "forward", "drop"),
         ]);
         assert!(analyze_nft(&j).is_empty());
     }
@@ -728,6 +931,69 @@ mod tests {
         ]);
         let c = analyze_nft(&j);
         assert_eq!(c[0].ours, vec![(7, Some(8443))]);
+    }
+
+    #[test]
+    fn a_dropping_forward_chain_is_found_with_its_hook_and_a_filter_chain_that_accepts_is_not() {
+        let j = rs(vec![
+            chain("inet", "filter", "input", "input", "accept"),
+            chain("inet", "filter", "forward", "forward", "drop"),
+            chain("inet", "filter", "output", "output", "drop"),
+        ]);
+        let c = analyze_nft(&j);
+        assert_eq!(c.len(), 1);
+        assert_eq!(
+            (c[0].hook.as_str(), c[0].chain.as_str()),
+            ("forward", "forward")
+        );
+    }
+
+    #[test]
+    fn our_bridge_rules_are_recognised_by_their_comment_kind() {
+        let j = rs(vec![
+            chain("inet", "filter", "input", "input", "drop"),
+            rule(
+                "inet",
+                "filter",
+                "input",
+                9,
+                Some("hx-agent-bridge:in-udp"),
+                json!([{"accept": null}]),
+            ),
+            rule(
+                "inet",
+                "filter",
+                "input",
+                10,
+                Some("hx-agent-bridge:in-tcp"),
+                json!([{"accept": null}]),
+            ),
+        ]);
+        let c = analyze_nft(&j);
+        assert_eq!(
+            c[0].bridge_ours,
+            vec![(9, "in-udp".to_owned()), (10, "in-tcp".to_owned())]
+        );
+        assert!(!bridge_missing(&c[0]));
+        let kinds = bridge_nft_kinds("forward", "hxbr0");
+        assert_eq!(
+            kinds.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            ["fwd-in", "fwd-out"]
+        );
+        assert!(
+            kinds[1]
+                .1
+                .join(" ")
+                .contains("oifname \"hxbr0\" ct state established,related")
+        );
+        let input = bridge_nft_kinds("input", "hxbr0");
+        assert!(input[0].1.join(" ").contains("udp dport { 53, 67 }"));
+        assert!(input[1].1.join(" ").ends_with("tcp dport 53"));
+    }
+
+    #[test]
+    fn the_bridge_is_the_production_name() {
+        assert_eq!(bridge_name(), "hxbr0");
     }
 
     #[test]

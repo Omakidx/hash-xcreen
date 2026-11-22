@@ -404,10 +404,18 @@ impl FakeRunner {
                     .position(|x| x == "dport")
                     .and_then(|i| a.get(i + 1))
                     .and_then(|p| p.parse::<u64>().ok());
+                let comment = a
+                    .last()
+                    .map(|c| c.trim_matches('"').to_owned())
+                    .unwrap_or_default();
                 self.next_handle += 1;
+                let expr = if comment == "hx-agent-port" {
+                    json!([{"match": {"left": {"payload": {"protocol": "th", "field": "dport"}}, "op": "==", "right": port}}, {"accept": null}])
+                } else {
+                    json!([{"accept": null}])
+                };
                 self.nft_items.push(json!({"rule": {"family": fam, "table": tab, "chain": chain, "handle": self.next_handle,
-                    "comment": "hx-agent-port",
-                    "expr": [{"match": {"left": {"payload": {"protocol": "th", "field": "dport"}}, "op": "==", "right": port}}, {"accept": null}]}}));
+                    "comment": comment, "expr": expr}}));
                 Self::ok("")
             }
             (Some("delete"), Some("rule")) => {
@@ -526,8 +534,12 @@ impl Runner for FakeRunner {
                     } else {
                         "Status: inactive\n"
                     }),
-                    Some("allow") => {
-                        let rule = format!("allow {}", a[1]);
+                    // `allow ...`, `route allow ...` (a trailing `comment X` is dropped).
+                    Some("allow") | Some("route")
+                        if a.get(1).map(String::as_str) != Some("delete") =>
+                    {
+                        let end = a.iter().position(|x| x == "comment").unwrap_or(a.len());
+                        let rule = a[..end].join(" ");
                         if self.ufw_rules.contains(&rule) {
                             Self::ok("Skipping adding existing rule\n")
                         } else {
@@ -548,8 +560,13 @@ impl Runner for FakeRunner {
                         }
                         Self::ok(&t)
                     }
-                    Some("delete") => {
-                        let spec = format!("allow {}", a.last().cloned().unwrap_or_default());
+                    // `delete <rule>` and `route delete <rule>`.
+                    Some("delete") | Some("route") => {
+                        let spec = if a[0] == "route" {
+                            format!("route {}", a[2..].join(" "))
+                        } else {
+                            a[1..].join(" ")
+                        };
                         self.ufw_rules.retain(|r| *r != spec);
                         Self::ok("Rule deleted\n")
                     }
