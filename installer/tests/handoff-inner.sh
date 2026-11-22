@@ -1,4 +1,5 @@
 #!/bin/sh
+# shellcheck disable=SC2034 # the paths assigned after sourcing install.sh are read by its functions
 # Runs install.sh's `main` in a fake root, as the shell under test (installer/tests/handoff.sh).
 #   handoff-inner.sh <install.sh> <fake dir> <os-release file> <as-root yes|no> <expect-uid> <agent path> <main args...>
 # The paths install.sh fixes for a real host are re-pointed into <fake dir>; main execs the
