@@ -1,0 +1,172 @@
+/*
+ * hash-xcreen design tokens (mockups, workstream 1G).
+ *
+ * The whole visual system is the variables in this file. The app maps them
+ * one to one onto a Slint `global Tokens { out property <color> ... }`, so a
+ * token here is a token there. Nothing in the mockups uses a raw colour
+ * outside this file, except the remote desktop picture (it is remote
+ * content, drawn the same in both themes).
+ *
+ * Theme selection: dark is the default. `data-theme="light"` or
+ * `data-theme="dark"` on <html> forces one; `data-theme="system"` follows
+ * the OS (the app's "System" setting, userflow §1 and §12).
+ *
+ * Contrast (WCAG 2.2 AA): every text token on every surface it is used on is
+ * >= 4.5:1; borders of controls and focus rings are >= 3:1 against the
+ * surface behind them. The ratios are listed on design-system.html.
+ */
+
+:root {
+  color-scheme: dark;
+
+  /* Surfaces, darkest to lightest */
+  --bg: #0e1116;            /* window background */
+  --surface: #151a21;       /* cards, panels, sidebars */
+  --surface-2: #1c222b;     /* inputs, raised rows, title bar */
+  --surface-3: #262d38;     /* hover, selected row */
+
+  /* Lines */
+  --border: #2c3441;        /* decorative dividers */
+  --border-strong: #727d8f; /* control outlines (3:1 on every surface) */
+
+  /* Text */
+  --text: #e8ebf0;          /* primary */
+  --text-2: #b2bac7;        /* secondary */
+  --text-3: #959fae;        /* hints, captions (4.5:1 on surface-2) */
+
+  /* Accent (primary actions, links, selection) */
+  --accent: #6aa6ff;
+  --accent-hover: #8dbbff;
+  --on-accent: #08101d;     /* text on an accent fill */
+  --accent-soft: #172a47;   /* tinted background */
+  --accent-text: #8dbbff;   /* accent as text on surfaces */
+
+  /* Status. Always paired with a word or an icon, never colour alone. */
+  --success: #5fd39a;
+  --success-bg: #12301f;
+  --warning: #f0b84d;
+  --warning-bg: #35290f;
+  --danger: #ff8d8d;        /* as text and icon */
+  --danger-bg: #3a1c21;
+  --danger-fill: #cf3b43;   /* destructive button fill */
+  --on-danger-fill: #ffffff;
+  --info: #8dbbff;
+  --info-bg: #172a47;
+  --neutral-bg: #232a35;    /* offline, unknown */
+
+  /* Focus: a 2 px ring with a 2 px gap, on every interactive element */
+  --focus: #8dbbff;
+
+  /* Overlays */
+  --scrim: rgba(4, 7, 11, 0.66);
+  --shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
+
+  /* Toolbar floating over the remote desktop */
+  --float-bg: rgba(21, 26, 33, 0.94);
+  --float-border: #3a4352;
+
+  /* Type: system fonts only (no web fonts, works offline) */
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "DejaVu Sans Mono", Menlo, Consolas, monospace;
+  --fs-xs: 12px;   /* captions, badges */
+  --fs-sm: 13px;   /* dense tables, hints */
+  --fs-md: 14px;   /* body */
+  --fs-lg: 16px;   /* card titles, inputs */
+  --fs-xl: 20px;   /* screen sections */
+  --fs-2xl: 26px;  /* screen titles */
+  --fs-3xl: 34px;  /* welcome, PIN dots */
+  --lh: 1.45;
+  --fw-regular: 400;
+  --fw-medium: 600;
+
+  /* Spacing (4 px base) */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+  --sp-7: 48px;
+
+  /* Radii */
+  --r-sm: 4px;     /* badges, small chips */
+  --r-md: 8px;     /* buttons, inputs */
+  --r-lg: 12px;    /* cards, dialogs */
+  --r-full: 999px; /* switches, pills */
+
+  /* Sizes */
+  --control-h: 36px;   /* buttons and inputs; 44 px hit area on touch */
+  --control-h-lg: 44px;
+  --appbar-h: 56px;
+}
+
+/* Light theme */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f2f4f8;
+  --surface: #ffffff;
+  --surface-2: #f6f8fb;
+  --surface-3: #e8ecf2;
+  --border: #d4dae3;
+  --border-strong: #697384;
+  --text: #151a21;
+  --text-2: #424d5e;
+  --text-3: #566173;
+  --accent: #1d5fd6;
+  --accent-hover: #174fb4;
+  --on-accent: #ffffff;
+  --accent-soft: #e3edfd;
+  --accent-text: #1750b8;
+  --success: #12683d;
+  --success-bg: #e3f4ea;
+  --warning: #805000;
+  --warning-bg: #fcf0d9;
+  --danger: #ac2019;
+  --danger-bg: #fdebe9;
+  --danger-fill: #b3261e;
+  --on-danger-fill: #ffffff;
+  --info: #1750b8;
+  --info-bg: #e3edfd;
+  --neutral-bg: #e8ecf2;
+  --focus: #1d5fd6;
+  --scrim: rgba(18, 24, 33, 0.5);
+  --shadow: 0 8px 28px rgba(20, 30, 50, 0.2);
+  --float-bg: rgba(255, 255, 255, 0.95);
+  --float-border: #b9c2cf;
+}
+
+@media (prefers-color-scheme: light) {
+  :root[data-theme="system"] {
+    color-scheme: light;
+    --bg: #f2f4f8;
+    --surface: #ffffff;
+    --surface-2: #f6f8fb;
+    --surface-3: #e8ecf2;
+    --border: #d4dae3;
+    --border-strong: #697384;
+    --text: #151a21;
+    --text-2: #424d5e;
+    --text-3: #566173;
+    --accent: #1d5fd6;
+    --accent-hover: #174fb4;
+    --on-accent: #ffffff;
+    --accent-soft: #e3edfd;
+    --accent-text: #1750b8;
+    --success: #12683d;
+    --success-bg: #e3f4ea;
+    --warning: #805000;
+    --warning-bg: #fcf0d9;
+    --danger: #ac2019;
+    --danger-bg: #fdebe9;
+    --danger-fill: #b3261e;
+    --on-danger-fill: #ffffff;
+    --info: #1750b8;
+    --info-bg: #e3edfd;
+    --neutral-bg: #e8ecf2;
+    --focus: #1d5fd6;
+    --scrim: rgba(18, 24, 33, 0.5);
+    --shadow: 0 8px 28px rgba(20, 30, 50, 0.2);
+    --float-bg: rgba(255, 255, 255, 0.95);
+    --float-border: #b9c2cf;
+  }
+}
