@@ -15,6 +15,7 @@
 //! | [`verifier`] | `HMAC(pepper, Argon2id(secret))` records, their file, `PepperEnrol`, and `PrivdPinVerifier` (the authenticator's PIN check) |
 //! | [`privd_client`] | the async client of `hx-privd` (role `Gateway`) |
 //! | [`session`] | one authorized connection's control loop, claiming, takeover (ipc.md 18) |
+//! | [`server_mgmt`] | server management from the app (protocol 1.3 `ServerMgmt`): overview, PIN and password, restart, Docker off, limits, update |
 //! | [`setup`] | the post-pairing setup of the one-liner path (protocol 1.3): coordinator, job, `INTENT_SETUP` connections |
 //! | [`takeover`] | takeover policy and the 3-per-10-minutes limit |
 //! | [`devices`] | list, revoke, change notices, audit events (protocol 5.9) |
@@ -46,6 +47,7 @@ pub mod live;
 pub mod privd_client;
 pub mod relay;
 pub mod server;
+pub mod server_mgmt;
 pub mod session;
 pub mod setup;
 pub mod takeover;
