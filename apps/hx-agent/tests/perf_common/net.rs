@@ -121,10 +121,16 @@ pub struct Control {
     /// UDP bytes per second that crossed the shaped link (server to client), 0 when the
     /// profile has no rate.
     pub udp_mbit: f64,
-    /// `tc -s qdisc show` of the server-side device after the control (the counters show the
-    /// drops netem made).
+    /// `tc -s qdisc show` of the server-side and of the client-side device after the control
+    /// (the counters show the drops netem made; loss is applied on each end, so a drop in one
+    /// direction shows only on that direction's sender).
     pub tc_after: String,
+    pub tc_after_client: String,
+    /// Drops counted by both qdiscs together.
     pub netem_dropped: u64,
+    /// Drops counted by the server-side and by the client-side qdisc alone.
+    pub netem_dropped_server: u64,
+    pub netem_dropped_client: u64,
     /// Human-readable verdict lines.
     pub notes: Vec<String>,
 }
@@ -245,6 +251,21 @@ impl Net {
         run("tc", &["-s", "qdisc", "show", "dev", DEV_S]).unwrap_or_default()
     }
 
+    /// `tc -s qdisc show dev hxc0`, read in the client namespace.
+    pub fn tc_client(&self) -> String {
+        self.in_client("tc", &["-s", "qdisc", "show", "dev", DEV_C])
+            .unwrap_or_default()
+    }
+
+    /// Fills the drop counters of `c` from both ends' qdiscs.
+    pub fn read_drops(&self, c: &mut Control) {
+        c.tc_after = self.tc_server();
+        c.tc_after_client = self.tc_client();
+        c.netem_dropped_server = parse_dropped(&c.tc_after);
+        c.netem_dropped_client = parse_dropped(&c.tc_after_client);
+        c.netem_dropped = c.netem_dropped_server + c.netem_dropped_client;
+    }
+
     /// The client interface's (rx, tx) byte counters, read in the client namespace.
     pub fn client_bytes(&self) -> Option<(u64, u64)> {
         let out = self.in_client("cat", &["/proc/net/dev"]).ok()?;
@@ -264,7 +285,18 @@ impl Net {
         // 400 round trips) < 1e-5), few enough that a 80 ms profile stays under 10 s.
         let count = if p.loss_pct > 0.0 { 400 } else { 60 };
         let interval = 0.02;
-        let pg = ping(count, interval)?;
+        let mut pg = ping(count, interval)?;
+        // A lossy profile that shows no loss at all in 400 probes is practically impossible
+        // (1.5 % per direction); probe once more before judging, and judge the total.
+        if p.loss_pct > 0.0 && pg.received == pg.sent {
+            let again = ping(count, interval)?;
+            pg.sent += again.sent;
+            pg.received += again.received;
+            pg.loss = 100.0 * f64::from(pg.sent - pg.received) / f64::from(pg.sent.max(1));
+            pg.avg = (pg.avg + again.avg) / 2.0;
+            pg.min = pg.min.min(again.min);
+            pg.max = pg.max.max(again.max);
+        }
         c.rtt_min_ms = pg.min;
         c.rtt_avg_ms = pg.avg;
         c.rtt_max_ms = pg.max;
@@ -275,8 +307,7 @@ impl Net {
         if p.rate_mbit > 0 {
             c.udp_mbit = self.udp_rate()?;
         }
-        c.tc_after = self.tc_server();
-        c.netem_dropped = parse_dropped(&c.tc_after);
+        self.read_drops(&mut c);
         c.notes = judge_control(p, &c);
         Ok(c)
     }
@@ -437,8 +468,16 @@ pub fn judge_control(p: &Profile, c: &Control) -> Vec<String> {
         ));
     }
     if p.loss_pct > 0.0 {
-        if c.netem_dropped == 0 || c.ping_received == c.ping_sent {
-            v.push("FAIL the lossy profile lost nothing".to_string());
+        // Loss is applied on each end: count the drops of both qdiscs and the lost pings. A
+        // profile that really applies no loss still shows none of the three.
+        if c.netem_dropped == 0 && c.ping_received == c.ping_sent {
+            v.push(format!(
+                "FAIL the lossy profile lost nothing (server qdisc dropped {}, client qdisc dropped {}, {} of {} pings lost)",
+                c.netem_dropped_server,
+                c.netem_dropped_client,
+                c.ping_sent - c.ping_received,
+                c.ping_sent
+            ));
         }
         if c.ping_loss_pct > 12.0 {
             v.push(format!(
@@ -535,6 +574,47 @@ mod tests {
                 .any(|l| l.starts_with("FAIL")),
             "{:?}",
             judge_control(&BROADBAND, &c)
+        );
+    }
+
+    #[test]
+    fn the_lossy_control_counts_the_drops_of_both_ends() {
+        let base = Control {
+            baseline_rtt_avg_ms: 0.05,
+            rtt_min_ms: 40.0,
+            rtt_avg_ms: 40.3,
+            ping_sent: 400,
+            ping_received: 400,
+            ..Control::default()
+        };
+        let fails = |c: &Control| {
+            judge_control(&LOSSY, c)
+                .iter()
+                .any(|l| l.contains("lost nothing"))
+        };
+        // CI failure: the pings lost 3 of 400 and the server's qdisc saw none (the drops were on
+        // the client's qdisc).
+        let c = Control {
+            ping_received: 397,
+            netem_dropped_client: 3,
+            netem_dropped: 3,
+            ..base.clone()
+        };
+        assert!(!fails(&c), "{:?}", judge_control(&LOSSY, &c));
+        // Drops on one qdisc alone are enough, with or without lost pings.
+        let c = Control {
+            netem_dropped_server: 2,
+            netem_dropped: 2,
+            ..base.clone()
+        };
+        assert!(!fails(&c));
+        // A profile that applies no loss shows none of the three: still a failure, and it says
+        // what it counted.
+        assert!(fails(&base));
+        assert!(
+            judge_control(&LOSSY, &base)
+                .iter()
+                .any(|l| l.contains("server qdisc dropped 0"))
         );
     }
 
