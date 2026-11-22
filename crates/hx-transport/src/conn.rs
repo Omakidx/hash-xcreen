@@ -230,6 +230,9 @@ pub(crate) struct Inner {
     authorized: AtomicBool,
     /// Set by the first `authorize` call, before the features are stored.
     auth_claimed: AtomicBool,
+    /// Server side: set by `authorize_control_only`, before `authorized`. Input, media,
+    /// transfers and audio stay shut for the whole life of the connection.
+    control_only: AtomicBool,
     /// Features usable now: all negotiated ones for a client, none until `authorize` for a server.
     effective_features: AtomicU64,
     /// Pre-authentication slot, released on authorize or close.
@@ -312,6 +315,7 @@ impl Inner {
             claimed_cursor: AtomicBool::new(false),
             authorized: AtomicBool::new(is_client),
             auth_claimed: AtomicBool::new(is_client),
+            control_only: AtomicBool::new(false),
             effective_features: AtomicU64::new(effective),
             slot: StdMutex::new(p.slot),
             auth_timeout: p.auth_timeout,
@@ -462,6 +466,20 @@ impl Inner {
                 "only pairing, auth and goodbye are accepted before authorization".into(),
             ));
         }
+        // A control-only connection (protocol 1.3 setup) takes setup messages and goodbye and
+        // nothing else: not view config, not device management, not a second auth exchange.
+        if self.is_control_only() && !matches!(variant, Ctl::Setup(_) | Ctl::Goodbye(_)) {
+            return Err(Error::Violation(
+                "only setup and goodbye are accepted on a control-only connection".into(),
+            ));
+        }
+        // Setup messages exist only where the SETUP feature was negotiated (and, on a server,
+        // only after authorization: the gate above already refuses them before it).
+        if matches!(variant, Ctl::Setup(_)) && !self.features().contains(Features::SETUP) {
+            return Err(Error::Violation(
+                "setup message without the SETUP feature".into(),
+            ));
+        }
         self.router
             .control
             .send(m)
@@ -470,7 +488,7 @@ impl Inner {
     }
 
     pub(crate) async fn deliver_input(&self, e: InputEvent) -> Result<()> {
-        if !self.is_authorized() {
+        if !self.is_authorized() || self.is_control_only() {
             // Never queue input from a peer that has not been authorized.
             self.counters.input_dropped.fetch_add(1, Ordering::Relaxed);
             return Ok(());
@@ -510,7 +528,7 @@ impl Inner {
     }
 
     pub(crate) fn deliver_mouse(&self, m: MouseMove) {
-        if !self.is_authorized() {
+        if !self.is_authorized() || self.is_control_only() {
             self.counters
                 .datagrams_dropped
                 .fetch_add(1, Ordering::Relaxed);
@@ -537,6 +555,10 @@ impl Inner {
         self.authorized.load(Ordering::SeqCst)
     }
 
+    pub(crate) fn is_control_only(&self) -> bool {
+        self.control_only.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn features(&self) -> Features {
         Features(self.effective_features.load(Ordering::SeqCst))
     }
@@ -549,9 +571,10 @@ impl Inner {
         }
     }
 
-    /// Server-initiated channels need authorization first.
+    /// Server-initiated channels need authorization first, and never exist on a control-only
+    /// connection.
     pub(crate) fn require_authorized(&self) -> Result<()> {
-        if self.is_authorized() {
+        if self.is_authorized() && !self.is_control_only() {
             Ok(())
         } else {
             Err(Error::NotAuthorized)
@@ -665,9 +688,59 @@ impl Connection {
         Ok(())
     }
 
-    /// True once the connection may use every negotiated channel (always for a client).
+    /// Server side: declare the peer authenticated for **control messages only** (protocol
+    /// 1.3 `INTENT_SETUP`). It satisfies the authorization deadline and releases the
+    /// pre-authentication slot like [`authorize`](Self::authorize), but nothing else opens:
+    ///
+    /// * QUIC: the peer's unidirectional-stream credit stays 0 and the receive window is not
+    ///   raised, so it can send nothing but control messages and can receive no media;
+    /// * input and mouse data are dropped without queueing;
+    /// * the server-side send calls for cursor, video, audio and transfers fail with
+    ///   [`Error::NotAuthorized`];
+    /// * WebSocket: a transfer, file, frame-ack or any other non-control, non-input channel is
+    ///   a protocol violation (`PROTOCOL_ERROR`);
+    /// * control messages other than `setup` and `goodbye` (ping and pong are handled by the
+    ///   transport) are protocol violations.
+    ///
+    /// `allowed` is intersected with the negotiated features as in `authorize`; the `setup`
+    /// message additionally needs `Features::SETUP` in the result. Calling it twice, after
+    /// `authorize`, or on a client, is an error. The connection cannot be widened later.
+    pub fn authorize_control_only(&self, allowed: Features) -> Result<()> {
+        let i = self.inner();
+        self.require_role(Role::Server, "authorize_control_only")?;
+        if let Some(c) = i.closed_info() {
+            return Err(Error::Closed(c));
+        }
+        if i.auth_claimed
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(Error::Violation("already authorized".into()));
+        }
+        let effective = i.negotiated.features.intersect(allowed);
+        i.effective_features.store(effective.0, Ordering::SeqCst);
+        // Before `authorized`, so no reader can observe an authorized, unrestricted connection.
+        i.control_only.store(true, Ordering::SeqCst);
+        i.authorized.store(true, Ordering::SeqCst);
+        // Deliberately no `lift_restrictions`: QUIC credit and windows stay at their
+        // pre-authentication values.
+        if let Ok(mut s) = i.slot.lock() {
+            s.take();
+        }
+        Ok(())
+    }
+
+    /// True once the connection may use every negotiated channel (always for a client). A
+    /// control-only connection (see [`authorize_control_only`](Self::authorize_control_only))
+    /// also reports `true` here: check [`is_control_only`](Self::is_control_only) to tell them
+    /// apart.
     pub fn is_authorized(&self) -> bool {
         self.inner().is_authorized()
+    }
+
+    /// True if the server authorized this connection with `authorize_control_only`.
+    pub fn is_control_only(&self) -> bool {
+        self.inner().is_control_only()
     }
 
     /// Features usable now: the negotiated set after authorization (restricted by the
@@ -805,6 +878,7 @@ impl Connection {
                 self.require_role(Role::Client, "sending a client-only control message")?;
             }
             Some(Ctl::StreamInfo(_)) => self.require_role(Role::Server, "sending StreamInfo")?,
+            Some(Ctl::Setup(_)) => self.inner().require_feature(Features::SETUP, "setup")?,
             _ => {}
         }
         self.inner().send_control(m).await

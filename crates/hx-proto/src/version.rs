@@ -10,7 +10,7 @@ use crate::{
 /// Major version of this implementation; also part of the ALPN and WebSocket path.
 pub const PROTOCOL_MAJOR: u32 = 1;
 /// Minor version of this implementation.
-pub const PROTOCOL_MINOR: u32 = 2;
+pub const PROTOCOL_MINOR: u32 = 3;
 /// QUIC and TLS ALPN for native clients.
 pub const ALPN: &[u8] = b"hx/1";
 /// ALPN of the WebTransport (HTTP/3) entry, dispatched but not implemented in Phase 1.
@@ -72,17 +72,23 @@ impl Features {
     pub const SERVER_STATS: Self = Self(1 << 3);
     /// `DeviceMgmt` control messages: list and revoke paired devices (1.2).
     pub const DEVICE_MANAGEMENT: Self = Self(1 << 4);
+    /// `SetupMessage` control messages on `INTENT_SETUP` connections (1.3). Never offered on a
+    /// normal session.
+    pub const SETUP: Self = Self(1 << 5);
 
     /// Every feature defined up to and including `minor` of the current major.
     pub const fn defined_up_to(minor: u32) -> Self {
-        // Version 1.0 defines bits 0..=2, 1.1 adds bit 3, 1.2 adds bit 4. A later minor adds
-        // its bits here.
+        // Version 1.0 defines bits 0..=2, 1.1 adds bit 3, 1.2 adds bit 4, 1.3 adds bit 5. A
+        // later minor adds its bits here.
         let mut bits = Self::AUDIO.0 | Self::CLIPBOARD.0 | Self::FILE_TRANSFER.0;
         if minor >= 1 {
             bits |= Self::SERVER_STATS.0;
         }
         if minor >= 2 {
             bits |= Self::DEVICE_MANAGEMENT.0;
+        }
+        if minor >= 3 {
+            bits |= Self::SETUP.0;
         }
         Self(bits)
     }
@@ -95,6 +101,11 @@ impl Features {
     /// Bits present in both.
     pub const fn intersect(self, other: Self) -> Self {
         Self(self.0 & other.0)
+    }
+
+    /// The bits of `self` that are not in `other`.
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
     }
 
     /// Union of both sets.

@@ -8,6 +8,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let fds = protox::compile(["proto/hx.proto"], ["proto"])?;
     let mut config = prost_build::Config::new();
     config.bytes(["."]);
+    // Types that carry secrets get a hand-written, redacting `Debug` (see `src/redact.rs`).
+    config.skip_debug([
+        ".hx.v1.SetupSetPin",
+        ".hx.v1.SetupStart",
+        ".hx.v1.Opaque",
+        ".hx.v1.PairingCodeIssued",
+    ]);
     config.compile_fds(fds)?;
     Ok(())
 }

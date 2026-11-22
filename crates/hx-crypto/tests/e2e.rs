@@ -5,7 +5,7 @@ use std::{future::Future, sync::Arc, time::Duration};
 use hx_crypto::{
     Authenticator, AuthenticatorConfig, DeviceRegistry, Error, IdentityKey, ManualClock,
     MemoryRegistry, Outcome, PairClientOptions, PairingCredential, PairingLimits, PairingToken,
-    Pin, PinHash, PinParams, PinReply, RevokeReason, SessionOptions, connect_session,
+    Pin, PinHash, PinParams, PinReply, RevokeReason, RevokedBy, SessionOptions, connect_session,
     connect_with_pin, pair_device, tls,
 };
 use hx_proto::{
@@ -171,6 +171,7 @@ async fn pairing_with_a_long_token_pins_both_keys_and_is_single_use() {
         let Outcome::Paired {
             connection,
             device: rec,
+            ..
         } = e.next().await.expect("outcome")
         else {
             panic!("expected Paired");
@@ -665,11 +666,16 @@ async fn revoked_devices_are_refused_for_sessions_and_for_pairing() {
         let id = device.public().device_id();
         assert!(
             e.auth
-                .revoke(&id, RevokeReason::User)
+                .revoke(&id, RevokeReason::User, RevokedBy::Operator)
                 .await
                 .expect("revoke")
         );
-        assert!(!e.auth.revoke(&id, RevokeReason::User).await.expect("again"));
+        assert!(
+            !e.auth
+                .revoke(&id, RevokeReason::User, RevokedBy::Operator)
+                .await
+                .expect("again")
+        );
 
         let t = target(&e.server, pref);
         let pin = Pin::new(PIN).expect("pin");
@@ -745,7 +751,11 @@ async fn revoking_closes_a_live_session() {
         };
         let mut seen = e.auth.subscribe_revocations();
         e.auth
-            .revoke(&device.public().device_id(), RevokeReason::User)
+            .revoke(
+                &device.public().device_id(),
+                RevokeReason::User,
+                RevokedBy::Operator,
+            )
             .await
             .expect("revoke");
         assert_eq!(
@@ -1072,7 +1082,11 @@ async fn every_revocation_path_closes_the_live_session() {
         let (d, conn) = live_session(&mut e, pref).await;
         assert!(
             e.auth
-                .revoke(&d.public().device_id(), RevokeReason::User)
+                .revoke(
+                    &d.public().device_id(),
+                    RevokeReason::User,
+                    RevokedBy::Operator
+                )
                 .await
                 .expect("revoke")
         );
@@ -1101,7 +1115,12 @@ async fn every_revocation_path_closes_the_live_session() {
         let mut e = env_with(fast_watch()).await;
         let (d, conn) = live_session(&mut e, pref).await;
         e.registry
-            .revoke(&d.public().device_id(), RevokeReason::User, 1)
+            .revoke(
+                &d.public().device_id(),
+                RevokeReason::User,
+                RevokedBy::Operator,
+                1,
+            )
             .expect("direct revoke");
         assert_eq!(
             within(conn.closed()).await.code,
@@ -1129,7 +1148,7 @@ async fn a_dropped_revoke_call_still_announces() {
     let id = d.public().device_id();
     // Start the revoke and cancel the future at once.
     {
-        let fut = e.auth.revoke(&id, RevokeReason::User);
+        let fut = e.auth.revoke(&id, RevokeReason::User, RevokedBy::Operator);
         let _ = tokio::time::timeout(Duration::ZERO, fut).await;
     }
     assert_eq!(within(conn.closed()).await.code, CloseCode::Unauthorized);
@@ -1143,7 +1162,7 @@ async fn reinstate_goes_through_the_authenticator_and_clears_state() {
     let (d, _conn) = live_session(&mut e, pref).await;
     let id = d.public().device_id();
     e.auth
-        .revoke(&id, RevokeReason::User)
+        .revoke(&id, RevokeReason::User, RevokedBy::Operator)
         .await
         .expect("revoke");
     assert!(e.auth.reinstate(&id).await.expect("reinstate"));
@@ -1171,7 +1190,8 @@ impl DeviceRegistry for RevokeOnLookup {
     ) -> hx_crypto::Result<Option<hx_crypto::DeviceRecord>> {
         let found = self.0.find_by_key(key)?;
         if found.is_some() {
-            self.0.revoke(&key.device_id(), RevokeReason::User, 1)?;
+            self.0
+                .revoke(&key.device_id(), RevokeReason::User, RevokedBy::Operator, 1)?;
         }
         Ok(found)
     }
@@ -1204,9 +1224,10 @@ impl DeviceRegistry for RevokeOnLookup {
         &self,
         id: &hx_crypto::DeviceId,
         r: RevokeReason,
+        by: hx_crypto::RevokedBy,
         now: u64,
     ) -> hx_crypto::Result<bool> {
-        self.0.revoke(id, r, now)
+        self.0.revoke(id, r, by, now)
     }
     fn reinstate(&self, id: &hx_crypto::DeviceId) -> hx_crypto::Result<bool> {
         self.0.reinstate(id)
@@ -1274,7 +1295,11 @@ async fn refusals_do_not_say_whether_a_key_was_revoked() {
     let device = new_key();
     e.pair(&device, pref).await;
     e.auth
-        .revoke(&device.public().device_id(), RevokeReason::User)
+        .revoke(
+            &device.public().device_id(),
+            RevokeReason::User,
+            RevokedBy::Operator,
+        )
         .await
         .expect("revoke");
     let t = target(&e.server, pref);

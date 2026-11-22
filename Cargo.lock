@@ -1302,6 +1302,7 @@ dependencies = [
  "hx-transport",
  "proptest",
  "prost",
+ "quinn",
  "rcgen",
  "rustix",
  "rustls",
