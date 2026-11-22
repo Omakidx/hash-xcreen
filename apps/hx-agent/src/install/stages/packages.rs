@@ -1,5 +1,5 @@
 //! Stage `packages`: the prerequisite packages (design D4: `btrfs-progs`, `nftables`,
-//! `ca-certificates`, and `dnsmasq-base`). Done when `dpkg-query` says every one is installed.
+//! `ca-certificates`, `dnsmasq-base`, and `zstd`). Done when `dpkg-query` says every one is installed.
 //!
 //! `dnsmasq-base` is only a *Recommends* of the distro's `incus` package, and apt runs here with
 //! `--no-install-recommends`; without it Incus cannot create a managed bridge (`Failed to check
@@ -15,7 +15,13 @@ use crate::install::error::Result;
 use crate::install::runner::{APT_ENV, Call, Tool};
 
 /// What the installer needs on the host.
-pub const PACKAGES: &[&str] = &["btrfs-progs", "nftables", "ca-certificates", "dnsmasq-base"];
+pub const PACKAGES: &[&str] = &[
+    "btrfs-progs",
+    "nftables",
+    "ca-certificates",
+    "dnsmasq-base",
+    "zstd",
+];
 
 /// The apt lock wait, seconds.
 pub const LOCK_WAIT: &str = "DPkg::Lock::Timeout=600";

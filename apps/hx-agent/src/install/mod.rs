@@ -30,6 +30,7 @@ pub mod daemons;
 pub mod engine;
 pub mod error;
 pub mod fsx;
+pub mod image_file;
 pub mod interactive;
 pub mod lock;
 pub mod log;
@@ -55,6 +56,7 @@ use hx_crypto::PinParams;
 use zeroize::Zeroizing;
 
 use crate::cli::{Env, Prompter};
+use crate::privd::image::ImageKeys;
 use crate::privd::update::keys::UpdateKeys;
 use ctx::{Ctx, Hooks, Secrets, Timing};
 use daemons::{Daemons, SocketDaemons};
@@ -121,6 +123,8 @@ pub struct Deps<'a> {
     pub now: fn() -> u64,
     /// The release keys.
     pub keys: UpdateKeys,
+    /// The embedded image signing keys (the offline `--image-file` is verified against them).
+    pub image_keys: ImageKeys,
     /// Argon2id cost of the verifiers.
     pub verifier_params: PinParams,
     /// The effective uid (must be 0).
@@ -219,6 +223,7 @@ pub fn run(args: InstallArgs, deps: Deps<'_>) -> u8 {
         json,
         now,
         keys,
+        image_keys,
         verifier_params,
         euid,
         timing,
@@ -353,6 +358,8 @@ pub fn run(args: InstallArgs, deps: Deps<'_>) -> u8 {
         now,
         log,
         keys,
+        image_keys,
+        image_src: None,
         verifier_params,
         mode,
         opts,
@@ -410,6 +417,7 @@ pub fn run_cli(args: InstallArgs, env: &mut Env<'_>) -> u8 {
         json: env.json,
         now: env.now,
         keys: UpdateKeys::embedded(),
+        image_keys: ImageKeys::embedded(),
         verifier_params: env.config.verifier_params,
         euid: env.euid,
         timing: Timing::default(),

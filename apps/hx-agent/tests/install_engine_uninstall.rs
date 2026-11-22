@@ -142,7 +142,11 @@ fn destroy_removes_everything_in_order() {
         "/usr/local/lib/tmpfiles.d/hx.conf",
         "/etc/logrotate.d/hx-audit",
         "/etc/systemd/system/hx-gatewayd-public.socket.d",
+        "/etc/systemd/system/hx-update-fetcher@.service.d",
+        "/etc/systemd/system/hx-image-fetcher@.service.d",
         "/usr/local/lib/systemd/system/hx-privd.service",
+        "/usr/local/lib/systemd/system/hx-image-fetcher@.service",
+        "/usr/local/lib/systemd/system/var-lib-hx-imagein.mount",
         "/usr/local/lib/systemd/system/hx-host-firewall.service",
         "/usr/local/lib/systemd/system/hx-docker-user.service",
         "/usr/local/lib/systemd/system/hx-agent-port.service",
@@ -311,6 +315,28 @@ fn a_failure_at_u4_u5_and_u6_resumes_without_redoing_privd() {
     std::fs::remove_file(path(&m, "/var/lib/hx/updates/planted")).unwrap();
     ok(uninstall(&mut m, false, 0).0);
     assert_eq!(m.daemons.uninstalls.len(), 1);
+    assert!(!exists(&m, "/var/lib/hx"));
+    // U5: the same for the image fetcher's directory; a prebuilt image placed in the import
+    // directory (root-only, 4 GiB at most) goes with /var/lib/hx.
+    let mut m = installed();
+    std::fs::create_dir_all(path(&m, "/var/lib/hx/imagein")).unwrap();
+    std::fs::write(path(&m, "/var/lib/hx/imagein/planted"), b"x").unwrap();
+    std::fs::create_dir_all(path(&m, "/var/lib/hx/import")).unwrap();
+    std::fs::write(path(&m, "/var/lib/hx/import/hx-image.img"), b"image").unwrap();
+    let (r, _, _) = uninstall(&mut m, false, 0);
+    match r {
+        Err(UninstallError::Failed(e)) => {
+            assert!(e.message.contains("/var/lib/hx/imagein"), "{e}");
+            assert!(e.message.contains("refusing to walk"), "{e}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        exists(&m, "/var/lib/hx/import/hx-image.img"),
+        "nothing was walked"
+    );
+    std::fs::remove_file(path(&m, "/var/lib/hx/imagein/planted")).unwrap();
+    ok(uninstall(&mut m, false, 0).0);
     assert!(!exists(&m, "/var/lib/hx"));
     // U6: userdel fails.
     let mut m = installed();
