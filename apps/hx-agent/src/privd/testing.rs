@@ -781,8 +781,21 @@ impl FakeIncus {
                 // /var/lib/hx). The directories every distro image has count as existing.
                 if kind == "directory" {
                     const IMAGE_DIRS: &[&str] = &[
-                        "/", "/etc", "/home", "/opt", "/root", "/run", "/tmp", "/usr", "/var",
-                        "/var/lib", "/var/log",
+                        "/",
+                        "/etc",
+                        "/home",
+                        "/opt",
+                        "/root",
+                        "/run",
+                        "/tmp",
+                        "/usr",
+                        "/var",
+                        "/var/lib",
+                        "/var/log",
+                        // Every distro image has these; `finish_prebuilt` writes its session
+                        // hold drop-in under /etc/systemd/user (hx-provision).
+                        "/etc/systemd",
+                        "/etc/systemd/user",
                     ];
                     let parent = std::path::Path::new(&p)
                         .parent()
