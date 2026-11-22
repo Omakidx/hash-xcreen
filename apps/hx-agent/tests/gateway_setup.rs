@@ -892,13 +892,15 @@ async fn set_pin_cancel_and_finish_are_refused_once_the_binding_is_gone() {
     e.open_window(7200).await;
     let version = e.pair_app().await;
     let mut s = e.key_only(version).await;
-    // The window ends while the connection is still open.
+    // The window ends while the connection is still open. The request is either answered
+    // FAILED (the re-check) or, when the tick gets there first, the connection is closed with
+    // SETUP_CLOSED; both are correct, and in neither case is the PIN stored.
     e.clock.advance(Duration::from_secs(7201));
-    let ack = s
-        .set_pin(&Pin::new("123456").unwrap())
-        .await
-        .expect("answered");
-    assert_eq!(status_of(&ack), A::Failed, "set_pin after the window");
+    match s.set_pin(&Pin::new("123456").unwrap()).await {
+        Ok(ack) => assert_eq!(status_of(&ack), A::Failed, "set_pin after the window"),
+        Err(Error::SetupClosed) => {}
+        Err(other) => panic!("expected FAILED or SETUP_CLOSED, got {other:?}"),
+    }
     assert!(
         !e.gw().verifiers().has_pin(),
         "no PIN was stored through a connection whose window had ended"
@@ -916,7 +918,17 @@ async fn cancel_and_finish_are_refused_for_a_device_that_lost_the_binding() {
         A::Ok
     );
     e.clock.advance(Duration::from_secs(7201));
-    for (name, ack) in [("cancel", s.cancel().await), ("finish", s.finish().await)] {
-        assert_eq!(status_of(&ack.expect("answered")), A::Failed, "{name}");
+    // Answered FAILED, or closed with SETUP_CLOSED when the tick gets there first.
+    for name in ["cancel", "finish"] {
+        let r = if name == "cancel" {
+            s.cancel().await
+        } else {
+            s.finish().await
+        };
+        match r {
+            Ok(ack) => assert_eq!(status_of(&ack), A::Failed, "{name}"),
+            Err(Error::SetupClosed) => break,
+            Err(other) => panic!("{name}: expected FAILED or SETUP_CLOSED, got {other:?}"),
+        }
     }
 }
