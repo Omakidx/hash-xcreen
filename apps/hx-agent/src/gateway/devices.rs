@@ -14,7 +14,7 @@
 //! * Audit events are best effort with a few retries: a compromised gateway can omit or forge
 //!   them (ipc.md 6.15); the log is a tripwire, not a guarantee.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -67,7 +67,9 @@ pub struct DeviceService {
     revoke_lock: Arc<tokio::sync::Mutex<()>>,
     clock: Arc<dyn Clock>,
     /// Lockout revocations already recorded (see `sweep_lockouts`).
-    recorded_lockouts: Mutex<HashSet<DeviceId>>,
+    /// Keyed by the device and the time of the revocation that was recorded, so a *new*
+    /// lockout of the same device is never mistaken for the old one.
+    recorded_lockouts: Mutex<HashMap<DeviceId, u64>>,
     /// When each device asked to revoke (the rate limit holds per device, across connections).
     revoke_times: Mutex<HashMap<DeviceId, VecDeque<std::time::Instant>>>,
     /// Revocations of *other* devices that a device made recently, for the cooling-off rule.
@@ -174,16 +176,16 @@ impl DeviceService {
     ) -> Arc<Self> {
         let (tx, _) = broadcast::channel(64);
         // Lockouts that happened before this start were recorded then.
-        let already: HashSet<DeviceId> = auth
+        let already: HashMap<DeviceId, u64> = auth
             .registry()
             .list()
             .unwrap_or_default()
             .into_iter()
-            .filter(|r| {
+            .filter_map(|r| {
                 r.revoked
-                    .is_some_and(|v| v.reason == RevokeReason::TooManyPinFailures)
+                    .filter(|v| v.reason == RevokeReason::TooManyPinFailures)
+                    .map(|v| (r.id, v.at_unix))
             })
-            .map(|r| r.id)
             .collect();
         let svc = Arc::new(Self {
             auth: auth.clone(),
@@ -210,6 +212,27 @@ impl DeviceService {
             while !matches!(rx.recv().await, Err(broadcast::error::RecvError::Closed)) {
                 let Some(svc) = weak.upgrade() else { break };
                 svc.sweep_lockouts().await;
+            }
+        });
+        // A device that reinstated itself with the account password is announced from the
+        // authenticator's commit, not from the connection's outcome (a deadline can drop the
+        // exchange after the registry changed, which would leave it unaudited).
+        let weak = std::sync::Arc::downgrade(&svc);
+        let mut re = auth.subscribe_reinstatements();
+        tokio::spawn(async move {
+            loop {
+                match re.recv().await {
+                    Ok(id) => {
+                        let Some(svc) = weak.upgrade() else { break };
+                        if let Ok(Some(rec)) = svc.auth.registry().get(&id) {
+                            svc.announce_reinstated_with_password(&rec);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::error!(missed = n, "reinstatement announcements were missed");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
             }
         });
         svc
@@ -305,13 +328,16 @@ impl DeviceService {
             // Only a revocation that a device made is undone, never an operator's or a lockout.
             let user_revoked = matches!(
                 self.auth.registry().get(&target),
-                Ok(Some(r)) if r.revoked.is_some_and(|v| v.reason == RevokeReason::User)
+                Ok(Some(r)) if r.revoked.is_some_and(|v| {
+                    v.reason == RevokeReason::User && v.by == RevokedBy::Device
+                })
             );
             if !user_revoked || target == culprit {
                 continue;
             }
             match self.auth.reinstate(&target).await {
                 Ok(true) => {
+                    self.forget_lockout(&target);
                     tracing::warn!(
                         culprit = %super::util::short_id(&culprit),
                         target = %super::util::short_id(&target),
@@ -353,25 +379,44 @@ impl DeviceService {
         let Ok(records) = self.records() else {
             return;
         };
-        for r in records {
-            let locked_out = r
-                .revoked
-                .is_some_and(|v| v.reason == RevokeReason::TooManyPinFailures);
-            if !locked_out {
-                continue;
-            }
+        // The recorded set follows the registry: a device that is no longer lockout-revoked
+        // (an operator reinstated it, it reinstated itself, ...), or that was revoked again
+        // at another time, is forgotten, so its next lockout is recorded whichever path lifted
+        // the first one.
+        let locked: HashMap<DeviceId, u64> = records
+            .iter()
+            .filter_map(|r| {
+                r.revoked
+                    .filter(|v| v.reason == RevokeReason::TooManyPinFailures)
+                    .map(|v| (r.id, v.at_unix))
+            })
+            .collect();
+        self.recorded_lockouts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|id, at| locked.get(id) == Some(at));
+        for (id, at) in locked {
             let fresh = self
                 .recorded_lockouts
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .insert(r.id);
+                .insert(id, at)
+                .is_none();
             if fresh {
                 // Recorded under the revocation lock like the other paths (audit, closing the
                 // sessions, notice and the cooling-off rule see a consistent registry).
                 let _serial = self.revoke_lock.lock().await;
-                self.record_revoked(r.id, None).await;
+                self.record_revoked(id, None).await;
             }
         }
+    }
+
+    /// Forgets that a lockout of `id` was recorded (it was lifted), so the next one is.
+    fn forget_lockout(&self, id: &DeviceId) {
+        self.recorded_lockouts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(id);
     }
 
     /// A device paired: record it and tell the live sessions.
@@ -397,13 +442,10 @@ impl DeviceService {
     }
 
     /// A device reinstated itself with the account password (protocol 11.7): record it
-    /// (`DEVICE_REINSTATED`, cause `password`, never the password), tell the live sessions, and
-    /// let a later lockout of the same device be recorded again.
+    /// (`DEVICE_REINSTATED`, cause `password`, never the password) and tell the live sessions.
+    /// A later lockout of the same device is recorded again by `sweep_lockouts`, which follows
+    /// the registry.
     pub fn announce_reinstated_with_password(&self, rec: &DeviceRecord) {
-        self.recorded_lockouts
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&rec.id);
         self.bump_version();
         self.audit(AuditEvent::DeviceReinstated, rec.id, "password");
         let _ = self.tx.send(Arc::new(DeviceNotice {
@@ -636,6 +678,7 @@ impl DeviceService {
         };
         if rec.is_revoked() {
             self.auth.reinstate(&target).await?;
+            self.forget_lockout(&target);
             let rec = self.auth.registry().get(&target)?;
             if let Some(r) = &rec {
                 self.announce_reinstated(r);

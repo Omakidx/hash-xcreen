@@ -114,13 +114,20 @@ struct Env {
 }
 
 async fn env() -> Env {
+    env_with(|r| r, AuthenticatorConfig::default()).await
+}
+
+async fn env_with(
+    wrap: impl FnOnce(Arc<MemoryRegistry>) -> Arc<dyn DeviceRegistry>,
+    config: AuthenticatorConfig,
+) -> Env {
     let server_key = new_key();
     let registry = Arc::new(MemoryRegistry::new());
     let clock = Arc::new(ManualClock::new());
     let auth = Authenticator::with_clock(
         server_key.clone(),
-        registry.clone(),
-        AuthenticatorConfig::default(),
+        wrap(registry.clone()),
+        config,
         clock.clone(),
     );
     let server = Arc::new(
@@ -749,4 +756,106 @@ fn the_password_message_is_redacted_and_round_trips() {
         AuthMessage::from_control(&c).expect("auth").body,
         Some(Body::Password(_))
     ));
+}
+
+// ------------------------------------------------------------------ the commit is announced
+
+/// A registry whose reads become slow once a reinstatement was committed, so that the
+/// exchange's deadline fires between the registry write and the end of the exchange.
+struct SlowAfterReinstate {
+    inner: Arc<MemoryRegistry>,
+    armed: std::sync::atomic::AtomicBool,
+    delay: Duration,
+}
+
+impl DeviceRegistry for SlowAfterReinstate {
+    fn get(&self, id: &DeviceId) -> hx_crypto::Result<Option<hx_crypto::DeviceRecord>> {
+        if self.armed.load(Ordering::SeqCst) {
+            std::thread::sleep(self.delay);
+        }
+        self.inner.get(id)
+    }
+    fn list(&self) -> hx_crypto::Result<Vec<hx_crypto::DeviceRecord>> {
+        self.inner.list()
+    }
+    fn upsert_paired(
+        &self,
+        key: &hx_crypto::PublicKey,
+        name: &str,
+        now_unix: u64,
+    ) -> hx_crypto::Result<hx_crypto::DeviceRecord> {
+        self.inner.upsert_paired(key, name, now_unix)
+    }
+    fn begin_pin_attempt(&self, id: &DeviceId) -> hx_crypto::Result<u32> {
+        self.inner.begin_pin_attempt(id)
+    }
+    fn refund_pin_attempt(&self, id: &DeviceId) -> hx_crypto::Result<u32> {
+        self.inner.refund_pin_attempt(id)
+    }
+    fn reset_pin_failures(&self, id: &DeviceId) -> hx_crypto::Result<()> {
+        self.inner.reset_pin_failures(id)
+    }
+    fn revoke_if_failed(&self, id: &DeviceId, max: u32, now: u64) -> hx_crypto::Result<bool> {
+        self.inner.revoke_if_failed(id, max, now)
+    }
+    fn record_pin_success(&self, id: &DeviceId, now: u64) -> hx_crypto::Result<()> {
+        self.inner.record_pin_success(id, now)
+    }
+    fn revoke(
+        &self,
+        id: &DeviceId,
+        reason: RevokeReason,
+        by: RevokedBy,
+        now: u64,
+    ) -> hx_crypto::Result<bool> {
+        self.inner.revoke(id, reason, by, now)
+    }
+    fn reinstate_after_lockout(
+        &self,
+        id: &DeviceId,
+        now: u64,
+        max_age: u64,
+    ) -> hx_crypto::Result<bool> {
+        let done = self.inner.reinstate_after_lockout(id, now, max_age)?;
+        self.armed.store(true, Ordering::SeqCst);
+        Ok(done)
+    }
+    fn reinstate(&self, id: &DeviceId) -> hx_crypto::Result<bool> {
+        self.inner.reinstate(id)
+    }
+    fn remove(&self, id: &DeviceId) -> hx_crypto::Result<bool> {
+        self.inner.remove(id)
+    }
+}
+
+/// Security review F3: if the exchange's deadline fires after the registry already holds the
+/// device as active, `Outcome::Reinstated` is lost, but the reinstatement is still announced
+/// (from the commit itself), so the application can audit it.
+#[tokio::test]
+async fn a_reinstatement_that_commits_just_before_the_deadline_is_still_announced() {
+    let mut e = env_with(
+        |inner| {
+            Arc::new(SlowAfterReinstate {
+                inner,
+                armed: false.into(),
+                delay: Duration::from_millis(1500),
+            })
+        },
+        AuthenticatorConfig {
+            pin_timeout: Duration::from_millis(500),
+            ..AuthenticatorConfig::default()
+        },
+    )
+    .await;
+    e.auth.set_reinstate_gate(Gate::new(PasswordVerdict::Right));
+    let mut announced = e.auth.subscribe_reinstatements();
+    e.lock_out();
+    let c = e.open().await;
+    let _ = c.send_control(&password_message(GOOD)).await;
+    // The exchange ran out of time after the commit ...
+    assert!(matches!(e.next().await, Err(Error::Timeout(_))));
+    // ... the device is active in the registry ...
+    assert!(!e.registry.get(&e.id()).unwrap().unwrap().is_revoked());
+    // ... and the commit announced it.
+    assert_eq!(within(announced.recv()).await.unwrap(), e.id());
 }

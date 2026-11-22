@@ -620,18 +620,19 @@ impl Session {
             .server_mgmt
             .handle(self.device.id, body, session_active)
             .await;
-        let lockout = answer.lockout;
+        let revoked = answer.revoked;
         let out = pb::ControlMessage::new(Ctl::ServerMgmt(pb::ServerMgmt {
             request_id,
             body: Some(answer.body),
         }));
         let sent = self.send(out).await;
-        if lockout {
-            // The 5th wrong PIN: the answer is delivered, then the device is revoked and ends.
+        if revoked {
+            // The 5th wrong PIN: the revocation was persisted and announced before the answer
+            // was built. The answer is a best effort (the authenticator closes the device's
+            // connections as it revokes), and the session ends.
             if sent.is_ok() {
                 let _ = self.conn.ping(GOODBYE_FLUSH).await;
             }
-            self.mgr.server_mgmt.lockout(self.device.id).await;
             return Flow::End(Some((CloseCode::Unauthorized, "device revoked")));
         }
         match sent {
