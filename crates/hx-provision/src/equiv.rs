@@ -146,12 +146,22 @@ export LC_ALL=C
 umask 077
 # `running` is reported before the XFCE session has started, and the session writes per-user state
 # as it starts (XDG folders in the locale's language, ~/Desktop, .cache and .local/share when they
-# do not exist yet). Wait, at most 2 minutes, until xfdesktop runs (a /proc scan: procps may not be installed) and give it a moment to finish,
-# so both desktops are read in the same state. Not finding it is not an error: the trees then
-# show what is there.
+# do not exist yet). Wait, at most 2 minutes, until xfdesktop runs (a /proc scan: procps may not
+# be installed), so both desktops are read in the same state. Not finding it is not an error:
+# the trees then show what is there.
 xfdesktop_up() { grep -qx xfdesktop /proc/[0-9]*/comm 2>/dev/null; }
 for i in $(seq 240); do xfdesktop_up && break; sleep 0.5; done
-sleep 5
+# Then wait until the top of the home tree has stopped changing (five equal samples a second
+# apart, at most 90 s): xfdesktop makes ~/Desktop, and other session programs their folders, a
+# few seconds after they start, at a pace that differs between two boots.
+home_sig() { find "/home/$u" -xdev -maxdepth 2 -printf '%p %m %u\n' 2>/dev/null | sort | cksum; }
+last=; same=0
+for i in $(seq 90); do
+  cur=$(home_sig)
+  if [ "$cur" = "$last" ]; then same=$((same + 1)); else same=0; last=$cur; fi
+  [ "$same" -ge 5 ] && break
+  sleep 1
+done
 rm -rf -- "$d"; mkdir -p -- "$d"
 dpkg-query -W -f '${Package}\t${Architecture}\t${db:Status-Abbrev}\t${Version}\n' > "$d/packages"
 apt-mark showauto 2>/dev/null | sort > "$d/auto"
