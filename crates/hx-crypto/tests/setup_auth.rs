@@ -15,7 +15,7 @@ use std::{
 use hx_crypto::{
     Authenticator, AuthenticatorConfig, BoxFuture, DeviceId, DeviceRegistry, Error, IdentityKey,
     ManualClock, MemoryRegistry, Outcome, PairClientOptions, PairedWith, PairingCredential, Pin,
-    PinVerdict, PinVerifier, RevokeReason, SetupAdmission, SetupGate, pair_device, tls,
+    PinVerdict, PinVerifier, RevokeReason, RevokedBy, SetupAdmission, SetupGate, pair_device, tls,
     wire::{AuthMessage, AuthResult, AuthStatus, PinAttempt, auth_message::Body},
 };
 use hx_proto::{
@@ -465,7 +465,7 @@ async fn unknown_and_revoked_devices_get_the_same_uniform_refusal() {
 
     // Revoked key.
     e.auth
-        .revoke(&e.id(), RevokeReason::User)
+        .revoke(&e.id(), RevokeReason::User, RevokedBy::Operator)
         .await
         .expect("revoke");
     let r = e.connect_setup().await;
@@ -674,7 +674,7 @@ async fn a_key_only_connection_is_closed_when_its_device_is_revoked() {
         panic!("expected Setup");
     };
     e.auth
-        .revoke(&e.id(), RevokeReason::User)
+        .revoke(&e.id(), RevokeReason::User, RevokedBy::Operator)
         .await
         .expect("revoke");
     let info = within(connection.closed()).await;
@@ -914,7 +914,7 @@ async fn a_revocation_while_the_pin_is_checked_is_noticed_before_authorization()
     c.send_control(&pin_message("482913")).await.expect("PIN");
     tokio::time::sleep(Duration::from_millis(100)).await;
     e.auth
-        .revoke(&e.id(), RevokeReason::User)
+        .revoke(&e.id(), RevokeReason::User, RevokedBy::Operator)
         .await
         .expect("revoke");
     assert!(matches!(e.next().await, Err(Error::Revoked)));

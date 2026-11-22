@@ -58,6 +58,10 @@ pub enum AuthStatus {
     /// Protocol 1.3, sent only on an `INTENT_SETUP` connection whose device already has a PIN:
     /// the setup connection needs the PIN first (the exchange is then exactly §11.4).
     PinRequired = 6,
+    /// Protocol 1.3, sent only on an `INTENT_REINSTATE` connection: send the account password.
+    PasswordRequired = 7,
+    /// Protocol 1.3, `INTENT_REINSTATE` only: the password was wrong.
+    WrongPassword = 8,
 }
 
 /// Envelope body of `ControlMessage.pairing`.
@@ -139,7 +143,7 @@ pub struct PairFailure {
 #[derive(Clone, PartialEq, Message)]
 pub struct AuthMessage {
     /// The message.
-    #[prost(oneof = "auth_message::Body", tags = "1, 2")]
+    #[prost(oneof = "auth_message::Body", tags = "1, 2, 3")]
     pub body: Option<auth_message::Body>,
 }
 
@@ -154,6 +158,9 @@ pub mod auth_message {
         /// Server answers.
         #[prost(message, tag = "2")]
         Result(super::AuthResult),
+        /// Client sends the account password (`INTENT_REINSTATE`, protocol 1.3).
+        #[prost(message, tag = "3")]
+        Password(super::PasswordAttempt),
     }
 }
 
@@ -208,6 +215,61 @@ impl Message for PinAttempt {
     fn clear(&mut self) {
         self.pin.zeroize();
         self.pin.clear();
+    }
+}
+
+/// A password attempt (`INTENT_REINSTATE`, protocol 1.3). Hand-written like [`PinAttempt`]:
+/// `Debug` never shows the password and the bytes are zeroized on drop. Wire format:
+/// `bytes password = 1` (1 to 511 bytes, UTF-8, no NUL, CR or LF; checked by the receiver).
+#[derive(Clone, PartialEq, Default)]
+pub struct PasswordAttempt {
+    /// The account password.
+    pub password: Vec<u8>,
+}
+
+impl fmt::Debug for PasswordAttempt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PasswordAttempt { password: [redacted] }")
+    }
+}
+
+impl Drop for PasswordAttempt {
+    fn drop(&mut self) {
+        self.password.zeroize();
+    }
+}
+
+impl Message for PasswordAttempt {
+    fn encode_raw(&self, buf: &mut impl prost::bytes::BufMut) {
+        if !self.password.is_empty() {
+            prost::encoding::bytes::encode(1, &self.password, buf);
+        }
+    }
+
+    fn merge_field(
+        &mut self,
+        tag: u32,
+        wire_type: prost::encoding::WireType,
+        buf: &mut impl prost::bytes::Buf,
+        ctx: prost::encoding::DecodeContext,
+    ) -> std::result::Result<(), prost::DecodeError> {
+        match tag {
+            1 => prost::encoding::bytes::merge(wire_type, &mut self.password, buf, ctx),
+            _ => prost::encoding::skip_field(wire_type, tag, buf, ctx),
+        }
+    }
+
+    fn encoded_len(&self) -> usize {
+        if self.password.is_empty() {
+            0
+        } else {
+            prost::encoding::bytes::encoded_len(1, &self.password)
+        }
+    }
+
+    fn clear(&mut self) {
+        self.password.zeroize();
+        self.password.clear();
     }
 }
 

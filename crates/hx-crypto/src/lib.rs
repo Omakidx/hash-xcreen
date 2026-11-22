@@ -36,8 +36,8 @@ pub mod wire;
 
 pub use auth::{
     Authenticator, AuthenticatorConfig, BoxFuture, DEFAULT_LOCKED_WAIT, MAX_LOCKED_WAIT, Outcome,
-    PinVerdict, PinVerifier, RegistryView, RevocationGuard, RevocationPermit, SetupAdmission,
-    SetupGate,
+    PasswordVerdict, PinVerdict, PinVerifier, RegistryView, ReinstateGate, RevocationGuard,
+    RevocationPermit, SetupAdmission, SetupGate,
 };
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use error::{Error, Result};
@@ -47,7 +47,7 @@ pub use pairing::{
 };
 pub use pin::{MAX_PIN_FAILURES, PinHash, PinParams};
 pub use registry::{
-    DeviceRecord, DeviceRegistry, FileRegistry, MemoryRegistry, Revocation, RevokeReason,
+    DeviceRecord, DeviceRegistry, FileRegistry, MemoryRegistry, Revocation, RevokeReason, RevokedBy,
 };
 pub use secrets::{PairingCode, PairingCredential, PairingToken, Pin};
 pub use session::{AwaitingPin, PinReply, SessionOptions, connect_session, connect_with_pin};

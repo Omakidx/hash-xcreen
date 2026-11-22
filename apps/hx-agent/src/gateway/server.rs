@@ -365,6 +365,11 @@ async fn handle_pending(sh: Arc<Shared>, pending: PendingSession) {
                 .close(CloseCode::SetupClosed, "setup is not available")
                 .await;
         }
+        // No `ReinstateGate` is installed yet, so this cannot happen until the gateway wires
+        // it (announce DEVICE_REINSTATED / DeviceEvent REINSTATED, audit with cause PASSWORD).
+        Ok(Outcome::Reinstated { device }) => {
+            tracing::info!(device = %device.id, "device reinstated with the account password");
+        }
         Ok(Outcome::Refused(_)) => {}
         Err(e) => tracing::debug!(error = %e, "authentication ended without success"),
     }
