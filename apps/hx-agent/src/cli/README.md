@@ -151,8 +151,10 @@ an argument, an environment, a log or the state.
 A run again resumes and converges: a stage is skipped only when it is recorded as done and its
 check still passes. `pairing-token`, `pairing` and `finish` are never skipped (a token or code must
 be fresh). A changed option that cannot change after its stage is done (`--user`, `--distro`,
-`--docker`, `--storage-device`, ...) is exit 12 with the command that changes it. `--image prebuilt`
-and `--image-file` are exit 6.
+`--docker`, `--storage-device`, ...) is exit 12 with the command that changes it. `--image-file`
+implies `--image prebuilt` (exit 2 together with `--image build`); preflight checks its signed
+manifest, entry, size and SHA-256 (exit 10 when they do not verify, exit 9 for an unusable file or
+too little disk).
 
 The port rule (stage `firewall-port`): with ufw active, `ufw allow <p>/tcp` and `/udp`; else, if a
 native nftables input chain drops, one rule `meta l4proto { tcp, udp } th dport <p> accept comment
