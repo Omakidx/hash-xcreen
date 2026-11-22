@@ -57,6 +57,18 @@ fn audit(e: &SetupEnv, needle: &str) -> usize {
         .count()
 }
 
+/// Waits (bounded) for an audit line: gatewayd answers the client before its `RecordEvent`
+/// reaches privd's audit log, so a check right after the reply can race it.
+async fn audit_line(e: &SetupEnv, pred: impl Fn(&str) -> bool) -> String {
+    for _ in 0..200 {
+        if let Some(l) = e.h.audit.lines().into_iter().rev().find(|l| pred(l)) {
+            return l;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("the expected audit line never appeared");
+}
+
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
@@ -131,13 +143,7 @@ async fn changing_the_pin_checks_the_current_one_stores_the_new_one_and_audits()
     assert!(e.login(&tablet, NEW_PIN).await.is_ok());
     assert!(e.login(&tablet, PIN).await.is_err());
     let id = hex(phone.public().device_id().as_bytes());
-    let line =
-        e.h.audit
-            .lines()
-            .into_iter()
-            .rev()
-            .find(|l| l.contains("PIN_CHANGED"))
-            .unwrap();
+    let line = audit_line(&e, |l| l.contains("PIN_CHANGED")).await;
     assert!(line.contains(&id), "{line}");
     assert!(
         e.h.audit
@@ -249,14 +255,9 @@ async fn changing_the_password_checks_the_current_one_in_privd_and_refreshes_the
             .with(|s| s.execs.iter().any(|x| x.contains("chpasswd")))
     );
     assert_ne!(e.gw().verifiers().password().unwrap().to_bytes(), before);
-    assert_eq!(audit(&e, "PASSWORD_CHANGED"), 1);
     let id = hex(phone.public().device_id().as_bytes());
-    assert!(
-        e.h.audit
-            .lines()
-            .iter()
-            .any(|l| l.contains("PASSWORD_CHANGED") && l.contains(&id))
-    );
+    audit_line(&e, |l| l.contains("PASSWORD_CHANGED") && l.contains(&id)).await;
+    assert_eq!(audit(&e, "PASSWORD_CHANGED"), 1);
     for needle in [PASSWORD, NEW_PASSWORD] {
         assert!(
             e.h.incus
@@ -352,12 +353,7 @@ async fn restart_docker_limits_are_mapped_and_audited() {
     let r = within(a.restart_desktop(false)).await.unwrap();
     assert_eq!(status(&r), S::Ok, "{r:?}");
     let id = hex(phone.public().device_id().as_bytes());
-    assert!(
-        e.h.audit
-            .lines()
-            .iter()
-            .any(|l| l.contains("DESKTOP_RESTARTED") && l.contains(&id))
-    );
+    audit_line(&e, |l| l.contains("DESKTOP_RESTARTED") && l.contains(&id)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
