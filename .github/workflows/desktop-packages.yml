@@ -223,7 +223,9 @@ jobs:
       fail-fast: false
       matrix:
         # Debian 13 and Ubuntu 26.04 have a different FFmpeg (or none installed): the AppImage
-        # must run on the one it bundles. Only the display libraries a desktop has are installed.
+        # must run on the one it bundles. Only the libraries a desktop has are installed (display,
+        # fontconfig, harfbuzz, fribidi: the AppImage excludelist leaves them to the host)
+        # (with fontconfig, harfbuzz and fribidi, which the AppImage excludelist leaves to the host).
         image: ["ubuntu:24.04", "ubuntu:26.04", "debian:13"]
     steps:
       - name: Install what a desktop provides, plus Xvfb and git
@@ -232,7 +234,8 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates git xvfb xauth \
-            libegl1 libxkbcommon0 libxkbcommon-x11-0 libwayland-client0 libx11-6 libxcb1 libfontconfig1
+            libegl1 libxkbcommon0 libxkbcommon-x11-0 libwayland-client0 libx11-6 libxcb1 libfontconfig1 \
+            libharfbuzz0b libfribidi0
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # after the checkout, which cleans the workspace
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4

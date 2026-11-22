@@ -17,7 +17,7 @@
 # provides (its excludelist: glibc, OpenGL/EGL, libdrm, X11 and so on) and patches RPATH to
 # $ORIGIN/../lib; appimagetool packs the AppDir with the pinned runtime. FFmpeg IS bundled (see
 # README.md for why). The system provides: glibc, the graphics stack (EGL, Wayland, X11/XCB,
-# libxkbcommon are loaded at run time) and, for saved servers, a Secret Service (keyring).
+# libxkbcommon are loaded at run time), fontconfig, harfbuzz and fribidi (the excludelist) and, for saved servers, a Secret Service (keyring).
 set -eu
 export LC_ALL=C
 # shellcheck source=packaging/hx-desktop/common.sh
