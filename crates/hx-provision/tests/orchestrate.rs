@@ -1359,7 +1359,10 @@ fn nft_ruleset_text() {
     let open =
         nft_host_protection(&fw("hxbr0", Some("10.77.3.1"), Some("10.77.3.0/24"), true)).unwrap();
     assert!(!open.contains("10.0.0.0/8") && !open.contains("fc00::/7"));
-    assert!(!open.contains("64:ff9b"), "NAT64 is private-network space too");
+    assert!(
+        !open.contains("64:ff9b"),
+        "NAT64 is private-network space too"
+    );
     assert!(
         open.contains("ct status dnat drop") && open.contains("counter drop\n  }\n  chain forward")
     );

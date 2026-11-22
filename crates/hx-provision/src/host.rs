@@ -354,7 +354,9 @@ pub fn nft_host_protection(fw: &HostFirewall) -> Result<String, IncusError> {
     }
     if !fw.allow_private_networks {
         out.push_str("    ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16 } counter drop\n");
-        out.push_str("    ip6 daddr { fc00::/7, fe80::/10, 64:ff9b::/96, 64:ff9b:1::/48 } counter drop\n");
+        out.push_str(
+            "    ip6 daddr { fc00::/7, fe80::/10, 64:ff9b::/96, 64:ff9b:1::/48 } counter drop\n",
+        );
     }
     out.push_str("  }\n}\n");
     Ok(out)
