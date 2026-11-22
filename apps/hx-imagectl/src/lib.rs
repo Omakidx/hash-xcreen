@@ -9,8 +9,8 @@
 //! hx-imagectl desktop --recipe R --path build|prebuilt [--image F] --user U --password-file P
 //!                     --facts OUT [--prefix hxci] [--pool-gib N] [--cpu N] [--memory-mib N] [--keep]
 //! hx-imagectl compare A.json B.json --recipe R
-//! hx-imagectl manifest --entries DIR... [--previous M --previous-sig S --pubkey K...]
-//!                      [--wanted FILE] --timestamp T --out M
+//! hx-imagectl manifest [--entries DIR...] [--previous M --previous-sig S --pubkey K...]
+//!                      [--wanted FILE] [--drop RECIPE/BUILD_ID...] --timestamp T --out M
 //! hx-imagectl verify --manifest M --sig S --pubkey K... [--image F]
 //! hx-imagectl cleanup [--prefix hxci]
 //! ```
@@ -52,8 +52,10 @@ hx-imagectl: build, compare, manifest and verify the prebuilt desktop images (CI
           [--prefix hxci] [--pool-gib N] [--cpu N] [--memory-mib N] [--keep]
                                            create a desktop on one path and write its facts
   compare A.json B.json --recipe R         equivalence check; the table goes to stdout, exit 1 on drift
-  manifest --entries DIR... [--previous M --previous-sig S --pubkey K...] [--wanted FILE]
-           --timestamp T --out M           build the images manifest (it is signed with minisign afterwards)
+  manifest [--entries DIR...] [--previous M --previous-sig S --pubkey K...] [--wanted FILE]
+           [--drop RECIPE/BUILD_ID...] --timestamp T --out M
+                                           build the images manifest (signed with minisign afterwards);
+                                           --drop withdraws published images, with no --entries it re-signs
   verify --manifest M --sig S --pubkey K... [--image F]
                                            verify the signature, the trusted comment, the rules and an image file
   cleanup [--prefix hxci]                  remove the objects created under the prefix (local runs)

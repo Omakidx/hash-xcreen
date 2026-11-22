@@ -123,8 +123,11 @@ fn build_signed(
 ) -> (PathBuf, PathBuf) {
     let m = dir.join(format!("{name}.json"));
     let ts = ts.to_string();
-    let mut args = vec!["manifest", "--entries"];
-    args.extend(cells.iter().map(|c| s(c)));
+    let mut args = vec!["manifest"];
+    if !cells.is_empty() {
+        args.push("--entries");
+        args.extend(cells.iter().map(|c| s(c)));
+    }
     args.extend(["--timestamp", &ts, "--out", s(&m)]);
     args.extend_from_slice(extra);
     let o = run(&args);
@@ -485,4 +488,64 @@ fn compare_exit_codes_and_the_table_on_stdout() {
         "ubuntu-24.04-xfce-basic",
     ]);
     assert_eq!(code(&o), 3);
+}
+
+#[test]
+fn a_withdrawal_re_signs_the_published_manifest_without_the_bad_image() {
+    let d = tempfile::tempdir().unwrap();
+    let keys = Keys::new();
+    let key = keys.pub_file(d.path(), "image.pub");
+    let a = cell(
+        d.path(),
+        "ubuntu-24.04-xfce-basic",
+        "20261110.1",
+        &"a".repeat(64),
+        NOW - 800,
+    );
+    let b = cell(
+        d.path(),
+        "debian-13-xfce-basic",
+        "20261110.1",
+        &"b".repeat(64),
+        NOW - 790,
+    );
+    let (m1, s1) = build_signed(d.path(), &keys, &[&a, &b], NOW - 700, &[], "m1");
+    let prev = [
+        "--previous",
+        s(&m1),
+        "--previous-sig",
+        s(&s1),
+        "--pubkey",
+        s(&key),
+    ];
+
+    // no --entries: only the previous manifest minus the withdrawn image, with a newer timestamp
+    let mut extra: Vec<&str> = prev.to_vec();
+    extra.extend(["--drop", "debian-13-xfce-basic/20261110.1"]);
+    let (m2, s2) = build_signed(d.path(), &keys, &[], NOW, &extra, "m2");
+    let parsed = ImagesManifest::parse(&fs::read(&m2).unwrap()).unwrap();
+    assert_eq!(parsed.images.len(), 1);
+    assert_eq!(parsed.images[0].recipe, "ubuntu-24.04-xfce-basic");
+    assert_eq!(code(&verify(&m2, &s2, &key, &[])), 0);
+
+    // a name that is not in the previous manifest is refused (a typo must not pass silently)
+    let now = NOW.to_string();
+    let x = d.path().join("x.json");
+    let mut args = vec!["manifest"];
+    args.extend(prev);
+    args.extend([
+        "--drop",
+        "debian-13-xfce-basic/20261199.9",
+        "--timestamp",
+        &now,
+        "--out",
+        s(&x),
+    ]);
+    let o = run(&args);
+    assert_eq!(code(&o), 1, "{}", err(&o));
+
+    // nothing to put in the manifest at all is a usage error
+    let y = d.path().join("y.json");
+    let o = run(&["manifest", "--timestamp", "1", "--out", s(&y)]);
+    assert_eq!(code(&o), 2, "{}", err(&o));
 }

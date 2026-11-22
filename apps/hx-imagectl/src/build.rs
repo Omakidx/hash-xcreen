@@ -209,7 +209,7 @@ async fn publish_and_export(
         .await?
         .ok_or_else(|| failed("the published image has no alias"))?;
     eprintln!("published {fp} in {:?}", t.elapsed());
-    let unpacked = unpacked_size(builder).await;
+    let disk_usage = unpacked_size(builder).await;
 
     let tmp = out.join(".export");
     std::fs::create_dir(&tmp).map_err(|e| failed(format!("create {}: {e}", tmp.display())))?;
@@ -233,6 +233,11 @@ async fn publish_and_export(
         )));
     }
     check_zstd(&exported)?;
+    let unpacked = match disk_usage {
+        0 => decompressed_size(&exported).await,
+        n => n,
+    };
+    eprintln!("unpacked size {unpacked} bytes");
     if !(1..=MAX_IMAGE_BYTES).contains(&size) {
         return Err(failed(format!(
             "the image is {size} bytes; the manifest allows 1 byte to 4 GiB"
@@ -283,7 +288,7 @@ fn check_zstd(path: &Path) -> Result<(), CliError> {
 }
 
 /// Bytes the builder's root disk uses (what the image takes once unpacked); 0 when Incus does not
-/// say, which the caller replaces by the file size.
+/// say (a stopped container without a quota usually reports nothing).
 async fn unpacked_size(builder: &str) -> u64 {
     let Ok(text) = incus(&["query", &format!("/1.0/instances/{builder}/state")]).await else {
         return 0;
@@ -292,4 +297,72 @@ async fn unpacked_size(builder: &str) -> u64 {
         .ok()
         .and_then(|v| v["disk"]["root"]["usage"].as_u64())
         .unwrap_or(0)
+}
+
+/// Size of the decompressed tar stream (`zstd -dc | wc -c`): close to what the image takes once
+/// unpacked. 0 when it cannot be measured, which the caller replaces by a conservative multiple of
+/// the file size.
+async fn decompressed_size(path: &Path) -> u64 {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let Ok(mut child) = Command::new("zstd")
+            .args(["-dc", "-q"])
+            .arg(&path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return 0;
+        };
+        let mut total = 0u64;
+        if let Some(mut out) = child.stdout.take() {
+            let mut buf = vec![0u8; 1 << 20];
+            while let Ok(n) = out.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                total += n as u64;
+            }
+        }
+        match child.wait() {
+            Ok(st) if st.success() => total,
+            _ => 0,
+        }
+    })
+    .await
+    .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_decompressed_size_is_measured_with_zstd() {
+        let d = tempfile::tempdir().unwrap();
+        let raw = d.path().join("raw");
+        std::fs::write(&raw, vec![7u8; 300_000]).unwrap();
+        let z = d.path().join("raw.zst");
+        let ok = std::process::Command::new("zstd")
+            .arg("-q")
+            .arg(&raw)
+            .arg("-o")
+            .arg(&z)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("no zstd binary: skipping");
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        assert_eq!(rt.block_on(decompressed_size(&z)), 300_000);
+        assert_eq!(rt.block_on(decompressed_size(&d.path().join("nope"))), 0);
+        assert!(check_zstd(&z).is_ok());
+        assert!(check_zstd(&raw).is_err());
+    }
 }

@@ -1,7 +1,7 @@
 //! `manifest` and `verify`: build the images manifest from the matrix cells' entries, and check a
 //! manifest and its signature (optionally against an image file).
 //!
-//! `manifest --entries DIR... [--previous M --previous-sig S --pubkey K...] [--wanted FILE]
+//! `manifest [--entries DIR...] [--previous M --previous-sig S --pubkey K...] [--wanted FILE] [--drop R/B...]
 //! --timestamp T --out M` reads `DIR/entry.json` of every cell (and re-hashes the image files next
 //! to it, so what is published is what was built), carries over the still-wanted entries of the
 //! previous manifest that no new entry replaces and that are within 30 days, validates the result
@@ -23,7 +23,7 @@ use crate::util::{CliError, failed, now_unix, read_bounded, refused, sha256_file
 /// Options of `manifest`.
 pub const MANIFEST_SPEC: Spec = Spec {
     values: &["previous", "previous-sig", "timestamp", "out", "wanted"],
-    lists: &["entries", "pubkey"],
+    lists: &["entries", "pubkey", "drop"],
     flags: &[],
     positionals: 0,
 };
@@ -72,12 +72,15 @@ pub struct Summary {
 
 /// Merge `new` entries with the `previous` manifest's. A previous entry is carried over when no
 /// new entry has the same recipe and digest, it is in `wanted` (when a set is given), and it is
-/// at most 30 days old at `timestamp`. If more than 32 would remain, the oldest carried entries go
-/// first. The timestamp must not go backwards.
+/// at most 30 days old at `timestamp`. An entry named in `withdraw` (`recipe/build_id`) is removed
+/// from the previous manifest (a withdrawal of a bad image; a name that matches nothing is an
+/// error). If more than 32 would remain, the oldest carried entries go first. The timestamp must
+/// not go backwards.
 pub fn merge(
     new: Vec<ImageEntry>,
     previous: Option<&ImagesManifest>,
     wanted: Option<&BTreeSet<(String, String)>>,
+    withdraw: &BTreeSet<String>,
     timestamp: u64,
     now: u64,
 ) -> Result<(ImagesManifest, Summary), CliError> {
@@ -97,10 +100,15 @@ pub fn merge(
                 prev.timestamp
             )));
         }
+        let mut withdrawn: BTreeSet<&str> = BTreeSet::new();
         for e in &prev.images {
             let key = (e.recipe.clone(), e.recipe_digest.clone());
             let label = format!("{} {}", e.recipe, e.build_id);
-            if covered.contains(&key) {
+            let id = format!("{}/{}", e.recipe, e.build_id);
+            if let Some(w) = withdraw.get(&id) {
+                withdrawn.insert(w.as_str());
+                summary.dropped.push(format!("{label}: withdrawn"));
+            } else if covered.contains(&key) {
                 summary
                     .dropped
                     .push(format!("{label}: replaced by a new build"));
@@ -114,6 +122,13 @@ pub fn merge(
                 carried.push(e.clone());
             }
         }
+        if let Some(missing) = withdraw.iter().find(|w| !withdrawn.contains(w.as_str())) {
+            return Err(refused(format!(
+                "--drop {missing}: the previous manifest has no such image"
+            )));
+        }
+    } else if !withdraw.is_empty() {
+        return Err(CliError::Usage("--drop needs --previous".into()));
     }
     let mut total = new.len() + carried.len();
     if total > MAX_ENTRIES {
@@ -171,9 +186,7 @@ fn load_wanted(path: &Path) -> Result<BTreeSet<(String, String)>, CliError> {
 
 /// Run `manifest`.
 pub fn run_manifest(p: &Parsed) -> Result<String, CliError> {
-    let dirs = p
-        .list("entries")
-        .ok_or_else(|| CliError::Usage("--entries DIR... is required".into()))?;
+    let dirs = p.list("entries").unwrap_or(&[]);
     let timestamp: u64 = p
         .require("timestamp")?
         .parse()
@@ -209,7 +222,20 @@ pub fn run_manifest(p: &Parsed) -> Result<String, CliError> {
         .get("wanted")
         .map(|w| load_wanted(Path::new(w)))
         .transpose()?;
-    let (m, summary) = merge(new, previous.as_ref(), wanted.as_ref(), timestamp, now)?;
+    let withdraw: BTreeSet<String> = p.list("drop").unwrap_or(&[]).iter().cloned().collect();
+    if new.is_empty() && previous.is_none() {
+        return Err(CliError::Usage(
+            "give --entries DIR..., or --previous to re-sign what is published".into(),
+        ));
+    }
+    let (m, summary) = merge(
+        new,
+        previous.as_ref(),
+        wanted.as_ref(),
+        &withdraw,
+        timestamp,
+        now,
+    )?;
     let json = m.to_json().map_err(|e| failed(e.to_string()))?;
     if json.len() > MAX_MANIFEST_BYTES {
         return Err(failed("the manifest is larger than 1 MiB"));
@@ -333,6 +359,10 @@ mod tests {
         }
     }
 
+    fn none() -> BTreeSet<String> {
+        BTreeSet::new()
+    }
+
     const R1: &str = "ubuntu-24.04-xfce-basic";
     const R2: &str = "debian-13-xfce-basic";
 
@@ -343,7 +373,7 @@ mod tests {
             NOW - 9 * DAY,
         );
         let n = entry(R1, 'a', "20261110.1", NOW - 10);
-        let (m, s) = merge(vec![n], Some(&p), None, NOW, NOW).unwrap();
+        let (m, s) = merge(vec![n], Some(&p), None, &none(), NOW, NOW).unwrap();
         assert_eq!(m.images.len(), 1);
         assert_eq!(m.images[0].build_id, "20261110.1");
         assert_eq!((s.new, s.carried, s.dropped.len()), (1, 0, 1));
@@ -362,7 +392,7 @@ mod tests {
         ]
         .into();
         let n = entry(R1, 'a', "20261120.1", NOW - 10);
-        let (m, s) = merge(vec![n], Some(&p), Some(&wanted), NOW, NOW).unwrap();
+        let (m, s) = merge(vec![n], Some(&p), Some(&wanted), &none(), NOW, NOW).unwrap();
         let names: Vec<&str> = m.images.iter().map(|e| e.recipe.as_str()).collect();
         assert_eq!(names, [R2, R1], "sorted by recipe name");
         assert_eq!(m.images[0], keep);
@@ -378,6 +408,7 @@ mod tests {
             vec![entry(R1, 'a', "20261120.1", NOW - 10)],
             Some(&p),
             None,
+            &none(),
             NOW - 1,
             NOW,
         )
@@ -391,6 +422,7 @@ mod tests {
             vec![entry(R1, 'a', "20261120.1", NOW + 100)],
             None,
             None,
+            &none(),
             NOW,
             NOW,
         )
@@ -412,11 +444,28 @@ mod tests {
             .collect();
         let p = prev(old, NOW - 1);
         let n = entry(R1, 'a', "20261120.1", NOW - 10);
-        let (m, s) = merge(vec![n], Some(&p), None, NOW, NOW).unwrap();
+        let (m, s) = merge(vec![n], Some(&p), None, &none(), NOW, NOW).unwrap();
         assert_eq!(m.images.len(), MAX_ENTRIES);
         // the oldest carried entry (the largest i) was dropped
         assert!(m.images.iter().all(|e| e.build_id != "20261101.32"));
         assert_eq!((s.new, s.carried, s.dropped.len()), (1, 31, 1));
+    }
+
+    #[test]
+    fn a_withdrawn_image_is_removed_and_a_typo_is_refused() {
+        let bad = entry(R2, 'b', "20261110.1", NOW - DAY);
+        let good = entry(R1, 'a', "20261110.1", NOW - DAY);
+        let p = prev(vec![bad, good.clone()], NOW - DAY);
+        let w: BTreeSet<String> = [format!("{R2}/20261110.1")].into();
+        let (m, s) = merge(vec![], Some(&p), None, &w, NOW, NOW).unwrap();
+        assert_eq!(m.images, [good]);
+        assert_eq!((s.new, s.carried, s.dropped.len()), (0, 1, 1));
+        assert!(s.dropped[0].contains("withdrawn"));
+        let typo: BTreeSet<String> = [format!("{R2}/20261199.9")].into();
+        let e = merge(vec![], Some(&p), None, &typo, NOW, NOW).unwrap_err();
+        assert!(matches!(e, CliError::Refused(_)), "{e:?}");
+        let e = merge(vec![], None, None, &w, NOW, NOW).unwrap_err();
+        assert!(matches!(e, CliError::Usage(_)), "{e:?}");
     }
 
     #[test]
