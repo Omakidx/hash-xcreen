@@ -207,8 +207,8 @@ Notes (design approved 2026-11-22, written before the code):
 
 ### 1H — Hardening
 - [x] Fuzz targets for every pre-auth and container-supplied parser, running nightly
-- [ ] Performance suite on the dedicated runner with regression thresholds
-- [ ] End-to-end tests: install → pair → connect → type and scroll → disconnect, under netem profiles
+- [ ] Performance suite on the dedicated runner with regression thresholds (criterion benches, the LAN end-to-end macro run and `perf/check.py` against `perf/baseline.json`; the workflow targets the `hx-perf` label and stays inactive until the maintainer registers a runner, see [testing.md](testing.md); `perf/run.sh` runs it locally meanwhile) **Open until** the maintainer registers the quiet `hx-perf` runner and the first reference baseline is recorded there.
+- [ ] End-to-end tests: install → pair → connect → type and scroll → disconnect, under netem profiles (`e2e_netem.rs`, unprivileged veth + netem, every profile measured; the lossy profile currently exposes a corrupt-picture defect, [testing.md](testing.md) section 2.8) **Open until** the lossy-profile video corruption is fixed and the lossy step runs without `continue-on-error`. The install step is covered by the installer-vm and nested-Incus suites; this suite starts from an installed stack (accepted by the integrator).
 - [ ] Independent security review of 1B, 1C and 1E; findings fixed
 
 ### Gate 1

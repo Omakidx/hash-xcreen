@@ -1,0 +1,68 @@
+name: Performance
+
+# INACTIVE until a runner with the label `hx-perf` is registered and the repository variable
+# HX_PERF_RUNNER is set to `true` (docs/testing.md, "The performance runner"). Until then the job
+# is skipped, not queued: a schedule would otherwise leave a job waiting forever for a runner
+# that does not exist. Meanwhile run the suite on demand with `perf/run.sh`.
+#
+# The suite: criterion microbenchmarks, the LAN end-to-end flow repeated, and a comparison with
+# perf/baseline.json. It measures latency and CPU, so it must run on a quiet dedicated machine,
+# never on a shared hosted runner.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Repetitions of the LAN end-to-end run"
+        default: "5"
+      mode:
+        description: "gates (Gate 1 only) or regression (also against the recorded baseline)"
+        default: "regression"
+        type: choice
+        options: [regression, gates]
+  schedule:
+    - cron: "23 2 * * *"
+
+permissions:
+  contents: read
+
+# One run at a time on the one machine; a queued night run does not cancel a manual one.
+concurrency:
+  group: perf
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  perf:
+    name: Performance suite (dedicated runner)
+    if: ${{ vars.HX_PERF_RUNNER == 'true' }}
+    runs-on: [self-hosted, hx-perf]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2
+        with:
+          tool: cargo-nextest
+      - name: Machine is quiet
+        # A busy machine measures the neighbour, not the code.
+        run: sh perf/quiet.sh 0.50 900
+      - name: The checker's own tests
+        run: python3 -I perf/test_check.py
+      - name: Run the suite
+        env:
+          HX_PERF_STRICT: "1"
+          HX_PERF_RUNS: ${{ inputs.runs || '5' }}
+          PERF_MODE: ${{ inputs.mode || 'regression' }}
+        run: sh perf/run.sh --mode "$PERF_MODE" --strict
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ always() }}
+        with:
+          name: perf-results
+          path: |
+            target/tmp/perf-macro.json
+            target/criterion/**/new/estimates.json
+          if-no-files-found: warn

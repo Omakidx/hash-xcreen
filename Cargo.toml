@@ -24,6 +24,8 @@ hx-session = { path = "apps/hx-session", version = "0.1.0" }
 hx-transport = { path = "crates/hx-transport", version = "0.1.0" }
 bytes = "1"
 crossbeam-channel = "0.5"
+# Microbenchmarks (docs/testing.md). No default features: no plotting stack, no rayon.
+criterion = { version = "0.8", default-features = false }
 # Links the system FFmpeg (6.1 on Ubuntu 24.04) through pkg-config; 7.1 is the newest ffmpeg-next that supports it.
 ffmpeg-next = { version = "7.1", default-features = false, features = ["codec", "format"] }
 prost = "0.14"
