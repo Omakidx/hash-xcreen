@@ -677,6 +677,19 @@ async fn handle_binary(inner: &Arc<Inner>, b: Bytes) -> Result<()> {
         .split_first()
         .ok_or_else(|| Error::Violation("empty websocket message".into()))?;
     let ch = ChannelId::from_u8(first)?;
+    // A control-only connection (protocol 1.3 setup) has no transfer, audio or video: those
+    // channels are a protocol violation. Input and mouse data are dropped by their delivery
+    // functions, which also count them.
+    if inner.is_control_only()
+        && !matches!(
+            ch,
+            ChannelId::Control | ChannelId::Input | ChannelId::MouseMove
+        )
+    {
+        return Err(Error::Violation(format!(
+            "channel {ch:?} is not allowed on a control-only connection"
+        )));
+    }
     match (inner.role, ch) {
         (_, ChannelId::Control) => {
             check_len(body, MAX_CONTROL_MESSAGE)?;

@@ -51,7 +51,7 @@
 //! ```
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     future::Future,
     sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
@@ -70,9 +70,9 @@ use crate::{
     clock::{Clock, SystemClock},
     error::{Error, Result},
     keys::{DeviceId, IdentityKey, PublicKey},
-    pairing::{PairedDevice, PairingLimits, PairingWindow, serve_pairing},
+    pairing::{PairedDevice, PairedWith, PairingLimits, PairingWindow, serve_pairing},
     pin::{MAX_PIN_FAILURES, PinHash, backoff_after},
-    registry::{DeviceRecord, DeviceRegistry, RevokeReason},
+    registry::{DeviceRecord, DeviceRegistry, RevokeReason, RevokedBy},
     secrets::Pin,
     text::sanitize_label,
     tls,
@@ -113,6 +113,14 @@ pub struct AuthenticatorConfig {
     /// How long a lockout revocation waits for the [`RevocationGuard`] before it revokes
     /// anyway (default 5 s). The lockout is never skipped: a slow or stuck hook only delays it.
     pub revocation_guard_timeout: Duration,
+    /// Backstop on every [`SetupGate::admit`] call (default 10 s). A gate that does not answer
+    /// in time counts as [`SetupAdmission::Unavailable`] (the client gets `BUSY`).
+    pub setup_gate_timeout: Duration,
+    /// How long after a PIN lockout a device may still reinstate itself with the account
+    /// password (default 30 days, protocol §11.7).
+    pub reinstate_max_age: Duration,
+    /// Password attempts one device may make per hour, over all its connections (default 3).
+    pub reinstate_attempts_per_hour: u32,
 }
 
 impl Default for AuthenticatorConfig {
@@ -131,6 +139,9 @@ impl Default for AuthenticatorConfig {
             min_hash_budget: Duration::from_secs(1),
             unavailable_retry: Duration::from_secs(2),
             revocation_guard_timeout: Duration::from_secs(5),
+            setup_gate_timeout: Duration::from_secs(10),
+            reinstate_max_age: Duration::from_secs(30 * 24 * 60 * 60),
+            reinstate_attempts_per_hour: 3,
         }
     }
 }
@@ -200,6 +211,68 @@ pub trait PinVerifier: Send + Sync + 'static {
         device: &'a DeviceId,
         pin: Zeroizing<Vec<u8>>,
     ) -> BoxFuture<'a, PinVerdict>;
+}
+
+/// What a [`SetupGate`] says about a known, active device that asks for `INTENT_SETUP`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetupAdmission {
+    /// Setup is not open for this device (not the bound setup device, or the window is
+    /// closed): `Refuse{SETUP_CLOSED}`, close code 10.
+    Closed,
+    /// Setup is open for this device and **no PIN exists**: the connection is authorized
+    /// control-only on the strength of the pinned key, and may only set the PIN.
+    KeyOnly,
+    /// Setup is open for this device and a PIN exists: the connection is told `PIN_REQUIRED`
+    /// and authorized only after a correct PIN (protocol §11.4, unchanged).
+    NeedsPin,
+    /// The answer could not be had now (for example the privileged daemon, which is the
+    /// authority on the window, did not answer in time): `Refuse{BUSY}`. The client retries.
+    ///
+    /// This variant is an addition to the design's three, needed for design D2's "if privd
+    /// can't be reached the answer is `Refuse{BUSY}`".
+    Unavailable,
+}
+
+/// The application's view of whether `INTENT_SETUP` may proceed for a device. The
+/// authenticator checks the key, the revocation state and the client's version and features
+/// itself; this is only the part it cannot know: the bound setup device and the window.
+///
+/// It is asked once before `HelloAck` and **again right before the connection is authorized**,
+/// so a window that closed or a binding that moved while a PIN was being hashed is noticed.
+/// An implementation must bound its own external calls (the authenticator also enforces
+/// [`AuthenticatorConfig::setup_gate_timeout`]) and must never log secrets.
+pub trait SetupGate: Send + Sync + 'static {
+    /// Admission for `device`, a known and active device.
+    fn admit<'a>(&'a self, device: &'a DeviceId) -> BoxFuture<'a, SetupAdmission>;
+}
+
+/// What a [`ReinstateGate`] found out about one account password. The same verdicts as for a
+/// PIN ([`PinVerdict`]): `Right`, `Wrong` (counted), `Unavailable` and `Locked` (refunded,
+/// answered `NOT_AVAILABLE`).
+pub type PasswordVerdict = PinVerdict;
+
+/// Checks the account password for `INTENT_REINSTATE` (protocol §11.7). The authenticator
+/// decides who may ask (a key revoked by the PIN lockout less than
+/// [`AuthenticatorConfig::reinstate_max_age`] ago) and owns the attempt limits (3 messages per
+/// connection, [`AuthenticatorConfig::reinstate_attempts_per_hour`] per device); the gate only
+/// answers a [`PasswordVerdict`]. The gateway implements it with privd `PepperVerify(PASSWORD)`.
+///
+/// Like [`PinVerifier`]: bound every external call with a timeout (answer `Unavailable` when it
+/// fires), answer `Wrong` only for a definite "no", and never log or keep the password. A
+/// malformed password never reaches the gate.
+pub trait ReinstateGate: Send + Sync + 'static {
+    /// True if a password can be checked at all (a password verifier exists and is current).
+    /// When false the client gets `NOT_AVAILABLE`.
+    fn has_password(&self, _device: &DeviceId) -> bool {
+        true
+    }
+
+    /// Check `password` for `device`.
+    fn verify<'a>(
+        &'a self,
+        device: &'a DeviceId,
+        password: Zeroizing<Vec<u8>>,
+    ) -> BoxFuture<'a, PasswordVerdict>;
 }
 
 /// Proof that a [`RevocationGuard`] was entered. Dropping it leaves the guard.
@@ -273,13 +346,16 @@ enum Judged {
 #[derive(Debug)]
 pub enum Outcome {
     /// Pairing succeeded. The connection is open and still restricted (pairing connections
-    /// carry control messages only); the application may exchange its setup messages on it
-    /// and must then close it with `NO_ERROR`. The device reconnects with `INTENT_SESSION`.
+    /// carry the pairing exchange only); the application closes it with `NO_ERROR`. The device
+    /// then reconnects with `INTENT_SETUP` (protocol 1.3, if it is the setup device) or
+    /// `INTENT_SESSION`.
     Paired {
         /// The pairing connection.
         connection: Connection,
         /// The registry entry of the new device.
         device: DeviceRecord,
+        /// The secret the device paired with.
+        with: PairedWith,
     },
     /// The PIN was right and the connection was authorized.
     Authorized {
@@ -288,7 +364,32 @@ pub enum Outcome {
         /// The device.
         device: DeviceRecord,
     },
-    /// The session was refused before `HelloAck` (the client was told); nothing is left open.
+    /// An `INTENT_SETUP` connection was admitted and authorized **control-only**
+    /// ([`Connection::authorize_control_only`], features `SETUP`). `AuthResult{OK}` has been
+    /// sent; the application sends `SetupState` next. The connection is closed automatically
+    /// if the device is revoked.
+    Setup {
+        /// The control-only connection.
+        connection: Connection,
+        /// The device.
+        device: DeviceRecord,
+        /// True if the device proved a PIN on this connection; false if it was admitted on its
+        /// key alone (`SetupAdmission::KeyOnly`: it may only set the PIN).
+        pin_verified: bool,
+    },
+    /// An `INTENT_REINSTATE` connection proved the account password: the registry now has the
+    /// device active again (PIN counter reset, revocation cleared) and `AuthResult{OK}` was
+    /// sent. **No session is authorized**; the connection was closed with `NO_ERROR`. The
+    /// application announces the change (`DeviceEvent REINSTATED`) and audits it
+    /// (`DEVICE_REINSTATED`, cause `PASSWORD`).
+    Reinstated {
+        /// The device, as now stored (active).
+        device: DeviceRecord,
+    },
+    /// The session was refused (the client was told) and nothing is left open. For
+    /// `INTENT_SETUP` this also covers a refusal after `HelloAck`: the connection was closed
+    /// with the matching code (`SETUP_CLOSED` or `BUSY`) because the admission changed before
+    /// authorization.
     Refused(RefuseReason),
 }
 
@@ -320,6 +421,10 @@ struct Inner {
     clock: Arc<dyn Clock>,
     window: PairingWindow,
     pin: RwLock<Option<Arc<dyn PinVerifier>>>,
+    setup_gate: RwLock<Option<Arc<dyn SetupGate>>>,
+    reinstate_gate: RwLock<Option<Arc<dyn ReinstateGate>>>,
+    /// When each device made its password attempts in the last hour (memory only).
+    password_attempts: Mutex<HashMap<DeviceId, VecDeque<Instant>>>,
     revocation_guard: RwLock<Option<Arc<dyn RevocationGuard>>>,
     config: AuthenticatorConfig,
     revocations: broadcast::Sender<DeviceId>,
@@ -362,6 +467,9 @@ impl Authenticator {
                 window: PairingWindow::new(clock.clone(), config.pairing.clone()),
                 clock,
                 pin: RwLock::new(None),
+                setup_gate: RwLock::new(None),
+                reinstate_gate: RwLock::new(None),
+                password_attempts: Mutex::new(HashMap::new()),
                 revocation_guard: RwLock::new(None),
                 config,
                 revocations,
@@ -402,6 +510,36 @@ impl Authenticator {
         }
     }
 
+    /// Install the [`SetupGate`] that admits `INTENT_SETUP` connections. Without one every
+    /// `INTENT_SETUP` hello is refused `UNAUTHORIZED` like an unknown device. Takes effect for
+    /// the next connection.
+    pub fn set_setup_gate(&self, gate: Arc<dyn SetupGate>) {
+        if let Ok(mut g) = self.inner.setup_gate.write() {
+            *g = Some(gate);
+        }
+    }
+
+    /// Install the [`ReinstateGate`] that checks the account password for `INTENT_REINSTATE`.
+    /// Without one every `INTENT_REINSTATE` hello is refused `UNAUTHORIZED` like an unknown
+    /// device. Takes effect for the next attempt.
+    pub fn set_reinstate_gate(&self, gate: Arc<dyn ReinstateGate>) {
+        if let Ok(mut g) = self.inner.reinstate_gate.write() {
+            *g = Some(gate);
+        }
+    }
+
+    fn reinstate_gate(&self) -> Option<Arc<dyn ReinstateGate>> {
+        self.inner
+            .reinstate_gate
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+    }
+
+    fn setup_gate(&self) -> Option<Arc<dyn SetupGate>> {
+        self.inner.setup_gate.read().ok().and_then(|g| g.clone())
+    }
+
     /// Install the [`RevocationGuard`] the authenticator enters around a PIN-lockout
     /// revocation. Takes effect for the next lockout.
     pub fn set_revocation_guard(&self, guard: Arc<dyn RevocationGuard>) {
@@ -426,10 +564,10 @@ impl Authenticator {
     /// [`subscribe_revocations`](Self::subscribe_revocations). Returns false if the device is
     /// unknown or already revoked. The write and the announcement run as one unit that
     /// finishes even if the caller's future is dropped.
-    pub async fn revoke(&self, id: &DeviceId, reason: RevokeReason) -> Result<bool> {
+    pub async fn revoke(&self, id: &DeviceId, reason: RevokeReason, by: RevokedBy) -> Result<bool> {
         let id = *id;
         self.commit(move |r, tx, now| {
-            let revoked = r.revoke(&id, reason, now)?;
+            let revoked = r.revoke(&id, reason, by, now)?;
             if revoked {
                 // No receiver is fine: nothing is live.
                 let _ = tx.send(id);
@@ -588,6 +726,8 @@ impl Authenticator {
         match intent {
             Intent::Pair => self.pair(pending, key, known).await,
             Intent::Session => self.session(pending, known, rx).await,
+            Intent::Setup => self.setup(pending, known, rx).await,
+            Intent::Reinstate => self.reinstate_with_password(pending, known).await,
             Intent::Unspecified => {
                 self.refuse(pending, RefuseReason::Unauthorized, NOT_AUTHORIZED)
                     .await
@@ -644,11 +784,12 @@ impl Authenticator {
         )
         .await;
         match result {
-            Ok(Ok(PairedDevice { record })) => {
+            Ok(Ok(PairedDevice { record, with })) => {
                 tracing::info!(device = %record.id, key = %key.fingerprint().short(), "device paired");
                 Ok(Outcome::Paired {
                     connection: conn,
                     device: record,
+                    with,
                 })
             }
             Ok(Err(e)) => {
@@ -749,6 +890,390 @@ impl Authenticator {
         Ok(Outcome::Authorized {
             connection: conn,
             device,
+        })
+    }
+
+    // -------------------------------------------------------------- reinstate (protocol 1.3)
+
+    /// `INTENT_REINSTATE` (protocol §11.7): the key must be known, revoked by the PIN lockout
+    /// and less than `reinstate_max_age` old; everything else is the uniform `UNAUTHORIZED`.
+    async fn reinstate_with_password(
+        &self,
+        pending: PendingSession,
+        known: Option<DeviceRecord>,
+    ) -> Result<Outcome> {
+        let speaks = pending
+            .hello()
+            .version
+            .as_ref()
+            .is_some_and(|v| v.major == hx_proto::version::PROTOCOL_MAJOR && v.minor >= 3);
+        let max_age = self.inner.config.reinstate_max_age.as_secs();
+        let now = self.inner.clock.unix_secs();
+        let device = match known {
+            Some(d)
+                if speaks
+                    && d.revoked.is_some_and(|v| {
+                        v.by == RevokedBy::Lockout && now.saturating_sub(v.at_unix) < max_age
+                    }) =>
+            {
+                d
+            }
+            _ => {
+                return self
+                    .refuse(pending, RefuseReason::Unauthorized, NOT_AUTHORIZED)
+                    .await;
+            }
+        };
+        let Some(gate) = self.reinstate_gate() else {
+            return self
+                .refuse(pending, RefuseReason::Unauthorized, NOT_AUTHORIZED)
+                .await;
+        };
+        let conn = pending
+            .accept(ServerHello {
+                capabilities: capabilities(&[], Features::NONE),
+                software: self.inner.config.software.clone(),
+            })
+            .await?;
+        let left = self.password_attempts_left(&device.id);
+        if let Err(e) = self
+            .send_result(&conn, AuthStatus::PasswordRequired, left, Duration::ZERO)
+            .await
+        {
+            conn.close(CloseCode::InternalError, "could not ask for the password")
+                .await;
+            return Err(e);
+        }
+        let verdict = match tokio::time::timeout(
+            self.inner.config.pin_timeout,
+            self.password_exchange(&conn, &device, &gate),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(_) => Err(Error::Timeout("password exchange")),
+        };
+        match verdict {
+            Ok(record) => {
+                tracing::info!(device = %record.id, "device reinstated with the account password");
+                close_after(&conn, CloseCode::NoError, "reinstated").await;
+                Ok(Outcome::Reinstated { device: record })
+            }
+            Err(e) => {
+                close_after(&conn, CloseCode::Unauthorized, "authentication failed").await;
+                Err(e)
+            }
+        }
+    }
+
+    fn password_attempts_left(&self, id: &DeviceId) -> u32 {
+        let now = self.inner.clock.now();
+        let mut m = self
+            .inner
+            .password_attempts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let q = m.entry(*id).or_default();
+        prune_hour(q, now);
+        self.inner
+            .config
+            .reinstate_attempts_per_hour
+            .saturating_sub(u32::try_from(q.len()).unwrap_or(u32::MAX))
+    }
+
+    /// Read up to [`MAX_PASSWORD_MESSAGES`] attempts. `Ok` means the device is reinstated
+    /// and the client was told (a failure to tell it does not undo that).
+    async fn password_exchange(
+        &self,
+        conn: &Connection,
+        device: &DeviceRecord,
+        gate: &Arc<dyn ReinstateGate>,
+    ) -> Result<DeviceRecord> {
+        let cfg = &self.inner.config;
+        let id = device.id;
+        for _ in 0..MAX_PASSWORD_MESSAGES {
+            let m = conn.recv_control().await?;
+            let Some(Body::Password(mut attempt)) = AuthMessage::from_control(&m)?.body else {
+                return Err(Error::Protocol("expected a password attempt"));
+            };
+            let password = Zeroizing::new(std::mem::take(&mut attempt.password));
+            drop(attempt);
+
+            // One check at a time per device, so parallel connections cannot multiply guesses.
+            let _guard = self.device_lock(&id).lock_owned().await;
+            // The per-device budget: an attempt over it is not verified and not counted.
+            let now = self.inner.clock.now();
+            let (over, wait) = {
+                let mut map = self
+                    .inner
+                    .password_attempts
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                let q = map.entry(id).or_default();
+                prune_hour(q, now);
+                if q.len() >= cfg.reinstate_attempts_per_hour as usize {
+                    let oldest = q.front().copied().unwrap_or(now);
+                    (
+                        true,
+                        (oldest + PASSWORD_WINDOW).saturating_duration_since(now),
+                    )
+                } else {
+                    q.push_back(now);
+                    (false, Duration::ZERO)
+                }
+            };
+            if over {
+                self.send_result(conn, AuthStatus::Backoff, 0, wait).await?;
+                continue;
+            }
+            if !gate.has_password(&id) {
+                self.refund_password_attempt(&id);
+                self.send_result(conn, AuthStatus::NotAvailable, 0, Duration::ZERO)
+                    .await?;
+                return Err(Error::PinNotAvailable);
+            }
+            // A malformed password is a wrong one without a check.
+            let verdict = if hx_proto::message::password_problem(&password).is_some() {
+                PasswordVerdict::Wrong
+            } else {
+                gate.verify(&id, password).await
+            };
+            match verdict {
+                PasswordVerdict::Right => {
+                    let (max_age, now_unix) = (
+                        cfg.reinstate_max_age.as_secs(),
+                        self.inner.clock.unix_secs(),
+                    );
+                    let done = self
+                        .reg(move |r| r.reinstate_after_lockout(&id, now_unix, max_age))
+                        .await?;
+                    if !done {
+                        // Revoked again by someone else, or too old by now: stays revoked.
+                        return Err(Error::Revoked);
+                    }
+                    self.set_not_before(&id, None);
+                    let record = self
+                        .reg(move |r| r.get(&id))
+                        .await?
+                        .ok_or(Error::UnknownDevice)?;
+                    let left = self.password_attempts_left(&id);
+                    if let Err(e) = self
+                        .send_result(conn, AuthStatus::Ok, left, Duration::ZERO)
+                        .await
+                    {
+                        tracing::warn!(error = %e, "could not confirm a reinstatement; it stands");
+                    }
+                    return Ok(record);
+                }
+                PasswordVerdict::Wrong => {
+                    tracing::warn!(remote = %conn.remote_addr(), device = %id, "wrong password for a reinstatement");
+                    let left = self.password_attempts_left(&id);
+                    self.send_result(conn, AuthStatus::WrongPassword, left, Duration::ZERO)
+                        .await?;
+                }
+                PasswordVerdict::Unavailable | PasswordVerdict::Locked { .. } => {
+                    tracing::warn!(device = %id, "the password verifier could not answer");
+                    self.refund_password_attempt(&id);
+                    self.send_result(conn, AuthStatus::NotAvailable, 0, Duration::ZERO)
+                        .await?;
+                    return Err(Error::PinNotAvailable);
+                }
+            }
+        }
+        Err(Error::Protocol(
+            "too many password attempts on one connection",
+        ))
+    }
+
+    /// Give back the last counted attempt (it was never judged).
+    fn refund_password_attempt(&self, id: &DeviceId) {
+        if let Some(q) = self
+            .inner
+            .password_attempts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_mut(id)
+        {
+            q.pop_back();
+        }
+    }
+
+    // -------------------------------------------------------------- setup (protocol 1.3)
+
+    /// Ask the gate, bounded by [`AuthenticatorConfig::setup_gate_timeout`].
+    async fn admit(&self, gate: &Arc<dyn SetupGate>, id: &DeviceId) -> SetupAdmission {
+        match tokio::time::timeout(self.inner.config.setup_gate_timeout, gate.admit(id)).await {
+            Ok(a) => a,
+            Err(_) => {
+                tracing::warn!(device = %id, "the setup gate did not answer in time");
+                SetupAdmission::Unavailable
+            }
+        }
+    }
+
+    /// `INTENT_SETUP`: the admission matrix of design D2. Everything that does not identify a
+    /// known, active device that speaks 1.3 with the `SETUP` feature is the same uniform
+    /// `UNAUTHORIZED` refusal as for a session.
+    async fn setup(
+        &self,
+        pending: PendingSession,
+        known: Option<DeviceRecord>,
+        rx: broadcast::Receiver<DeviceId>,
+    ) -> Result<Outcome> {
+        let hello = pending.hello();
+        let speaks_setup = hello
+            .version
+            .as_ref()
+            .is_some_and(|v| v.major == hx_proto::version::PROTOCOL_MAJOR && v.minor >= 3)
+            && hello
+                .capabilities
+                .as_ref()
+                .is_some_and(|c| Features(c.features).contains(Features::SETUP));
+        let device = match known {
+            Some(d) if !d.is_revoked() && speaks_setup => d,
+            _ => {
+                return self
+                    .refuse(pending, RefuseReason::Unauthorized, NOT_AUTHORIZED)
+                    .await;
+            }
+        };
+        let Some(gate) = self.setup_gate() else {
+            return self
+                .refuse(pending, RefuseReason::Unauthorized, NOT_AUTHORIZED)
+                .await;
+        };
+        let admission = self.admit(&gate, &device.id).await;
+        match admission {
+            SetupAdmission::Closed => {
+                return self
+                    .refuse(pending, RefuseReason::SetupClosed, "setup is closed")
+                    .await;
+            }
+            SetupAdmission::Unavailable => {
+                return self
+                    .refuse(
+                        pending,
+                        RefuseReason::Busy,
+                        "setup is not available right now",
+                    )
+                    .await;
+            }
+            SetupAdmission::NeedsPin
+                if self.pin_verifier().is_none_or(|v| !v.has_pin(&device.id)) =>
+            {
+                // The gate and the verifier disagree: no way to check a PIN, so no setup.
+                return self
+                    .refuse(pending, RefuseReason::Unauthorized, NOT_AUTHORIZED)
+                    .await;
+            }
+            SetupAdmission::KeyOnly | SetupAdmission::NeedsPin => {}
+        }
+        let conn = pending
+            .accept(ServerHello {
+                capabilities: capabilities(&[], Features::SETUP),
+                software: self.inner.config.software.clone(),
+            })
+            .await?;
+        if admission == SetupAdmission::KeyOnly {
+            return self
+                .authorize_setup(conn, device.id, &gate, SetupAdmission::KeyOnly, false, rx)
+                .await;
+        }
+
+        // NeedsPin: tell the client, then run exactly the §11.4 exchange.
+        let cfg = &self.inner.config;
+        let left = cfg.max_pin_failures.saturating_sub(device.failed_pins);
+        if let Err(e) = self
+            .send_result(&conn, AuthStatus::PinRequired, left, Duration::ZERO)
+            .await
+        {
+            conn.close(CloseCode::InternalError, "could not ask for the PIN")
+                .await;
+            return Err(e);
+        }
+        let deadline = std::time::Instant::now() + cfg.pin_timeout;
+        let verdict = match tokio::time::timeout(
+            cfg.pin_timeout,
+            self.pin_exchange(&conn, &device, deadline),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(_) => Err(Error::Timeout("PIN exchange")),
+        };
+        if let Err(e) = verdict {
+            close_after(&conn, CloseCode::Unauthorized, "authentication failed").await;
+            return Err(e);
+        }
+        self.authorize_setup(conn, device.id, &gate, SetupAdmission::NeedsPin, true, rx)
+            .await
+    }
+
+    /// The last steps of an `INTENT_SETUP` admission, with everything re-checked right before
+    /// the connection is authorized: the registry (a revocation while a PIN was hashed) and the
+    /// gate (the window, the binding). Then authorize control-only, watch for revocation and
+    /// tell the client.
+    async fn authorize_setup(
+        &self,
+        conn: Connection,
+        id: DeviceId,
+        gate: &Arc<dyn SetupGate>,
+        expected: SetupAdmission,
+        pin_verified: bool,
+        rx: broadcast::Receiver<DeviceId>,
+    ) -> Result<Outcome> {
+        let fresh = self.reg(move |r| r.get(&id)).await;
+        let device = match fresh {
+            Ok(Some(d)) if !d.is_revoked() => d,
+            Ok(_) => {
+                close_after(&conn, CloseCode::Unauthorized, "device revoked").await;
+                return Err(Error::Revoked);
+            }
+            Err(e) => {
+                conn.close(CloseCode::InternalError, "registry failure")
+                    .await;
+                return Err(e);
+            }
+        };
+        let now = self.admit(gate, &id).await;
+        if now != expected {
+            let (code, reason, text) = match now {
+                SetupAdmission::Closed => (
+                    CloseCode::SetupClosed,
+                    RefuseReason::SetupClosed,
+                    "setup is closed",
+                ),
+                _ => (CloseCode::Busy, RefuseReason::Busy, "setup state changed"),
+            };
+            tracing::info!(device = %id, ?now, ?expected, "setup admission changed before authorization");
+            conn.close(code, text).await;
+            return Ok(Outcome::Refused(reason));
+        }
+        // Authorize first, then tell the client (protocol §13).
+        if let Err(e) = conn.authorize_control_only(Features::SETUP) {
+            conn.close(CloseCode::InternalError, "authorize failed")
+                .await;
+            return Err(e.into());
+        }
+        self.watch(conn.clone(), id, rx);
+        let sent = self
+            .send_result(
+                &conn,
+                AuthStatus::Ok,
+                self.inner.config.max_pin_failures,
+                Duration::ZERO,
+            )
+            .await;
+        if let Err(e) = sent {
+            conn.close(CloseCode::InternalError, "could not confirm")
+                .await;
+            return Err(e);
+        }
+        tracing::info!(device = %id, pin_verified, "setup connection authorized (control only)");
+        Ok(Outcome::Setup {
+            connection: conn,
+            device,
+            pin_verified,
         })
     }
 
@@ -1025,6 +1550,21 @@ impl Authenticator {
                 }
             }
         });
+    }
+}
+
+/// Password attempt messages one `INTENT_REINSTATE` connection may send.
+const MAX_PASSWORD_MESSAGES: usize = 3;
+
+/// The window of the per-device password budget.
+const PASSWORD_WINDOW: Duration = Duration::from_secs(60 * 60);
+
+fn prune_hour(q: &mut VecDeque<Instant>, now: Instant) {
+    while q
+        .front()
+        .is_some_and(|t| now.saturating_duration_since(*t) >= PASSWORD_WINDOW)
+    {
+        q.pop_front();
     }
 }
 

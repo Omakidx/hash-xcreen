@@ -14,8 +14,8 @@ use std::{
 use hx_crypto::{
     Authenticator, AuthenticatorConfig, AwaitingPin, BoxFuture, Clock, DeviceId, DeviceRegistry,
     Error, IdentityKey, ManualClock, MemoryRegistry, Outcome, PairClientOptions, PairingCredential,
-    Pin, PinReply, PinVerdict, PinVerifier, RevokeReason, SessionOptions, connect_session,
-    connect_with_pin, pair_device, tls,
+    Pin, PinReply, PinVerdict, PinVerifier, RevokeReason, RevokedBy, SessionOptions,
+    connect_session, connect_with_pin, pair_device, tls,
 };
 use hx_proto::{channel::CloseCode, pb::RefuseReason};
 use hx_transport::{Server, ServerOptions, Target, TransportPreference};
@@ -573,7 +573,7 @@ async fn unknown_revoked_and_no_pin_devices_get_the_same_refusal() {
     e.auth
         .set_pin_verifier(Scripted::new(PinVerdict::Right, Duration::ZERO));
     e.auth
-        .revoke(&e.id(), RevokeReason::User)
+        .revoke(&e.id(), RevokeReason::User, RevokedBy::Operator)
         .await
         .expect("revoke");
     let revoked = refusal(e.device.clone()).await;

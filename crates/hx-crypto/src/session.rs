@@ -142,7 +142,11 @@ impl AwaitingPin {
             AuthStatus::Backoff => Ok(PinReply::Backoff { retry_after: wait }),
             AuthStatus::Revoked => Err(Error::Revoked),
             AuthStatus::NotAvailable => Err(Error::PinNotAvailable),
-            AuthStatus::Unspecified => Err(Error::Protocol("unknown auth status")),
+            // Only an INTENT_SETUP server sends it; a session server never does.
+            AuthStatus::PinRequired
+            | AuthStatus::PasswordRequired
+            | AuthStatus::WrongPassword
+            | AuthStatus::Unspecified => Err(Error::Protocol("unknown auth status")),
         }
     }
 
