@@ -25,8 +25,8 @@ mod validate;
 
 pub use commands::{
     CommandClass, CommandInfo, DEFAULT_DEADLINE_MS, admin_only_argument, command_info,
-    gateway_denied, is_valid_desktop_id, is_valid_snapshot_name, is_valid_update_version,
-    is_valid_username_syntax, snapshot_kind_of,
+    gateway_denied, is_valid_desktop_id, is_valid_image_file_name, is_valid_snapshot_name,
+    is_valid_update_version, is_valid_username_syntax, snapshot_kind_of,
 };
 pub use validate::{check_secret_against_slot, validate_frame, validate_request};
 

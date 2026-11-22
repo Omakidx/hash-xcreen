@@ -278,10 +278,7 @@ fn validate_create_desktop(r: &pb::CreateDesktopRequest) -> Check {
     )?;
     if let Some(f) = &r.image_file {
         require(
-            f.starts_with("/var/lib/hx/import/")
-                && f.len() <= 255
-                && !f.bytes().any(|b| b == 0)
-                && !f.split('/').any(|c| c == ".."),
+            super::commands::is_valid_image_file_name(f),
             "create_desktop.image_file",
         )?;
     }

@@ -208,6 +208,8 @@ struct Rd {
     buf: Vec<u8>,
     pos: usize,
     deadline: Instant,
+    /// A body-time cap (probes): no single wait on the socket outlasts it.
+    cap: Option<Instant>,
 }
 
 impl Rd {
@@ -215,7 +217,13 @@ impl Rd {
         if self.pos < self.buf.len() {
             return Ok(());
         }
-        let slice = remaining(self.deadline)?.min(IO_SLICE);
+        let mut slice = remaining(self.deadline)?.min(IO_SLICE);
+        if let Some(cap) = self.cap {
+            slice = slice.min(
+                cap.saturating_duration_since(Instant::now())
+                    .max(Duration::from_millis(1)),
+            );
+        }
         let _ = self.tls.sock.set_read_timeout(Some(slice));
         self.buf.resize(16 * 1024, 0);
         self.pos = 0;
@@ -286,6 +294,44 @@ impl Rd {
             n -= take as u64;
         }
         Ok(())
+    }
+}
+
+/// How much of a body a probe may read, and until when.
+struct Budget {
+    left: u64,
+    until: Instant,
+}
+
+impl Rd {
+    /// Copies up to `n` body bytes, but no more than the budget allows and not past its time.
+    /// `Ok(true)` when all `n` were copied, `Ok(false)` when the budget ended first.
+    fn copy_budget(
+        &mut self,
+        mut n: u64,
+        b: &mut Budget,
+        sink: &mut dyn Write,
+    ) -> Result<bool, FetchError> {
+        self.cap = Some(b.until);
+        while n > 0 {
+            if b.left == 0 || Instant::now() >= b.until {
+                return Ok(false);
+            }
+            match self.fill() {
+                Ok(()) => {}
+                Err(FetchError::Timeout("read")) if Instant::now() >= b.until => {
+                    return Ok(false);
+                }
+                Err(e) => return Err(e),
+            }
+            let avail = &self.buf[self.pos..];
+            let take = usize::try_from(n.min(b.left)).map_or(avail.len(), |t| t.min(avail.len()));
+            sink.write_all(&avail[..take])?;
+            self.pos += take;
+            n -= take as u64;
+            b.left -= take as u64;
+        }
+        Ok(true)
     }
 }
 
@@ -360,6 +406,25 @@ fn read_head(rd: &mut Rd) -> Result<Head, FetchError> {
     }
 }
 
+/// What a `GET` is allowed to read.
+pub(super) struct GetOpts<'a> {
+    /// Hosts a request or redirect may name.
+    pub hosts: &'a [String],
+    /// Largest body accepted (a larger declared or received body is `Quota`).
+    pub max_body: u64,
+    /// A probe: read at most this many body bytes and for at most this long, then stop quietly.
+    pub prefix: Option<(u64, Duration)>,
+}
+
+/// The outcome of a `GET`.
+pub(super) struct Got {
+    /// Body bytes written to the sink.
+    pub bytes: u64,
+    /// The whole body was read (false: a probe's budget ended first).
+    #[allow(dead_code)]
+    pub complete: bool,
+}
+
 /// `GET url` into `sink`, following redirects to release hosts, at most `max_body` bytes.
 /// Returns the number of body bytes written.
 pub(super) fn get(
@@ -369,11 +434,27 @@ pub(super) fn get(
     max_body: u64,
     sink: &mut dyn Write,
 ) -> Result<u64, FetchError> {
+    let opts = GetOpts {
+        hosts: &cfg.hosts,
+        max_body,
+        prefix: None,
+    };
+    get_with(cfg, url, deadline, &opts, sink).map(|g| g.bytes)
+}
+
+/// [`get`] with the hosts and the read budget chosen by the caller.
+pub(super) fn get_with(
+    cfg: &Config,
+    url: &Url,
+    deadline: Instant,
+    opts: &GetOpts<'_>,
+    sink: &mut dyn Write,
+) -> Result<Got, FetchError> {
     let mut url = url.clone();
     for _ in 0..=MAX_REDIRECTS {
-        if !cfg.host_allowed(&url.host) {
+        if !opts.hosts.contains(&url.host) {
             return Err(FetchError::Refused(format!(
-                "`{}` is not a release host",
+                "`{}` is not an allowed host",
                 url.host
             )));
         }
@@ -398,10 +479,17 @@ pub(super) fn get(
             buf: Vec::new(),
             pos: 0,
             deadline,
+            cap: None,
         };
         let head = read_head(&mut rd)?;
         match head.status {
-            200 => return read_body(&mut rd, &head, max_body, sink),
+            200 => {
+                let mut budget = opts.prefix.map(|(bytes, time)| Budget {
+                    left: bytes,
+                    until: Instant::now() + time,
+                });
+                return read_body(&mut rd, &head, opts.max_body, budget.as_mut(), sink);
+            }
             301 | 302 | 303 | 307 | 308 => {
                 let loc = head
                     .location
@@ -429,10 +517,12 @@ fn read_body(
     rd: &mut Rd,
     head: &Head,
     max_body: u64,
+    mut budget: Option<&mut Budget>,
     sink: &mut dyn Write,
-) -> Result<u64, FetchError> {
+) -> Result<Got, FetchError> {
     if head.chunked {
         let mut total = 0u64;
+        let mut written = 0u64;
         loop {
             let line = rd.line(MAX_LINE)?;
             let hex = line.split(';').next().unwrap_or("").trim();
@@ -445,7 +535,10 @@ fn read_body(
                 // Trailers, up to a blank line.
                 for _ in 0..32 {
                     if rd.line(MAX_LINE)?.is_empty() {
-                        return Ok(total);
+                        return Ok(Got {
+                            bytes: written,
+                            complete: true,
+                        });
                     }
                 }
                 return Err(FetchError::Response("too many trailers".into()));
@@ -454,7 +547,20 @@ fn read_body(
                 .checked_add(size)
                 .filter(|t| *t <= max_body)
                 .ok_or(FetchError::Quota("response body"))?;
-            rd.copy(size, sink)?;
+            if let Some(b) = budget.as_deref_mut() {
+                let before = b.left;
+                let done = rd.copy_budget(size, b, sink)?;
+                written += before - b.left;
+                if !done {
+                    return Ok(Got {
+                        bytes: written,
+                        complete: false,
+                    });
+                }
+            } else {
+                rd.copy(size, sink)?;
+                written += size;
+            }
             if !rd.line(MAX_LINE)?.is_empty() {
                 return Err(FetchError::Response("missing chunk terminator".into()));
             }
@@ -468,8 +574,19 @@ fn read_body(
     if n > max_body {
         return Err(FetchError::Quota("response body"));
     }
+    if let Some(b) = budget {
+        let before = b.left;
+        let complete = rd.copy_budget(n, b, sink)?;
+        return Ok(Got {
+            bytes: before - b.left,
+            complete,
+        });
+    }
     rd.copy(n, sink)?;
-    Ok(n)
+    Ok(Got {
+        bytes: n,
+        complete: true,
+    })
 }
 
 #[cfg(test)]

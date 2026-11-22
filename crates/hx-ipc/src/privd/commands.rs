@@ -254,6 +254,19 @@ pub fn snapshot_kind_of(s: &str) -> Option<&'static str> {
     ok.then_some(kind)
 }
 
+/// Offline image file name: `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`, a name inside the fixed
+/// directory `/var/lib/hx/import/`, never a path (section 6.5). `..` is excluded by the
+/// character set only as a component, so a name that is all dots is refused as well.
+pub fn is_valid_image_file_name(s: &str) -> bool {
+    let b = s.as_bytes();
+    !b.is_empty()
+        && b.len() <= 128
+        && b[0].is_ascii_alphanumeric()
+        && b[1..]
+            .iter()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
+}
+
 /// Release version: `^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}(-(alpha|beta|rc)\.[0-9]{1,4})?$`
 /// (section 6.12, rule 1). Checked before the string is used in any path, command or log.
 pub fn is_valid_update_version(s: &str) -> bool {

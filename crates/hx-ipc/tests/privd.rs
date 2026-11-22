@@ -57,7 +57,7 @@ fn every_command() -> Vec<Command> {
             docker: true,
             docker_isolation_acknowledged: true,
             settings: Some(DesktopSettings::default()),
-            image_file: Some("/var/lib/hx/import/main.img".into()),
+            image_file: Some("main.img".into()),
         }),
         Command::GetDesktop(GetDesktopRequest { desktop_id: id() }),
         Command::ListDesktops(ListDesktopsRequest {}),
@@ -904,10 +904,33 @@ fn request_validation_rules() {
     );
     cd.docker = false;
     assert!(ok(Command::CreateDesktop(cd.clone())));
-    cd.image_file = Some("/var/lib/hx/import/../../etc/shadow".into());
-    assert!(!ok(Command::CreateDesktop(cd.clone())));
-    cd.image_file = Some("/tmp/x".into());
-    assert!(!ok(Command::CreateDesktop(cd)));
+    // The offline image is a file name in the fixed directory, never a path.
+    for bad in [
+        "/var/lib/hx/import/main.img",
+        "../../etc/shadow",
+        "a/b.img",
+        "/tmp/x",
+        "..",
+        ".hidden",
+        "-x.img",
+        "",
+        "a b.img",
+        "a\0b.img",
+        &"a".repeat(129),
+    ] {
+        cd.image_file = Some(bad.into());
+        assert!(!ok(Command::CreateDesktop(cd.clone())), "{bad:?}");
+    }
+    for good in [
+        "main.img",
+        "hx-image-ubuntu-24.04-xfce-basic-20261123.1.img",
+        "A_b-1",
+    ] {
+        cd.image_file = Some(good.into());
+        assert!(ok(Command::CreateDesktop(cd.clone())), "{good:?}");
+    }
+    cd.image_file = Some("a".repeat(128));
+    assert!(ok(Command::CreateDesktop(cd)));
     // ranges and syntax.
     assert!(!ok(Command::BeginSetup(pb::BeginSetupRequest {
         expires_in_s: 59

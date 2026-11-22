@@ -6,6 +6,7 @@
 //! | Step | Mode | What |
 //! |---|---|---|
 //! | `session_links` | both | the session-link proxy device of each registry desktop |
+//! | `images` | both | every `hx-img-*` image recorded in `images-state` (prebuilt desktop images privd imported; leftovers of `/var/lib/hx/import/` are the CLI's) |
 //! | `desktops` | destroy | each registry desktop and its `hx-` snapshots |
 //! | `host_objects` | destroy | profiles, bridge, ACL, pool (each only with the hash-xcreen marker) |
 //! | `nft_table` | destroy | `nft delete table inet hx` if the table exists |
@@ -52,6 +53,7 @@ use super::hostsetup::docker_user_rules;
 use crate::privd::cancel::{LOCK_WAIT, LockKey};
 use crate::privd::daemon::{Ctx, Daemon, Reply};
 use crate::privd::error::CmdError;
+use crate::privd::image::cache;
 use crate::privd::log;
 use crate::privd::runner::{Program, Tool};
 
@@ -99,6 +101,7 @@ pub struct UninstallState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
     SessionLinks,
+    Images,
     Desktops,
     HostObjects,
     NftTable,
@@ -111,6 +114,7 @@ impl Step {
     fn name(self) -> &'static str {
         match self {
             Self::SessionLinks => "session_links",
+            Self::Images => "images",
             Self::Desktops => "desktops",
             Self::HostObjects => "host_objects",
             Self::NftTable => "nft_table",
@@ -123,6 +127,7 @@ impl Step {
     fn label(self) -> &'static str {
         match self {
             Self::SessionLinks => "removing the session links",
+            Self::Images => "deleting the imported desktop images",
             Self::Desktops => "destroying the desktops",
             Self::HostObjects => "deleting the profiles, bridge, ACL and pool",
             Self::NftTable => "removing the host nftables table",
@@ -135,9 +140,10 @@ impl Step {
 
 fn steps_for(mode: UninstallMode) -> &'static [Step] {
     match mode {
-        UninstallMode::Keep => &[Step::SessionLinks],
+        UninstallMode::Keep => &[Step::SessionLinks, Step::Images],
         UninstallMode::Destroy => &[
             Step::SessionLinks,
+            Step::Images,
             Step::Desktops,
             Step::HostObjects,
             Step::NftTable,
@@ -436,6 +442,7 @@ async fn run_step<T: Transport + Clone + 'static>(
 ) -> Result<(), CmdError> {
     match step {
         Step::SessionLinks => session_links(d, ctx, ids, st, rep).await,
+        Step::Images => images(d, ctx, st, rep).await,
         Step::Desktops => desktops(d, ctx, ids, st, rep).await,
         Step::HostObjects => host_objects(d, ctx, st, rep).await,
         Step::NftTable => nft_table(d, st, rep).await,
@@ -480,6 +487,38 @@ async fn session_links<T: Transport + Clone + 'static>(
             Link::Unmarked => rep.warnings.push(format!(
                 "instance `{name}` has our name but not our marker; its devices were left alone"
             )),
+        }
+    }
+    Ok(())
+}
+
+/// Both modes: every image recorded in `images-state` (the `hx-img-*` images privd imported and has
+/// not deleted yet). An image Incus no longer has is just forgotten; one that cannot be deleted
+/// (Incus down) is a warning, and the uninstall goes on.
+async fn images<T: Transport + Clone + 'static>(
+    d: &Daemon<T>,
+    ctx: &Ctx,
+    st: &mut UninstallState,
+    rep: &mut Report,
+) -> Result<(), CmdError> {
+    let recorded = d.read_images_state()?;
+    if recorded.cached.is_empty() {
+        return Ok(());
+    }
+    let client = d.incus.scoped();
+    for c in recorded.cached {
+        let fp = c.fingerprint;
+        let short = fp.get(..12).unwrap_or(&fp).to_string();
+        let gone = d
+            .run_cancellable(ctx, &client, None, async {
+                Ok::<_, CmdError>(cache::purge(d, &client, &fp).await)
+            })
+            .await?;
+        if gone {
+            note_removed(st, format!("image:{short}"));
+        } else {
+            rep.warnings
+                .push(format!("image {short} could not be deleted from Incus"));
         }
     }
     Ok(())

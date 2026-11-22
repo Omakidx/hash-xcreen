@@ -12,9 +12,16 @@ fn repo() -> PathBuf {
 
 /// The base64 key line of a key file, or `UNPROVISIONED` (the rule of `privd::update::keys`).
 fn file_key(name: &str) -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("release-keys")
-        .join(name);
+    key_in("release-keys", name)
+}
+
+/// Like [`file_key`] for the image keys (`image-keys/`), a separate pair.
+fn image_key(name: &str) -> String {
+    key_in("image-keys", name)
+}
+
+fn key_in(dir: &str, name: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(dir).join(name);
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     text.lines()
         .map(str::trim)
@@ -62,8 +69,11 @@ fn the_release_gate_blocks_exactly_while_a_key_is_unprovisioned() {
         .arg(repo().join("release/gate.sh"))
         .output()
         .unwrap();
-    let provisioned =
-        file_key("current.pub") != "UNPROVISIONED" && file_key("next.pub") != "UNPROVISIONED";
+    // The gate blocks while either key set is unprovisioned: the release keys, and (maintainer
+    // decision, wave 2 Q2) the image keys, which sit in their own directory.
+    let provisioned = ["current.pub", "next.pub"]
+        .iter()
+        .all(|n| file_key(n) != "UNPROVISIONED" && image_key(n) != "UNPROVISIONED");
     assert_eq!(
         out.status.success(),
         provisioned,

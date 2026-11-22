@@ -1,0 +1,4 @@
+UNPROVISIONED
+# Replace this file with the minisign public key of the NEXT desktop-image signing key (rotation,
+# like the release keys: the next release embeds the old `next` as `current`). Both files must be
+# provisioned for a release build (the release gate refuses an UNPROVISIONED image key).
