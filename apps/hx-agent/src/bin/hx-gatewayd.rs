@@ -4,9 +4,14 @@
 //! ([`hx_agent::gateway::config`] documents the keys). Start-up order, which the seccomp
 //! allowlist depends on:
 //!
-//! 1. parse the configuration, load the identity key from the systemd credential, open the
+//! 0. in `main`, before any thread exists: parse the configuration and adopt the activated
+//!    sockets (this removes `LISTEN_*` from the environment);
+//! 1. load the identity key from the systemd credential, open the
 //!    state directory (device registry, verifiers) and bind the QUIC and WebSocket sockets and
-//!    the admin socket (systemd hands the admin socket over by socket activation);
+//!    the admin socket. Under systemd both come by socket activation, selected by descriptor
+//!    name (`admin`, `public`; [`hx_agent::gateway::activation`]): the public port must equal
+//!    the port of `listen`, or the start is refused. Without activation the gateway binds
+//!    `listen` and the admin socket itself;
 //! 2. register the signal handlers;
 //! 3. `PR_SET_DUMPABLE=0`, `RLIMIT_CORE=0`, `mlockall`;
 //! 4. install the seccomp allowlist on every thread;
@@ -20,6 +25,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use hx_agent::gateway::activation;
 use hx_agent::gateway::admin::{self, AdminPolicy};
 use hx_agent::gateway::cli::{Args, parse_args};
 use hx_agent::gateway::config::{GatewayConfig, SeccompMode};
@@ -47,13 +53,13 @@ fn init_logging() {
         .init();
 }
 
-/// The admin socket systemd passed (socket activation), or one bound at `config.admin_socket`.
-fn admin_listener(config: &GatewayConfig) -> Result<UnixListener, String> {
-    let mut fds = listenfd::ListenFd::from_env();
-    if let Ok(Some(std_listener)) = fds.take_unix_listener(0) {
-        std_listener
-            .set_nonblocking(true)
-            .map_err(|e| e.to_string())?;
+/// The admin socket systemd passed (socket activation, the descriptor named `admin`), or one
+/// bound at `config.admin_socket`.
+fn admin_listener(
+    config: &GatewayConfig,
+    activated: Option<std::os::unix::net::UnixListener>,
+) -> Result<UnixListener, String> {
+    if let Some(std_listener) = activated {
         return UnixListener::from_std(std_listener).map_err(|e| e.to_string());
     }
     admin::bind(&config.admin_socket).map_err(|e| format!("cannot create the admin socket: {e}"))
@@ -78,12 +84,21 @@ fn notify_ready() {
     }
 }
 
-async fn run(args: Args) -> Result<(), String> {
+/// The configuration, with the debug-only override applied.
+fn load_config(args: &Args) -> Result<GatewayConfig, String> {
     let mut config = GatewayConfig::load(&args.config).map_err(|e| e.to_string())?;
     if let Some(path) = &args.link_socket {
         tracing::warn!(path = %path.display(), "DEBUG BUILD: dialling this link socket");
         config.link_socket = Some(path.clone());
     }
+    Ok(config)
+}
+
+async fn run(
+    args: Args,
+    config: GatewayConfig,
+    activated: activation::Activated,
+) -> Result<(), String> {
     let creds = std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from);
     let identity = load_identity(
         &config
@@ -108,7 +123,8 @@ async fn run(args: Args) -> Result<(), String> {
             Some(PrivdClient::new(&config.privd_socket, Default::default())),
         ),
     );
-    opts.admin_listener = Some(admin_listener(&config)?);
+    opts.admin_listener = Some(admin_listener(&config, activated.admin)?);
+    opts.public_listeners = activated.public;
     if let Some(uid) = args.admin_allow_uid {
         tracing::warn!(uid, "DEBUG BUILD: the admin socket also accepts this uid");
         opts.admin_policy = AdminPolicy::OnlyUid(uid);
@@ -163,6 +179,19 @@ fn main() -> ExitCode {
         println!("{} {}", env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
+    // Everything that touches the process environment (socket activation removes `LISTEN_*`)
+    // happens here, while the process is still single-threaded: `remove_var` is unsound once
+    // the runtime's worker threads exist.
+    let (config, activated) = match load_config(&args).and_then(|c| {
+        let a = activation::from_process(c.listen.port()).map_err(|e| e.to_string())?;
+        Ok((c, a))
+    }) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, "hx-gatewayd failed");
+            return ExitCode::FAILURE;
+        }
+    };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("hx-gatewayd")
@@ -174,7 +203,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(run(args)) {
+    match runtime.block_on(run(args, config, activated)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "hx-gatewayd failed");

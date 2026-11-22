@@ -20,6 +20,7 @@
 //! | [`desktop`] | **the seam** for the session link, its stub, and the privd supervisor |
 //! | [`relay`] | the real desktop link: the relay between a client and `hx-session` |
 //! | [`admin`] | the root-only admin socket (ipc.md 9) |
+//! | [`activation`] | systemd socket activation by descriptor name (`admin`, `public`) |
 //! | [`live`] | the set of live sessions and its caps |
 //! | [`config`] | the configuration file |
 //! | [`cli`] | the command line, with the test-only flag behind a feature |
@@ -32,6 +33,7 @@
 //! on drop; errors carry no request content; peer-supplied text is sanitized before it is
 //! logged. The pepper never enters this process.
 
+pub mod activation;
 pub mod admin;
 pub mod cli;
 pub mod config;

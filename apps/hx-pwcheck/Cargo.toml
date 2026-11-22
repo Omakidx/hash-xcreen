@@ -1,0 +1,34 @@
+[package]
+name = "hx-pwcheck"
+description = "Current-password checker run by hx-privd inside a desktop container (fixed argv, status-only answer)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Test-only: HX_PWCHECK_SHADOW replaces the path of the shadow file. A release build never
+# enables it: only the crate's own dev-dependency on itself switches it on.
+test-shadow-path = []
+
+[lib]
+name = "hx_pwcheck"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hx-pwcheck"
+path = "src/main.rs"
+
+[dependencies]
+rustix = { workspace = true, features = ["fs", "process", "stdio"] }
+subtle = "2.6.1"
+zeroize.workspace = true
+
+[dev-dependencies]
+hx-pwcheck = { path = ".", features = ["test-shadow-path"] }
+tempfile = "3.27.0"

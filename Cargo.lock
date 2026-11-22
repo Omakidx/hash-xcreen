@@ -944,6 +944,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hx-pwcheck"
+version = "0.1.0"
+dependencies = [
+ "hx-pwcheck",
+ "rustix",
+ "subtle",
+ "tempfile",
+ "zeroize",
+]
+
+[[package]]
 name = "hx-session"
 version = "0.1.0"
 dependencies = [
