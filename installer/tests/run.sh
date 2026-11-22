@@ -49,6 +49,13 @@ out=$("$shell" "$here/selftest-case.sh" "$inst")
 if [ "$out" = "selftest=ok
 broken=rejected" ]; then echo "ok   selftest (and it rejects a broken verifier)"; else echo "FAIL selftest: $out"; fail=1; fi
 
+# A hostile TMPDIR is ignored: the self-test and the verifier make their scratch directories under
+# /tmp, never in a directory the caller points at.
+mkdir "$tmp/hostile"
+out=$(TMPDIR="$tmp/hostile" "$shell" "$here/selftest-case.sh" "$inst")
+if [ "$out" = "selftest=ok
+broken=rejected" ] && [ -z "$(ls -A "$tmp/hostile")" ]; then echo "ok   a hostile TMPDIR is ignored (nothing created in it)"; else echo "FAIL hostile TMPDIR: $out / $(ls -A "$tmp/hostile")"; fail=1; fi
+
 # fetch: the hard cap does not depend on curl (curl before 8.4 ignores --max-filesize without a
 # Content-Length), for the manifest cap (1 MiB) and for an artifact-sized cap, and curl gets -q first.
 for max in 1048576 40960; do
