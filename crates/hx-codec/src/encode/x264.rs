@@ -317,7 +317,7 @@ impl X264Encoder {
                 Ok(()) => {
                     let mut buf = self.pool.get();
                     buf.set(self.pkt.data().unwrap_or(&[]));
-                    out = Some((buf, self.pkt.is_key()));
+                    out = Some((buf, self.pkt.is_key(), packet_qp(&self.pkt)));
                 }
                 Err(ffmpeg::Error::Other { errno }) if errno == EAGAIN => break,
                 Err(ffmpeg::Error::Eof) => break,
@@ -325,7 +325,7 @@ impl X264Encoder {
             }
         }
         let t_end = mono_ns();
-        let Some((data, key)) = out else {
+        let Some((data, key, qp)) = out else {
             return Ok(None);
         };
         let is_idr = h264::starts_with_idr(&data);
@@ -338,6 +338,7 @@ impl X264Encoder {
             idr: is_idr,
             width: self.cfg.width,
             height: self.cfg.height,
+            qp,
             timing: FrameTiming {
                 t_damage_ns: meta.t_damage_ns,
                 t_capture_ns: meta.t_capture_ns,
@@ -406,6 +407,19 @@ fn open(cfg: &EncoderConfig) -> Result<ffmpeg::encoder::Video, EncodeError> {
     opts.set("bufsize", &cfg.buffer_bits().to_string());
     opts.set("x264-params", &x264);
     enc.open_with(opts).map_err(EncodeError::Open)
+}
+
+/// libavcodec's `FF_QP2LAMBDA`: the quality statistic is the QP times this.
+const QP2LAMBDA: u32 = 118;
+
+/// The frame's average QP from the packet's quality statistics (libx264 attaches them to
+/// every packet): the first four bytes are `QP * FF_QP2LAMBDA`, little endian.
+fn packet_qp(pkt: &ffmpeg::Packet) -> Option<u8> {
+    let sd = pkt
+        .side_data()
+        .find(|d| d.kind() == ffmpeg::codec::packet::side_data::Type::QualityStats)?;
+    let b: [u8; 4] = sd.data().get(..4)?.try_into().ok()?;
+    u8::try_from((u32::from_le_bytes(b) + QP2LAMBDA / 2) / QP2LAMBDA).ok()
 }
 
 /// Copy a converted picture into the encoder's frame, honouring its (aligned) strides.
