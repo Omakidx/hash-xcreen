@@ -241,7 +241,7 @@ Fixed options may change freely while the desktop is not ready: `CreateDesktop` 
 | 2 | usage, or missing secrets |
 | 3 | daemon unavailable |
 | 4 | refused by privd or gatewayd |
-| 6 | not in this release (reserved: no option uses it since 1D) |
+| 6 | not in this release (no install option uses it since 1D; `uninstall` still exits 6 when an old privd answers `UNIMPLEMENTED`, [ipc.md](ipc.md) §6.13) |
 | 7 | not root |
 | 8 | declined |
 | 9 | preflight failed (nothing changed) |
@@ -493,7 +493,7 @@ Out of scope: the VPS provider, or anyone with root on the host.
 - The agent generates a long-term identity key at install; each client device generates a device key.
 - Pairing uses **SPAKE2**, with either the long random token from the app or a short code printed by an interactive install. Neither side reveals the secret, and a man in the middle learns nothing.
 - After pairing, every connection is TLS 1.3 with both keys pinned (mutual authentication, no certificate authority).
-- **Pairing a new device from an already paired one.** A device that is logged in with its PIN can ask the server for a short pairing code (device management, [protocol.md](protocol.md) §5.4): at most 3 per hour per server and one live code at a time, audited with the requesting device's id (never the code). A device paired this way is an ordinary device: it needs the PIN and is never a setup device.
+- **Pairing a new device from an already paired one.** A device that is logged in with its PIN can ask the server for a short pairing code (device management, [protocol.md](protocol.md) §5.9): at most 3 per hour per server and one live code at a time, audited with the requesting device's id (never the code). A device paired this way is an ordinary device: it needs the PIN and is never a setup device.
 - **The setup connection (one-liner path).** Pairing ends its connection, because it has a 30 s authorization budget and a single-use token cannot resume. The app reconnects with its pinned key on a separate connection type, `INTENT_SETUP` ([protocol.md](protocol.md) §5.10), accepted only from the **bound setup device**, only while the root-opened setup window is open and privd reports `SETUP_OPEN`. The setup device is the device that paired with the token that the installer put in place while the window was open (a pairing code never binds); another device that pairs, by any other secret, is an ordinary device that can never open a setup connection. Until a PIN exists the connection is **key-only** and can do nothing but set the PIN; afterwards every setup connection needs the PIN, with the same counting, backoff and revocation as a session. The binding ends when setup finishes, when the window closes or expires, or when the device is revoked; to recover, rerun the one-liner (its `pairing-token` stage always asks for a fresh token). The setup connection carries no streaming and no authority beyond the Gateway role's own commands during the window (§5.3).
 
 ### 8.3 Credentials
