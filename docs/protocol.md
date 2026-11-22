@@ -1,6 +1,6 @@
-# Wire protocol (version 1.2)
+# Wire protocol (version 1.3)
 
-This document defines protocol 1.0 and its additive revisions 1.1 and 1.2 (§4.5 and §4.6 list exactly what each adds; everything tagged "1.1" is absent from a 1.0 peer, everything tagged "1.2" from a 1.1 peer). The contract between hash-xcreen's session/agent side (the **server**) and its viewers (the **client**: desktop app now, browser and others later). The code in `crates/hx-proto` (messages, media header, versioning) and `crates/hx-transport` (QUIC and WebSocket transports) implements exactly what is written here. If the two disagree, that is a bug in one of them: fix it and update this file in the same branch.
+This document defines protocol 1.0 and its additive revisions 1.1, 1.2 and 1.3 (§4.5, §4.6 and §4.7 list exactly what each adds; everything tagged "1.1" is absent from a 1.0 peer, everything tagged "1.2" from a 1.1 peer, everything tagged "1.3" from a 1.2 peer). The contract between hash-xcreen's session/agent side (the **server**) and its viewers (the **client**: desktop app now, browser and others later). The code in `crates/hx-proto` (messages, media header, versioning) and `crates/hx-transport` (QUIC and WebSocket transports) implements exactly what is written here. If the two disagree, that is a bug in one of them: fix it and update this file in the same branch.
 
 Design background is in [architecture.md](architecture.md) §6–§8. Pairing and authentication (workstream 1B) are specified in §11.
 
@@ -52,6 +52,8 @@ After `HelloAck` the server side of a connection is **restricted** until the ser
 - The server sends nothing but control messages (no video, cursor, audio, transfers).
 - The negotiated features (§4.3) are not yet in effect.
 
+**Control-only authorization (1.3, `INTENT_SETUP` only).** A setup connection (§5.10) is authorized with a narrower step than a session: the authorization deadline is satisfied and the pre-authentication slot released, and the control variants that §5.10 lists (`setup`, plus `goodbye`, `ping`, `pong`) are processed, with the `SETUP` feature in effect and nothing else. The QUIC unidirectional-stream credit stays at 0, input and mouse data keep being dropped, the server sends no media, and a transfer, audio or video message on WebSocket remains a protocol error. A setup connection therefore never carries streaming, clipboard or files, whatever it negotiated.
+
 Authorizing makes the negotiated features effective (optionally narrowed by the application, for example clipboard off for one device), raises the QUIC limits of §1 and releases the connection's pre-authentication slot. A client may assume nothing about its own authorization until the server says so in an application-level message (for example the result of the `auth` exchange); a client MUST NOT start input, transfers or other channels before that. The restricted state exists only on the server; a client is never restricted.
 
 ## 3. Channels
@@ -60,7 +62,7 @@ Every QUIC stream and every datagram begins with a one-byte **channel id**. WebS
 
 | Id | Channel | Direction | QUIC transport | Priority | Messages |
 |---|---|---|---|---|---|
-| `0x01` | Control | both | One client-opened **bidirectional** stream, opened first | High (50) | `ControlMessage`, length-prefixed (includes the 1.1 `ServerStats`, §5.8, the takeover `Goodbye`, §5.7, and the 1.2 `DeviceMgmt`, §5.9) |
+| `0x01` | Control | both | One client-opened **bidirectional** stream, opened first | High (50) | `ControlMessage`, length-prefixed (includes the 1.1 `ServerStats`, §5.8, the takeover `Goodbye`, §5.7, the 1.2 `DeviceMgmt`, §5.9, and the 1.3 `SetupMessage`, §5.10) |
 | `0x02` | Input (keys, buttons, scroll) | client → server | One long-lived client-opened unidirectional stream | Highest (100) | `InputEvent`, length-prefixed |
 | `0x03` | Mouse motion | client → server | **Datagrams**, latest wins | Highest (datagrams are sent ahead of stream data) | `MouseMove` datagram (§7.1) |
 | `0x04` | Cursor | server → client | One long-lived server-opened unidirectional stream | High (50) | `CursorEvent`, length-prefixed |
@@ -97,6 +99,7 @@ Rules:
 | File transfer total | 4294967296 (4 GiB) ceiling and default, lowered by `max_file_bytes` (§5.6); applies to every version |
 | `Goodbye.peer_device_name` / `peer_device_id` (1.1) | 64 bytes (sanitised) / 0 or 16 bytes |
 | `ServerStats` rate (1.1) | at most 1 per second sent; a client may drop beyond 4 per second |
+| Setup (1.3, §5.10) | `SetupSetPin.pin` at most 16 bytes; `SetupStart.password` at most 1024 bytes on the wire (1 to 511 after validation); strings at their per-field caps (§5.10); `SetupResult.warnings` at most 16 entries; a worst-case `SetupResult` stays below 64 KiB (a test checks it); requests per connection at most 2 per second, burst 8 |
 | WebSocket transfer chunk | 65536 |
 | Queued, unread incoming transfer data (WebSocket) | 1 MiB per transfer and 4 MiB per connection; a transfer that exceeds either is aborted (`abort`, §9.4). On QUIC the same bound comes from stream and connection flow control (§1) |
 | Unread input messages queued (WebSocket) | 4096; a peer that outpaces the application beyond this is closed with `PROTOCOL_ERROR` (QUIC: per-stream flow control instead) |
@@ -112,9 +115,9 @@ A receiver that sees a value above its limit treats it as a protocol error (reli
 
 | Field | # | Type | Meaning |
 |---|---|---|---|
-| `version` | 1 | `Version` | Client protocol `major.minor` (this document: `1.2`; a client that implements only 1.0 sends `1.0`) |
+| `version` | 1 | `Version` | Client protocol `major.minor` (this document: `1.3`; a client that implements only 1.0 sends `1.0`) |
 | `capabilities` | 2 | `Capabilities` | What the client can decode and do |
-| `intent` | 3 | `Intent` | `INTENT_SESSION` (1) normal session, `INTENT_PAIR` (2) pairing, §11. `INTENT_UNSPECIFIED` (0) is invalid |
+| `intent` | 3 | `Intent` | `INTENT_SESSION` (1) normal session, `INTENT_PAIR` (2) pairing, §11, `INTENT_SETUP` (3, **1.3**) post-pairing setup, §5.10 (sent only to a server known to be at least 1.3). `INTENT_UNSPECIFIED` (0) is invalid |
 | `software` | 4 | string | e.g. `hx-desktop 0.1.0`, informational, at most 128 bytes |
 | `device_name` | 5 | string | Human label, informational, at most 64 bytes. Never used for authorisation |
 
@@ -131,7 +134,7 @@ A receiver that sees a value above its limit treats it as a protocol error (reli
 
 | Field | # | Type | Meaning |
 |---|---|---|---|
-| `reason` | 1 | `RefuseReason` (a refusal without a reason is sent as `UNAUTHORIZED`, so the close code is never 0) | `UPDATE_REQUIRED` (1), `UNAUTHORIZED` (2), `BUSY` (3), `PAIRING_CLOSED` (4); `UNSPECIFIED` (0) is invalid |
+| `reason` | 1 | `RefuseReason` (a refusal without a reason is sent as `UNAUTHORIZED`, so the close code is never 0) | `UPDATE_REQUIRED` (1), `UNAUTHORIZED` (2), `BUSY` (3), `PAIRING_CLOSED` (4), `SETUP_CLOSED` (5, **1.3**, `INTENT_SETUP` only); `UNSPECIFIED` (0) is invalid |
 | `message` | 2 | string | Human-readable, at most 256 bytes (longer text is cut on a character boundary), safe to show |
 | `version` | 3 | `Version` | Server version, so the client can say what to update |
 
@@ -143,7 +146,7 @@ A receiver that sees a value above its limit treats it as a protocol error (reli
 
 ### 4.2 Version rules
 
-- The version is `major.minor`; this document defines `1.0`, `1.1` and `1.2`.
+- The version is `major.minor`; this document defines `1.0`, `1.1`, `1.2` and `1.3`.
 - **Different major** (the `Hello` major differs from the ALPN/path major or from the server's): the server answers `Refuse{reason: UPDATE_REQUIRED, version: <server version>}` and closes with `UPDATE_REQUIRED` (§8). The client shows an "update required" message. No other message is processed. The `Hello` of a different major is parsed only as far as `version` (field 1); every other field of it is ignored.
 - **Same major, different minor**: accepted. The negotiated minor is `min(client.minor, server.minor)`. Both sides then use only features available at the negotiated minor and present in both capability sets (§4.3). Unknown protobuf fields are ignored (standard protobuf behaviour), so a newer minor can add fields and messages that an older peer skips; a newer minor MUST NOT send a new message type on a channel to a peer whose negotiated minor predates it (a `ControlMessage` whose only variant is unknown to the receiver has no variant set and is malformed, so a new control variant is never safe to send to an older peer).
 - Security properties (authentication, authorization, size limits, the restricted state) are never gated by a minor version or a feature bit: every peer enforces them regardless of what was negotiated.
@@ -154,7 +157,7 @@ A receiver that sees a value above its limit treats it as a protocol error (reli
 
 Capabilities advertised in `HelloAck` are an *offer*: negotiated features take effect only when the server authorizes the connection (§2.1). For an `INTENT_PAIR` hello the server advertises no features and no codecs, so a pairing connection can never carry anything but control messages.
 
-`features` is a bitmask. Both sides compute `negotiated = client.features & server.features & mask(negotiated_minor)` (bits 0 to 2 exist from 1.0, bit 3 from 1.1, bit 4 from 1.2) and `codecs = client.video_codecs ∩ server.video_codecs`, in the server's order of preference. Bits unknown to a side are ignored by that side.
+`features` is a bitmask. Both sides compute `negotiated = client.features & server.features & mask(negotiated_minor)` (bits 0 to 2 exist from 1.0, bit 3 from 1.1, bit 4 from 1.2, bit 5 from 1.3) and `codecs = client.video_codecs ∩ server.video_codecs`, in the server's order of preference. Bits unknown to a side are ignored by that side.
 
 | Bit | Name | Introduced | Enables |
 |---|---|---|---|
@@ -162,7 +165,8 @@ Capabilities advertised in `HelloAck` are an *offer*: negotiated features take e
 | 1 | `CLIPBOARD` | 1.0 | Clipboard channel `0x07` |
 | 2 | `FILE_TRANSFER` | 1.0 | Files channel `0x08` |
 | 3 | `SERVER_STATS` | 1.1 | `ServerStats` control messages (§5.8), sent only while the client has asked for them (`ViewConfig.stats_enabled`) |
-| 4 | `DEVICE_MANAGEMENT` | 1.2 | `DeviceMgmt` control messages (§5.9): list paired devices, revoke one, and the server's change notices |
+| 4 | `DEVICE_MANAGEMENT` | 1.2 | `DeviceMgmt` control messages (§5.9): list paired devices, revoke one, the server's change notices and (1.3) a request for a pairing code |
+| 5 | `SETUP` | 1.3 | `SetupMessage` control messages (§5.10). Offered **only** in the `HelloAck` of an `INTENT_SETUP` connection; a normal session offers `defined_up_to(3)` without it, so a `setup` message on a session is a `PROTOCOL_ERROR` at the application level (the same pattern as `DeviceMgmt`) |
 
 An empty `codecs` intersection is not a handshake error; the server then answers `StreamInfo` only after a `ViewConfig` with a codec that is in the intersection, and rejects other codecs with `Goodbye` (code `PROTOCOL_ERROR`). Video, cursor, input, mouse and control are always available (not feature-gated).
 
@@ -191,6 +195,22 @@ Why 1.2 and not an additive bit inside 1.1: `Features::defined_up_to(1)` is the 
 | Addition | Where | Gated by |
 |---|---|---|
 | `DeviceMgmt` (`ControlMessage.device_mgmt` = 12): `ListDevices`, `DeviceList`, `RevokeDevice`, `RevokeResult`, `DeviceEvent` | §5.2, §5.9 | Negotiated minor at least 2 **and** feature `DEVICE_MANAGEMENT` |
+
+### 4.7 What 1.3 adds
+
+Decision: **a minor bump to 1.3, with a new feature bit**, for two things the app needs and 1.2 cannot express: finishing a **one-liner** install from the app after pairing (§5.10), and **pairing a new device from an already paired one** (§5.9). Nothing in 1.0 to 1.2 changes meaning, so there is no new major and the ALPN stays `hx/1`. The 1.3 minor is claimed by this change (the image work of 1D changes only the privd schema, not `hx.proto`).
+
+| Addition | Where | Gated by |
+|---|---|---|
+| `INTENT_SETUP` (`Intent` 3) | §4.1, §5.10 | A client sends it **only** if the `HelloAck.version.minor` it saw on a **successfully confirmed** pairing was at least 3 (the pairing `HelloAck` is trusted only after SPAKE2 confirmation), and checks again that the setup `HelloAck` has minor at least 3 and `SETUP` negotiated |
+| `SETUP_CLOSED` (`RefuseReason` 5) and close code 10 (WebSocket 4010) | §4.1, §8 | `INTENT_SETUP` connections only |
+| Feature bit 5 `SETUP` | §4.3 | Offered only on `INTENT_SETUP` connections |
+| `SetupMessage` (`ControlMessage.setup` = 13) and its messages | §5.2, §5.10 | Negotiated minor at least 3 **and** feature `SETUP`, on `INTENT_SETUP` connections only |
+| `AuthStatus` `PIN_REQUIRED` (6) | §11.4 | Sent only on `INTENT_SETUP` connections |
+| `DeviceMgmt` bodies `create_pairing_code` (15) and `pairing_code_issued` (16) | §5.9 | Negotiated minor at least 3 **and** feature `DEVICE_MANAGEMENT`, on an authorized `INTENT_SESSION` connection |
+| Redacting `Debug` for `SetupSetPin`, `SetupStart`, `PairingCodeIssued` and `Opaque` (`skip_debug` plus hand-written impls; this also fixes today's `Opaque` PIN leak through `Debug`) | §14 | n/a (implementation rule) |
+
+**Why an old server never sees the new intent.** A same-major `Hello` is fully validated, and an intent other than `SESSION` or `PAIR` is malformed on a 1.2 server, which then closes with `PROTOCOL_ERROR` and never sends a polite `Refuse`. Hence the confirmed-version gate in the table: the client never sends `INTENT_SETUP` to a server that has not shown, inside a confirmed pairing, that it is 1.3 or newer; the app then tells the user to update the server.
 
 ## 5. Messages
 
@@ -225,7 +245,8 @@ A `oneof` envelope. Exactly one variant MUST be set, else the message is invalid
 | `stats` | 9 | C → S | Client decode statistics |
 | `goodbye` | 10 | both | Orderly end, informational |
 | `server_stats` | 11 | S → C | **1.1.** Numeric statistics for the stats overlay, §5.8 |
-| `device_mgmt` | 12 | both | **1.2.** Device management: list and revoke paired devices, change notices, §5.9 |
+| `device_mgmt` | 12 | both | **1.2.** Device management: list and revoke paired devices, change notices, §5.9; **1.3:** request a pairing code |
+| `setup` | 13 | both | **1.3.** Post-pairing setup on an `INTENT_SETUP` connection, §5.10 |
 | `pairing` | 100 | both | **Owned by 1B.** Opaque pairing envelope, §11 |
 | `auth` | 101 | both | **Owned by 1B.** Opaque PIN/auth envelope, §11 |
 
@@ -345,7 +366,7 @@ Rules: it is sent only after authorization, only if `SERVER_STATS` was negotiate
 
 ### 5.9 Device management (1.2)
 
-Lets a client list the devices paired with the server and revoke one: the "Revoke that device" action after a takeover (§5.7) and Server details → Security in the app (userflow: "Paired devices: name, last seen; Revoke any device"). It is one control variant, `ControlMessage.device_mgmt` (field 12, `DeviceMgmt`), used in both directions and negotiated by the feature `DEVICE_MANAGEMENT` (§4.3, §4.6).
+Lets a client list the devices paired with the server, revoke one and (1.3) ask for a pairing code for a new device: the "Revoke that device" action after a takeover (§5.7) and Server details → Security in the app (userflow: "Paired devices: name, last seen; Revoke any device"). It is one control variant, `ControlMessage.device_mgmt` (field 12, `DeviceMgmt`), used in both directions and negotiated by the feature `DEVICE_MANAGEMENT` (§4.3, §4.6).
 
 `DeviceMgmt` = `request_id` (1, uint32) and one body (`oneof`):
 
@@ -356,17 +377,19 @@ Lets a client list the devices paired with the server and revoke one: the "Revok
 | `revoke` (`RevokeDevice`) | 12 | C → S | `device_id` (1, bytes, exactly 16) |
 | `revoke_result` (`RevokeResult`) | 13 | S → C | `status` (1, `RevokeStatus`) |
 | `event` (`DeviceEvent`) | 14 | S → C | `kind` (1, `DeviceEventKind`), `device` (2, `DeviceInfo`), `by_device_id` (3, bytes, empty or 16) |
+| `create_pairing_code` (`CreatePairingCode`) | 15 | C → S | **1.3.** `expires_in_s` (1, uint32) |
+| `pairing_code_issued` (`PairingCodeIssued`) | 16 | S → C | **1.3.** `code` (1, string), `expires_at_unix` (2, uint64), `status` (3, `PairingCodeStatus`), `retry_after_s` (4, uint32) |
 
 `DeviceInfo`: `device_id` (1, 16 bytes), `name` (2, string: the label the device chose at pairing, **already sanitised** by the server as in §5.7, at most 64 bytes; a receiver rejects a longer one or one that still contains a control, bidirectional or invisible character; show it as plain text next to the first 8 hex digits of the id and never use it for authorization), `created_unix` (3), `last_seen_unix` (4, 0 = never), `status` (5, `DeviceStatus`: `ACTIVE` 1 or `REVOKED` 2), `revoke_reason` (6, `DeviceRevokeReason`: `USER` 1 or `TOO_MANY_PIN_FAILURES` 2, set exactly when revoked), `revoked_unix` (7, set only when revoked), `current` (8, true on the entry of the device that asked, in a `DeviceList` only, at most one).
 
-`RevokeStatus`: `OK` 1, `NOT_FOUND` 2, `ALREADY_REVOKED` 3, `LAST_ACTIVE_DEVICE` 4, `RATE_LIMITED` 5, `FAILED` 6 (a server fault). `UNSPECIFIED` (0) is invalid. `DeviceEventKind`: `ADDED` 1, `REVOKED` 2, `REINSTATED` 3.
+`RevokeStatus`: `OK` 1, `NOT_FOUND` 2, `ALREADY_REVOKED` 3, `LAST_ACTIVE_DEVICE` 4, `RATE_LIMITED` 5, `FAILED` 6 (a server fault). `UNSPECIFIED` (0) is invalid. `DeviceEventKind`: `ADDED` 1, `REVOKED` 2, `REINSTATED` 3. `PairingCodeStatus` (1.3): `OK` 1, `RATE_LIMITED` 2, `INVALID_ARGUMENT` 3, `FAILED` 4 (a server fault); `UNSPECIFIED` (0) is invalid.
 
 **Request ids.** A request and its answer carry the same non-zero `request_id`, chosen by the client; a `DeviceEvent` carries 0 and nothing else may. A client may have several requests outstanding; the server processes the requests of one connection in arrival order and answers each exactly once.
 
 **Authorization.** Device management is available only on a connection that is **authorized** (§2.1: the pinned key checked and the PIN passed) and that negotiated `DEVICE_MANAGEMENT`:
 
 - While the connection is restricted the transport already treats the variant as a protocol error (§2.1 lists the only control messages processed). It is never available on a pairing connection (§11.2), which stays restricted.
-- A `DeviceMgmt` from a client that did not negotiate the feature, a body that only the server may send (`device_list`, `revoke_result`, `event`), a request with `request_id` 0 or an event with a non-zero one is a protocol error (`PROTOCOL_ERROR`). `hx_proto::pb::DeviceMgmt::direction` tells a receiver which way a body may travel, because the transport cannot see it (one envelope carries both directions).
+- A `DeviceMgmt` from a client that did not negotiate the feature, a body that only the server may send (`device_list`, `revoke_result`, `event`, `pairing_code_issued`), a request with `request_id` 0 or an event with a non-zero one is a protocol error (`PROTOCOL_ERROR`). `hx_proto::pb::DeviceMgmt::direction` tells a receiver which way a body may travel, because the transport cannot see it (one envelope carries both directions).
 - Authority comes from the authenticated session alone, never from a field: `device_id` names the **target**, and any authenticated paired device may target any device. That is the intended model (a stolen device is revoked from another device, architecture §8.1) and it rests on the PIN: a thief who holds a device key but not its PIN cannot reach this route.
 - The server re-reads the registry for every request and limits the rate: **at most 10 revoke requests per minute per device, counted over all its connections**; further ones are answered `RATE_LIMITED` and change nothing. `list` is bounded by the 128-entry cap.
 
@@ -382,9 +405,184 @@ Lets a client list the devices paired with the server and revoke one: the "Revok
 
 **Change notices.** Whenever the registry changes (a device pairs, is revoked by anyone, or is reinstated by the operator) the server sends a `DeviceEvent` to **every live authorized session that negotiated `DEVICE_MANAGEMENT`**, the actor's own included, with `device` as it is after the change and `by_device_id` set to the device that caused it, or empty if it was the operator, the PIN lockout or the server itself. This is how a revocation is "shown to all paired devices": online devices get the event, offline ones find the revoked entry in their next `DeviceList`. A client shows it as a notice ("Phone revoked by Laptop") and never acts on it beyond display. The server sends at most one event per change and bounds every write to the control channel (5 s): a client that does not read its control channel for that long is disconnected (`BUSY`), because a half-written message cannot be skipped (the next `ListDevices` is authoritative after a reconnect).
 
+**Pairing a new device from the app (1.3).** The Security screen lets an already paired, PIN-logged-in device give a new device a short pairing code, instead of the user running `hx-agent pairing code` on the server. The new bodies are not skippable by a 1.2 peer (an unknown body decodes as a `DeviceMgmt` with no body, which is malformed), so they are gated by the **negotiated minor at least 3** as well as by `DEVICE_MANAGEMENT` (§4.7): a client never sends `create_pairing_code` to a server whose negotiated minor is below 3, and a server never sends `pairing_code_issued` to such a client.
+
+- **Who may ask.** Only a PIN-authenticated `INTENT_SESSION` connection of an **active** device that negotiated `DEVICE_MANAGEMENT`; as for every body of this message, authority comes from the authenticated session alone. Never on a pairing connection or a setup connection (both restricted or control-only, §2.1, §5.10).
+- **The code.** `expires_in_s` is 60 to 900; any other value is answered `INVALID_ARGUMENT` and nothing is created. A value above the server's `pairing_ttl_s` is capped silently, so `expires_at_unix` (Unix seconds) is the authoritative expiry. The code is the existing short code of §11.3 (`XXXX-XXXX`, 3 started attempts, single use) created **exactly like** the admin socket's `CreatePairingCode` ([ipc.md](ipc.md) §9); the new device pairs with `INTENT_PAIR`, mode `CODE`, as for an interactive install.
+- **Limits.** At most **3 codes per hour per server** (counted over all devices and connections; the fourth is answered `RATE_LIMITED` with `retry_after_s`, and nothing changes) and **one live code at a time**: a new code replaces the previous one, which stops working at once.
+- **Audit.** Every issued code is recorded as `RecordEvent DEVICE_PAIRING_CODE_ISSUED` with the requesting device's id ([ipc.md](ipc.md) §6.15); the code itself is never logged or recorded. A device that pairs with it appears as a `DeviceEvent` `ADDED` to every live session, like any new device.
+- **What the new device is.** An ordinary device: it needs the PIN to log in and is **never a setup device** (§5.10: only a device paired with the installer's token can open `INTENT_SETUP`).
+- **Secrecy.** `PairingCodeIssued` carries a secret: its `Debug` is redacting (`skip_debug`, §14), neither side logs it, and the app shows it only while the dialog is open. The trust model is the one of revoking: a thief needs the device key **and** the PIN, and the audit log and the `ADDED` notice show a device that a thief added.
+
 **Claiming the desktop.** Authenticating claims nothing: the server applies its one-active-client rule and the takeover policy (§5.7, ipc.md §18) when the client sends its first `ViewConfig`, not when the PIN is accepted. A client that connects only to manage devices (the "Revoke that device" path after `TAKEN_OVER`, or a settings screen) therefore never sends `ViewConfig`, displaces nobody and is not displaced. The server closes a session that has sent no `ViewConfig` within 5 minutes of authorization with `NO_ERROR` (configurable).
 
 Limits: a `DeviceList` of 128 worst-case entries stays below the 64 KiB control message limit (§3.1; checked by a test). Field validation and `hx_proto::message::MgmtDirection` are in `crates/hx-proto`.
+
+### 5.10 Post-pairing setup (1.3)
+
+The one-liner path (architecture §5.1) ends the installer at pairing: the password, the PIN and the desktop are chosen **in the app afterwards**. This section is the contract for that. The server side (the coordinator, the job, the privd calls) is [ipc.md](ipc.md) §5.5; the decisions are [ipc.md](ipc.md) §22 (decision 20).
+
+**Why a new connection type.** The pairing connection cannot carry setup: the transport closes any connection that is not authorized within 30 s, pairing alone may use 20 s of that, its `HelloAck` advertises no features, a restricted connection accepts only `pairing`, `auth` and `goodbye`, and the token is single use, so it cannot be resumed. A 45-minute desktop build cannot run on it. Setup messages on a normal PIN session were rejected: they would widen the pre-authentication surface (a new message on a restricted connection), leave a "paired, no PIN" dead end if the 30 s budget is missed, clash with the 5-minute idle close of a session, and mix setup authority into every session. So the pairing connection is unchanged (closed with `NO_ERROR` once pairing is done, §11.2), and the device **reconnects with its pinned key** and `Hello{intent: SETUP, version 1.3, features ⊇ SETUP}`.
+
+**Admission** (decided before `HelloAck` and checked again right before authorizing):
+
+| Condition | Server answer |
+|---|---|
+| Unknown or revoked key; client minor below 3; `SETUP` not offered; no setup gate installed | `Refuse{UNAUTHORIZED}`, the same uniform text as today |
+| A known, active key, unless **all** of these hold: the device is the **bound setup device**, the server's persisted mirror says the setup window is open, and `hx-privd` reports the phase `SETUP_OPEN` | `Refuse{SETUP_CLOSED}`, close code 10. If privd cannot be asked: `Refuse{BUSY}` |
+| Admitted, and **no PIN exists** on the server | **KeyOnly**: authorized control-only (§2.1); the server sends `AuthResult{OK}`, then `SetupState`. Only `set_pin` and `goodbye` work; `start`, `cancel` and `finish` are answered `PIN_REQUIRED`. When `set_pin` succeeds on that connection it becomes **SetupAuthorized**: it proved its key and chose the PIN |
+| Admitted, and a PIN exists | **NeedsPin**: `AuthResult{PIN_REQUIRED}` (§11.4), then the exchange is exactly §11.4 (an attempt is counted before it is checked, backoff, the 5th failure revokes, the check goes through the server's PIN verifier); on success the connection is SetupAuthorized |
+
+**The bound setup device.** When the installer's token is installed while the setup window is open, the server records the token's public 8-byte id. The device that then pairs with **that token** (not with a code: a code has 40 bits of entropy and belongs to the interactive path) becomes the **setup device**; a previously bound device loses the binding and its live setup connection is closed with `SETUP_CLOSED`. A second device that pairs with any other secret is an ordinary paired device: it cannot log in until a PIN exists, then logs in normally (the PIN is for all devices), and it can **never** open `INTENT_SETUP`. The binding ends when setup finishes, when the window closes or expires, and when the setup device is revoked (which also cancels a running job). To recover from a lost or revoked app device, the user reruns the one-liner, whose token stage always asks for a fresh token.
+
+**Versioning.** See §4.7: a client sends `INTENT_SETUP` only after a confirmed pairing whose `HelloAck.version.minor` was at least 3 (`server_supports_setup`), and re-checks the minor and `SETUP` on the setup `HelloAck`. Otherwise the app says the server must be updated.
+
+#### Wire (`crates/hx-proto/proto/hx.proto`, package `hx.v1`, everything tagged 1.3)
+
+```proto
+enum Intent { ...; INTENT_SETUP = 3; }               // 1.3; only to a server known to be >= 1.3
+enum RefuseReason { ...; REFUSE_REASON_SETUP_CLOSED = 5; } // 1.3, INTENT_SETUP only
+// ControlMessage.oneof message:  SetupMessage setup = 13;  // 1.3, feature SETUP, INTENT_SETUP connections only
+
+message SetupMessage {
+  uint32 request_id = 1;           // non-zero on set_pin/start/cancel/finish and the ack answering them; 0 on state/progress/result
+  oneof body {
+    SetupState    state    = 10;   // S->C push: on authorization and on every job transition
+    SetupSetPin   set_pin  = 11;   // C->S
+    SetupStart    start    = 12;   // C->S
+    SetupCancel   cancel   = 13;   // C->S
+    SetupFinish   finish   = 14;   // C->S
+    SetupAck      ack      = 15;   // S->C, exactly one per request, same request_id
+    SetupProgress progress = 16;   // S->C push
+    SetupResult   result   = 17;   // S->C push
+  }
+}
+message SetupSetPin { bytes pin = 1; }                       // 6..=16 ASCII digits. skip_debug, redacted
+message SetupStart  { SetupOptions options = 1; bytes password = 2;  // 1..=511 B, UTF-8, no NUL/CR/LF. skip_debug
+                      reserved 3 to 9; }                     // Phase 2 sealed secrets (Drive token), sealed only
+message SetupCancel {}
+message SetupFinish {}
+
+enum SetupDistro { SETUP_DISTRO_UNSPECIFIED=0; SETUP_DISTRO_UBUNTU_24_04=1; SETUP_DISTRO_UBUNTU_26_04=2;
+                   SETUP_DISTRO_DEBIAN_12=3; SETUP_DISTRO_DEBIAN_13=4; }   // numbering = privd Distro
+enum SetupDesktop { SETUP_DESKTOP_UNSPECIFIED=0 /* = XFCE */; SETUP_DESKTOP_XFCE=1; }
+enum SetupPreset  { SETUP_PRESET_UNSPECIFIED=0; SETUP_PRESET_BASIC=1; SETUP_PRESET_DEVELOPER=2; }
+enum SetupImageMode { SETUP_IMAGE_MODE_UNSPECIFIED=0 /* = AUTO */; SETUP_IMAGE_MODE_AUTO=1;
+                      SETUP_IMAGE_MODE_BUILD=2; SETUP_IMAGE_MODE_PREBUILT=3; }
+message SetupOptions {
+  SetupDistro distro = 1;            // required
+  SetupDesktop desktop = 2;
+  SetupPreset preset = 3;            // required
+  string username = 4;               // 1..=32, ^[a-z_][a-z0-9_-]{0,31}$; reserved names refused (hx_provision::Username is authority)
+  SetupImageMode image_mode = 5;
+  SetupLimits limits = 6;            // 0 = server default; host bounds checked by privd (ipc 6.8)
+  bool docker = 7;
+  bool docker_isolation_acknowledged = 8;   // MUST be true when docker is true
+  SetupDesktopSettings settings = 9;
+}
+message SetupLimits { uint32 cpu = 1; uint64 memory_mib = 2; uint64 disk_gib = 3; }  // static caps: cpu<=1024, memory_mib<=16777216, disk_gib<=65536
+message SetupDesktopSettings { string hostname = 1; string timezone = 2; string locale = 3; string keyboard = 4; } // <=63/64/32/40 bytes, printable ASCII; privd validates content (ipc 6.5)
+
+enum SetupJobState { SETUP_JOB_STATE_UNSPECIFIED=0; IDLE=1; RUNNING=2; SUCCEEDED=3; FAILED=4; CANCELLED=5; } // prefixed in the .proto
+enum SetupDesktopState { ..._UNSPECIFIED=0; NONE=1; CREATING=2; READY=3; FAILED=4; UNKNOWN=5; }       // from GetDesktop; UNKNOWN if privd unreachable
+message SetupHostFacts { uint32 cpu_count = 1; uint64 memory_total_mib = 2; uint64 pool_total_gib = 3;
+                         uint64 pool_free_gib = 4; bool docker_supported = 5; string os = 6 /* <=64 */; string arch = 7 /* <=16 */; }
+message SetupState {
+  SetupJobState job = 1; uint32 job_id = 2; bool pin_set = 3; SetupDesktopState desktop = 4;
+  uint64 window_expires_unix = 5; bool finished = 6;
+  SetupProgress last_progress = 7;   // when RUNNING
+  SetupResult last_result = 8;       // when the job ended (memory only; lost on gatewayd restart)
+  SetupHostFacts host = 9;
+}
+enum SetupAckStatus { ..._UNSPECIFIED=0; OK=1; INVALID_ARGUMENT=2; PIN_REQUIRED=3; PIN_ALREADY_SET=4; BUSY=5;
+                      NOT_RUNNING=6; ALREADY_FINISHED=7; WINDOW_TOO_SHORT=8; RATE_LIMITED=9; LOCKED=10;
+                      UNAVAILABLE=11; DESKTOP_NOT_READY=12; FAILED=13; }
+message SetupAck { SetupAckStatus status = 1; string field = 2 /* <=64, the invalid field, never a value */;
+                   string message = 3 /* <=256, sanitized */; uint32 retry_after_ms = 4; uint32 job_id = 5; }
+enum SetupStage { ..._UNSPECIFIED=0; PREFLIGHT=1; IMAGE_FETCH=2; IMAGE_IMPORT=3; BUILD=4; LAUNCH=5; POST=6;
+                  SESSION=7; DOCKER=8; VERIFIERS=9; FINISH=10; DONE=11; }
+message SetupProgress { uint32 job_id = 1; SetupStage stage = 2; uint32 index = 3; uint32 total = 4;
+                        string step = 5 /* <=128, sanitized */; uint32 percent = 6 /* 0..=100 or 255 */; bool ok = 7; uint32 elapsed_ms = 8; }
+enum SetupPathTaken { ..._UNSPECIFIED=0; PREBUILT=1; BUILD=2; EXISTING=3; }
+enum SetupDockerStatus { ..._UNSPECIFIED=0; NOT_REQUESTED=1; ENABLED=2; UNSUPPORTED_INCUS=3; SELF_TEST_FAILED=4; NOT_ENABLED=5; }
+message SetupDocker { SetupDockerStatus status = 1; string docker_version = 2; string found = 3; string required = 4;
+                      bool isolation_restored = 5; string hint = 6 /* <=256 */; }   // privd output_tail is NOT forwarded
+enum SetupErrorCode { ..._UNSPECIFIED=0; INVALID_ARGUMENT=1; DESKTOP_EXISTS=2; INSUFFICIENT_SPACE=3; RATE_LIMITED=4;
+                      LOCKED=5; WINDOW_CLOSED=6; TIMED_OUT=7; CANCELLED=8; UNAVAILABLE=9; UNSUPPORTED=10;
+                      ISOLATION_NOT_RESTORED=11; INTERNAL=12; }
+message SetupError { SetupErrorCode code = 1; SetupStage stage = 2; string message = 3 /* <=256 */; bool retryable = 4; uint32 retry_after_ms = 5; }
+message SetupResult { uint32 job_id = 1; SetupJobState status = 2; SetupPathTaken path_taken = 3; string reason = 4;
+                      repeated string warnings = 5 /* <=16 x <=256 */; SetupDocker docker = 6; SetupError error = 7;
+                      bool finished = 8; uint32 elapsed_ms = 9; }
+```
+
+Elided enum names (`...`) are the type's name in upper snake case as a prefix, as `SETUP_JOB_STATE_IDLE`; the `.proto` is authoritative for spelling. Also on the wire: `CloseCode::SetupClosed = 10` (WebSocket 4010, §8) and `AuthStatus::PinRequired = 6` (§11.4), both sent only on `INTENT_SETUP` connections.
+
+**Validation.** `hx-proto` fails with `PROTOCOL_ERROR` on: the hard size caps (password at most 1024 bytes, PIN at most 16, strings at their caps, warnings at most 16); the direction of a body (`SetupMessage::direction()`, modelled on `DeviceMgmt::direction`: `set_pin`, `start`, `cancel` and `finish` only from the client; `state`, `ack`, `progress` and `result` only from the server); and the request-id rules below. **Semantic** checks, answered `SetupAck{INVALID_ARGUMENT, field}` and never as a close, are: the password rules (1 to 511 bytes, valid UTF-8, no NUL, CR or LF: one shared checker, `hx_proto::message::password_problem`, used by the client and the server), the PIN digits (6 to 16 ASCII digits, as §11.4), the username regex (`hx_provision::Username` is the authority), enum values, and Docker requested without `docker_isolation_acknowledged`.
+
+**Request ids.** `set_pin`, `start`, `cancel` and `finish` carry a non-zero `request_id` chosen by the client; the server answers each with exactly one `ack` carrying the same id. `state`, `progress` and `result` carry 0 and nothing else may. A client may keep several requests outstanding; the server handles one connection's requests in order.
+
+**Server state machine, per `INTENT_SETUP` connection:**
+
+```
+Pending --(unknown/revoked | minor<3 | no SETUP offered)--> Refuse UNAUTHORIZED
+Pending --(gate Closed)--> Refuse SETUP_CLOSED
+Pending --(gate KeyOnly)--> HelloAck -> recheck -> authorize control-only -> AuthResult{OK} -> KEY_ONLY
+Pending --(gate NeedsPin)--> HelloAck -> AuthResult{PIN_REQUIRED} -> PIN_PENDING
+PIN_PENDING --(PIN ok, recheck)--> authorize control-only -> AuthResult{OK} -> SETUP_AUTHORIZED
+PIN_PENDING --(wrong x5 / timeout / 5 msgs)--> close UNAUTHORIZED (the 5th wrong PIN revokes: job cancelled, unbound)
+KEY_ONLY: set_pin ok -> SETUP_AUTHORIZED; start/cancel/finish -> ack PIN_REQUIRED; others -> PROTOCOL_ERROR
+SETUP_AUTHORIZED: set_pin -> ack PIN_ALREADY_SET; start; cancel; finish; goodbye
+any: binding moved / window closed with no job to report -> close SETUP_CLOSED; revoked -> close UNAUTHORIZED;
+     idle 10 min with no job running -> close NO_ERROR; a new setup connection of the same device -> old closed NO_ERROR "replaced";
+     job ended with finished=true -> SetupResult, flush, close NO_ERROR "setup finished"
+```
+
+**Job** (one per server, independent of any connection; [ipc.md](ipc.md) §5.5): `IDLE` → `start` → `RUNNING` → `SUCCEEDED` | `FAILED` | `CANCELLED`; from an ended state a new `start` is allowed unless setup is finished; a second `start` while one runs is answered `BUSY`.
+
+**Messages and their rules.**
+
+- **`SetupState`** is pushed on authorization and on every job transition. It reports the job state and id, whether a PIN is set (`pin_set`), the desktop's state as the server sees it, the window's expiry, whether setup is finished, the last progress (while `RUNNING`), the last result (kept in memory only: lost on a server restart) and the host facts the wizard shows.
+- **`set_pin`** succeeds at most once, because a PIN can only be set while none exists (`PIN_ALREADY_SET` otherwise). The PIN is for all devices, as in the SSH path.
+- **`start`** carries the options and the password. It is refused with `WINDOW_TOO_SHORT` when less than **50 minutes** remain in the setup window (the 45-minute `CreateDesktop` maximum plus a margin; the app then shows `sudo hx-agent setup extend`); an admitted job runs to completion. It is refused with `PIN_REQUIRED` before a PIN exists, `BUSY` while a job runs, `ALREADY_FINISHED` after setup is finished, and `RATE_LIMITED` past 6 `start` requests per hour per server.
+- **`cancel`** takes effect only while a privd command is running (the server cancels it, privd destroys the unfinished instance); at any other time it is answered `OK` and the `result` shows what actually happened. After a cancel the window stays open and the app may start again. `cancel` with no job running is `NOT_RUNNING`.
+- **`finish`** retries finishing setup if the job's own finish failed transiently; it is idempotent (`OK`, or `ALREADY_FINISHED` when setup is already finished) and is answered `DESKTOP_NOT_READY` when no usable desktop exists. The job itself finishes setup at its end, which closes the window and the setup power that comes with it as early as possible.
+- **`progress`** is coalesced, latest wins, at most 4 per second; a stage change is sent at once. `index` and `total` count steps within the stage, and `percent` 255 means unknown. `step` is sanitized again by the server. The server stages map 1:1 to privd's `PREFLIGHT`, `IMAGE_FETCH`, `IMAGE_IMPORT`, `BUILD`, `LAUNCH`, `POST`, `SESSION`, `DOCKER` and `DONE`; `VERIFIERS` and `FINISH` are the server's own.
+- **`result`** ends a job: `SUCCEEDED` (with the path taken, `reason`, warnings and the Docker outcome), `FAILED` (with a `SetupError`: code, the stage, a sanitized message, `retryable`, `retry_after_ms`) or `CANCELLED`. With `finished = false` on a success the window had already closed: the warning names `sudo hx-agent setup begin` then `sudo hx-agent setup finish`. The error codes are mapped from privd's in [ipc.md](ipc.md) §5.5. A Docker self-test failure during setup is reported in `SetupDocker`; retrying Docker is possible only afterwards, through the Admin CLI (`hx-agent docker enable`).
+- **Secrets.** The password and PIN follow the SSH path's rules (6 to 16 digits; 1 to 511 bytes of UTF-8 without NUL, CR or LF); nothing is cached by the server across a disconnect, a job end or a restart. A client therefore sends the password **only to start a new job**: watching a running job needs none. `SetupSetPin`, `SetupStart` and `Opaque` have a redacting `Debug` (§14); the server copies a secret into zeroizing memory at once and drops the message (the prost-decoded buffers are not wiped, best effort like the PIN of §11.5).
+- **Limits.** At most 2 requests per second per connection (burst 8), else close `BUSY`; one live setup connection per server; control writes bounded to 5 s, and a client that does not read is closed `BUSY` while the job continues.
+
+**Client rules.** Pair (record the server key and the confirmed version) → if `server_supports_setup`, reconnect with `INTENT_SETUP` → KeyOnly: `set_pin`; NeedsPin: send the PIN → read `SetupState`:
+
+- `IDLE` or `FAILED`: `start(options, password)`.
+- `RUNNING`: watch only; nothing to re-send (this is how a dropped connection resumes).
+- `SUCCEEDED` with `finished = false`: `finish`.
+- Then wait for the `result` and the close, connect with `INTENT_SESSION` and the PIN, and go on as in §2.
+
+A `SETUP_CLOSED` refusal (or close) at any point means the window is gone: go to the normal PIN login (a server that finished setup refuses `INTENT_SETUP` this way). The app keeps the PIN in zeroizing memory only until the first successful login. `UNAUTHORIZED` after a confirmed pairing means the device lost its binding or was revoked: say so and offer to rerun the one-liner.
+
+**Client library** (`hx_crypto::setup`, so the app and the tests share it):
+
+```rust
+pub async fn connect_setup(target:&Target, device:&Arc<IdentityKey>, server_key:&PublicKey, opts:&SetupConnectOptions) -> Result<SetupAuth>;
+pub enum SetupAuth { Ready(SetupSession), NeedsPin(AwaitingSetupPin) }
+impl AwaitingSetupPin { pub async fn submit_pin(&mut self, pin:&Pin) -> Result<PinReply>; pub fn into_session(self) -> Result<SetupSession>; }
+pub struct Password(/* Zeroizing, redacting Debug, validated with hx_proto::message::password_problem */);
+impl SetupSession {
+  pub fn state(&self) -> &pb::SetupState;
+  pub async fn set_pin(&mut self, pin:&Pin) -> Result<pb::SetupAck>;
+  pub async fn start(&mut self, opts: pb::SetupOptions, pw:&Password) -> Result<pb::SetupAck>;
+  pub async fn cancel(&mut self) -> Result<pb::SetupAck>;
+  pub async fn finish(&mut self) -> Result<pb::SetupAck>;
+  pub async fn next_event(&mut self) -> Result<SetupEvent>;   // State | Progress | Result | Closed(CloseInfo)
+}
+pub fn server_supports_setup(v: &pb::Version) -> bool;        // minor >= 3, used with the confirmed pairing HelloAck
+// errors: Error::SetupClosed (refuse/close SETUP_CLOSED -> go to normal login), Error::UpdateRequired
+```
+
+**Server-side contracts** that this section relies on (code, not wire): `hx_transport::Connection::authorize_control_only(allowed: Features)` (server only; satisfies the deadline, releases the pre-authentication slot, lets the control variants through, keeps the QUIC unidirectional credit at 0, still drops input and mouse and refuses media sends; `Hello` validation accepts `Intent::Setup`; `RefuseReason::SetupClosed` maps to close code 10; `Features::SETUP`, `defined_up_to(3)` and a `Features::without` helper; `PROTOCOL_MINOR = 3`), and in `hx-crypto` a `SetupGate` (`admit(device)` returns `Closed`, `KeyOnly` or `NeedsPin`, bounds its own calls, and without it `INTENT_SETUP` is refused `UNAUTHORIZED`), the additive `Outcome::Paired { …, with: PairedWith::{Token{id}, Code} }` and `Outcome::Setup { connection, device, pin_verified }`. The gate and the registry are checked again immediately before `authorize_control_only`; on a NeedsPin connection the PIN exchange reuses the session's `pin_exchange` unchanged, and the revocation watcher closes the connection.
+
+**Threats this section answers** (the full table is in the 1G design record): a token thief who wins the pairing race gets the desktop setup, which is inherent to bearer tokens; the legitimate app then fails to pair ("wrong or expired, or intercepted", §11.3) and the user reruns the one-liner, and the device is visible in `hx-agent devices` and the audit log. A stolen setup-device key before a PIN exists equals the owner for the few minutes before `set_pin`; afterwards every setup connection needs the PIN, with lockout after 5. A malicious paired client during setup has no field for Admin-only options (the server builds the privd request from typed, validated values: no `image_file`, no pool device, no private networks, `desktop_id` from configuration). A protocol downgrade is impossible inside pinned TLS: `INTENT_SETUP` needs a client minor of at least 3 and `SETUP`, and an old server is never sent the intent.
 
 ## 6. Media (video) channel
 
@@ -476,6 +674,7 @@ Connection close (QUIC `CONNECTION_CLOSE` application error code; WebSocket clos
 | 7 | `SHUTDOWN` | Server is stopping |
 | 8 | `INTERNAL_ERROR` | Server fault |
 | 9 | `TAKEN_OVER` | **1.1.** Another device took over this desktop (§5.7). Sent only to a peer whose negotiated minor is at least 1; a 1.0 peer would read it as `INTERNAL_ERROR` |
+| 10 | `SETUP_CLOSED` | **1.3.** An `INTENT_SETUP` connection that is not (or no longer) admitted: the device is not the bound setup device, the setup window is closed, or the binding moved (§5.10). Sent only on `INTENT_SETUP` connections, so only to a 1.3 peer |
 
 Unknown codes received are treated as `INTERNAL_ERROR` (so a 1.0 peer reads `TAKEN_OVER` that way). The reason string of a close is for logs only (at most 128 bytes, never secrets).
 
@@ -550,6 +749,17 @@ There are none on the wire. The sender SHOULD interleave: control, input, mouse 
 | `Goodbye` with an over-long or unsanitised `peer_device_name`, or a `peer_device_id` of other than 0 or 16 bytes | Malformed (as any invalid message) |
 | `DeviceMgmt` without negotiated `DEVICE_MANAGEMENT`, a server-only body from a client, or a request id that breaks §5.9 | Close, `PROTOCOL_ERROR` |
 | `DeviceMgmt` while restricted | Close, `PROTOCOL_ERROR` (transport, §2.1) |
+| `DeviceMgmt` `create_pairing_code` or `pairing_code_issued` with a negotiated minor below 3, or `pairing_code_issued` from a client | Close, `PROTOCOL_ERROR` |
+| `create_pairing_code` with `expires_in_s` outside 60 to 900 | `PairingCodeIssued{INVALID_ARGUMENT}`, nothing created |
+| More than 3 pairing codes in an hour | `PairingCodeIssued{RATE_LIMITED, retry_after_s}`, nothing changes |
+| `INTENT_SETUP` from an unknown or revoked key, from a client below 1.3 or without `SETUP` offered | `Refuse(UNAUTHORIZED)`, close `UNAUTHORIZED` (uniform text) |
+| `INTENT_SETUP` from a device that is not the bound setup device, with the window closed or privd not in `SETUP_OPEN` | `Refuse(SETUP_CLOSED)`, close `SETUP_CLOSED` (the app goes to the normal PIN login) |
+| `INTENT_SETUP` while privd cannot be asked | `Refuse(BUSY)`, close `BUSY` |
+| `SetupMessage` on a connection that is not `INTENT_SETUP`, without `SETUP` negotiated, a server-only body from a client, or a request id that breaks §5.10 | Close, `PROTOCOL_ERROR` |
+| `SetupMessage` that fails `hx-proto`'s hard caps (password above 1024 bytes, PIN above 16, a string above its cap, more than 16 warnings) | Close, `PROTOCOL_ERROR` |
+| A setup request with an invalid value (password rule, PIN digits, username, enum, Docker without the acknowledgement) | `SetupAck{INVALID_ARGUMENT, field}`, continue |
+| `start`, `cancel` or `finish` on a KeyOnly connection | `SetupAck{PIN_REQUIRED}`, continue |
+| `start` with less than 50 minutes of setup window left | `SetupAck{WINDOW_TOO_SHORT}`; the app shows `sudo hx-agent setup extend` |
 | Close `TAKEN_OVER` | End the session, show the notice (§5.7), do not reconnect automatically |
 | Control message sent by the wrong role (`ViewConfig`, `RequestKeyframe`, `ClientStats` from the server; `StreamInfo` and `ServerStats` from the client) | Close, `PROTOCOL_ERROR` |
 | `Hello`, `HelloAck` or `Refuse` after the handshake | Close, `PROTOCOL_ERROR` |
@@ -586,10 +796,14 @@ Key identifiers: the **fingerprint** of a key is the SHA-256 of its 32 raw bytes
 | `SESSION` | unknown or revoked | `Refuse{UNAUTHORIZED}` (the message does not say which) |
 | `SESSION` | paired, no PIN configured on the server | `Refuse{UNAUTHORIZED}` |
 | `SESSION` | paired | `HelloAck`, PIN exchange (§11.4), then `authorize()` |
+| `SETUP` (1.3) | unknown or revoked; client minor below 3; `SETUP` not offered | `Refuse{UNAUTHORIZED}` (the same uniform text) |
+| `SETUP` | known and active, but not the bound setup device, the window closed, or privd not in `SETUP_OPEN` | `Refuse{SETUP_CLOSED}` (close code 10); `Refuse{BUSY}` if privd cannot be asked |
+| `SETUP` | the bound setup device, window open, **no PIN configured** | `HelloAck` (feature `SETUP` only), control-only authorization, `AuthResult{OK}`, `SetupState`; only `set_pin` works until a PIN exists (§5.10) |
+| `SETUP` | the bound setup device, window open, a PIN configured | `HelloAck`, `AuthResult{PIN_REQUIRED}`, then the PIN exchange of §11.4, then control-only authorization |
 
-On the **pairing connection** only `ControlMessage.pairing` (field 100) is processed. When the exchange succeeds the server application keeps the (still restricted) connection open for as long as it needs (for example to receive the password and PIN setup of architecture §5.3, whose messages 1C/1G specify) and then closes it with `NO_ERROR`; the device reconnects with `INTENT_SESSION` using its pinned key. A failed or timed-out exchange ends with `PairFailure` (when it can be sent) and a close with `UNAUTHORIZED`. The whole exchange is bounded (default 20 s).
+On the **pairing connection** only `ControlMessage.pairing` (field 100) is processed. When the exchange succeeds the server **always** closes the connection with `NO_ERROR` (the gateway after about 2 s); it never carries setup, a password or a PIN. The device reconnects using its pinned key: with `INTENT_SESSION` and the PIN, or, in the one-liner path, with `INTENT_SETUP` (§5.10). A failed or timed-out exchange ends with `PairFailure` (when it can be sent) and a close with `UNAUTHORIZED`. The whole exchange is bounded (default 20 s).
 
-On a **session connection** only `ControlMessage.auth` (field 101) and `goodbye`/`ping`/`pong` are processed until authorization. The server calls `Connection::authorize()` **before** sending the `AuthResult` that reports success (§13), so a client that sees success can use every channel at once.
+On a **session connection** only `ControlMessage.auth` (field 101) and `goodbye`/`ping`/`pong` are processed until authorization. A **setup connection** (§5.10) is processed the same way until it is authorized control-only; on a KeyOnly connection it is authorized straight away (§2.1), because the PIN does not exist yet. The server calls `Connection::authorize()` **before** sending the `AuthResult` that reports success (§13), so a client that sees success can use every channel at once.
 
 ### 11.3 Pairing exchange (field 100)
 
@@ -637,7 +851,7 @@ The PIN is a 6 to 16 digit secret chosen by the user at setup. The server stores
 | Message | Fields |
 |---|---|
 | `PinAttempt` (C→S) | `pin` 1 (bytes, 6 to 16 ASCII digits) |
-| `AuthResult` (S→C) | `status` 1 (`OK` = 1, `WRONG_PIN` = 2, `BACKOFF` = 3, `REVOKED` = 4, `NOT_AVAILABLE` = 5, sent if the server has no PIN verifier when the attempt arrives), `attempts_left` 2, `retry_after_ms` 3 |
+| `AuthResult` (S→C) | `status` 1 (`OK` = 1, `WRONG_PIN` = 2, `BACKOFF` = 3, `REVOKED` = 4, `NOT_AVAILABLE` = 5, sent if the server has no PIN verifier when the attempt arrives, `PIN_REQUIRED` = 6, **1.3**, sent by the server **only** on an `INTENT_SETUP` connection, unsolicited, to ask the client for its PIN: §5.10), `attempts_left` 2, `retry_after_ms` 3 |
 
 The channel is TLS 1.3 with both keys pinned, so the PIN travels in clear inside it. Rules, enforced on the server only:
 
@@ -666,8 +880,8 @@ On **every** `PendingSession` the application looks the peer key up in the curre
 
 ### 11.6 Notes for the agent (1C)
 
-- Never call `authorize()` on an `Outcome::Paired` connection: it is a pairing connection with no features.
-- Post-pairing password and PIN setup is allowed only for first-time setup, or when the request proves the current Linux password. It must finish inside the transport's authorization deadline (30 s by default; the pairing exchange itself may take up to 20 s of it).
+- Never call `authorize()` on an `Outcome::Paired` connection: it is a pairing connection with no features. An `Outcome::Setup` connection is authorized with `authorize_control_only` only, never `authorize()` (§5.10). `Outcome::Paired` carries `with: PairedWith::{Token{id}, Code}`, which is how the application binds the setup device (only a `Token` whose id the installer registered while the window was open binds).
+- Post-pairing password and PIN setup does **not** run on the pairing connection (the transport's 30 s authorization deadline, of which the pairing exchange may use 20 s, cannot hold a 45-minute build, and the single-use token cannot be resumed). It runs on an `INTENT_SETUP` connection (§5.10, [ipc.md](ipc.md) §5.5), allowed only to the bound setup device while the setup window is open, for first-time setup. Setting a password or PIN later, or after a lockout, is not a protocol path (the operator's CLI, or re-pairing with the Linux password).
 - CLI revoke, remove and reinstate go through the agent. `reinstate` only after the Linux password was verified by `hx-privd`'s peppered verifier (`PepperVerify`, a failure-capped yes/no check, with `PepperEnrol` for setting it up; see [ipc.md](ipc.md) §6.15).
 - An operator's lockout reset (zero the failure counter of a device that is not revoked) is `Authenticator::reset_lockout` (`DeviceRegistry::reset_pin_failures` underneath, which does not stamp `last_seen`); it waits for a running PIN check of that device and also drops the in-memory wait.
 - `Authenticator::is_backing_off(&DeviceId)` (and `backoff_remaining`, the wait left) tell whether a device's PIN is held back right now: a wrong-PIN backoff, an `Unavailable` hold or a `Locked` wait. It is an in-memory lookup, for the admin device list.
@@ -685,8 +899,9 @@ A TLS or certificate verification failure while connecting (QUIC TLS alert, reje
 - Application-layer policy owned by 1B/1C: re-check pinned/revoked keys on every `PendingSession`, close live sessions on revocation, sanitize `Hello.software` and `Hello.device_name` before display or logging, clamp input coordinates in the injector, and treat transfer file names as hints.
 - `hx-transport` does not yet enforce the 1.1 rules for `ServerStats` (rejecting it from a client or when `SERVER_STATS` was not negotiated, §5.8) nor apply `Negotiated::max_file_bytes` to incoming file headers (§5.6); the gateway/transport round must add both, and until then the application layer does.
 - Resolved in 1.2: the client-facing "Revoke that device" route is `DeviceMgmt` (§5.9).
+- Resolved in 1.3: password, PIN and desktop setup from the app in the one-liner path is `INTENT_SETUP` (§5.10; the open item was the pairing connection that "keeps the restricted connection open … for the password and PIN setup", §11.2, and the 30 s budget of §11.6). Pairing a new device from the app is `DeviceMgmt` `create_pairing_code` (§5.9).
 - Fuzz targets for 1H: `MediaHeader::decode`, `decode_datagram`, `message::decode::<ControlMessage | InputEvent | CursorEvent | TransferHeader>`, `message::decode_framed`, `version::peek_hello_version`, `file_name_problem`, and the WebSocket message router.
 
 ## 14. Schema location
 
-The protobuf schema is `crates/hx-proto/proto/hx.proto` (package `hx.v1`); field numbers there are the numbers in this document. The messages inside the `pairing` and `auth` envelopes (§11) are defined by `crates/hx-crypto/src/wire.rs`. Field numbers are never reused. Adding fields or messages is a minor-version change (§4.2); the 1.1 additions are listed in §4.5 and the 1.2 additions in §4.6.
+The protobuf schema is `crates/hx-proto/proto/hx.proto` (package `hx.v1`); field numbers there are the numbers in this document. The messages inside the `pairing` and `auth` envelopes (§11) are defined by `crates/hx-crypto/src/wire.rs`. Field numbers are never reused. Adding fields or messages is a minor-version change (§4.2); the 1.1 additions are listed in §4.5, the 1.2 additions in §4.6 and the 1.3 additions in §4.7. The 1.3 messages (`SetupMessage` and its parts, `DeviceMgmt` bodies 15 and 16, `Intent` 3, `RefuseReason` 5) are in `hx.proto` itself. **Secret-bearing types** (`SetupSetPin`, `SetupStart`, `PairingCodeIssued`, and the existing `Opaque`, whose generated `Debug` prints its bytes, so the auth PIN leaked through it) are built with `prost_build::Config::skip_debug` and have hand-written redacting `Debug` impls in `hx-proto`; the redaction must also hold through every envelope that can contain one (`DeviceMgmt`, `SetupMessage`, `ControlMessage`), so a derived `Debug` on an envelope never prints a nested secret.
