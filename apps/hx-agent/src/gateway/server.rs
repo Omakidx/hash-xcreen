@@ -186,8 +186,7 @@ impl Gateway {
                     Features::defined_up_to(PROTOCOL_MINOR).without(Features::SETUP),
                     config.max_file_bytes,
                 ),
-                session_features: Features::defined_up_to(PROTOCOL_MINOR)
-                    .without(Features::SETUP),
+                session_features: Features::defined_up_to(PROTOCOL_MINOR).without(Features::SETUP),
                 pairing: PairingLimits {
                     token_ttl: ttl,
                     code_ttl: ttl,
@@ -353,6 +352,7 @@ impl Gateway {
     /// Stops accepting, tells live clients (`SHUTDOWN`) and ends the background tasks.
     pub async fn shutdown(mut self) {
         let _ = self.shutdown.send(true);
+        self.shared.setup.shutdown();
         self.server.close();
         self.shared
             .live
@@ -367,6 +367,7 @@ impl Gateway {
 impl Drop for Gateway {
     fn drop(&mut self) {
         let _ = self.shutdown.send(true);
+        self.shared.setup.shutdown();
         for t in &self.tasks {
             t.abort();
         }

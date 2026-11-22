@@ -24,9 +24,7 @@ use zeroize::Zeroizing;
 
 use super::job::{self, JobRequest};
 use super::store::{Persisted, SetupStore};
-use super::{
-    MIN_WINDOW_REMAINING_S, PIN_ATTEMPTS_PER_HOUR, STARTS_PER_HOUR, SetupSettings,
-};
+use super::{MIN_WINDOW_REMAINING_S, PIN_ATTEMPTS_PER_HOUR, STARTS_PER_HOUR, SetupSettings};
 use crate::gateway::devices::DeviceService;
 use crate::gateway::privd_client::{PrivdClient, PrivdError, PrivdLane};
 use crate::gateway::util::short_id;
@@ -93,6 +91,8 @@ pub(super) struct State {
     pub conn: Option<(u64, hx_transport::Connection)>,
     pub host: Option<pb::SetupHostFacts>,
     pub desktop: pb::SetupDesktopState,
+    /// The running job's task, aborted when gatewayd stops.
+    pub job_task: Option<tokio::task::AbortHandle>,
 }
 
 pub(super) struct Shared {
@@ -101,7 +101,10 @@ pub(super) struct Shared {
     pub privd: PrivdClient,
     pub lane: PrivdLane,
     pub verifiers: Arc<VerifierStore>,
-    pub devices: Arc<DeviceService>,
+    /// Weak: the authenticator holds this coordinator as its setup gate, and the device service
+    /// holds the authenticator, so a strong reference would be a cycle that keeps the registry
+    /// lock alive for ever.
+    pub devices: std::sync::Weak<DeviceService>,
     pub clock: Arc<dyn Clock>,
     pub settings: SetupSettings,
     pub events: broadcast::Sender<Arc<Event>>,
@@ -139,6 +142,19 @@ impl Shared {
 
     pub(super) fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.st.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub(super) fn bump_version(&self) {
+        if let Some(d) = self.devices.upgrade() {
+            d.bump_version();
+        }
+    }
+
+    /// A server-wide audit event (no device), best effort in the background.
+    pub(super) fn audit(&self, event: AuditEvent, label: &str) {
+        if let Some(d) = self.devices.upgrade() {
+            d.audit_opt(event, None, label);
+        }
     }
 
     pub(super) fn publish(&self, e: Event) {
@@ -264,12 +280,7 @@ impl Shared {
             if attempt > 0 {
                 tokio::time::sleep(self.settings.finish_retry_wait).await;
             }
-            match tokio::time::timeout(
-                Duration::from_secs(15),
-                self.privd.finish_setup(),
-            )
-            .await
-            {
+            match tokio::time::timeout(Duration::from_secs(15), self.privd.finish_setup()).await {
                 Ok(Ok(())) => {
                     self.mark_finished();
                     return FinishOutcome::Done;
@@ -378,11 +389,12 @@ impl SetupCoordinator {
                 conn: None,
                 host: None,
                 desktop: pb::SetupDesktopState::Unknown,
+                job_task: None,
             }),
             privd,
             lane,
             verifiers,
-            devices,
+            devices: Arc::downgrade(&devices),
             clock,
             settings,
             events,
@@ -533,6 +545,14 @@ impl SetupCoordinator {
         self.sh.publish(Event::State);
     }
 
+    /// Stops a running job (gatewayd is stopping): its privd connection closes, which privd
+    /// treats as a cancel and destroys the unfinished instance.
+    pub fn shutdown(&self) {
+        if let Some(h) = self.sh.lock().job_task.take() {
+            h.abort();
+        }
+    }
+
     /// For the admin `Status`.
     pub fn status(&self) -> SetupStatus {
         let mut st = self.sh.lock();
@@ -594,10 +614,8 @@ impl SetupCoordinator {
             tracing::error!(error = %e, "storing the setup PIN failed");
             return ack_msg(S::Failed, "the PIN could not be stored");
         }
-        self.sh.devices.bump_version();
-        self.sh
-            .devices
-            .audit_opt(AuditEvent::PinChanged, None, "setup");
+        self.sh.bump_version();
+        self.sh.audit(AuditEvent::PinChanged, "setup");
         self.sh.publish(Event::State);
         ack(S::Ok)
     }
@@ -605,7 +623,9 @@ impl SetupCoordinator {
     /// `start`: validates, applies the limits and spawns the job.
     pub(super) fn start(&self, device: &DeviceId, start: pb::SetupStart) -> pb::SetupAck {
         use pb::SetupAckStatus as S;
-        let pb::SetupStart { options, password, .. } = start;
+        let pb::SetupStart {
+            options, password, ..
+        } = start;
         let password = Zeroizing::new(password.to_vec());
         let now = self.sh.clock.now();
         let mut st = self.sh.lock();
@@ -656,7 +676,8 @@ impl SetupCoordinator {
         };
         drop(st);
         let sh = self.sh.clone();
-        tokio::spawn(job::run(sh, id, request, password, ctl));
+        let handle = tokio::spawn(job::run(sh, id, request, password, ctl));
+        self.sh.lock().job_task = Some(handle.abort_handle());
         self.sh.publish(Event::State);
         pb::SetupAck {
             job_id: id,
@@ -695,8 +716,7 @@ impl SetupCoordinator {
             }
         }
         let t = self.sh.settings.privd_timeout;
-        match tokio::time::timeout(t, self.sh.privd.get_desktop(&self.sh.settings.desktop_id))
-            .await
+        match tokio::time::timeout(t, self.sh.privd.get_desktop(&self.sh.settings.desktop_id)).await
         {
             Ok(Ok(Some(d))) if usable(&d) => {}
             Ok(Ok(_)) => return ack(S::DesktopNotReady),
@@ -757,7 +777,14 @@ impl SetupGate for SetupCoordinator {
             match tokio::time::timeout(t, self.sh.privd.get_host_info()).await {
                 Ok(Ok(h)) if h.phase == privd_pb::Phase::SetupOpen as i32 => {}
                 Ok(Ok(_)) => return SetupAdmission::Closed,
-                _ => return SetupAdmission::Unavailable,
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "setup admission: privd could not be asked");
+                    return SetupAdmission::Unavailable;
+                }
+                Err(_) => {
+                    tracing::warn!("setup admission: privd did not answer in time");
+                    return SetupAdmission::Unavailable;
+                }
             }
             if self.sh.verifiers.has_pin() {
                 SetupAdmission::NeedsPin

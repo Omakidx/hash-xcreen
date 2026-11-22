@@ -796,28 +796,27 @@ pub struct LaneCall {
     /// The request id, for [`PrivdLane::cancel`].
     pub request_id: u64,
     lane: Arc<LaneInner>,
-    task: Option<tokio::task::JoinHandle<Result<pb::response::Result, PrivdError>>>,
+    task: tokio::task::JoinHandle<Result<pb::response::Result, PrivdError>>,
 }
 
 impl LaneCall {
     /// Waits for privd's answer.
     pub async fn wait(mut self) -> Result<pb::response::Result, PrivdError> {
-        let task = self.task.take().expect("waited once");
-        task.await
-            .unwrap_or_else(|_| Err(PrivdError::Unavailable("the call was aborted".into())))
+        let r = (&mut self.task).await;
+        r.unwrap_or_else(|_| Err(PrivdError::Unavailable("the call was aborted".into())))
     }
 }
 
 impl Drop for LaneCall {
     fn drop(&mut self) {
-        if let Some(t) = &self.task {
-            t.abort();
-            self.lane
-                .cancels
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&self.request_id);
-        }
+        // Dropping the call (or the job that waits on it, when gatewayd stops) closes the
+        // connection, which privd treats as a cancel. Aborting a finished task does nothing.
+        self.task.abort();
+        self.lane
+            .cancels
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.request_id);
     }
 }
 
@@ -909,7 +908,7 @@ impl PrivdLane {
         LaneCall {
             request_id,
             lane: self.0.clone(),
-            task: Some(task),
+            task,
         }
     }
 

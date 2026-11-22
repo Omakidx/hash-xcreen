@@ -201,7 +201,11 @@ pub(super) fn map_privd(e: &PrivdError, stage: pb::SetupStage) -> Fail {
         PrivdError::Unavailable(_) => Fail {
             retryable: true,
             retry_after_ms: 2000,
-            ..Fail::new(C::Unavailable, stage, "the server's privileged service is unavailable")
+            ..Fail::new(
+                C::Unavailable,
+                stage,
+                "the server's privileged service is unavailable",
+            )
         },
         _ => Fail::new(C::Internal, stage, "an internal error"),
     }
@@ -266,9 +270,9 @@ impl Progress {
         }
     }
 
-    fn from_privd(&self, p: &privd_pb::Progress) {
-        use privd_pb::ProgressStage as P;
+    fn forward_privd(&self, p: &privd_pb::Progress) {
         use pb::SetupStage as S;
+        use privd_pb::ProgressStage as P;
         let stage = match P::try_from(p.stage).unwrap_or(P::Unspecified) {
             P::Preflight | P::Host => S::Preflight,
             P::ImageFetch => S::ImageFetch,
@@ -383,11 +387,17 @@ pub(super) async fn run(
             });
         }
     }
+    tracing::debug!(
+        job = job_id,
+        status = result.status,
+        "setup job: refreshing the facts"
+    );
     sh.refresh_facts().await;
+    tracing::debug!(job = job_id, "setup job: publishing the result");
     {
         let mut st = sh.lock();
-        st.job.state = pb::SetupJobState::try_from(result.status)
-            .unwrap_or(pb::SetupJobState::Failed);
+        st.job.state =
+            pb::SetupJobState::try_from(result.status).unwrap_or(pb::SetupJobState::Failed);
         st.job.progress = None;
         st.job.result = Some(result.clone());
         st.job.ctl = None;
@@ -418,7 +428,14 @@ async fn steps(
     if ctl.is_cancelled() {
         return Err(Fail::cancelled(S::Preflight));
     }
-    prog.emit(S::Preflight, 2, 3, "Looking for an existing desktop", 255, false);
+    prog.emit(
+        S::Preflight,
+        2,
+        3,
+        "Looking for an existing desktop",
+        255,
+        false,
+    );
     let existing = tokio::time::timeout(t, sh.privd.get_desktop(&sh.settings.desktop_id))
         .await
         .map_err(|_| map_privd(&PrivdError::Timeout, S::Preflight))?
@@ -434,20 +451,17 @@ async fn steps(
     prog.emit(S::Preflight, 3, 3, "Preflight done", 100, true);
 
     prog.emit(S::Verifiers, 1, 1, "Saving the password check", 255, false);
-    sh.verifiers
-        .set_password(record)
-        .map_err(|e| {
-            tracing::error!(error = %e, "storing the password verifier failed");
-            Fail::new(
-                pb::SetupErrorCode::Internal,
-                S::Verifiers,
-                "the password check could not be saved",
-            )
-        })?;
-    sh.devices.bump_version();
-    sh.devices.audit_opt(
+    sh.verifiers.set_password(record).map_err(|e| {
+        tracing::error!(error = %e, "storing the password verifier failed");
+        Fail::new(
+            pb::SetupErrorCode::Internal,
+            S::Verifiers,
+            "the password check could not be saved",
+        )
+    })?;
+    sh.bump_version();
+    sh.audit(
         hx_ipc::privd::pb::AuditEvent::PasswordVerifierChanged,
-        None,
         "setup",
     );
 
@@ -495,10 +509,13 @@ async fn existing_path(
     }
     if d.state == privd_pb::DesktopState::Stopped as i32 {
         prog.emit(S::Launch, 1, 1, "Starting the desktop", 255, false);
-        tokio::time::timeout(START_TIMEOUT, sh.privd.start_desktop(&sh.settings.desktop_id))
-            .await
-            .map_err(|_| map_privd(&PrivdError::Timeout, S::Launch))?
-            .map_err(|e| map_privd(&e, S::Launch))?;
+        tokio::time::timeout(
+            START_TIMEOUT,
+            sh.privd.start_desktop(&sh.settings.desktop_id),
+        )
+        .await
+        .map_err(|_| map_privd(&PrivdError::Timeout, S::Launch))?
+        .map_err(|e| map_privd(&e, S::Launch))?;
     }
     if ctl.is_cancelled() {
         return Err(Fail::cancelled(S::Launch));
@@ -557,16 +574,22 @@ async fn create_path(
     let result = loop {
         tokio::select! {
             r = &mut wait => break r,
-            Some(p) = rx.recv() => prog.from_privd(&p),
+            Some(p) = rx.recv() => prog.forward_privd(&p),
             () = ctl.notify.notified(), if !cancel_sent => {
                 cancel_sent = true;
+                tracing::debug!(request_id, "setup job: cancelling the privd command");
                 sh.lane.cancel(request_id);
             }
         }
     };
+    tracing::debug!(
+        request_id,
+        ok = result.is_ok(),
+        "setup job: the privd command ended"
+    );
     // Frames that arrived with the answer.
     while let Ok(p) = rx.try_recv() {
-        prog.from_privd(&p);
+        prog.forward_privd(&p);
     }
     match result {
         Ok(privd_pb::response::Result::CreateDesktop(r)) => {
@@ -709,10 +732,19 @@ mod tests {
         };
         let s = pb::SetupStage::Build;
         for (e, want) in [
-            (remote(E::InvalidArgument, D::Unspecified), C::InvalidArgument),
-            (remote(E::FailedPrecondition, D::DesktopExists), C::DesktopExists),
+            (
+                remote(E::InvalidArgument, D::Unspecified),
+                C::InvalidArgument,
+            ),
+            (
+                remote(E::FailedPrecondition, D::DesktopExists),
+                C::DesktopExists,
+            ),
             (remote(E::FailedPrecondition, D::Pool), C::InsufficientSpace),
-            (remote(E::FailedPrecondition, D::SetupWindowClosed), C::WindowClosed),
+            (
+                remote(E::FailedPrecondition, D::SetupWindowClosed),
+                C::WindowClosed,
+            ),
             (
                 remote(E::FailedPrecondition, D::IsolationNotRestored),
                 C::IsolationNotRestored,

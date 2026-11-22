@@ -192,8 +192,14 @@ mod tests {
             device: device_id(&[9; 16]),
         };
         store.save(&state).unwrap();
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-        assert!(!path.with_extension("tmp").exists(), "no temporary file is left");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(
+            !path.with_extension("tmp").exists(),
+            "no temporary file is left"
+        );
         let (_, again) = SetupStore::open(&path).unwrap();
         assert_eq!(again, state);
         // Overwriting and clearing.
@@ -212,7 +218,10 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         fs::write(&path, "window_opened nope\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(matches!(SetupStore::open(&path), Err(StoreError::Malformed)));
+        assert!(matches!(
+            SetupStore::open(&path),
+            Err(StoreError::Malformed)
+        ));
         fs::remove_file(&path).unwrap();
         let target = d.path().join("t");
         fs::write(&target, "").unwrap();

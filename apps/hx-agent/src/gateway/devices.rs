@@ -428,7 +428,11 @@ impl DeviceService {
     ///   (`PairingWindow::issue_code_with_ttl` keeps a single code);
     /// * the code is the admin socket's short code, and the audit event
     ///   `DEVICE_PAIRING_CODE_ISSUED` names the requester, never the code.
-    pub fn create_pairing_code(&self, requester: DeviceId, expires_in_s: u32) -> pb::PairingCodeIssued {
+    pub fn create_pairing_code(
+        &self,
+        requester: DeviceId,
+        expires_in_s: u32,
+    ) -> pb::PairingCodeIssued {
         use pb::PairingCodeStatus as S;
         let refuse = |status: S, retry: u32| pb::PairingCodeIssued {
             code: String::new(),
@@ -461,7 +465,10 @@ impl DeviceService {
                 .front()
                 .map(|t| CODE_WINDOW.saturating_sub(now.saturating_duration_since(*t)))
                 .unwrap_or(CODE_WINDOW);
-            return refuse(S::RateLimited, u32::try_from(wait.as_secs().max(1)).unwrap_or(u32::MAX));
+            return refuse(
+                S::RateLimited,
+                u32::try_from(wait.as_secs().max(1)).unwrap_or(u32::MAX),
+            );
         }
         let code = match self.auth.pairing().issue_code_with_ttl(ttl) {
             Ok(c) => c,

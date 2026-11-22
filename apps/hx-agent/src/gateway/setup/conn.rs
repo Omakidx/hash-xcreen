@@ -57,14 +57,21 @@ impl Bucket {
     }
 }
 
-async fn send(conn: &Connection, body: pb::setup_message::Body, request_id: u32) -> Result<(), Exit> {
+async fn send(
+    conn: &Connection,
+    body: pb::setup_message::Body,
+    request_id: u32,
+) -> Result<(), Exit> {
     let m = pb::ControlMessage::new(Ctl::Setup(pb::SetupMessage {
         request_id,
         body: Some(body),
     }));
     match tokio::time::timeout(SEND_TIMEOUT, conn.send_control(&m)).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(_)) => Err(Exit::Gone),
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, "a setup message could not be sent");
+            Err(Exit::Gone)
+        }
         // A client that does not read: the write may be half done, so the connection cannot
         // be used any more. The job is not affected.
         Err(_) => Err(Exit::Close(CloseCode::Busy, "not reading")),
@@ -181,6 +188,7 @@ impl SetupCoordinator {
         ev: &Event,
     ) -> Result<bool, Exit> {
         use pb::setup_message::Body as B;
+        tracing::debug!(event = ?std::mem::discriminant(ev), "setup connection: event");
         match ev {
             Event::State => {
                 send(conn, B::State(self.sh.snapshot()), 0).await?;
@@ -199,7 +207,11 @@ impl SetupCoordinator {
                 }
                 Ok(finished)
             }
-            Event::Kick { device, code, reason } => {
+            Event::Kick {
+                device,
+                code,
+                reason,
+            } => {
                 if device.as_ref().is_none_or(|d| d == me) {
                     return Err(Exit::Close(*code, reason));
                 }
