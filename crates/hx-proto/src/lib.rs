@@ -22,6 +22,7 @@ pub mod error;
 pub mod media;
 pub mod message;
 pub mod order;
+mod redact;
 pub mod version;
 
 /// Generated protobuf types for package `hx.v1` (see `proto/hx.proto`).

@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hx_crypto::auth::{BoxFuture, RevocationGuard, RevocationPermit};
-use hx_crypto::{Authenticator, Clock, DeviceId, DeviceRecord, RevokeReason};
+use hx_crypto::{Authenticator, Clock, DeviceId, DeviceRecord, RevokeReason, RevokedBy};
 use hx_ipc::privd::pb::AuditEvent;
 use hx_proto::channel::MAX_DEVICE_LIST;
 use hx_proto::message::sanitize_device_name;
@@ -98,7 +98,12 @@ impl RevokeTicket<'_> {
     pub async fn commit(self) -> pb::RevokeStatus {
         use pb::RevokeStatus as S;
         let (svc, requester, target) = (self.svc, self.requester, self.target);
-        match svc.auth.revoke(&target, RevokeReason::User).await {
+        let by = if target == requester {
+            RevokedBy::SelfRevoke
+        } else {
+            RevokedBy::Device
+        };
+        match svc.auth.revoke(&target, RevokeReason::User, by).await {
             Ok(true) => {
                 if target != requester {
                     svc.recent
@@ -507,7 +512,11 @@ impl DeviceService {
             return Ok(Some(0));
         }
         let sessions = self.live.count_for(&target);
-        if self.auth.revoke(&target, RevokeReason::User).await? {
+        if self
+            .auth
+            .revoke(&target, RevokeReason::User, RevokedBy::Operator)
+            .await?
+        {
             self.record_revoked(target, None).await;
         }
         Ok(Some(sessions))

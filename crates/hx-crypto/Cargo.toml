@@ -37,5 +37,7 @@ zeroize = "1.9.2"
 
 [dev-dependencies]
 proptest = "1"
+# Raw QUIC peers: a 1.2 client (older minor) cannot be built with the high-level client.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rcgen = "0.14"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
