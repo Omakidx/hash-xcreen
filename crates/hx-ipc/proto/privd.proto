@@ -55,6 +55,9 @@ enum ErrorDetail {
   ERROR_DETAIL_DOCKER_USER = 10;
   ERROR_DETAIL_DESKTOP_EXISTS = 11;
   ERROR_DETAIL_OWNER_KEY_NOT_ENROLLED = 12;
+  // An Uninstall has begun (section 6.13): every Gateway command and every Admin mutation other
+  // than Uninstall is refused with FAILED_PRECONDITION until the agent is removed.
+  ERROR_DETAIL_UNINSTALLING = 13;
 }
 
 message Error {
@@ -136,6 +139,7 @@ enum ProgressStage {
   PROGRESS_STAGE_BACKUP = 11;
   PROGRESS_STAGE_RESTORE = 12;
   PROGRESS_STAGE_DONE = 13;
+  PROGRESS_STAGE_UNINSTALL = 14;
 }
 
 message Progress {
@@ -734,7 +738,23 @@ message ApplyUpdateResult {
 
 message RollbackUpdateResult {}
 message DestroyDesktopResult {}
-message UninstallResult {}
+// What privd's part of an uninstall did (section 6.13). privd removes only the objects it created;
+// units, binaries, credentials and gatewayd's state are removed by `hx-agent uninstall`.
+// Each list has at most 64 entries of at most 256 bytes.
+message UninstallResult {
+  // What the uninstall did: true when the desktop and the host objects were kept. A keep request
+  // answered after a destroy has converged reports false (the desktop is gone).
+  bool keep_desktop = 1;
+  // Objects removed, as `kind:name` (`session-link:main`, `desktop:main`, `profile:hx-desktop`,
+  // `network:hxbr0`, `acl:hx-isolate`, `pool:hx-pool`, `nft-table:inet hx`,
+  // `docker-user-rules:2`, `file:/etc/hx/host-firewall.nft`, `file:/etc/sysctl.d/...`).
+  repeated string removed = 2;
+  // Objects deliberately left: everything of the destroy list in keep mode, an object that has
+  // our name but not our marker, and the live sysctl values (they revert at the next boot).
+  repeated string kept = 3;
+  // Problems that did not stop the uninstall.
+  repeated string warnings = 4;
+}
 message ResetLockoutResult {}
 message EnrolOwnerKeyResult {}
 message UpgradeIncusResult {}

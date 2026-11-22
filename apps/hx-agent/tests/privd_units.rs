@@ -232,3 +232,100 @@ fn m2_the_audit_log_is_rotated_with_a_sighup_to_privd() {
     assert!(text.contains("postrotate"));
     assert!(text.contains("--signal=HUP hx-privd.service"));
 }
+
+#[test]
+fn the_privd_service_hands_a_failed_update_to_the_rescue_helper() {
+    use hx_agent::privd::cmd::update_resume::MAX_ATTEMPTS;
+    let u = parse(&read("hx-privd.service"));
+    assert_eq!(
+        words(&u, "Unit", "OnFailure"),
+        ["hx-privd-rescue.service"],
+        "OnFailure must name the helper and nothing else"
+    );
+    assert_eq!(one(&u, "Unit", "StartLimitIntervalSec"), "300");
+    let burst: u32 = one(&u, "Unit", "StartLimitBurst").parse().unwrap();
+    // privd's own crash-loop rollback needs MAX_ATTEMPTS starts first; systemd must not give up
+    // before that.
+    assert!(
+        burst > MAX_ATTEMPTS,
+        "StartLimitBurst {burst} must exceed MAX_ATTEMPTS {MAX_ATTEMPTS}"
+    );
+    assert_eq!(burst, 5);
+    // The limit only ever fires with Restart= in play.
+    assert_eq!(one(&u, "Service", "Restart"), "on-failure");
+    // The options are in [Unit]: in [Service] systemd ignores them (with a warning).
+    assert!(!u["Service"].contains_key("StartLimitBurst"));
+    assert!(!u["Service"].contains_key("StartLimitIntervalSec"));
+}
+
+#[test]
+fn the_rescue_unit_is_a_locked_down_oneshot_that_can_only_move_the_release_links() {
+    let u = parse(&read("hx-privd-rescue.service"));
+    assert_eq!(one(&u, "Service", "Type"), "oneshot");
+    // Outside /usr/lib/hx, so that pruning and updates never touch it.
+    assert_eq!(
+        one(&u, "Service", "ExecStart"),
+        "/usr/lib/hx-rescue/hx-privd-rescue"
+    );
+    assert!(
+        !one(&u, "Service", "ExecStart").starts_with("/usr/lib/hx/"),
+        "the helper must live outside the release directory"
+    );
+    assert_eq!(one(&u, "Service", "User"), "root");
+    // The release directory is the only writable path.
+    assert_eq!(one(&u, "Service", "ProtectSystem"), "strict");
+    assert_eq!(words(&u, "Service", "ReadWritePaths"), ["/usr/lib/hx"]);
+    // No arguments, no environment, no shell line.
+    for k in ["Environment", "EnvironmentFile", "PassEnvironment"] {
+        assert!(!u["Service"].contains_key(k), "{k}");
+    }
+    assert!(!one(&u, "Service", "ExecStart").contains(' '));
+    // No capability at all, and nothing that could regain one.
+    assert_eq!(one(&u, "Service", "CapabilityBoundingSet"), "");
+    assert_eq!(one(&u, "Service", "AmbientCapabilities"), "");
+    for (k, v) in [
+        ("NoNewPrivileges", "yes"),
+        ("PrivateNetwork", "yes"),
+        ("PrivateDevices", "yes"),
+        ("PrivateTmp", "yes"),
+        ("ProtectHome", "yes"),
+        ("MemoryDenyWriteExecute", "yes"),
+        ("RestrictSUIDSGID", "yes"),
+        ("RestrictNamespaces", "yes"),
+        ("LockPersonality", "yes"),
+        ("ProtectKernelTunables", "yes"),
+        ("ProtectKernelModules", "yes"),
+        ("ProtectControlGroups", "yes"),
+        ("RestrictAddressFamilies", "AF_UNIX"),
+        ("IPAddressDeny", "any"),
+    ] {
+        assert_eq!(one(&u, "Service", k), v, "{k}");
+    }
+    // A loop is bounded: it cannot restart privd more than 3 times an hour.
+    assert_eq!(one(&u, "Unit", "StartLimitIntervalSec"), "3600");
+    assert_eq!(one(&u, "Unit", "StartLimitBurst"), "3");
+    // Nothing installs or pulls it in except OnFailure= of the privd unit.
+    assert!(!u.contains_key("Install"));
+    assert!(!u["Unit"].contains_key("Requires") && !u["Unit"].contains_key("Wants"));
+    // The two ends agree.
+    let privd = parse(&read("hx-privd.service"));
+    assert_eq!(
+        words(&privd, "Unit", "OnFailure"),
+        ["hx-privd-rescue.service"]
+    );
+}
+
+#[test]
+fn the_rescue_helper_restarts_exactly_the_privd_units_with_fixed_arguments() {
+    use hx_agent::privd::rescue::{RESET_ARGS, START_ARGS};
+    for args in [RESET_ARGS, START_ARGS] {
+        for a in &args[1..] {
+            assert!(
+                ["hx-privd.service", "hx-privd.socket"].contains(a),
+                "{a} is not a privd unit"
+            );
+        }
+    }
+    assert_eq!(RESET_ARGS[0], "reset-failed");
+    assert_eq!(START_ARGS[0], "start");
+}

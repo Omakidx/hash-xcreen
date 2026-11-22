@@ -62,6 +62,10 @@ pub const MAX_SOFTWARE_LEN: usize = 64;
 pub const MAX_ERROR_MESSAGE_LEN: usize = 256;
 /// Maximum length of a `Progress.step`.
 pub const MAX_PROGRESS_STEP_LEN: usize = 128;
+/// Most entries in each list of an `UninstallResult`.
+pub const MAX_UNINSTALL_ITEMS: usize = 64;
+/// Longest entry of an `UninstallResult` list.
+pub const MAX_UNINSTALL_TEXT_LEN: usize = 256;
 /// Maximum number of secret slots on one request.
 pub const MAX_SECRET_SLOTS: usize = 4;
 
