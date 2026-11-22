@@ -10,6 +10,9 @@
 //!                       (SPAKE2 pairing)                 │ authorized
 //!                                      │                 ▼
 //!                           DeviceService::announce  SessionManager::serve ──► DesktopLink (seam)
+//!                                      │ INTENT_SETUP / INTENT_REINSTATE
+//!                                      ▼
+//!                  SetupCoordinator::serve   ReinstateGate (password via privd)
 //!  hx-agent CLI (root) ── admin socket ──► admin::serve ──► DeviceService / Login / VerifierStore
 //! ```
 //!
@@ -40,9 +43,12 @@ use super::desktop::DesktopLink;
 use super::devices::DeviceService;
 use super::live::LiveSessions;
 use super::privd_client::PrivdClient;
+use super::server_mgmt::{ServerMgmtService, ServerMgmtSettings};
 use super::session::{SessionManager, SessionSettings};
+use super::setup::store::{SetupStore, StoreError};
+use super::setup::{SetupCoordinator, SetupSettings};
 use super::util::log_text;
-use super::verifier::{PrivdPinVerifier, VerifierError, VerifierStore};
+use super::verifier::{PrivdPinVerifier, PrivdReinstateGate, VerifierError, VerifierStore};
 
 /// The software string sent in `HelloAck` (at most 128 bytes).
 pub const SOFTWARE: &str = concat!("hx-gatewayd ", env!("CARGO_PKG_VERSION"));
@@ -61,6 +67,9 @@ pub enum GatewayError {
     /// Binding the public endpoint failed.
     #[error("transport: {0}")]
     Transport(#[from] hx_transport::Error),
+    /// The setup store could not be opened.
+    #[error("setup store: {0}")]
+    Setup(#[from] StoreError),
     /// Another I/O failure.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
@@ -85,6 +94,12 @@ pub struct StartOptions {
     pub clock: Arc<dyn Clock>,
     /// Transport options (pre-authentication limits and so on).
     pub server_options: ServerOptions,
+    /// The setup coordinator's tunables; `None` is the production values for
+    /// `config.desktop_id` (tests lower the Argon2id cost and the retry wait).
+    pub setup: Option<SetupSettings>,
+    /// The server-management tunables; `None` is the production values (tests lower the
+    /// Argon2id cost).
+    pub server_mgmt: Option<ServerMgmtSettings>,
 }
 
 impl StartOptions {
@@ -103,6 +118,8 @@ impl StartOptions {
             admin_policy: AdminPolicy::RootOnly,
             clock: Arc::new(SystemClock),
             server_options: ServerOptions::default(),
+            setup: None,
+            server_mgmt: None,
         }
     }
 }
@@ -113,6 +130,7 @@ struct Shared {
     devices: Arc<DeviceService>,
     sessions: Arc<SessionManager>,
     live: Arc<LiveSessions>,
+    setup: SetupCoordinator,
 }
 
 /// A running gateway.
@@ -150,6 +168,8 @@ impl Gateway {
             admin_policy,
             clock,
             server_options,
+            setup: setup_settings,
+            server_mgmt: server_mgmt_settings,
         } = opts;
 
         // State: the registry (hx-crypto's single-writer file) and the verifiers, side by side
@@ -165,13 +185,14 @@ impl Gateway {
             AuthenticatorConfig {
                 server_name: config.server_name.clone(),
                 software: SOFTWARE.into(),
-                // What a session is offered and gets when its PIN is accepted.
+                // What a session is offered and gets when its PIN is accepted. `SETUP` is
+                // offered only on `INTENT_SETUP` connections (protocol 4.7).
                 capabilities: capabilities_with_file_limit(
                     &OFFERED_CODECS,
-                    Features::defined_up_to(PROTOCOL_MINOR),
+                    Features::defined_up_to(PROTOCOL_MINOR).without(Features::SETUP),
                     config.max_file_bytes,
                 ),
-                session_features: Features::defined_up_to(PROTOCOL_MINOR),
+                session_features: Features::defined_up_to(PROTOCOL_MINOR).without(Features::SETUP),
                 pairing: PairingLimits {
                     token_ttl: ttl,
                     code_ttl: ttl,
@@ -183,12 +204,42 @@ impl Gateway {
         );
         let privd = PrivdClient::new(&config.privd_socket, Default::default());
         // The PIN check: Argon2id here, the yes/no from privd's pepper (docs/ipc.md 5.3).
-        auth.set_pin_verifier(Arc::new(PrivdPinVerifier::new(
+        let pin_verifier = Arc::new(PrivdPinVerifier::new(verifiers.clone(), privd.clone()));
+        auth.set_pin_verifier(pin_verifier.clone());
+        // The account password check of a device locked out by its PIN (protocol 11.7).
+        auth.set_reinstate_gate(Arc::new(PrivdReinstateGate::new(
             verifiers.clone(),
             privd.clone(),
         )));
         let live = LiveSessions::new();
         let devices = DeviceService::new(auth.clone(), privd.clone(), live.clone(), clock.clone());
+        devices.set_pairing_ttl_s(config.pairing_ttl_s);
+        // The post-pairing setup: its own persisted state next to the registry.
+        let (setup_store, persisted) = SetupStore::open(config.state_dir.join("setup"))?;
+        let setup = SetupCoordinator::new(
+            setup_store,
+            persisted,
+            privd.clone(),
+            verifiers.clone(),
+            devices.clone(),
+            &auth,
+            clock.clone(),
+            setup_settings.unwrap_or_else(|| SetupSettings::new(config.desktop_id.clone())),
+        );
+        auth.set_setup_gate(Arc::new(setup.clone()));
+        // Server management from the app (protocol 1.3): the PIN and password changes, the
+        // overview, restart, Docker off, limits and the agent update.
+        let server_mgmt = ServerMgmtService::new(
+            privd.clone(),
+            verifiers.clone(),
+            pin_verifier,
+            registry.clone(),
+            auth.clone(),
+            devices.clone(),
+            clock.clone(),
+            server_mgmt_settings
+                .unwrap_or_else(|| ServerMgmtSettings::new(config.desktop_id.clone())),
+        );
         let sessions = SessionManager::new(
             SessionSettings {
                 desktop_id: config.desktop_id.clone(),
@@ -199,6 +250,7 @@ impl Gateway {
             link,
             privd.clone(),
             devices.clone(),
+            server_mgmt,
             live.clone(),
             clock,
         );
@@ -213,6 +265,7 @@ impl Gateway {
             devices: devices.clone(),
             sessions: sessions.clone(),
             live: live.clone(),
+            setup: setup.clone(),
         });
         let admin_state = AdminState::new(
             devices,
@@ -222,6 +275,7 @@ impl Gateway {
             live,
             config.argon2_min_memory_kib,
             config.pairing_ttl_s,
+            setup,
         );
         let (shutdown, shutdown_rx) = watch::channel(false);
         Ok(Self {
@@ -298,6 +352,11 @@ impl Gateway {
         &self.shared.live
     }
 
+    /// The setup coordinator.
+    pub fn setup(&self) -> &SetupCoordinator {
+        &self.shared.setup
+    }
+
     /// The privd client (tests and tools create verifiers with it).
     pub fn privd(&self) -> &PrivdClient {
         &self.privd
@@ -311,6 +370,7 @@ impl Gateway {
     /// Stops accepting, tells live clients (`SHUTDOWN`) and ends the background tasks.
     pub async fn shutdown(mut self) {
         let _ = self.shutdown.send(true);
+        self.shared.setup.shutdown();
         self.server.close();
         self.shared
             .live
@@ -325,6 +385,7 @@ impl Gateway {
 impl Drop for Gateway {
     fn drop(&mut self) {
         let _ = self.shutdown.send(true);
+        self.shared.setup.shutdown();
         for t in &self.tasks {
             t.abort();
         }
@@ -344,13 +405,18 @@ async fn handle_pending(sh: Arc<Shared>, pending: PendingSession) {
     // is read for every session, the PIN is checked by `PrivdPinVerifier`.
     match sh.auth.authenticate(pending).await {
         Ok(Outcome::Paired {
-            connection, device, ..
+            connection,
+            device,
+            with,
         }) => {
             tracing::info!(device = %device.id, "device paired");
+            // The device that pairs with the installer's token while the setup window is open
+            // becomes the setup device (a code never binds).
+            sh.setup.on_paired(&device, with);
             sh.devices.announce_added(&device);
-            // Post-pairing setup messages (password, PIN) are specified by 1G; until then the
-            // pairing connection is closed once the client has had a moment to read the end of
-            // the exchange (protocol 11.2).
+            // The pairing connection carries nothing else (protocol 11.2): it is closed once
+            // the client has had a moment to read the end of the exchange, and the device
+            // reconnects with `INTENT_SETUP` or `INTENT_SESSION`.
             let _ = tokio::time::timeout(Duration::from_secs(2), connection.closed()).await;
             connection.close(CloseCode::NoError, "paired").await;
         }
@@ -358,17 +424,19 @@ async fn handle_pending(sh: Arc<Shared>, pending: PendingSession) {
             tracing::info!(device = %device.id, "session authorized");
             sh.sessions.serve(connection, device, revocations).await;
         }
-        // No `SetupGate` is installed until the setup coordinator exists, so the authenticator
-        // refuses `INTENT_SETUP` before this can happen; close defensively if it ever does.
-        Ok(Outcome::Setup { connection, .. }) => {
-            connection
-                .close(CloseCode::SetupClosed, "setup is not available")
-                .await;
+        Ok(Outcome::Setup {
+            connection,
+            device,
+            pin_verified,
+        }) => {
+            tracing::info!(device = %device.id, pin_verified, "setup connection authorized");
+            sh.setup.serve(connection, device, pin_verified).await;
         }
-        // No `ReinstateGate` is installed yet, so this cannot happen until the gateway wires
-        // it (announce DEVICE_REINSTATED / DeviceEvent REINSTATED, audit with cause PASSWORD).
+        // The password was proven and the registry already holds the device as active again;
+        // announce it and audit it (cause `password`, never the password). No session exists.
         Ok(Outcome::Reinstated { device }) => {
             tracing::info!(device = %device.id, "device reinstated with the account password");
+            sh.devices.announce_reinstated_with_password(&device);
         }
         Ok(Outcome::Refused(_)) => {}
         Err(e) => tracing::debug!(error = %e, "authentication ended without success"),

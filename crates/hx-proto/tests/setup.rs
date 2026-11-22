@@ -83,7 +83,7 @@ fn version_constants_and_feature_bit() {
     assert!(Features::defined_up_to(2).contains(Features::DEVICE_MANAGEMENT));
     assert_eq!(
         Features::defined_up_to(3).0,
-        Features::defined_up_to(2).0 | Features::SETUP.0
+        Features::defined_up_to(2).0 | Features::SETUP.0 | Features::SERVER_MANAGEMENT.0
     );
     let normal = Features::defined_up_to(3).without(Features::SETUP);
     assert!(!normal.contains(Features::SETUP));

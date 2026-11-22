@@ -145,8 +145,8 @@ async fn pair_then_pin_login(pref: hx_transport::TransportPreference) {
     assert_eq!(n.version.minor, PROTOCOL_MINOR);
     assert!(
         conn.enabled_features()
-            .contains(Features::defined_up_to(PROTOCOL_MINOR)),
-        "every offered feature is in effect: {:?}",
+            .contains(Features::defined_up_to(PROTOCOL_MINOR).without(Features::SETUP)),
+        "every session feature is in effect (SETUP is for INTENT_SETUP only): {:?}",
         conn.enabled_features()
     );
     assert_eq!(

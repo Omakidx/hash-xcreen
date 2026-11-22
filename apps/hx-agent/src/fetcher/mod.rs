@@ -16,6 +16,9 @@
 //! | `manifest-stable`, `manifest-beta` | `manifest-<arch>.json` and its `.minisig` from the channel's release | `manifest.json`, `manifest.json.minisig` |
 //! | `artifact-<version>` | `hx-<version>-<arch>.tar.gz` from the release `v<version>` | `artifact.tar.gz` |
 //!
+//! The image template (`hx-image-fetcher@.service`, prebuilt desktop images) is the same binary
+//! with its own jobs, directory and limits: see [`images`].
+//!
 //! # Network rules
 //!
 //! HTTPS only, TLS 1.3 only (rustls without `tls12`), roots from the system store. A request
@@ -27,6 +30,7 @@
 //! manifest file and 256 MiB per artifact; 5 GiB for the directory as a whole.
 
 mod http;
+pub mod images;
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -37,6 +41,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub use http::{Url, parse_url};
+pub use images::{ImageJob, ImageLimits, Template, run_image};
 
 /// The hosts a download may come from (and be redirected to).
 pub const RELEASE_HOSTS: &[&str] = &[
@@ -183,6 +188,8 @@ pub struct Config {
     pub max_manifest: u64,
     /// Largest artifact.
     pub max_artifact: u64,
+    /// Limits of the image template's jobs (`images`).
+    pub image: ImageLimits,
 }
 
 impl Config {
@@ -208,11 +215,16 @@ impl Config {
             artifact_timeout: ARTIFACT_TIMEOUT,
             max_manifest: MAX_MANIFEST_BYTES,
             max_artifact: MAX_ARTIFACT_BYTES,
+            image: ImageLimits::production(),
         })
     }
 
-    fn host_allowed(&self, host: &str) -> bool {
-        self.hosts.iter().any(|h| h == host)
+    /// The production configuration of the image template: the same, writing into the image
+    /// unit's bind-mounted directory (`/var/lib/hx-image`).
+    pub fn production_image() -> Result<Self, FetchError> {
+        let mut c = Self::production()?;
+        c.out_dir = images::IMAGE_OUT_DIR.into();
+        Ok(c)
     }
 
     /// The `(url path, output file name)` pairs of a job and the byte cap of each.

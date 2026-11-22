@@ -27,6 +27,7 @@ use super::cmd;
 use super::config::PrivdConfig;
 use super::error::CmdError;
 use super::identity::{self, Violation};
+use super::image::ImageDeps;
 use super::limiter::{Limiter, Purpose};
 use super::log;
 use super::pepper::Pepper;
@@ -159,6 +160,14 @@ pub struct Daemon<T: Transport + Clone + 'static> {
     pub(crate) host_probe: Mutex<Option<(u64, bool, bool)>>,
     /// The collaborators of self-update (keys, systemd, health probes); replaceable in tests.
     update_deps: Mutex<Arc<UpdateDeps>>,
+    /// The collaborators of the prebuilt-image path (keys, systemd); replaceable in tests.
+    image_deps: Mutex<Arc<ImageDeps>>,
+    /// Serialises the read-decide-write of `images-state` (`CreateDesktop`, `Uninstall`).
+    pub(crate) image_state_gate: Mutex<()>,
+    /// One use of the image fetcher's directory at a time: it is shared, hostile, and swept before
+    /// every job, so two requests must not interleave. A leaf lock (taken after the desktop lock,
+    /// never held while taking another).
+    pub(crate) image_dir_lock: tokio::sync::Mutex<()>,
     /// Serialises the read-decide-write of `uninstall-state` (`cmd::uninstall`).
     pub(crate) uninstall_gate: Mutex<()>,
     /// This daemon's own `Arc`, so that a command can hand work to a task that outlives it (the
@@ -214,6 +223,7 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
             &cfg.socket_path,
             &cfg.update.admin_socket,
         );
+        let image_deps = ImageDeps::system(deps.runner.clone());
         Ok(Arc::new_cyclic(|me| Self {
             cfg,
             incus,
@@ -231,6 +241,9 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
             suppressed: std::sync::atomic::AtomicU64::new(0),
             host_probe: Mutex::new(None),
             update_deps: Mutex::new(Arc::new(update_deps)),
+            image_deps: Mutex::new(Arc::new(image_deps)),
+            image_state_gate: Mutex::new(()),
+            image_dir_lock: tokio::sync::Mutex::new(()),
             uninstall_gate: Mutex::new(()),
             me: me.clone(),
         }))
@@ -246,6 +259,18 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_update_deps(&self, deps: UpdateDeps) {
         *lock(&self.update_deps) = Arc::new(deps);
+    }
+
+    /// The collaborators of the image path.
+    pub(crate) fn image_deps(&self) -> Arc<ImageDeps> {
+        lock(&self.image_deps).clone()
+    }
+
+    /// Replaces the image collaborators (a test image key, a fake systemd). Only with the
+    /// `test-support` feature: a release build has no way to change the embedded keys.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_image_deps(&self, deps: ImageDeps) {
+        *lock(&self.image_deps) = Arc::new(deps);
     }
 
     // ----- connections -------------------------------------------------------------------

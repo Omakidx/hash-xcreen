@@ -41,6 +41,10 @@ pub enum ReadError {
     /// Larger than its quota (or than the size the signed manifest announced).
     #[error("`{0}` exceeds its size quota")]
     TooBig(String),
+    /// Owned by someone other than the user the directory requires (an offline import
+    /// directory is root's).
+    #[error("`{0}` is not owned by the expected user")]
+    Owner(String),
     /// Smaller than the size the signed manifest announced.
     #[error("`{0}` is shorter than announced")]
     Short(String),
@@ -57,6 +61,8 @@ pub enum ReadError {
 /// The open fetch directory.
 pub struct FetchDir {
     fd: OwnedFd,
+    /// Every file read must be owned by this uid (the offline import directory: root's).
+    owner: Option<u32>,
 }
 
 fn dir_flags() -> OFlags {
@@ -91,7 +97,32 @@ impl FetchDir {
     /// Opens the directory without following a symlink at its last component.
     pub fn open(path: &Path) -> io::Result<Self> {
         let fd = rustix::fs::open(path, dir_flags(), Mode::empty())?;
-        Ok(Self { fd })
+        Ok(Self { fd, owner: None })
+    }
+
+    /// Requires every file read through this handle to be owned by `uid`.
+    #[must_use]
+    pub fn require_owner(mut self, uid: u32) -> Self {
+        self.owner = Some(uid);
+        self
+    }
+
+    /// Whether `name` exists in the directory (without following a symlink).
+    pub fn exists(&self, name: &str) -> io::Result<bool> {
+        match rustix::fs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => Ok(true),
+            Err(rustix::io::Errno::NOENT) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Removes `name` relative to the directory descriptor (never following a link). A name that
+    /// is not there is not an error.
+    pub fn unlink(&self, name: &str) -> io::Result<()> {
+        match rustix::fs::unlinkat(&self.fd, name, AtFlags::empty()) {
+            Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Removes every entry privd can remove, relative to the directory descriptor, then checks
@@ -138,7 +169,7 @@ impl FetchDir {
     }
 
     /// Opens `name` as the rules above require and returns the descriptor and its length.
-    fn open_checked(&self, name: &str, max: u64) -> Result<(File, u64), ReadError> {
+    pub(crate) fn open_checked(&self, name: &str, max: u64) -> Result<(File, u64), ReadError> {
         let io_err = |source| ReadError::Io {
             name: name.to_string(),
             source,
@@ -165,6 +196,9 @@ impl FetchDir {
         }
         if st.st_nlink != 1 {
             return Err(ReadError::Linked(name.to_string()));
+        }
+        if self.owner.is_some_and(|uid| st.st_uid != uid) {
+            return Err(ReadError::Owner(name.to_string()));
         }
         let len = u64::try_from(st.st_size).unwrap_or(u64::MAX);
         if len > max {
@@ -263,7 +297,7 @@ pub struct Staged {
 
 /// An unnamed read-write file in `dir` (`O_TMPFILE`), or, where the file system has no
 /// `O_TMPFILE`, a file created exclusively and unlinked at once.
-fn anonymous_file(dir: &Path) -> io::Result<File> {
+pub(crate) fn anonymous_file(dir: &Path) -> io::Result<File> {
     match rustix::fs::open(
         dir,
         OFlags::RDWR | OFlags::TMPFILE | OFlags::CLOEXEC,

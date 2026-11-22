@@ -1,0 +1,40 @@
+# The image fetcher's directory as a size-capped tmpfs (docs/ipc.md 6.12, "Prebuilt images (1D)").
+#
+# The image fetcher hands a prebuilt desktop image to privd in chunks of 32 MiB, at most two at a
+# time (back-pressure: before it writes chunk k+2 it waits until privd has taken chunk k). That
+# needs 64 MiB of chunks plus markers: 80 MiB, and 16 inodes (two chunk and two marker names, `end`,
+# the probe and the manifest files, with room to spare, no inode flood). A 5 GiB tmpfs would be
+# RAM on a 4 GB host; a loop-mounted quota disk would need CAP_SYS_ADMIN in privd and mkfs in the
+# installer. Nothing executable, no devices, no setuid; the contents vanish at reboot, which is
+# right for scratch data privd treats as hostile.
+#
+# A separate mount from var-lib-hx-updates.mount because the update path takes the host lock and
+# CreateDesktop takes the desktop lock: a shared directory would let one fetch sweep the other's
+# files (and would add a desktop-to-host lock order that conflicts with Uninstall's).
+#
+# Mode 1733: owned by root (privd sweeps it), the fetcher's dynamic user may create names but not
+# list or remove other users' files. privd checks owner and mode on every use.
+
+[Unit]
+Description=hash-xcreen image fetcher directory (size-capped tmpfs)
+Documentation=https://github.com/Omakidx/hash-xcreen/blob/main/docs/ipc.md
+# NOT a local-fs mount, for the same reason as var-lib-hx-updates.mount: the mount point is made by
+# tmpfiles (tmpfiles.d/hx.conf), so this unit starts after systemd-tmpfiles-setup.service, which
+# itself starts after local-fs.target. A mount with default dependencies (ordered Before=
+# local-fs.target) would close a cycle with it. hx-privd.service and the image fetcher pull the
+# mount in with RequiresMountsFor=.
+DefaultDependencies=no
+After=systemd-tmpfiles-setup.service
+Requires=systemd-tmpfiles-setup.service
+Before=umount.target
+Conflicts=umount.target
+ConditionPathIsDirectory=/var/lib/hx/imagein
+
+[Mount]
+What=tmpfs
+Where=/var/lib/hx/imagein
+Type=tmpfs
+Options=size=80M,nr_inodes=16,mode=1733,uid=0,gid=0,nosuid,nodev,noexec
+
+[Install]
+WantedBy=multi-user.target
