@@ -111,7 +111,8 @@ Every language, library, tool and external service hash-xcreen uses, and why. It
 | Test runner | `cargo nextest`; `proptest` for property tests; `criterion` for microbenchmarks; `cargo-fuzz` for the fuzz targets (`fuzz/README.md`) |
 | Gateway test support | `tempfile`, `hmac` + `sha2` (a fake `hx-privd` that derives its own pepper), `quinn` + `rustls` (a raw QUIC client that can announce protocol 1.0, for the takeover fallback), `strace` as an optional development aid for deriving the seccomp allowlist | Tests of `hx-gatewayd` against a privd written from `docs/ipc.md` alone |
 | UI tests | Slint testing backend; screenshot comparison; **Playwright** for the web client |
-| Network simulation | `tc netem` profiles in CI |
+| Network simulation | `tc netem` profiles in CI, made unprivileged: two network namespaces in a user namespace (`unshare -rn`, `nsenter`) joined by a veth pair, `netem` on both ends, `ip`, `tc` and `ping` from iproute2 and iputils (docs/testing.md) |
+| Performance suite | `criterion` microbenchmarks (default features off, so no plotting stack); the macro run is the LAN end-to-end test repeated; `perf/check.py` compares with the committed `perf/baseline.json` (Python 3, standard library only, no pip packages) |
 | CI | GitHub Actions (Incus on Linux runners, KVM Incus VMs for the installer matrix); a local nested-container harness (an unprivileged Incus container with its own Incus) for the installer; a dedicated self-hosted runner for performance |
 | Supply chain | `cargo-deny`, `cargo-audit`, Renovate |
 | Release tooling | `.github/workflows/release.yml` (not `dist`: its archive layouts and lack of a signed manifest conflict with the release contract); the `x86_64-unknown-linux-musl` target with `musl-tools` for the agent binaries; `dpkg-deb` and `dpkg-shlibdeps` (native to the distro, exact sonames) for the `hx-session` packages, built in per-distro job containers; Conventional Commits, `git-cliff` |
