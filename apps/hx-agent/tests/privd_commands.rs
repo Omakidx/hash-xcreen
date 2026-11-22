@@ -269,6 +269,63 @@ async fn the_phase_and_window_survive_a_restart() {
     assert_eq!(err(&r).1, ErrorDetail::SetupWindowClosed);
 }
 
+/// The expiry trap (ipc.md 5.1, 1G): a window that expired before `FinishSetup` leaves privd in
+/// `UNINITIALIZED`. Admin's `FinishSetup` then moves to `READY` when a ready desktop exists;
+/// Gateway's stays refused, and so does Admin's without a ready desktop.
+#[tokio::test]
+async fn admin_finish_setup_from_uninitialized_needs_a_ready_desktop() {
+    let h = Harness::start(GW);
+    let finish = || Command::FinishSetup(Default::default());
+    let enrol = || {
+        Command::PepperEnrol(pb::PepperEnrolRequest {
+            purpose: pb::LockoutPurpose::Pin as i32,
+        })
+    };
+    // Fresh install: nothing open, nothing ready.
+    assert_eq!(
+        err(&run(&h, Role::Admin, finish()).await).1,
+        ErrorDetail::SetupWindowClosed
+    );
+    open_window(&h).await;
+    // The window expires before anyone finished, and no desktop was ever made.
+    h.clock.advance_secs(7_201);
+    assert_eq!(
+        err(&run(&h, Role::Admin, finish()).await).1,
+        ErrorDetail::SetupWindowClosed,
+        "no ready desktop: still refused"
+    );
+    add_desktop(&h);
+    assert_eq!(
+        err(&run(&h, Role::Gateway, finish()).await).1,
+        ErrorDetail::SetupWindowClosed,
+        "Gateway stays refused"
+    );
+    let r = run_with(
+        &h.daemon,
+        Role::Gateway,
+        enrol(),
+        &[pb::SecretKind::MacInput],
+        &[&[1u8; 32]],
+    )
+    .await;
+    assert_eq!(
+        err(&r).1,
+        ErrorDetail::SetupWindowClosed,
+        "class A is refused in UNINITIALIZED"
+    );
+    ok(run(&h, Role::Admin, finish()).await);
+    // READY now: FinishSetup converges and a Gateway class A command passes the phase gate.
+    ok(run(&h, Role::Gateway, finish()).await);
+    ok(run_with(
+        &h.daemon,
+        Role::Gateway,
+        enrol(),
+        &[pb::SecretKind::MacInput],
+        &[&[1u8; 32]],
+    )
+    .await);
+}
+
 #[tokio::test]
 async fn finish_setup_needs_a_ready_desktop_unless_admin_forces() {
     let h = Harness::start(GW);
