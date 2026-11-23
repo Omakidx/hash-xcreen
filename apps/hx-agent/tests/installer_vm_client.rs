@@ -105,3 +105,112 @@ fn vm_login() {
         }
     }
 }
+
+/// Gate 1 "wrong PIN x5 revokes the device; revoked devices cannot connect", against a real
+/// installed server: pairs one device with `$HX1E_VM_CREDS` (a single `quic:` or `ws:` entry),
+/// logs in once with the right PIN, then sends wrong PINs (waiting out each backoff) until the
+/// server revokes the device, and finally checks that the right PIN is refused as `Revoked`.
+#[test]
+#[ignore = "run against an installed server, with HX1E_VM_ADDR, HX1E_VM_SERVER_KEY, HX1E_VM_CREDS"]
+fn vm_wrong_pin() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use hx_crypto::{Error, IdentityKey, PairClientOptions, PairingCredential, Pin};
+
+    let addr: std::net::SocketAddr = std::env::var("HX1E_VM_ADDR")
+        .expect("HX1E_VM_ADDR")
+        .parse()
+        .expect("ip:port");
+    let server = client::hex_to_key(&std::env::var("HX1E_VM_SERVER_KEY").expect("server key"));
+    let pin = std::fs::read_to_string(dir().join("pin")).expect("pin file");
+    let pin = pin.trim().to_owned();
+    // A wrong PIN of the same length: the last digit changed.
+    let mut wrong = pin.clone();
+    let last = wrong.pop().expect("a PIN");
+    wrong.push(if last == '0' { '1' } else { '0' });
+    let creds = std::env::var("HX1E_VM_CREDS").expect("HX1E_VM_CREDS");
+    let (kind, cred) = creds.split_once(':').expect("kind:credential");
+    let pref = match kind {
+        "quic" => TransportPreference::Quic,
+        "ws" => TransportPreference::WebSocket,
+        other => panic!("unknown transport {other}"),
+    };
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let t = client::target(addr);
+        let device = Arc::new(IdentityKey::generate().expect("device key"));
+        let paired = hx_crypto::pair_device(
+            &t,
+            &device,
+            &PairingCredential::parse(cred).expect("credential"),
+            &PairClientOptions {
+                preference: pref,
+                device_name: "hx1e-wrong-pin".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("pairing");
+        assert_eq!(paired.server_key, server, "the pinned server key");
+        paired.finish().await;
+        let opts = {
+            use hx_proto::VideoCodec;
+            use hx_proto::version::{Features, PROTOCOL_MINOR, capabilities};
+            hx_crypto::SessionOptions {
+                preference: pref,
+                device_name: "hx1e-wrong-pin".into(),
+                capabilities: capabilities(
+                    &[VideoCodec::H264],
+                    Features::defined_up_to(PROTOCOL_MINOR),
+                ),
+                ..Default::default()
+            }
+        };
+        let login = |p: String| {
+            let (t, device, opts) = (t.clone(), device.clone(), opts.clone());
+            async move {
+                tokio::time::timeout(
+                    Duration::from_secs(60),
+                    hx_crypto::connect_with_pin(&t, &device, server, &Pin::new(&p).expect("pin"), &opts),
+                )
+                .await
+                .expect("an answer in time")
+            }
+        };
+        drop(login(pin.clone()).await.expect("the right PIN logs in first"));
+        eprintln!("PASS the paired device logs in with the right PIN");
+        let mut wrong_answers = 0;
+        for _ in 0..20 {
+            match login(wrong.clone()).await {
+                Err(Error::WrongPin {
+                    attempts_left,
+                    retry_after,
+                }) => {
+                    wrong_answers += 1;
+                    eprintln!("wrong PIN {wrong_answers}: {attempts_left} left, retry after {retry_after:?}");
+                    tokio::time::sleep(retry_after + Duration::from_millis(200)).await;
+                }
+                Err(Error::Backoff { retry_after }) => {
+                    tokio::time::sleep(retry_after + Duration::from_millis(200)).await;
+                }
+                Err(Error::Revoked) => break,
+                Err(e) => panic!("unexpected answer to a wrong PIN: {e}"),
+                Ok(_) => panic!("a wrong PIN logged in"),
+            }
+        }
+        assert!(
+            (4..=5).contains(&wrong_answers),
+            "the device is revoked by the fifth wrong PIN ({wrong_answers} WrongPin answers)"
+        );
+        eprintln!("PASS revoked after {} wrong PINs", wrong_answers + usize::from(wrong_answers == 4));
+        match login(pin.clone()).await {
+            Err(Error::Revoked) => eprintln!("PASS the revoked device is refused with the right PIN"),
+            Err(e) => panic!("the revoked device got another refusal: {e}"),
+            Ok(_) => panic!("a revoked device logged in"),
+        }
+    });
+}
