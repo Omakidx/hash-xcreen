@@ -358,7 +358,7 @@ fn repo_step_verifies_the_pinned_fingerprint_and_pushes_the_pin() {
     let acts = lower(repo, &Secrets::none()).unwrap();
     let s = script_of(&acts[0]);
     assert!(
-        s.contains("'0AB215679C571D1C8325275B9BDB3D89CE49EC21'"),
+        s.contains("'738BEB9321D1AAEC13EA9391AEBDF4819BE21867'"),
         "{s}"
     );
     assert!(s.contains("key fingerprint mismatch") && s.contains("exit 1"));
@@ -367,7 +367,23 @@ fn repo_step_verifies_the_pinned_fingerprint_and_pushes_the_pin() {
         panic!("{acts:?}")
     };
     assert_eq!(f.path, "/etc/apt/preferences.d/mozillateam.pref");
-    assert!(String::from_utf8_lossy(&f.content).contains("Pin-Priority: 1001"));
+    let pin = String::from_utf8_lossy(&f.content);
+    assert!(pin.contains("Pin-Priority: 1001"));
+    // Ubuntu's snap-installing transitional firefox is never a candidate, PPA reachable or not.
+    assert!(
+        pin.contains("Pin: release o=Ubuntu\nPin-Priority: -1"),
+        "{pin}"
+    );
+    // A repository whose index cannot be fetched fails the update (and is retried) instead of
+    // being dropped with a warning, which would also drop its pins.
+    let install = p
+        .build
+        .iter()
+        .find(|s| matches!(s, Step::AptInstall { .. }))
+        .unwrap();
+    let install_acts = lower(install, &Secrets::none()).unwrap();
+    let i = script_of(&install_acts[0]);
+    assert!(i.contains("update -qq --error-on=any"), "{i}");
 }
 
 #[test]

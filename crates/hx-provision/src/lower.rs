@@ -23,7 +23,9 @@ const APT_PRELUDE: &str = r#"export DEBIAN_FRONTEND=noninteractive
 APT_OPTS="-o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Acquire::Retries=3 -o DPkg::Lock::Timeout=120"
 apt_update() {
   for i in 1 2 3 4; do
-    timeout 120 apt-get $APT_OPTS update -qq && return 0
+    # --error-on=any: an index that cannot be fetched (a mirror or PPA answering 503) is an error
+    # and is retried, not a warning that silently drops the repository and its pins.
+    timeout 120 apt-get $APT_OPTS update -qq --error-on=any && return 0
     echo "apt-get update: attempt $i failed" >&2
     sleep $((i * 5))
   done

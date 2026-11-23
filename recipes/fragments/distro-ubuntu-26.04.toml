@@ -18,7 +18,8 @@ libavutil_pkg = "libavutil60"
 # The PPA's signing key as reported by the Launchpad API (signing_key_fingerprint of
 # ~mozillateam/+archive/ubuntu/ppa). Its Release files are signed by this key and by the older
 # 0AB21567... key, but apt on 26.04 rejects the old one (rsa1024). The recipe step fails unless the
-# downloaded file holds exactly one primary key with this fingerprint.
+# downloaded file holds exactly one primary key with this fingerprint. The second pin stanza keeps
+# Ubuntu's snap-installing transitional `firefox` from ever being chosen (see the 24.04 fragment).
 [[apt_repo]]
 name = "mozillateam"
 key_url = "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x738BEB9321D1AAEC13EA9391AEBDF4819BE21867"
@@ -30,6 +31,10 @@ pin = '''
 Package: firefox*
 Pin: release o=LP-PPA-mozillateam
 Pin-Priority: 1001
+
+Package: firefox*
+Pin: release o=Ubuntu
+Pin-Priority: -1
 '''
 
 [apt]

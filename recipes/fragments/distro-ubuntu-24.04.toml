@@ -15,10 +15,16 @@ distro_version = "24.04"
 libavcodec_pkg = "libavcodec60"
 libavutil_pkg = "libavutil58"
 
+# The PPA's signing key as reported by the Launchpad API (signing_key_fingerprint of
+# ~mozillateam/+archive/ubuntu/ppa), as on 26.04: the PPA's Release files are also signed by the
+# older 0AB21567... key, which apt 2.8 warns about (rsa1024) and newer apt rejects.
+# The second pin stanza: Ubuntu's own `firefox` is a transitional package that installs the snap,
+# which cannot work in an unprivileged container. It must never be chosen, also not when the PPA is
+# unreachable (then the install fails clearly instead).
 [[apt_repo]]
 name = "mozillateam"
-key_url = "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x0AB215679C571D1C8325275B9BDB3D89CE49EC21"
-key_fingerprint = "0AB215679C571D1C8325275B9BDB3D89CE49EC21"
+key_url = "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x738BEB9321D1AAEC13EA9391AEBDF4819BE21867"
+key_fingerprint = "738BEB9321D1AAEC13EA9391AEBDF4819BE21867"
 uri = "https://ppa.launchpadcontent.net/mozillateam/ppa/ubuntu"
 suite = "{{codename}}"
 components = "main"
@@ -26,6 +32,10 @@ pin = '''
 Package: firefox*
 Pin: release o=LP-PPA-mozillateam
 Pin-Priority: 1001
+
+Package: firefox*
+Pin: release o=Ubuntu
+Pin-Priority: -1
 '''
 
 [apt]
