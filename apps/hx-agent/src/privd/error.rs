@@ -143,6 +143,47 @@ fn daemon_text(e: &impl std::fmt::Display) -> String {
     sanitize_text(&e.to_string(), 200)
 }
 
+/// The answer for a failed recipe step, within [`MAX_ERROR_MESSAGE_LEN`]: the step's kind (its
+/// first word, not a long package list) and the END of its output, where the error is; the
+/// front of the text would be the step description and the first warnings.
+fn apply_text(a: &hx_provision::ApplyError) -> String {
+    use hx_provision::{ApplyError, exec::StepFailure};
+    let ApplyError::Step {
+        stage,
+        index,
+        step,
+        failure,
+    } = a
+    else {
+        return daemon_text(a);
+    };
+    let kind: String = step
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(40)
+        .collect();
+    let (head, tail) = match failure {
+        StepFailure::ExitCode { code, tail } => (
+            format!("{stage:?} stage, step {index} ({kind}): exit status {code}: "),
+            tail.clone(),
+        ),
+        StepFailure::Exec(e) => (
+            format!("{stage:?} stage, step {index} ({kind}): "),
+            e.to_string(),
+        ),
+    };
+    let head = sanitize_text(&head, MAX_ERROR_MESSAGE_LEN / 2);
+    let room = MAX_ERROR_MESSAGE_LEN.saturating_sub(head.len());
+    let clean = sanitize_text(tail.trim_end(), usize::MAX);
+    let mut start = clean.len().saturating_sub(room);
+    while !clean.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{head}{}", &clean[start..])
+}
+
 impl From<IncusError> for CmdError {
     fn from(e: IncusError) -> Self {
         match &e {
@@ -168,7 +209,15 @@ impl From<ProvisionError> for CmdError {
             ProvisionError::NotReady(r) => {
                 CmdError::precondition(ErrorDetail::DesktopNotReady, daemon_text(&r))
             }
-            ProvisionError::Apply(a) => CmdError::internal(daemon_text(&a)),
+            ProvisionError::Apply(a) => {
+                // The whole text (container output, already sanitized and capped at the tail by
+                // hx-provision) goes to the journal; the answer keeps what fits in 256 bytes.
+                crate::privd::log::error(&format!(
+                    "desktop step failed: {}",
+                    sanitize_text(&a.to_string(), 4096)
+                ));
+                CmdError::internal(apply_text(&a))
+            }
             ProvisionError::Invalid(m) => CmdError::invalid(sanitize_text(&m, 200)),
             ProvisionError::NotOurs(_) => {
                 CmdError::denied("the object does not carry the hash-xcreen marker")
@@ -186,5 +235,40 @@ impl From<std::io::Error> for CmdError {
     fn from(e: std::io::Error) -> Self {
         crate::privd::log::warn(&format!("io error: {e}"));
         CmdError::internal("an I/O operation on the host failed")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hx_provision::{ApplyError, Stage, exec::StepFailure};
+
+    #[test]
+    fn a_failed_step_keeps_its_kind_and_the_end_of_its_output() {
+        let packages = (0..60)
+            .map(|i| format!("package-{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let tail = format!(
+            "W: {} \nE: dpkg: error processing archive firefox (--unpack)",
+            "a long warning ".repeat(40)
+        );
+        let a = ApplyError::Step {
+            stage: Stage::Build,
+            index: 4,
+            step: format!("apt-install {packages}"),
+            failure: StepFailure::ExitCode { code: 1, tail },
+        };
+        let m = apply_text(&a);
+        assert!(m.len() <= MAX_ERROR_MESSAGE_LEN, "{} bytes", m.len());
+        assert!(
+            m.starts_with("Build stage, step 4 (apt-install): exit status 1: "),
+            "{m}"
+        );
+        assert!(
+            m.ends_with("E: dpkg: error processing archive firefox (--unpack)"),
+            "{m}"
+        );
+        assert!(!m.contains("package-1"), "no package list: {m}");
     }
 }
