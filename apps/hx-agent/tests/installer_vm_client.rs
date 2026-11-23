@@ -207,8 +207,14 @@ fn vm_wrong_pin() {
             "the device is revoked by the fifth wrong PIN ({wrong_answers} WrongPin answers)"
         );
         eprintln!("PASS revoked after {} wrong PINs", wrong_answers + usize::from(wrong_answers == 4));
+        // A revoked key is refused like an unknown one (protocol.md: `Refuse{UNAUTHORIZED}`,
+        // the same uniform text); `Revoked` is what a session that is cut off sees.
         match login(pin.clone()).await {
-            Err(Error::Revoked) => eprintln!("PASS the revoked device is refused with the right PIN"),
+            Err(Error::Revoked)
+            | Err(Error::Refused {
+                reason: hx_proto::pb::RefuseReason::Unauthorized,
+                ..
+            }) => eprintln!("PASS the revoked device is refused with the right PIN"),
             Err(e) => panic!("the revoked device got another refusal: {e}"),
             Ok(_) => panic!("a revoked device logged in"),
         }
