@@ -263,7 +263,7 @@ Every stage has a `check()` and a `run()`. It is skipped only when it is recorde
 | 2 | `packages` | installer | `btrfs-progs`, `nftables`, `ca-certificates`, `dnsmasq-base` (Incus only recommends it, and a managed bridge needs it), `zstd` (Incus decodes the zstd prebuilt image on the host, §4.3) |
 | 3 | `incus` | installer | Install or adopt Incus (§4.2), `systemctl enable --now incus.socket`, wait for its socket |
 | 4 | `release` | installer | Unpack the verified release into `/usr/lib/hx/<version>` and create `current` (§5.6) |
-| 5 | `system-files` | installer | sysusers, tmpfiles, logrotate, the rescue helper (§5.5, §5.7) |
+| 5 | `system-files` | installer | sysusers, tmpfiles, logrotate, the rescue helper (§5.5, §5.7), the `hx-agent` command link (§5.7) |
 | 6 | `credentials` | installer | Seal `pepper.cred` and `identity.cred` with `systemd-creds` (§5.7) |
 | 7 | `config` | installer | `gatewayd.toml`, `privd.toml`, unit drop-ins (port, resolvers) |
 | 8 | `units` | installer | Install the units, enable and start them |
@@ -336,6 +336,7 @@ The file is root 0600, written atomically (`privd::state::write_atomic`). The in
 
 - Units: `/usr/local/lib/systemd/system/`, outside the namespace dpkg manages. Installer drop-ins: `/etc/systemd/system/<unit>.d/50-hx-*.conf`, plus `hx-update-fetcher@.service.d/resolvers.conf` and `hx-image-fetcher@.service.d/resolvers.conf` (identical content).
 - `/usr/local/lib/sysusers.d/hx-gatewayd.conf`, `/usr/local/lib/tmpfiles.d/hx.conf`, `/etc/logrotate.d/hx-audit`, `/usr/lib/hx-rescue/hx-privd-rescue`.
+- **The `hx-agent` command:** the symlink `/usr/local/sbin/hx-agent` → `/usr/lib/hx/current/hx-agent` (absolute target), so that the `hx-agent …` the docs, the CLI help and the app tell the operator to run is on root's `PATH` and on `sudo`'s `secure_path` (Ubuntu and Debian both list `/usr/local/sbin` first). It points at `current`, not at a version, so it follows every update and rollback without being touched; `/usr/local/sbin` is outside dpkg's namespace, like the units. The `system-files` stage creates it and records it in `created.files`. **Ours** means exactly: a symlink whose target text is `/usr/lib/hx/current/hx-agent`. Anything else at that name (a file, a directory, a symlink elsewhere) is the administrator's: the installer never replaces it, warns that the command stays at `/usr/lib/hx/current/hx-agent`, and goes on (the link is a convenience, not a reason to fail an install). A missing link converges on the next run; a foreign one is left and the stage counts as done. Uninstall (U5) unlinks it only when it is still ours, never through a path in the state file, and notes a foreign one that it leaves. A server installed before the link existed gets it on its next `hx-agent install` run (privd's update cannot write `/usr/local/sbin`, and does not need to). Scripts and the app's own SSH install keep calling the full `/usr/lib/hx/current/hx-agent`, which does not depend on `PATH`.
 - The units are embedded in `hx-agent` with `include_str!`; a test asserts that every file under `apps/hx-agent/systemd/` is embedded.
 - **Not installed by the installer:** `hx-session`'s own units. They stay in the desktop recipe (`recipes/fragments/xfce-desktop.toml`) and reach the container with the rest of the recipe; the `hx-session` `.deb` carries binaries only (§13).
 
@@ -345,7 +346,7 @@ The file is root 0600, written atomically (`privd::state::write_atomic`). The in
 |---|---|
 | `packages` | `dpkg-query` reports the packages installed |
 | `release` | `current` resolves to a complete directory whose `VERSION` equals the agent's version |
-| `system-files`, `config` | content hashes equal |
+| `system-files`, `config` | content hashes equal; the `hx-agent` link is ours or the name is taken by something else |
 | `credentials` | both `.cred` files exist and decrypt to 32 bytes (decrypted into a pipe that is read and zeroized), and no `pepper.key` remains |
 | `units` | `is-enabled`, `is-active`, and privd answers `Hello` and `GetHostInfo` |
 | `incus` | the version reported by `GetHostInfo` |
