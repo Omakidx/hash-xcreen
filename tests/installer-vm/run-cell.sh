@@ -38,7 +38,8 @@
 #
 # Cell steps (build): launch the VM; install with failure injection and resume; the real install
 # with secrets on stdin; units and credentials; pairing and PIN login from the runner over QUIC and
-# WebSocket, and the first frame of the real desktop; the secrets canary; the host-ruleset checklist
+# WebSocket, and the first frame of the real desktop; five wrong PINs revoke a device; the secrets
+# canary; the host-ruleset checklist
 # from inside the desktop; idempotence; a pending update whose privd fails (OnFailure rollback); a
 # VM reboot; uninstall in both modes with an empty-leftovers check. The interactive variant runs
 # only: launch, the interactive install, pairing and login with the printed code, the canary, the
@@ -388,6 +389,13 @@ HX1E_VM_DIR="$S" HX1E_VM_ADDR="$vm_ip:443" HX1E_VM_SERVER_KEY="$server_key" HX1E
     HX1E_VM_CREDS="quic:$(cat "$S/token"),ws:$(code)" \
     "$CLIENT" --ignored --exact vm_login --nocapture 2>&1 | tee "$OUT/client.log" | grep -E '^(PASS|thread)' || die "client failed: see client.log"
 grep -q 'first frame' "$OUT/client.log" || die "no first frame"
+
+# ---- wrong PIN x5 revokes (Gate 1) ----
+step "wrong PIN x5 revokes the device; the revoked device cannot connect"
+HX1E_VM_DIR="$S" HX1E_VM_ADDR="$vm_ip:443" HX1E_VM_SERVER_KEY="$server_key" HX1E_VM_CREDS="quic:$(code)" \
+    "$CLIENT" --ignored --exact vm_wrong_pin --nocapture 2>&1 | tee "$OUT/wrongpin.log" | grep -E '^(PASS|thread)' ||
+    die "wrong-PIN check failed: see wrongpin.log"
+grep -q 'refused with the right PIN' "$OUT/wrongpin.log" || die "the revoked device was not refused"
 
 # ---- canary ----
 step "secrets canary"
