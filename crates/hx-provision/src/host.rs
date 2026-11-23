@@ -385,22 +385,25 @@ pub fn desktop_profile(naming: &Naming) -> ProfileSpec {
     }
 }
 
-/// The compatibility profile: Debian 13 guests hang at boot on newer host kernels unless their
-/// AppArmor profile allows `signal` (S3, kernel 7.0, Incus 6.0.5). It is a profile, not recipe
-/// content, because prebuilt images carry no instance configuration.
+/// The compatibility profile: on newer hosts (kernel 7.0, Incus 6.0.5, AppArmor 5.0) a guest's
+/// systemd cannot signal processes with another AppArmor label unless its profile allows
+/// `signal`. Debian 13 guests hang at boot (S3); Ubuntu guests boot but leave the old process of
+/// every restarted service behind, which broke networking after a systemd security update (Gate
+/// 1 dry run). It is a profile, not recipe content, because prebuilt images carry no instance
+/// configuration; its name stays `hx-compat-debian13` so existing hosts keep working.
 pub fn compat_profile(naming: &Naming) -> ProfileSpec {
     ProfileSpec {
         name: naming.compat_profile.clone(),
-        description: "hash-xcreen: AppArmor signal rule needed by Debian 13 guests".into(),
+        description: "hash-xcreen: AppArmor signal rule needed by desktop guests".into(),
         config: map([("raw.apparmor", "signal,")]),
         devices: BTreeMap::new(),
     }
 }
 
-/// Whether guests of `plan` need the compatibility profile (Debian 13).
-pub fn needs_compat_profile(plan: &Plan) -> bool {
-    plan.vars.get("distro").map(String::as_str) == Some("debian")
-        && plan.vars.get("distro_version").map(String::as_str) == Some("13")
+/// Whether guests of `plan` need the compatibility profile: every guest does (see
+/// [`compat_profile`]). Kept as a function so a future guest that must not have it can opt out.
+pub fn needs_compat_profile(_plan: &Plan) -> bool {
+    true
 }
 
 /// Whether [`ensure_host`] created an object or found it.

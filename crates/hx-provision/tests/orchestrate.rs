@@ -205,7 +205,8 @@ fn compat_profile_is_for_debian_13_only() {
     let c = Catalog::embedded();
     for d in Distro::ALL {
         let plan = c.resolve(id(d), &[]).unwrap();
-        assert_eq!(needs_compat_profile(&plan), d == Distro::Debian13, "{d}");
+        // Every guest: Ubuntu's systemd also needs the signal rule to restart services.
+        assert!(needs_compat_profile(&plan), "{d}");
     }
 }
 
@@ -375,12 +376,15 @@ fn desktop_spec_builds_an_unprivileged_container_with_limits() {
         ("40GiB", "hx1d-test-pool", "disk")
     );
 
-    // No limits: nothing set, no root override; Ubuntu gets no compat profile.
+    // No limits: nothing set, no root override; every guest gets the compat profile.
     let ub = c.resolve(id(Distro::Ubuntu2404), &[]).unwrap();
     let b = DesktopSpec::for_plan("c", naming.clone(), &ub, Limits::default())
         .to_create()
         .unwrap();
-    assert_eq!(b.profiles, ["hx1d-test-desktop"]);
+    assert_eq!(
+        b.profiles,
+        ["hx1d-test-desktop", "hx1d-test-compat-debian13"]
+    );
     assert!(b.devices.is_empty() && !b.config.contains_key("limits.cpu"));
 
     // A recipe can never turn privileged on.
