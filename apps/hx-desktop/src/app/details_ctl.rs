@@ -564,8 +564,7 @@ fn unlock(app: &Rc<App>, pin: String) {
                             "This device was removed from the server.".into()
                         }
                         crate::session::Outcome::NotAvailable { .. } => {
-                            "The server cannot check PINs right now. Try again in about a minute."
-                                .into()
+                            crate::session::connect::NOT_CHECKING_PINS.into()
                         }
                         crate::session::Outcome::IdentityChanged => {
                             "This server's identity changed. Nothing was sent.".into()
