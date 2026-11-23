@@ -1202,6 +1202,136 @@ fn the_rescue_helper_is_installed_outside_the_release_directory() {
     assert!(m2.json_lines().iter().any(|v| v["t"] == "warn" && v["message"].as_str().unwrap().contains("hx-privd-rescue")));
 }
 
+// ----- the hx-agent command link --------------------------------------------------------------
+
+fn link_target(m: &Machine) -> Option<String> {
+    let p = path(m, paths::CLI_LINK);
+    std::fs::symlink_metadata(&p)
+        .ok()
+        .filter(|md| md.file_type().is_symlink())
+        .map(|_| {
+            std::fs::read_link(&p)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+}
+
+#[test]
+fn the_hx_agent_command_is_a_link_through_current_and_recorded() {
+    let (mut m, _d) = installed();
+    assert_eq!(
+        link_target(&m).as_deref(),
+        Some("/usr/lib/hx/current/hx-agent"),
+        "an absolute link through current, so updates and rollbacks move it"
+    );
+    assert!(
+        m.state()
+            .unwrap()
+            .created
+            .files
+            .iter()
+            .any(|f| f == paths::CLI_LINK)
+    );
+    // A second run leaves it as it is (the tree hash includes links) and skips the stage.
+    let before = tree_hash(&m);
+    assert_eq!(rerun(&mut m, &[], &[]), 0);
+    assert_eq!(tree_hash(&m), before);
+    assert!(states(&m, "skip").contains(&"system-files".to_owned()));
+    assert!(
+        !m.json_lines().iter().any(|v| v["t"] == "warn"
+            && v["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains(paths::CLI_LINK)),
+        "no warning about our own link"
+    );
+}
+
+#[test]
+fn a_removed_hx_agent_link_converges_on_the_next_run() {
+    let (mut m, _d) = installed();
+    std::fs::remove_file(path(&m, paths::CLI_LINK)).unwrap();
+    assert_eq!(rerun(&mut m, &[], &[]), 0);
+    assert!(
+        states(&m, "done").contains(&"system-files".to_owned()),
+        "{:?}",
+        stage_lines(&m)
+    );
+    assert_eq!(
+        link_target(&m).as_deref(),
+        Some("/usr/lib/hx/current/hx-agent")
+    );
+}
+
+#[test]
+fn a_foreign_hx_agent_is_never_replaced_and_the_install_warns() {
+    use std::os::unix::fs::PermissionsExt;
+    // A file and a symlink elsewhere: both are the administrator's.
+    for foreign_link in [false, true] {
+        let (mut m, dir) = fresh();
+        let p = path(&m, paths::CLI_LINK);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        if foreign_link {
+            std::os::unix::fs::symlink("/opt/other/hx-agent", &p).unwrap();
+        } else {
+            std::fs::write(&p, b"#!/bin/sh\necho mine\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o750)).unwrap();
+        }
+        let before = std::fs::symlink_metadata(&p).unwrap();
+        assert_eq!(
+            full_install(&mut m, &dir),
+            0,
+            "{}",
+            String::from_utf8_lossy(&m.err)
+        );
+        let after = std::fs::symlink_metadata(&p).unwrap();
+        assert_eq!(before.file_type(), after.file_type());
+        if foreign_link {
+            assert_eq!(
+                std::fs::read_link(&p).unwrap().to_string_lossy(),
+                "/opt/other/hx-agent"
+            );
+        } else {
+            assert_eq!(std::fs::read(&p).unwrap(), b"#!/bin/sh\necho mine\n");
+            assert_eq!(after.permissions().mode() & 0o7777, 0o750);
+        }
+        assert!(
+            m.json_lines().iter().any(|v| v["t"] == "warn"
+                && v["message"].as_str().unwrap().contains(paths::CLI_LINK)
+                && v["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(paths::CLI_LINK_TARGET)),
+            "the install says where the CLI is"
+        );
+        let st = m.state().unwrap();
+        assert!(!st.created.files.iter().any(|f| f == paths::CLI_LINK));
+        assert!(st.notes.iter().any(|n| n.contains(paths::CLI_LINK)));
+        // The name being taken does not keep the stage open: a second run skips it.
+        assert_eq!(rerun(&mut m, &[], &[]), 0);
+        assert!(
+            states(&m, "skip").contains(&"system-files".to_owned()),
+            "{:?}",
+            stage_lines(&m)
+        );
+        // Once the administrator frees the name, the next run makes the link and drops the note.
+        std::fs::remove_file(&p).unwrap();
+        assert_eq!(rerun(&mut m, &[], &[]), 0);
+        assert_eq!(
+            link_target(&m).as_deref(),
+            Some("/usr/lib/hx/current/hx-agent")
+        );
+        assert!(
+            !m.state()
+                .unwrap()
+                .notes
+                .iter()
+                .any(|n| n.contains(paths::CLI_LINK))
+        );
+    }
+}
+
 // ----- credentials ----------------------------------------------------------------------------
 
 fn key_bytes(fill: u8) -> Vec<u8> {
