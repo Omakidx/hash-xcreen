@@ -691,6 +691,10 @@ pub async fn create_desktop<T: Transport + Clone + 'static>(
             // contract says: cancel what can be cancelled, force-stop and delete the instance
             // (which ends the rest), then wait for the operations and clean up the record.
             drop(work);
+            // A fetcher job the dropped work had running is being stopped by its guard: wait for
+            // that before cleaning up and answering, so the unit is gone before the caller (or
+            // the next request) sees the answer.
+            d.image_deps().pending_stops.wait().await;
             for op in client.in_flight_operations() {
                 let _ = client.cancel_operation(&op).await;
             }

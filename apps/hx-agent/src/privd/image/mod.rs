@@ -148,6 +148,9 @@ pub struct ImageDeps {
     pub keys: ImageKeys,
     /// systemd (the image fetcher units).
     pub systemd: Arc<dyn Systemd>,
+    /// Stops of fetcher units started when a fetch was dropped mid-job (a cancelled request);
+    /// the cancel path waits for them before it answers (see [`fetch::PendingStops`]).
+    pub pending_stops: Arc<fetch::PendingStops>,
 }
 
 impl ImageDeps {
@@ -156,6 +159,7 @@ impl ImageDeps {
         Self {
             keys: ImageKeys::embedded(),
             systemd: Arc::new(SystemdCtl::new(runner)),
+            pending_stops: Arc::default(),
         }
     }
 }
