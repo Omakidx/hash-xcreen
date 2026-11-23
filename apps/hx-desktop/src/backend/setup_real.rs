@@ -92,9 +92,7 @@ fn setup_error(e: hx_crypto::Error) -> SetupError {
         E::SetupClosed => SetupError::Closed,
         E::Transport(_) | E::Timeout(_) => SetupError::Unreachable,
         E::Revoked => SetupError::Other("This device was removed from the server.".into()),
-        E::PinNotAvailable => SetupError::Other(
-            "The server cannot check PINs right now. Try again in about a minute.".into(),
-        ),
+        E::PinNotAvailable => SetupError::Other(crate::session::connect::NOT_CHECKING_PINS.into()),
         other => SetupError::Other(crate::session::connect::sanitize(&other.to_string())),
     }
 }

@@ -108,7 +108,7 @@ pub enum State {
     Revoked,
     /// The pairing form after "Pair again".
     PairAgain,
-    /// Server cannot check PINs.
+    /// The server is not checking PINs ([`NOT_CHECKING_PINS`]).
     NotAvailable {
         /// Seconds until Try again is offered.
         secs: u64,
@@ -120,6 +120,14 @@ pub enum State {
     /// The PIN was accepted.
     Connected,
 }
+
+/// The text for a server that is not checking PINs (protocol `NOT_AVAILABLE`, userflow.md section 4):
+/// its PIN checks are locked until the administrator clears them, so the app names the command
+/// instead of promising that waiting helps.
+pub const NOT_CHECKING_PINS: &str = "This server is not checking PINs. This is not a wrong PIN and \
+nothing was counted. After too many wrong PINs from any device (10 in an hour), the server stops \
+checking PINs for every device until its administrator runs, on the server: \
+sudo /usr/lib/hx/current/hx-agent pin reset-lockout --purpose pin";
 
 /// The message above the PIN form.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -439,6 +447,10 @@ mod tests {
             Outcome::NotAvailable { .. }
         ));
         assert_eq!(classify_error(&Error::InvalidKey), Outcome::IdentityChanged);
+        // NOT_AVAILABLE means the server's PIN checks are locked until its administrator clears
+        // them: the text names the command instead of promising that waiting helps.
+        assert!(NOT_CHECKING_PINS.contains("pin reset-lockout --purpose pin"));
+        assert!(!NOT_CHECKING_PINS.contains("about a minute"));
         assert_eq!(
             classify_error(&Error::Transport(hx_transport::Error::PeerRejected(
                 "x".into()
