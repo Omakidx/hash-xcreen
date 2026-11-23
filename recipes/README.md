@@ -150,7 +150,11 @@ into the XFCE session, and passed the `hx-session` socket and service checks. No
 build: the Docker add-on on these (needs Incus 6.0.5), and the developer recipes' vendor installers
 (optional steps, which need direct internet and were not given it by the test's proxy).
 
-The mozillateam PPA is signed by two keys. Ubuntu 26.04 pins the current one
-(`738BEB93...1867`, from the Launchpad API); Ubuntu 24.04 still pins the older `0AB21567...EC21`,
-which the PPA's noble Release file still carries a signature from. A recipe can pin only one
-fingerprint, so if Launchpad drops the old signature the 24.04 recipe needs the new key too.
+The mozillateam PPA is signed by two keys. Both Ubuntu recipes pin the current one (`738BEB93...1867`,
+from the Launchpad API); the older `0AB21567...EC21` is rsa1024, which apt 2.8 (24.04) warns about and
+newer apt rejects. Both pin files also give Ubuntu's own `firefox` priority -1: it is a transitional
+package that installs the snap, which cannot work in an unprivileged container, so it must never be
+chosen, also not when the PPA is unreachable. Every `apt-get update` of a recipe runs with
+`--error-on=any`, so an index that cannot be fetched (Launchpad answered 503 during the Gate 1 dry
+run on 2026-11-23) is retried and then fails the step, instead of silently dropping the repository
+and its pins.
