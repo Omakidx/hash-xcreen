@@ -98,10 +98,38 @@ fn io_internal(what: &str, e: &io::Error) -> ImgErr {
     ImgErr::Internal(format!("{what} failed"))
 }
 
+/// The stops a dropped [`JobGuard`] started. A guard cannot wait in `drop`, so it spawns the stop
+/// and leaves the handle here; a request that was cancelled while a fetcher job ran waits for
+/// them (`wait`) before it answers and releases the image-directory lock, so the unit has stopped
+/// before the next request sweeps the directory.
+#[derive(Debug, Default)]
+pub struct PendingStops(std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>);
+
+impl PendingStops {
+    fn push(&self, h: tokio::task::JoinHandle<()>) {
+        if let Ok(mut v) = self.0.lock() {
+            v.retain(|h| !h.is_finished());
+            v.push(h);
+        }
+    }
+
+    /// Waits for every stop started so far.
+    pub async fn wait(&self) {
+        let handles = match self.0.lock() {
+            Ok(mut v) => std::mem::take(&mut *v),
+            Err(_) => return,
+        };
+        for h in handles {
+            let _ = h.await;
+        }
+    }
+}
+
 /// Stops the job when dropped while armed (the request was dropped mid-fetch, so the unit must not
 /// keep downloading into a directory the next request sweeps).
 struct JobGuard {
     systemd: Arc<dyn Systemd>,
+    pending: Arc<PendingStops>,
     job: ImageJob,
     armed: bool,
 }
@@ -119,7 +147,8 @@ impl Drop for JobGuard {
         }
         if let Ok(h) = tokio::runtime::Handle::try_current() {
             let (s, j) = (self.systemd.clone(), self.job.clone());
-            h.spawn(async move { s.stop_image_job(&j).await });
+            self.pending
+                .push(h.spawn(async move { s.stop_image_job(&j).await }));
         }
     }
 }
@@ -364,6 +393,7 @@ impl<'a> Fetch<'a> {
         // Armed before the start returns, so a cancel during the start still stops the unit.
         let guard = JobGuard {
             systemd: systemd.clone(),
+            pending: self.deps.pending_stops.clone(),
             job: job.clone(),
             armed: true,
         };

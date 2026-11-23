@@ -621,6 +621,7 @@ impl Env {
         d.set_image_deps(ImageDeps {
             keys: ImageKeys::from_public_keys(&[&self.signer.public()]).expect("keys"),
             systemd: self.systemd.clone(),
+            pending_stops: Default::default(),
         });
         d
     }
@@ -629,6 +630,7 @@ impl Env {
         self.h.daemon.set_image_deps(ImageDeps {
             keys: ImageKeys::from_public_keys(keys).expect("keys"),
             systemd: self.systemd.clone(),
+            pending_stops: Default::default(),
         });
     }
 
@@ -636,6 +638,7 @@ impl Env {
         self.h.daemon.set_image_deps(ImageDeps {
             keys: ImageKeys::none(),
             systemd: self.systemd.clone(),
+            pending_stops: Default::default(),
         });
     }
 
