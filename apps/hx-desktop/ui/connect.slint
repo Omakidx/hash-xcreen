@@ -195,7 +195,7 @@ export component ConnectScreen inherits Rectangle {
                             spacing: Tokens.sp-3;
                             Banner {
                                 title: "This server is not checking PINs";
-                                text: "This is not a wrong PIN and nothing was counted. After too many wrong PINs from any device (10 in an hour), the server stops checking PINs for every device until its administrator clears that. On the server, run: sudo /usr/lib/hx/current/hx-agent pin reset-lockout --purpose pin. Then try again.";
+                                text: "This is not a wrong PIN and nothing was counted. After too many wrong PINs from any device (10 in an hour), the server stops checking PINs for every device until its administrator clears that. On the server, run: sudo hx-agent pin reset-lockout --purpose pin. Then try again.";
                                 tone: 2;
                             }
 

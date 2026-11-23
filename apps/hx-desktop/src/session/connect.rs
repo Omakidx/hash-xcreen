@@ -127,7 +127,7 @@ pub enum State {
 pub const NOT_CHECKING_PINS: &str = "This server is not checking PINs. This is not a wrong PIN and \
 nothing was counted. After too many wrong PINs from any device (10 in an hour), the server stops \
 checking PINs for every device until its administrator runs, on the server: \
-sudo /usr/lib/hx/current/hx-agent pin reset-lockout --purpose pin";
+sudo hx-agent pin reset-lockout --purpose pin";
 
 /// The message above the PIN form.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -449,7 +449,7 @@ mod tests {
         assert_eq!(classify_error(&Error::InvalidKey), Outcome::IdentityChanged);
         // NOT_AVAILABLE means the server's PIN checks are locked until its administrator clears
         // them: the text names the command instead of promising that waiting helps.
-        assert!(NOT_CHECKING_PINS.contains("pin reset-lockout --purpose pin"));
+        assert!(NOT_CHECKING_PINS.ends_with("sudo hx-agent pin reset-lockout --purpose pin"));
         assert!(!NOT_CHECKING_PINS.contains("about a minute"));
         assert_eq!(
             classify_error(&Error::Transport(hx_transport::Error::PeerRejected(
