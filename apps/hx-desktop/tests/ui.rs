@@ -7,7 +7,8 @@ use hx_desktop::app::{App, Config, showcase};
 use hx_desktop::backend::demo;
 use hx_desktop::keys::MemoryKeyStore;
 use hx_desktop::{
-    AppWindow, ConnectVm, DetailsVm, HomeVm, Nav, Screen, ThemeMode, Tokens, UpdateVm, WizardVm,
+    AppWindow, ConnectVm, DesktopVm, DetailsVm, HomeVm, Nav, Screen, ThemeMode, Tokens, UpdateVm,
+    WizardVm,
 };
 use i_slint_backend_testing::ElementHandle;
 use slint::{ComponentHandle, Model};
@@ -222,6 +223,46 @@ fn desktop_overlays_block_and_offer_the_mockup_actions() {
     // Cancel is the safe default and there is no "always allow".
     assert!(find(&r.ui, "Cancel").is_some());
     assert!(find(&r.ui, "Always allow").is_none());
+}
+
+#[test]
+fn hover_and_drag_both_move_the_remote_pointer_once_per_event() {
+    use slint::LogicalPosition;
+    use slint::platform::{PointerEventButton, WindowEvent};
+    let r = rig();
+    showcase::apply(&r.app, "desktop");
+    let vm = r.ui.global::<DesktopVm>();
+    vm.set_hint(false);
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let s = seen.clone();
+    vm.on_pointer_moved(move |x, y| s.borrow_mut().push((x, y)));
+    let w = r.ui.window();
+    // Hover, no button held: a TouchArea's `moved` stays silent here; the pointer must not.
+    w.dispatch_event(WindowEvent::PointerMoved {
+        position: LogicalPosition::new(300.0, 300.0),
+    });
+    w.dispatch_event(WindowEvent::PointerMoved {
+        position: LogicalPosition::new(310.0, 305.0),
+    });
+    assert_eq!(*seen.borrow(), vec![(300.0, 300.0), (310.0, 305.0)]);
+    // Drag: still one call per event, not two.
+    let left = PointerEventButton::Left;
+    let at = LogicalPosition::new(310.0, 305.0);
+    w.dispatch_event(WindowEvent::PointerPressed {
+        position: at,
+        button: left,
+    });
+    w.dispatch_event(WindowEvent::PointerMoved {
+        position: LogicalPosition::new(320.0, 310.0),
+    });
+    assert_eq!(
+        *seen.borrow(),
+        vec![(300.0, 300.0), (310.0, 305.0), (320.0, 310.0)]
+    );
+    w.dispatch_event(WindowEvent::PointerReleased {
+        position: LogicalPosition::new(320.0, 310.0),
+        button: left,
+    });
 }
 
 #[test]

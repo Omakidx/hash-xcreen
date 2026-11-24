@@ -244,7 +244,15 @@ export component DesktopScreen inherits Rectangle {
         ta := TouchArea {
             enabled: !root.blocked;
             mouse-cursor: DesktopVm.cursor-visible ? MouseCursor.none : MouseCursor.default;
+            // Motion comes from `pointer-event`: a TouchArea's `moved` only fires while a
+            // button is held, and the remote pointer must follow hover too.
             pointer-event(e) => {
+                if (e.kind == PointerEventKind.move) {
+                    DesktopVm.pointer-moved(self.mouse-x, self.mouse-y);
+                    if (self.mouse-y < 6px && !DesktopVm.toolbar) {
+                        DesktopVm.toolbar = true;
+                    }
+                }
                 if (e.kind == PointerEventKind.down) {
                     fs.focus();
                     DesktopVm.menu = 0;
@@ -261,12 +269,6 @@ export component DesktopScreen inherits Rectangle {
                     } else if (e.button == PointerEventButton.forward) {
                         DesktopVm.pointer-button(4, e.kind == PointerEventKind.down, self.mouse-x, self.mouse-y);
                     }
-                }
-            }
-            moved => {
-                DesktopVm.pointer-moved(self.mouse-x, self.mouse-y);
-                if (self.mouse-y < 6px && !DesktopVm.toolbar) {
-                    DesktopVm.toolbar = true;
                 }
             }
             scroll-event(e) => {

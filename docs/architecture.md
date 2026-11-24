@@ -421,6 +421,9 @@ No damage means no capture, no encode and no traffic.
 
 Sent separately as shape (cached by hash) and position, and drawn by the client, so pointer movement never waits for video.
 
+- The client draws the cursor at the **local** pointer position on every pointer motion, hover included (not only while a button is held), and sends that motion to the server.
+- The server's position reports arrive one round trip later. A report that only echoes a position this client recently sent (it keeps the last 512) moves nothing; drawing it would pull the cursor back along its own trail. Only a report of a position the client did not send (a program moved the pointer) moves the drawn cursor. Shape and visibility from the server always apply.
+
 ### 6.4 Audio, clipboard, files
 
 - Audio: PipeWire capture in the container, Opus 10 ms frames with in-band FEC, sent as datagrams.
