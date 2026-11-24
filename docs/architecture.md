@@ -419,10 +419,11 @@ No damage means no capture, no encode and no traffic.
 
 ### 6.3 Cursor
 
-Sent separately as shape (cached by hash) and position, and drawn by the client, so pointer movement never waits for video.
+Sent separately as shape (cached by hash) and position, and shown by the client, so pointer movement never waits for video.
 
-- The client draws the cursor at the **local** pointer position on every pointer motion, hover included (not only while a button is held), and sends that motion to the server.
-- The server's position reports arrive one round trip later. A report that only echoes a position this client recently sent (it keeps the last 512) moves nothing; drawing it would pull the cursor back along its own trail. Only a report of a position the client did not send (a program moved the pointer) moves the drawn cursor. Shape and visibility from the server always apply.
+- The desktop client shows the remote shape as the **operating system's pointer** over the desktop view (Slint's `MouseCursor.custom`). The pointer then moves with the local mouse at the system's own rate, a move redraws nothing in the window, and a remote-desktop viewer of the client machine (Chrome Remote Desktop and the like) draws it locally too. Drawing the cursor into the window instead cost a full window redraw per mouse move, which on a machine without a GPU took most of a frame.
+- Every pointer motion, hover included (not only while a button is held), goes to the server. The server's position reports only carry the shape and its visibility to the client; their coordinates are not applied, because the pointer is the local one (a program on the server that moves the pointer is followed at the next local motion, which sends an absolute position).
+- Until the first shape arrives, and while the server reports its pointer hidden, the system's default pointer is shown.
 
 ### 6.4 Audio, clipboard, files
 
@@ -437,6 +438,7 @@ Sent separately as shape (cached by hash) and position, and drawn by the client,
   - The wgpu route stays an option, but depends on an unstable Slint feature tied to a wgpu major version and on unsafe Vulkan import code.
   - Copy-free display needs an EGL context. Slint's winit backend creates one on Wayland but a GLX context on X11, so X11 needs a custom Slint platform that creates its own EGL context.
   - Decoded colour must use the stream's colour space and range, not a fixed BT.709 assumption, and frame hand-off needs explicit GPU fences rather than `glFinish`.
+  - **Renderer on the CPU-upload path:** Slint's OpenGL renderer (FemtoVG) on a machine without a GPU runs on Mesa's llvmpipe, which spent about 2.3 cores and held frames 9-30 ms to show 1080p at 60 fps (a 16-core cloud VM), against about 0.24 cores for Slint's software renderer. So on Linux, when there is no GPU render node (`/dev/dri/renderD*`) or `LIBGL_ALWAYS_SOFTWARE` is set, the client picks the software renderer; `SLINT_BACKEND` still overrides the choice.
 - **Web**: WebCodecs hardware decode into a WebGL/WebGPU canvas; Pointer Lock and Keyboard Lock; protocol code shared as WASM.
 - Keyboard input is sent as physical scancodes so every layout works. The session maps HID usage → evdev → X keycode (`+ 8`) and injects through XTest; held keys and buttons are released on focus loss, disconnect and drop, pointer coordinates are clamped to the screen, scroll arrives in 1/120 notches and becomes wheel clicks, and untrusted input is rate-limited (key/button/scroll and pointer motion separately; releases exempt).
 - Remote resolution follows the client window (RandR); HiDPI scaling supported.

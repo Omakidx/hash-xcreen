@@ -83,3 +83,48 @@ impl Presenter for CpuPresenter {
         }
     }
 }
+
+/// True when OpenGL would run on the CPU (Mesa's llvmpipe), where Slint's software renderer
+/// shows the CPU-upload pictures at a tenth of the cost of its OpenGL renderer
+/// (architecture 6.5): `LIBGL_ALWAYS_SOFTWARE` is set, or `dri` (normally `/dev/dri`) has no
+/// GPU render node (`renderD*`) or does not exist. Only meaningful on Linux.
+pub fn opengl_runs_on_cpu(
+    always_software: Option<&std::ffi::OsStr>,
+    dri: &std::path::Path,
+) -> bool {
+    if always_software.is_some_and(|v| !v.is_empty() && v != "0" && v != "false") {
+        return true;
+    }
+    match std::fs::read_dir(dri) {
+        Ok(entries) => !entries
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with("renderD")),
+        Err(_) => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opengl_on_cpu_without_a_render_node_or_when_forced() {
+        let dir = std::env::temp_dir().join(format!("hx-dri-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // No /dev/dri at all: no GPU.
+        assert!(opengl_runs_on_cpu(None, &dir));
+        std::fs::create_dir_all(dir.join("by-path")).unwrap();
+        std::fs::write(dir.join("card0"), b"").unwrap();
+        // A display card without a render node (a virtual or display-only device).
+        assert!(opengl_runs_on_cpu(None, &dir));
+        std::fs::write(dir.join("renderD128"), b"").unwrap();
+        assert!(!opengl_runs_on_cpu(None, &dir));
+        // LIBGL_ALWAYS_SOFTWARE forces it; "0", "false" and empty do not.
+        assert!(opengl_runs_on_cpu(Some("1".as_ref()), &dir));
+        assert!(opengl_runs_on_cpu(Some("true".as_ref()), &dir));
+        for off in ["0", "false", ""] {
+            assert!(!opengl_runs_on_cpu(Some(off.as_ref()), &dir), "{off:?}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

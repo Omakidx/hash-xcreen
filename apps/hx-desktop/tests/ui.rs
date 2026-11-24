@@ -245,6 +245,13 @@ fn hover_and_drag_both_move_the_remote_pointer_once_per_event() {
         position: LogicalPosition::new(310.0, 305.0),
     });
     assert_eq!(*seen.borrow(), vec![(300.0, 300.0), (310.0, 305.0)]);
+    // The view keeps the pointer's window position, which a new remote shape replays so the
+    // system pointer changes while the mouse is still.
+    assert!(vm.get_pointer_inside());
+    assert_eq!(
+        (vm.get_pointer_window_x(), vm.get_pointer_window_y()),
+        (310.0, 305.0)
+    );
     // Drag: still one call per event, not two.
     let left = PointerEventButton::Left;
     let at = LogicalPosition::new(310.0, 305.0);

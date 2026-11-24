@@ -286,13 +286,15 @@ export global DesktopVm {
     in property <string> link-host;
     in property <string> link-rest;
 
-    // pointer cursor drawn by the app
+    // the remote pointer shape, shown as the system pointer over the desktop view
     in property <image> cursor;
     in property <bool> cursor-visible: false;
-    in property <length> cursor-x;
-    in property <length> cursor-y;
-    in property <length> cursor-hot-x;
-    in property <length> cursor-hot-y;
+    in property <int> cursor-hot-x;
+    in property <int> cursor-hot-y;
+    // where the pointer is over the desktop view, in window coordinates (set by the view)
+    in-out property <bool> pointer-inside: false;
+    in-out property <length> pointer-window-x;
+    in-out property <length> pointer-window-y;
 
     callback disconnect();
     callback pointer-moved(length, length);

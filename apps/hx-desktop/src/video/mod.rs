@@ -13,6 +13,6 @@ pub mod worker;
 
 pub use decode::{DecodeError, Decoder, Picture, yuv420_to_rgba};
 pub use pool::FramePool;
-pub use present::{CpuPresenter, FrameSink, PresentKind, Presenter};
+pub use present::{CpuPresenter, FrameSink, PresentKind, Presenter, opengl_runs_on_cpu};
 pub use stats::Stats;
 pub use worker::{DecodeThread, spawn_decoder};
