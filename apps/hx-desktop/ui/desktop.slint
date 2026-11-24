@@ -221,15 +221,6 @@ export component DesktopScreen inherits Rectangle {
         }
     }
 
-    // The remote cursor, drawn by the app.
-    if DesktopVm.cursor-visible && !root.blocked: Image {
-        source: DesktopVm.cursor;
-        x: DesktopVm.cursor-x - DesktopVm.cursor-hot-x;
-        y: DesktopVm.cursor-y - DesktopVm.cursor-hot-y;
-        width: self.source.width * 1px;
-        height: self.source.height * 1px;
-    }
-
     // Pointer and keyboard focus.
     fs := FocusScope {
         enabled: !root.blocked;
@@ -243,11 +234,18 @@ export component DesktopScreen inherits Rectangle {
         }
         ta := TouchArea {
             enabled: !root.blocked;
-            mouse-cursor: DesktopVm.cursor-visible ? MouseCursor.none : MouseCursor.default;
+            // The remote shape as the system pointer: it moves with the mouse and a move
+            // redraws nothing (architecture 6.3).
+            mouse-cursor: DesktopVm.cursor-visible ? MouseCursor.custom(DesktopVm.cursor, DesktopVm.cursor-hot-x, DesktopVm.cursor-hot-y) : MouseCursor.default;
+            changed has-hover => {
+                DesktopVm.pointer-inside = self.has-hover;
+            }
             // Motion comes from `pointer-event`: a TouchArea's `moved` only fires while a
             // button is held, and the remote pointer must follow hover too.
             pointer-event(e) => {
                 if (e.kind == PointerEventKind.move) {
+                    DesktopVm.pointer-window-x = self.absolute-position.x + self.mouse-x;
+                    DesktopVm.pointer-window-y = self.absolute-position.y + self.mouse-y;
                     DesktopVm.pointer-moved(self.mouse-x, self.mouse-y);
                     if (self.mouse-y < 6px && !DesktopVm.toolbar) {
                         DesktopVm.toolbar = true;

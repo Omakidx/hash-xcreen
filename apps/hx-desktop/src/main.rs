@@ -61,7 +61,20 @@ fn main() -> Result<(), slint::PlatformError> {
 
     // The id of the packaged desktop file (X11 WM_CLASS, Wayland app id).
     // The app id needs an existing platform: select the backend (SLINT_BACKEND is honoured) first.
-    slint::BackendSelector::new().select()?;
+    // Without a GPU, OpenGL runs on the CPU and costs ten times the software renderer
+    // (architecture 6.5); SLINT_BACKEND still overrides this.
+    let mut backend = slint::BackendSelector::new();
+    if cfg!(target_os = "linux")
+        && std::env::var_os("SLINT_BACKEND").is_none()
+        && hx_desktop::video::opengl_runs_on_cpu(
+            std::env::var_os("LIBGL_ALWAYS_SOFTWARE").as_deref(),
+            std::path::Path::new("/dev/dri"),
+        )
+    {
+        tracing::info!("no GPU render node: Slint's software renderer");
+        backend = backend.renderer_name("software".into());
+    }
+    backend.select()?;
     slint::set_xdg_app_id("io.github.omakidx.hashxcreen")?;
     let ui = AppWindow::new()?;
     let cfg = if demo_mode {
