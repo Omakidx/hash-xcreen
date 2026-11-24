@@ -23,7 +23,9 @@ use crate::clipboard::{self, Incoming};
 use crate::files::{
     Activity, Direction, SendCheck, TransferState, check_send, human_size, refusal_text,
 };
-use crate::input::{ChordDetector, Combo, Fit, Held, ViewTransform, hid_usage, scroll_units};
+use crate::input::{
+    ChordDetector, Combo, Fit, Held, SentMotion, ViewTransform, hid_usage, scroll_units,
+};
 use crate::links::{self, Link as WebLink};
 use crate::session::lifecycle::{Next, Reconnect, reconnects};
 use crate::session::{CloseReason, Desk, Established, Event, Link, Outcome, Wiring};
@@ -131,6 +133,7 @@ pub struct Ctx {
     remote: (u32, u32),
     shapes: HashMap<u64, (Image, (f32, f32))>,
     cursor_shape: u64,
+    sent: SentMotion,
     activities: Vec<(u64, Activity)>,
     clip: clipboard::Sync,
     link: Option<WebLink>,
@@ -214,6 +217,7 @@ pub fn enter(
         c.epoch += 1;
         c.held.clear();
         c.shapes.clear();
+        c.sent.clear();
         c.activities.clear();
         c.link = None;
         c.remote = (0, 0);
@@ -464,13 +468,17 @@ fn on_cursor(app: &Rc<App>, e: pb::CursorEvent) {
             let Some((img, hot)) = c.shapes.get(&p.shape_id).cloned() else {
                 return;
             };
-            let t = transform(&c, vm.get_fit());
-            let (x, y) = t.to_view(p.x, p.y);
+            // An echo of motion sent from here leaves the cursor at the local pointer
+            // (architecture 6.3); only a move made on the server places it.
+            if !c.sent.is_echo(p.x, p.y) {
+                let t = transform(&c, vm.get_fit());
+                let (x, y) = t.to_view(p.x, p.y);
+                vm.set_cursor_x(x);
+                vm.set_cursor_y(y);
+            }
             vm.set_cursor(img);
             vm.set_cursor_hot_x(hot.0);
             vm.set_cursor_hot_y(hot.1);
-            vm.set_cursor_x(x);
-            vm.set_cursor_y(y);
             vm.set_cursor_visible(p.visible && c.active.is_some());
             let id = p.shape_id;
             drop(c);
@@ -939,11 +947,13 @@ pub fn wire(app: &Rc<App>) {
     });
     let a = app.clone();
     vm.on_pointer_moved(move |x, y| {
-        let c = a.desk.borrow();
+        let mut c = a.desk.borrow_mut();
+        let c = &mut *c;
         let Some(act) = c.active.as_ref() else { return };
         let vm = a.ui().global::<DesktopVm>();
-        let t = transform(&c, vm.get_fit());
+        let t = transform(c, vm.get_fit());
         if let Some((rx, ry)) = t.to_remote(x, y) {
+            c.sent.record(rx, ry);
             act.desk.motion(rx, ry);
             vm.set_cursor_x(x);
             vm.set_cursor_y(y);
@@ -954,12 +964,15 @@ pub fn wire(app: &Rc<App>) {
     });
     let a = app.clone();
     vm.on_pointer_button(move |b, pressed, x, y| {
-        let c = a.desk.borrow();
+        let mut c = a.desk.borrow_mut();
+        let c = &mut *c;
         let Some(act) = c.active.as_ref() else { return };
-        let t = transform(&c, a.ui().global::<DesktopVm>().get_fit());
+        let t = transform(c, a.ui().global::<DesktopVm>().get_fit());
         let Some((rx, ry)) = t.to_remote(x, y) else {
             return;
         };
+        // A button carries a position too: the server moves the pointer there.
+        c.sent.record(rx, ry);
         let btn = match b {
             0 => MouseButton::Left,
             1 => MouseButton::Right,

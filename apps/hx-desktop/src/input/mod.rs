@@ -302,9 +302,69 @@ impl Held {
     }
 }
 
+/// Remote positions this client sent recently (architecture 6.3). The server's cursor
+/// reports arrive a round trip late; one that only echoes a position sent from here must not
+/// move the drawn cursor, or it drags the cursor back along its own trail while the mouse
+/// moves. A report of a position never sent from here is a move made on the server.
+#[derive(Debug, Default)]
+pub struct SentMotion {
+    recent: std::collections::VecDeque<(i32, i32)>,
+}
+
+impl SentMotion {
+    /// Positions kept: about half a second of a 1000 Hz mouse, more than a round trip.
+    pub const KEEP: usize = 512;
+
+    /// Records a position sent to the server.
+    pub fn record(&mut self, x: i32, y: i32) {
+        if self.recent.back() == Some(&(x, y)) {
+            return;
+        }
+        if self.recent.len() == Self::KEEP {
+            self.recent.pop_front();
+        }
+        self.recent.push_back((x, y));
+    }
+
+    /// True if the server's report is a position this client sent recently.
+    pub fn is_echo(&self, x: i32, y: i32) -> bool {
+        self.recent.iter().rev().any(|&p| p == (x, y))
+    }
+
+    /// Forgets everything (a new desktop session).
+    pub fn clear(&mut self) {
+        self.recent.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sent_motion_tells_echoes_from_server_moves_and_keeps_a_bounded_trail() {
+        let mut s = SentMotion::default();
+        assert!(!s.is_echo(10, 10), "nothing sent yet: a server move");
+        for i in 0..20 {
+            s.record(i, 2 * i);
+        }
+        // A late echo of any point on the trail, not only the newest, moves nothing.
+        assert!(s.is_echo(3, 6));
+        assert!(s.is_echo(19, 38));
+        // A position never sent is a move made on the server.
+        assert!(!s.is_echo(3, 7));
+        // Repeats are stored once; the trail is bounded and the oldest go first.
+        s.record(19, 38);
+        assert_eq!(s.recent.len(), 20);
+        for i in 0..SentMotion::KEEP as i32 {
+            s.record(1000 + i, 0);
+        }
+        assert_eq!(s.recent.len(), SentMotion::KEEP);
+        assert!(!s.is_echo(3, 6), "pushed out of the trail");
+        assert!(s.is_echo(1000 + SentMotion::KEEP as i32 - 1, 0));
+        s.clear();
+        assert!(!s.is_echo(1000, 0));
+    }
 
     #[test]
     fn usages_are_valid_protocol_values_and_unique() {
