@@ -889,10 +889,20 @@ fn units_and_credentials(l1: &L1, server_hex: &str) {
         ss.lines().filter(|l| l.contains(":443")).count() >= 2,
         "tcp and udp: {ss}"
     );
+    // The CLI is on the PATH sudo uses, as a link through `current` (design 5.7).
+    let link = l1.exec_ok("readlink /usr/local/sbin/hx-agent");
+    assert_eq!(link.trim(), AGENT, "the hx-agent link");
+    let found = l1.exec_ok(
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin sh -c 'command -v hx-agent && hx-agent --version'",
+    );
+    assert!(
+        found.starts_with("/usr/local/sbin/hx-agent\n") && found.contains("hx-agent "),
+        "hx-agent on PATH: {found}"
+    );
     pass(
         id,
         "units active",
-        "hx-privd.socket, hx-gatewayd-{admin,public}.socket, incus.socket (active) and hx-host-firewall.service (enabled; it only reloads the ruleset at boot, privd loaded it now); 443 tcp+udp listening",
+        "hx-privd.socket, hx-gatewayd-{admin,public}.socket, incus.socket (active) and hx-host-firewall.service (enabled; it only reloads the ruleset at boot, privd loaded it now); 443 tcp+udp listening; /usr/local/sbin/hx-agent links to the current CLI and is on sudo's PATH",
     );
 
     // The whole boot transaction, not just our units: an ordering cycle through an hx unit makes
@@ -1108,7 +1118,7 @@ fn canary(l1: &L1) {
     );
 }
 
-const HASHES: &str = "cd / && find etc/hx usr/local/lib/systemd/system etc/systemd/system usr/local/lib/sysusers.d usr/local/lib/tmpfiles.d etc/logrotate.d usr/lib/hx usr/lib/hx-rescue -xdev \\( -type f -o -type l \\) 2>/dev/null | sort | while read f; do case \"$f\" in */install-state.json|etc/hx/host-firewall.nft) ;; *) if [ -L \"$f\" ]; then echo \"L $f $(readlink \"$f\")\"; else echo \"$(sha256sum \"$f\" | cut -d' ' -f1) $(stat -c '%a %U:%G %Y' \"$f\") $f\"; fi;; esac; done";
+const HASHES: &str = "cd / && find etc/hx usr/local/lib/systemd/system etc/systemd/system usr/local/lib/sysusers.d usr/local/lib/tmpfiles.d etc/logrotate.d usr/lib/hx usr/lib/hx-rescue usr/local/sbin/hx-agent -xdev \\( -type f -o -type l \\) 2>/dev/null | sort | while read f; do case \"$f\" in */install-state.json|etc/hx/host-firewall.nft) ;; *) if [ -L \"$f\" ]; then echo \"L $f $(readlink \"$f\")\"; else echo \"$(sha256sum \"$f\" | cut -d' ' -f1) $(stat -c '%a %U:%G %Y' \"$f\") $f\"; fi;; esac; done";
 
 fn idempotence(l1: &L1) {
     let id = l1.d.id;
@@ -1386,6 +1396,7 @@ const ABSENT: &[&str] = &[
     "/etc/logrotate.d/hx-audit",
     "/etc/systemd/system/hx-gatewayd-public.socket.d",
     "/var/lib/hx-uninstall.json",
+    "/usr/local/sbin/hx-agent",
 ];
 
 /// What the installer created and uninstall left behind. In keep mode the host firewall ruleset

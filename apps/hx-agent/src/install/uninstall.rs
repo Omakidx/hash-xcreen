@@ -12,7 +12,7 @@
 //! | U2 | privd `Uninstall` (an old privd answers `UNIMPLEMENTED`: the manual steps, exit 6) |
 //! | U3 | stop and disable privd's units, both fetchers, the updates and image-in mounts (destroy: the firewall units too) |
 //! | U4 | remove the port rule (ufw, nft by comment) and its unit |
-//! | U5 | remove files and directories; gatewayd's state is emptied by a child running as that user |
+//! | U5 | remove files and directories (the `hx-agent` link only while it is ours); gatewayd's state is emptied by a child running as that user |
 //! | U6 | `userdel hx-gatewayd` |
 //! | U7 | `daemon-reload`, `reset-failed` |
 //! | U8 | drop the resume file |
@@ -38,6 +38,7 @@ use super::error::{InstallError, Result};
 use super::fsx::read_text;
 use super::paths::{self, Paths};
 use super::runner::{Call, Runner, Tool};
+use super::stages::files::{CliLink, cli_link};
 use super::stages::port;
 use super::state;
 use super::units::{self, Dest, FIREWALL_UNITS, GATEWAY_UNITS};
@@ -363,7 +364,7 @@ fn remove_path(p: &Path) -> io::Result<()> {
     }
 }
 
-fn u5_files(d: &mut UninstallDeps<'_>, keep: bool) -> Result<()> {
+fn u5_files(d: &mut UninstallDeps<'_>, keep: bool, notes: &mut Vec<String>) -> Result<()> {
     let p = d.paths.clone();
     // gatewayd's state FIRST: it is emptied by a child that runs this very binary, which lives in
     // /usr/lib/hx/current until the last step below. As that user (rule 15).
@@ -400,6 +401,17 @@ fn u5_files(d: &mut UninstallDeps<'_>, keep: bool) -> Result<()> {
     // The files the installer wrote: an exact set, unlinked one by one.
     for f in exact_files(keep) {
         unlink_file(&p.at(&f))?;
+    }
+    // The `hx-agent` command link: only while it is still ours. It is never in the exact set
+    // above, which unlinks whatever has the name.
+    let link = p.at(paths::CLI_LINK);
+    match cli_link(&link) {
+        CliLink::Ours => unlink_file(&link)?,
+        CliLink::Foreign => notes.push(format!(
+            "{} was not created by hash-xcreen and stays",
+            paths::CLI_LINK
+        )),
+        CliLink::Missing => {}
     }
     for dir in DROPIN_DIRS {
         // Only when empty; anything else in there is not ours.
@@ -610,7 +622,7 @@ pub fn run(
             }
             "U5" => {
                 say("U5: removing files\n");
-                u5_files(&mut d, keep_desktop)?;
+                u5_files(&mut d, keep_desktop, &mut report.notes)?;
             }
             "U6" => {
                 say("U6: removing the hx-gatewayd user\n");

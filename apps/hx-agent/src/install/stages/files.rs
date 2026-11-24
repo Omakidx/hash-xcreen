@@ -6,7 +6,8 @@
 //!
 //! Paths (design C7): units below `/usr/local/lib/systemd/system` (outside dpkg's namespace),
 //! sysusers and tmpfiles snippets below `/usr/local/lib`, installer drop-ins below
-//! `/etc/systemd/system`, the logrotate snippet in `/etc/logrotate.d`.
+//! `/etc/systemd/system`, the logrotate snippet in `/etc/logrotate.d`, the `hx-agent` command link
+//! in `/usr/local/sbin`.
 
 use std::net::IpAddr;
 
@@ -73,6 +74,72 @@ fn gateway_user_exists(ctx: &Ctx<'_>) -> bool {
     })
 }
 
+/// What occupies the name of the `hx-agent` command ([`paths::CLI_LINK`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliLink {
+    /// Nothing: the installer may create its link.
+    Missing,
+    /// A symlink whose target text is exactly [`paths::CLI_LINK_TARGET`]: the installer's.
+    Ours,
+    /// Anything else (a file, a directory, a link elsewhere, a name that cannot be inspected):
+    /// the administrator's, never replaced or removed.
+    Foreign,
+}
+
+/// Classifies `link` without following it.
+pub fn cli_link(link: &std::path::Path) -> CliLink {
+    match std::fs::symlink_metadata(link) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => CliLink::Missing,
+        Ok(m)
+            if m.file_type().is_symlink()
+                && std::fs::read_link(link)
+                    .is_ok_and(|t| t.as_os_str() == paths::CLI_LINK_TARGET) =>
+        {
+            CliLink::Ours
+        }
+        _ => CliLink::Foreign,
+    }
+}
+
+fn foreign_cli_note() -> String {
+    format!(
+        "{} exists and is not the installer's link; it was left alone, so run the CLI as {}",
+        paths::CLI_LINK,
+        paths::CLI_LINK_TARGET
+    )
+}
+
+/// Creates the `hx-agent` link when the name is free; leaves anything else there alone.
+fn ensure_cli_link(ctx: &mut Ctx<'_>) -> Result<()> {
+    let link = ctx.paths.at(paths::CLI_LINK);
+    let mut found = cli_link(&link);
+    if found == CliLink::Missing {
+        if let Some(dir) = link.parent() {
+            ensure_dir(dir, 0o755)?;
+        }
+        found = match std::os::unix::fs::symlink(paths::CLI_LINK_TARGET, &link) {
+            Ok(()) => CliLink::Ours,
+            // Something appeared in between: judge what it is.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => cli_link(&link),
+            Err(e) => return Err(e.into()),
+        };
+    }
+    let note = foreign_cli_note();
+    match found {
+        CliLink::Ours => {
+            ctx.state.created_file(paths::CLI_LINK);
+            ctx.state.notes.retain(|n| n != &note);
+        }
+        _ => {
+            ctx.warn("system-files", &note);
+            if !ctx.state.notes.contains(&note) {
+                ctx.state.notes.push(note);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Done-check of `system-files`.
 pub fn system_files_check(ctx: &mut Ctx<'_>) -> Result<bool> {
     for f in non_unit_rows() {
@@ -86,12 +153,17 @@ pub fn system_files_check(ctx: &mut Ctx<'_>) -> Result<bool> {
     {
         return Ok(false);
     }
+    // A foreign file at the command's name is left alone, so it does not keep the stage open.
+    if cli_link(&ctx.paths.at(paths::CLI_LINK)) == CliLink::Missing {
+        return Ok(false);
+    }
     Ok(gateway_user_exists(ctx)
         && ctx.paths.at(paths::CREDS_DIR).is_dir()
         && ctx.paths.at(paths::USR_LIB_HX).is_dir())
 }
 
-/// sysusers, tmpfiles, logrotate, the rescue helper, the directories, the `hx-gatewayd` user.
+/// sysusers, tmpfiles, logrotate, the rescue helper, the `hx-agent` link, the directories, the
+/// `hx-gatewayd` user.
 pub fn system_files_run(ctx: &mut Ctx<'_>) -> Result<Outcome> {
     let existed = gateway_user_exists(ctx);
     ensure_dir(&ctx.paths.at(paths::ETC_HX), 0o755)?;
@@ -110,6 +182,7 @@ pub fn system_files_run(ctx: &mut Ctx<'_>) -> Result<Outcome> {
             "this release has no hx-privd-rescue; a failed self-update will not be rolled back automatically",
         ),
     }
+    ensure_cli_link(ctx)?;
     let sysusers = ctx
         .paths
         .arg(&format!("{}/hx-gatewayd.conf", paths::SYSUSERS_DIR));

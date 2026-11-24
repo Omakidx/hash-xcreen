@@ -108,14 +108,21 @@ units)
         ls -l /run/credentials/hx-gatewayd.service/identity
         getfacl -p /run/credentials/hx-gatewayd.service/identity 2>&1 || true
     fi
-    pass "units active, 443 tcp+udp, systemd-analyze verify clean, credentials sealed (pepper.cred, identity.cred 0600 root), no pepper.key"
+    # The CLI is on the PATH sudo uses (secure_path on Ubuntu and Debian), through `current`.
+    [ "$(readlink /usr/local/sbin/hx-agent)" = /usr/lib/hx/current/hx-agent ] ||
+        fail "/usr/local/sbin/hx-agent is not the link to /usr/lib/hx/current/hx-agent: $(ls -l /usr/local/sbin/hx-agent 2>&1)"
+    found=$(PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin sh -c 'command -v hx-agent') ||
+        fail "hx-agent is not on sudo's PATH"
+    [ "$found" = /usr/local/sbin/hx-agent ] || fail "hx-agent resolves to $found"
+    v=$(PATH=/usr/local/sbin:/usr/bin:/bin hx-agent --version) || fail "hx-agent --version through the link failed"
+    pass "units active, 443 tcp+udp, systemd-analyze verify clean, credentials sealed (pepper.cred, identity.cred 0600 root), no pepper.key, hx-agent on PATH ($v)"
     ;;
 
 snapshot)
     out=${1:?snapshot <file>}
     cd /
     find etc/hx usr/local/lib/systemd/system etc/systemd/system usr/local/lib/sysusers.d usr/local/lib/tmpfiles.d \
-        etc/logrotate.d usr/lib/hx usr/lib/hx-rescue -xdev \( -type f -o -type l \) 2>/dev/null | sort |
+        etc/logrotate.d usr/lib/hx usr/lib/hx-rescue usr/local/sbin/hx-agent -xdev \( -type f -o -type l \) 2>/dev/null | sort |
         while read -r f; do
             case $f in
             */install-state.json | etc/hx/host-firewall.nft) ;;
@@ -199,7 +206,7 @@ leftovers)
         /usr/local/lib/systemd/system/hx-gatewayd-public.socket /usr/local/lib/systemd/system/hx-privd-rescue.service \
         /usr/local/lib/sysusers.d/hx-gatewayd.conf /usr/local/lib/tmpfiles.d/hx.conf /etc/logrotate.d/hx-audit \
         /etc/systemd/system/hx-gatewayd-public.socket.d /etc/systemd/system/hx-update-fetcher@.service.d \
-        /etc/systemd/system/hx-image-fetcher@.service.d /var/lib/hx-uninstall.json; do
+        /etc/systemd/system/hx-image-fetcher@.service.d /var/lib/hx-uninstall.json /usr/local/sbin/hx-agent; do
         if [ -e "$p" ] || [ -L "$p" ]; then left="$left $p"; fi
     done
     [ "$mode" = destroy ] && [ -e /etc/hx ] && left="$left /etc/hx"

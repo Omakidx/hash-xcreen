@@ -22,6 +22,11 @@ pub const USR_LIB_HX: &str = "/usr/lib/hx";
 pub const RESCUE_DIR: &str = "/usr/lib/hx-rescue";
 /// The rescue helper.
 pub const RESCUE_BIN: &str = "/usr/lib/hx-rescue/hx-privd-rescue";
+/// The `hx-agent` command on `PATH`: a symlink the installer owns only while it points at
+/// [`CLI_LINK_TARGET`] (design §5.7).
+pub const CLI_LINK: &str = "/usr/local/sbin/hx-agent";
+/// What [`CLI_LINK`] points at: through `current`, so it follows updates and rollbacks.
+pub const CLI_LINK_TARGET: &str = "/usr/lib/hx/current/hx-agent";
 /// `/etc/hx`.
 pub const ETC_HX: &str = "/etc/hx";
 /// Sealed credentials.

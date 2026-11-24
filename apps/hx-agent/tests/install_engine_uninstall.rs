@@ -254,6 +254,56 @@ fn the_notes_say_what_stays_installed() {
     assert!(all.contains("Zabbly apt repository stays") && all.contains("hx-zabbly.asc"));
 }
 
+#[test]
+fn uninstall_removes_our_hx_agent_link_in_both_modes() {
+    for keep in [false, true] {
+        let mut m = installed();
+        let link = path(&m, paths::CLI_LINK);
+        assert!(std::fs::symlink_metadata(&link).is_ok());
+        let rep = ok(uninstall(&mut m, keep, 0).0);
+        assert!(
+            std::fs::symlink_metadata(&link).is_err(),
+            "keep={keep}: our link is gone"
+        );
+        assert!(!rep.notes.join("\n").contains(paths::CLI_LINK));
+        // The directory is the system's, not ours.
+        assert!(link.parent().unwrap().is_dir());
+    }
+}
+
+#[test]
+fn uninstall_leaves_a_foreign_hx_agent_and_says_so() {
+    use std::os::unix::fs::PermissionsExt;
+    for foreign_link in [false, true] {
+        let mut m = installed();
+        let link = path(&m, paths::CLI_LINK);
+        std::fs::remove_file(&link).unwrap();
+        if foreign_link {
+            // A link to our binary, but not through `current`: still not ours.
+            std::os::unix::fs::symlink(format!("/usr/lib/hx/{VERSION}/hx-agent"), &link).unwrap();
+        } else {
+            std::fs::write(&link, b"mine").unwrap();
+            std::fs::set_permissions(&link, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        // Even a state that claims the name cannot make uninstall delete it.
+        let mut st = m.state().unwrap();
+        st.created.files.push(paths::CLI_LINK.into());
+        hx_agent::install::state::save(&m.paths.at(paths::STATE_FILE), &st).unwrap();
+        let rep = ok(uninstall(&mut m, false, 0).0);
+        let md = std::fs::symlink_metadata(&link).expect("a foreign hx-agent stays");
+        if foreign_link {
+            assert!(md.file_type().is_symlink());
+        } else {
+            assert_eq!(std::fs::read(&link).unwrap(), b"mine");
+        }
+        let all = rep.notes.join("\n");
+        assert!(
+            all.contains(paths::CLI_LINK) && all.contains("stays"),
+            "{all}"
+        );
+    }
+}
+
 // ----- resume ---------------------------------------------------------------------------------
 
 fn resume_state(m: &Machine) -> hx_agent::install::uninstall::UninstallState {
