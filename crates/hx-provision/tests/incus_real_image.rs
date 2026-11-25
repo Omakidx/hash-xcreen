@@ -617,6 +617,20 @@ async fn run(c: &Client<UnixTransport>) {
         .unwrap();
         std::fs::write(dir.join("drifts.md"), &table).unwrap();
     }
+    // The XDG folders are made by the post stage in the chosen language (de_DE), so no session
+    // program falls back to an English ~/Desktop beside ~/Schreibtisch (recipes/README.md).
+    let home = format!("/home/{USER}");
+    for (name, f) in [("A", &fa), ("B", &fb)] {
+        let paths: Vec<&str> = f.trees[&home].iter().map(|x| x.path.as_str()).collect();
+        assert!(
+            paths.contains(&format!("{home}/Schreibtisch").as_str()),
+            "{name}: no ~/Schreibtisch"
+        );
+        assert!(
+            !paths.contains(&format!("{home}/Desktop").as_str()),
+            "{name}: an English ~/Desktop beside ~/Schreibtisch"
+        );
+    }
     evidence!("total", "{:?}", t0.elapsed());
     if std::env::var("HX1D_ALLOW_DRIFT").as_deref() != Ok("1") {
         assert!(
