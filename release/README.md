@@ -24,7 +24,26 @@ Scripts behind `.github/workflows/release.yml` (design D7 of the 1E installer). 
 
 ## Repository settings the maintainer must make (not expressible in the repository)
 
-Checklist, to be done once before the first real release:
+Checklist, to be done once before the first real release.
+
+**Order matters: add the secrets LAST.** A secret placed in an environment before the controls
+below exist is reachable by whatever workflow can name that environment. Do them in this order:
+
+1. Create both environments with deployment policies (no secrets yet): `release-signing`
+   (tags `v*` only, plus a required reviewer) and `image-signing` (branch `main` only).
+2. Add the tag ruleset for `v*` and `channel-*`.
+3. Protect `main` (pull request, required CI jobs, CODEOWNERS review, no force pushes).
+4. ONLY THEN add the secrets to the environments.
+
+**A "tag is on main" check inside `release.yml` is not a control by itself.** The workflow that
+runs for a tag is the workflow file AT THAT TAG, so whoever can push a tag controls the code that
+checks it. The real controls are the environment deployment policy, the tag ruleset and the
+required reviewer. The in-workflow check is a second line against honest mistakes.
+
+**Reviewer checklist** (every `release-signing` approval): confirm the run's commit is on `main`
+(the commit shown on the run is an ancestor of `main`, not a branch or fork commit) and that the
+workflow files at that commit equal `main`'s; `.github/`, `release/`, `installer/` changes are
+CODEOWNERS-reviewed (`.github/CODEOWNERS`).
 
 - [ ] **Environment `release-signing`** (Settings, Environments): required reviewers (manual
       approval for every run); **deployment branches and tags: selected, allow only the tag
@@ -76,6 +95,17 @@ sudo sh install.sh --pair ...
   caps (a FIFO or a huge file is refused);
 - ignores `TMPDIR` (`unset` in `main`; the self-test makes its scratch directory under `/tmp`).
 
+## Pipeline rules (enforced by `gate.sh` check 8)
+
+- A job with `environment:` (it holds signing secrets) never runs `cargo`, `rustup`, a workspace
+  binary (`signed/hx-*`) or any workspace script: it downloads artifacts built by secret-free jobs,
+  installs minisign from apt and signs. Verification of the signature happens in a later secret-free job.
+- A job with `contents: write` never runs `cargo`/`rustup` or a workspace binary either; it uses only
+  runner-image tools (`gh`, `jq`, `sha256sum`, coreutils).
+- `container:` / `image:` values are pinned by `@sha256:` digest, like actions.
+- Signing jobs collect artifacts by exact name, never by `pattern:`.
+- `release.yml` `publish` refuses a version that is not strictly newer than the current channel manifest.
+
 ## Desktop packages (`hx-desktop`)
 
 The version release `v<version>` carries the desktop app next to the agent tarball. Build scripts,
@@ -83,7 +113,7 @@ package layout and the AppImage decisions are in [`packaging/hx-desktop/README.m
 
 | File | What |
 |---|---|
-| `hx-desktop_<version>_<distro>_amd64.deb` | `<distro>` is `ubuntu-24.04`, `debian-12` or `debian-13` (`ubuntu-26.04` is a known gap, below). `Depends` are the distro's own library packages. |
+| `hx-desktop_<version>_<distro>_amd64.deb` | `<distro>` is `ubuntu-24.04`, `debian-12` or `debian-13` (`ubuntu-26.04` is a known gap, below: its cell is NOT built by `release.yml` until it builds, so no artifact name for it is reserved for an attacker to fill). `Depends` are the distro's own library packages. |
 | `hx-desktop-<version>-x86_64.AppImage` | One file for every x86_64 Linux desktop with glibc 2.39 or newer; FFmpeg is bundled. |
 | `<file>.minisig` | A minisign signature of each file above, made in the `sign` job with the same `release-signing` key as `install.sh` (`-t "hx-desktop v<version> <file name>"`). |
 
