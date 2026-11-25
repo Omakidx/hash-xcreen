@@ -142,7 +142,9 @@ pub trait DeviceRegistry: Send + Sync + 'static {
 
     /// Add a device, or (if the key is already paired) update its name. An existing record
     /// keeps its failure counter. A **revoked** device is not touched and the call fails with
-    /// [`Error::Revoked`], decided inside the same atomic step as the write.
+    /// [`Error::Revoked`], decided inside the same atomic step as the write. A stored record
+    /// with this device id but a **different key** fails too (`Error::Protocol`), and is not
+    /// touched.
     fn upsert_paired(&self, key: &PublicKey, name: &str, now_unix: u64) -> Result<DeviceRecord>;
 
     /// Count a PIN attempt **before** it is checked (so an attempt that is cut off still
@@ -260,6 +262,17 @@ impl Store {
             let id = key.device_id();
             if s.get(&id).is_some_and(DeviceRecord::is_revoked) {
                 return (Err(Error::Revoked), false);
+            }
+            // The id is derived from the key, so a stored record with this id and another key
+            // can only come from a damaged or hand-edited registry (or a hash collision): fail
+            // instead of keeping the stored key under a name the new key claims.
+            if s.get(&id).is_some_and(|r| r.public_key != *key) {
+                return (
+                    Err(Error::Protocol(
+                        "a different key is already stored for this device id",
+                    )),
+                    false,
+                );
             }
             let rec = s.entry(id).or_insert_with(|| DeviceRecord {
                 id,
@@ -710,6 +723,41 @@ mod tests {
         fs::create_dir_all(&d).expect("tmp dir");
         fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).expect("chmod");
         d
+    }
+
+    #[test]
+    fn upsert_paired_fails_when_the_stored_key_differs() {
+        let r = MemoryRegistry::new();
+        let stored = key();
+        let other = key();
+        // A damaged registry: the record under `other`'s id holds `stored`'s key.
+        let id = other.device_id();
+        r.0.mutate(|s| {
+            s.insert(
+                id,
+                DeviceRecord {
+                    id,
+                    name: "original".into(),
+                    public_key: stored,
+                    created_unix: 1,
+                    last_seen_unix: 0,
+                    failed_pins: 0,
+                    revoked: None,
+                },
+            );
+            ((), true)
+        })
+        .unwrap();
+        assert!(matches!(
+            r.upsert_paired(&other, "intruder", 2),
+            Err(Error::Protocol(_))
+        ));
+        let rec = r.get(&id).unwrap().unwrap();
+        assert_eq!((rec.name.as_str(), rec.public_key), ("original", stored));
+        // The same key still updates its name.
+        let k = key();
+        r.upsert_paired(&k, "a", 1).unwrap();
+        assert_eq!(r.upsert_paired(&k, "b", 2).unwrap().name, "b");
     }
 
     #[test]
