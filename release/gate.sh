@@ -22,7 +22,12 @@
 #   6. supply chain: in EVERY file of .github/workflows every `uses:` is pinned to a full 40-hex
 #      commit SHA (a docker:// image to a sha256 digest), and no build cache (rust-cache,
 #      actions/cache) appears in release.yml: a release build is never restored from a cache a
-#      pull request could have written;
+#      pull request could have written; every `container:` / `image:` value that names a registry
+#      image (not `${{ ... }}`) is pinned by `@sha256:<64 hex>` as well;
+#   8. job isolation, in EVERY file of .github/workflows: a job with `environment:` (it holds
+#      signing secrets) runs no cargo, rustup, workspace binary (`signed/hx-*`, `target/*/hx-*`) or
+#      workspace script and checks nothing out; a job with `contents: write` runs no cargo, rustup or
+#      workspace binary. Such jobs only handle artifacts built by secret-free jobs;
 #   4. the compile-time gate exists: feature `release-build` in apps/hx-agent/Cargo.toml and its
 #      const assertion in privd/update/keys.rs (the build itself, with --features release-build,
 #      is the real enforcement and fails on an unprovisioned key).
@@ -187,6 +192,71 @@ if [ -f "$wf" ]; then
         good "release.yml uses no build cache"
     fi
 fi
+
+# ---- 6b. container and image references are pinned by digest ----
+# Every `container:` / `image:` value in every workflow that names a registry image (it contains ':'
+# or '/'; a `${{ matrix.image }}` indirection is checked where the matrix defines it) must carry
+# `@sha256:<64 hex>`. List forms (`image: ["a:1", "b:2"]`) are checked per element.
+image_refs() { # <file>: the container/image values, one per line (comments skipped)
+    awk '
+    /^[[:space:]]*#/ { next }
+    {
+        if (!match($0, /(^|[[:space:]{,])(container|image):[[:space:]]*/)) next
+        rest = substr($0, RSTART + RLENGTH)
+        if (rest == "" || rest ~ /^\$/) next
+        if (rest ~ /^\[/) {
+            sub(/^\[/, "", rest); sub(/\].*$/, "", rest)
+            n = split(rest, a, ",")
+            for (i = 1; i <= n; i++) { v = a[i]; gsub(/^[[:space:]"\047]+/, "", v); gsub(/[[:space:]"\047]+$/, "", v); print v }
+        } else {
+            v = rest; gsub(/^["\047]/, "", v); sub(/["\047 ,}].*$/, "", v); print v
+        }
+    }' "$1"
+}
+for f in $pinfiles; do
+    badref=''
+    for v in $(image_refs "$f"); do
+        case $v in *[:/]*) ;; *) continue ;; esac
+        case $v in '$'*) continue ;; esac
+        if ! printf '%s\n' "$v" | grep -Eq '@sha256:[0-9a-f]{64}$'; then badref="$badref $v"; fi
+    done
+    if [ -n "$badref" ]; then
+        bad "$(basename "$f") has container/image references not pinned by @sha256 digest:$badref"
+    else
+        good "every container/image reference in $(basename "$f") is pinned by digest"
+    fi
+done
+
+# ---- 8. job isolation: secrets and write tokens never meet workspace code ----
+isolation() { # <file>: one line per violation
+    awk -v F="$(basename "$1")" '
+    function flush() {
+        if (job == "") return
+        if ((env || wr) && runs != "") print F ": job " job " (" (env ? "environment" : "contents: write") ") runs build or workspace code:" runs
+        if (env && ws != "") print F ": job " job " (environment) runs a workspace script or checks the workspace out:" ws
+    }
+    /^[^ #]/ { if (injobs) flush(); job = ""; injobs = ($0 ~ /^jobs:/); if (!injobs && $0 ~ /^permissions:/) top = 1; next }
+    /^[[:space:]]*#/ { next }
+    !injobs { if (top && $0 ~ /^[[:space:]]+contents:[[:space:]]*write/) print F ": workflow-level permissions grant contents: write to every job"; next }
+    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { flush(); job = $1; sub(/:$/, "", job); env = 0; wr = 0; runs = ""; ws = ""; next }
+    {
+        if ($0 ~ /^    environment:/) env = 1
+        if ($0 ~ /contents:[[:space:]]*write/ || $0 ~ /permissions:[[:space:]]*write-all/) wr = 1
+        line = $0; sub(/^[[:space:]]+/, "", line)
+        if (line ~ /(^|[^A-Za-z0-9_.\/-])(cargo|rustup)([[:space:]]|$)/ || line ~ /signed\/hx-/ || line ~ /target\/([A-Za-z0-9_-]+\/)*(release|debug)\/hx-/) runs = runs " [" line "]"
+        if (line ~ /actions\/checkout@/ || line ~ /(^|[[:space:];&|(])(sh|bash|dash)[[:space:]]+(\.\/)?(release|installer|packaging|perf|scripts)\//) ws = ws " [" line "]"
+    }
+    END { if (injobs) flush() }' "$1"
+}
+for f in $pinfiles; do
+    iso=$(isolation "$f")
+    if [ -n "$iso" ]; then
+        bad "$(basename "$f") breaks job isolation (a signing or write-token job must only handle artifacts, never run build or workspace code):"
+        printf '%s\n' "$iso" >&2
+    else
+        good "no environment or contents: write job in $(basename "$f") runs build or workspace code"
+    fi
+done
 
 [ "$fail" = 0 ] && echo "release gate: PASSED" || echo "release gate: BLOCKED" >&2
 exit "$fail"
