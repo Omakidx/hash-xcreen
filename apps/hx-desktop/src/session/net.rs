@@ -381,14 +381,8 @@ impl Session {
             GAP_STATS,
             Event::Stats,
         );
-        let cursor_l: Arc<Latest<pb::CursorEvent>> = Arc::default();
-        forward_latest(
-            &handle,
-            cursor_l.clone(),
-            ev_tx.clone(),
-            GAP_CURSOR,
-            Event::Cursor,
-        );
+        let cursor_l: Arc<CursorSlot> = Arc::default();
+        forward_cursor(&handle, cursor_l.clone(), ev_tx.clone(), GAP_CURSOR);
         let clip_l: Arc<Latest<String>> = Arc::default();
         forward_latest(
             &handle,
@@ -933,6 +927,73 @@ fn forward_latest<T: Send + 'static>(
     });
 }
 
+/// Shape definitions kept in order (never coalesced: a position refers to a shape by id), at
+/// most as many as the UI caches; the newest position wins.
+const MAX_SHAPES_QUEUED: usize = 65;
+
+#[derive(Default)]
+struct CursorState {
+    shapes: std::collections::VecDeque<pb::CursorEvent>,
+    position: Option<pb::CursorEvent>,
+}
+
+#[derive(Default)]
+struct CursorSlot {
+    state: Mutex<CursorState>,
+    wake: tokio::sync::Notify,
+}
+
+impl CursorSlot {
+    fn put(&self, e: pb::CursorEvent) {
+        use pb::cursor_event::Event as C;
+        if let Ok(mut st) = self.state.lock() {
+            match e.event {
+                Some(C::Shape(_)) => {
+                    if st.shapes.len() >= MAX_SHAPES_QUEUED {
+                        st.shapes.pop_front();
+                    }
+                    st.shapes.push_back(e);
+                }
+                _ => st.position = Some(e),
+            }
+        }
+        self.wake.notify_one();
+    }
+
+    /// Queued shapes first, then the newest position: a shape always precedes the positions
+    /// that name it.
+    fn take(&self) -> Vec<pb::CursorEvent> {
+        let Ok(mut st) = self.state.lock() else {
+            return vec![];
+        };
+        let mut out: Vec<_> = st.shapes.drain(..).collect();
+        out.extend(st.position.take());
+        out
+    }
+}
+
+fn forward_cursor(
+    handle: &tokio::runtime::Handle,
+    slot: Arc<CursorSlot>,
+    tx: mpsc::UnboundedSender<Event>,
+    gap: Duration,
+) {
+    handle.spawn(async move {
+        loop {
+            tokio::select! {
+                () = slot.wake.notified() => {}
+                () = tx.closed() => break,
+            }
+            for e in slot.take() {
+                if tx.send(Event::Cursor(e)).is_err() {
+                    return;
+                }
+            }
+            tokio::time::sleep(gap).await;
+        }
+    });
+}
+
 #[derive(Clone)]
 struct Sinks {
     text: Arc<Latest<String>>,
@@ -1036,5 +1097,41 @@ mod tests {
         }
         assert!(seen.len() <= 2, "{seen:?}");
         assert_eq!(seen.last(), Some(&999));
+    }
+
+    #[tokio::test]
+    async fn a_shape_is_never_lost_to_the_position_that_follows() {
+        use pb::cursor_event::Event as C;
+        let slot: Arc<CursorSlot> = Arc::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        forward_cursor(
+            &tokio::runtime::Handle::current(),
+            slot.clone(),
+            tx,
+            Duration::from_millis(50),
+        );
+        slot.put(pb::CursorEvent {
+            event: Some(C::Shape(pb::CursorShape {
+                id: 7,
+                ..Default::default()
+            })),
+        });
+        for i in 0..100 {
+            slot.put(pb::CursorEvent {
+                event: Some(C::Position(pb::CursorPosition {
+                    shape_id: 7,
+                    x: i,
+                    ..Default::default()
+                })),
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut seen = vec![];
+        while let Ok(Event::Cursor(e)) = rx.try_recv() {
+            seen.push(e);
+        }
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(matches!(&seen[0].event, Some(C::Shape(s)) if s.id == 7));
+        assert!(matches!(&seen[1].event, Some(C::Position(p)) if p.x == 99 && p.shape_id == 7));
     }
 }
