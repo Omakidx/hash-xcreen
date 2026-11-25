@@ -62,7 +62,8 @@ use hx_proto::{
     pb::{self, Intent, RefuseReason},
     version::{Features, capabilities},
 };
-use hx_transport::{Connection, PendingSession, ServerHello};
+use hx_transport::{Connection, PendingSession, PreAuthClass, PreAuthClassifier, ServerHello};
+use rustls::pki_types::CertificateDer;
 use tokio::sync::broadcast;
 use zeroize::Zeroizing;
 
@@ -202,6 +203,16 @@ pub trait PinVerifier: Send + Sync + 'static {
     /// True if a PIN can be checked for `device` at all. When false the client gets
     /// `NOT_AVAILABLE` (and, before `HelloAck`, the same uniform refusal as for an unknown or revoked device).
     fn has_pin(&self, _device: &DeviceId) -> bool {
+        true
+    }
+
+    /// Whether the attempt that reaches the revocation limit (a device's last one) may be sent
+    /// to the verifier. A verifier whose `Wrong` answers are charged to a budget **shared by
+    /// every device** (privd's global PIN cap) answers false when sending it could exhaust that
+    /// budget; the authenticator then judges the attempt [`PinVerdict::Wrong`] locally (it still
+    /// revokes). Earlier attempts are always sent. Default true: every attempt is checked
+    /// (protocol §11.4, rule 4a).
+    fn allow_last_attempt(&self) -> bool {
         true
     }
 
@@ -478,6 +489,45 @@ struct Inner {
     device_locks: Mutex<HashMap<DeviceId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
+/// See [`Authenticator::pre_auth_classifier`].
+struct AuthClassifier(Arc<Inner>);
+
+impl PreAuthClassifier for AuthClassifier {
+    fn classify(&self, certs: Option<&[CertificateDer<'static>]>) -> PreAuthClass {
+        let uniform = PreAuthClass::Refuse {
+            pairing: RefuseReason::Unauthorized,
+        };
+        let Ok(key) = tls::peer_key(certs) else {
+            return uniform;
+        };
+        let Ok(known) = self.0.registry.find_by_key(&key) else {
+            return uniform;
+        };
+        match known {
+            Some(d) if !d.is_revoked() => PreAuthClass::Paired(d.id.as_bytes().to_vec()),
+            // Revoked by the PIN lockout, and still young enough to reinstate with the
+            // password (protocol §11.7): it must reach that step.
+            Some(d) => {
+                let max_age = self.0.config.reinstate_max_age.as_secs();
+                let now = self.0.clock.unix_secs();
+                let reinstatable = d.revoked.is_some_and(|v| {
+                    v.by == RevokedBy::Lockout && now.saturating_sub(v.at_unix) < max_age
+                });
+                if reinstatable {
+                    PreAuthClass::Paired(d.id.as_bytes().to_vec())
+                } else {
+                    uniform
+                }
+            }
+            // Unknown: it can only pair, and only while a secret is live.
+            None if self.0.window.is_open() => PreAuthClass::Unknown,
+            None => PreAuthClass::Refuse {
+                pairing: RefuseReason::PairingClosed,
+            },
+        }
+    }
+}
+
 /// Decides, for each incoming session, whether to pair it, check its PIN, or refuse it.
 /// Cheap to clone (shared state).
 #[derive(Clone)]
@@ -527,6 +577,14 @@ impl Authenticator {
     /// The pairing window: issue tokens and codes, close it.
     pub fn pairing(&self) -> &PairingWindow {
         &self.inner.window
+    }
+
+    /// The transport's pre-authentication classifier for this authenticator (protocol §11.5):
+    /// install it as `ServerOptions::classifier`. It reads the registry and the pairing window
+    /// in memory, never blocks, and only chooses the pool a connection waits in; every
+    /// `PendingSession` is still decided by [`authenticate`](Self::authenticate).
+    pub fn pre_auth_classifier(&self) -> Arc<dyn PreAuthClassifier> {
+        Arc::new(AuthClassifier(self.inner.clone()))
     }
 
     /// A read-only view of the registry (device list). Mutations go through
@@ -1566,7 +1624,10 @@ impl Authenticator {
             let counted = this.reg(move |r| r.begin_pin_attempt(&id)).await?;
             // An earlier attempt at the limit was cut off before its verdict: it counted.
             // A malformed PIN is a failure without a check.
-            let verdict = if counted > max || Pin::from_bytes(&pin).is_err() {
+            // The last attempt (the one that revokes) is judged locally only when the verifier
+            // says that asking could exhaust a failure budget shared by every device.
+            let last_unchecked = counted >= max && !verifier.allow_last_attempt();
+            let verdict = if counted > max || last_unchecked || Pin::from_bytes(&pin).is_err() {
                 PinVerdict::Wrong
             } else {
                 verifier.verify(&id, pin).await

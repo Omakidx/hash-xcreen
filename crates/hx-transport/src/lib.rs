@@ -33,5 +33,7 @@ pub use conn::{
     Connection, ConnectionOptions, ConnectionStats, PeerInfo, Role, TransportKind, VideoFrame,
 };
 pub use error::{CloseInfo, Error, Result};
-pub use server::{H3Handler, PendingSession, Server, ServerHello, ServerOptions};
+pub use server::{
+    H3Handler, PendingSession, PreAuthClass, PreAuthClassifier, Server, ServerHello, ServerOptions,
+};
 pub use transfer::{IncomingTransfer, TransferKind, TransferSender};

@@ -253,7 +253,7 @@ async fn wrong_pins_are_counted_backed_off_and_the_fifth_revokes(
     a.abandon().await;
 
     // Five wrong PINs in a row revoke the device, each one counted at the gateway and charged
-    // to privd's failure budget.
+    // to privd's failure budget (the last one is sent because few failures are charged this hour).
     let mut b = env.connect_unauth(&phone, "phone").await;
     for n in 1..=4u32 {
         env.clock.advance(Duration::from_secs(40));
@@ -274,7 +274,7 @@ async fn wrong_pins_are_counted_backed_off_and_the_fifth_revokes(
     assert_eq!(
         env.privd.with(|s| s.verify_fail),
         6,
-        "every wrong PIN reached privd"
+        "every wrong PIN reached privd: the hourly count was far from the cap"
     );
     // A revoked device is refused at the next connection.
     let err = hx_crypto::connect_session(

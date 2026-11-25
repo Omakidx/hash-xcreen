@@ -388,6 +388,8 @@ pub struct PrivdPinVerifier {
     privd: PrivdClient,
     timeout: Duration,
     locked_until: Mutex<Option<Instant>>,
+    /// When privd answered "wrong" (the failures it charged to the PIN purpose), last hour.
+    charged: Mutex<std::collections::VecDeque<Instant>>,
 }
 
 impl PrivdPinVerifier {
@@ -398,6 +400,7 @@ impl PrivdPinVerifier {
             privd,
             timeout: PRIVD_TIMEOUT,
             locked_until: Mutex::new(None),
+            charged: Mutex::new(Default::default()),
         }
     }
 
@@ -420,6 +423,22 @@ impl PrivdPinVerifier {
         }
     }
 
+    fn charged_in_last_hour(&self) -> usize {
+        let mut q = self.charged.lock().unwrap_or_else(|p| p.into_inner());
+        let hour = Duration::from_secs(3600);
+        while q.front().is_some_and(|t| t.elapsed() >= hour) {
+            q.pop_front();
+        }
+        q.len()
+    }
+
+    fn record_charged(&self) {
+        self.charged
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push_back(Instant::now());
+    }
+
     fn lock_for(&self, wait: Duration) {
         *self.locked_until.lock().unwrap_or_else(|p| p.into_inner()) = Some(Instant::now() + wait);
     }
@@ -428,6 +447,16 @@ impl PrivdPinVerifier {
 impl PinVerifier for PrivdPinVerifier {
     fn has_pin(&self, device: &DeviceId) -> bool {
         self.store.pin_for(device).is_some()
+    }
+
+    /// privd counts PIN failures globally, and the gateway is its only PIN caller. A device's
+    /// last attempt is sent unless it could bring the purpose to privd's hourly cap
+    /// (`charged in the last hour + 1 >= cap`): then it is judged wrong locally. The count is
+    /// kept in memory: a restart empties it, which only weakens the guard and never locks
+    /// anyone (docs/ipc.md section 5.3, protocol 11.4 rule 4a).
+    fn allow_last_attempt(&self) -> bool {
+        let cap = crate::privd::limiter::failure_caps(crate::privd::limiter::Purpose::Pin).0;
+        self.charged_in_last_hour() + 1 < cap
     }
 
     fn verify<'a>(
@@ -462,7 +491,10 @@ impl PinVerifier for PrivdPinVerifier {
             .await;
             match answer {
                 Ok(Ok(true)) => PinVerdict::Right,
-                Ok(Ok(false)) => PinVerdict::Wrong,
+                Ok(Ok(false)) => {
+                    self.record_charged();
+                    PinVerdict::Wrong
+                }
                 Ok(Err(e)) if e.is_locked() => {
                     let wait = match &e {
                         PrivdError::Remote(r) if !r.retry_after.is_zero() => r.retry_after,

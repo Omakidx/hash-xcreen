@@ -259,6 +259,13 @@ impl Gateway {
             clock,
         );
         let tls = tls::server_config(&identity)?;
+        // Right after TLS the transport asks the registry which pool a connection waits in
+        // (protocol 11.5): paired devices keep a reserved share that floods of unknown keys
+        // cannot take. A caller (a test) may install its own classifier.
+        let mut server_options = server_options;
+        if server_options.classifier.is_none() {
+            server_options.classifier = Some(auth.pre_auth_classifier());
+        }
         let server = Arc::new(match public_listeners {
             Some((udp, tcp)) => Server::from_listeners_paused(udp, tcp, tls, server_options)?,
             None => Server::bind_paused(config.listen, tls, server_options).await?,

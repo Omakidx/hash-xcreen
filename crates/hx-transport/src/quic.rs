@@ -31,6 +31,50 @@ const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const PREAUTH_RECEIVE_WINDOW: u32 = 256 * 1024;
 /// Steady-state connection receive window cap (both sides).
 const STEADY_RECEIVE_WINDOW: u32 = 64 * 1024 * 1024;
+/// Unidirectional streams a server may open towards a client (one per in-flight video frame,
+/// plus the cursor stream and transfers). Protocol §1.
+const CLIENT_UNI_STREAMS: u32 = 64;
+/// How many bytes of video frame bodies a client reads and holds at once (frames being read or
+/// waiting for the delivery queue). Protocol §1.
+pub(crate) const VIDEO_BYTES_IN_FLIGHT: usize = 64 * 1024 * 1024;
+/// The budget is counted in units of this many bytes.
+const BUDGET_UNIT: usize = 1024;
+
+/// Bounds the bytes of video frame bodies a client holds in memory at once, so a server that
+/// opens many streams cannot pile up frames while the application is slow. A frame takes its
+/// share **before** its body is read and gives it back once the frame is queued for delivery.
+pub(crate) struct FrameBudget {
+    sem: Arc<tokio::sync::Semaphore>,
+    units: usize,
+}
+
+impl FrameBudget {
+    pub(crate) fn new(bytes: usize) -> Self {
+        let units = (bytes / BUDGET_UNIT).max(1);
+        Self {
+            sem: Arc::new(tokio::sync::Semaphore::new(units)),
+            units,
+        }
+    }
+
+    /// Wait for room for a body of `len` bytes (a frame larger than the whole budget gets all
+    /// of it).
+    pub(crate) async fn acquire(&self, len: usize) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        let want = len.div_ceil(BUDGET_UNIT).clamp(1, self.units);
+        let want = u32::try_from(want).map_err(|_| Error::Violation("frame too large".into()))?;
+        self.sem
+            .clone()
+            .acquire_many_owned(want)
+            .await
+            .map_err(|_| Error::ChannelClosed)
+    }
+
+    #[cfg(test)]
+    fn available(&self) -> usize {
+        self.sem.available_permits() * BUDGET_UNIT
+    }
+}
+
 /// Unidirectional streams a client may open after authorization (input + transfers).
 const AUTHORIZED_CLIENT_UNI_STREAMS: u32 = 64;
 
@@ -54,7 +98,7 @@ pub(crate) fn transport_config(role: Role) -> Result<quinn::TransportConfig> {
         Role::Client => {
             // Server opens: cursor stream, one stream per video frame, transfers.
             t.max_concurrent_bidi_streams(0u32.into());
-            t.max_concurrent_uni_streams(1024u32.into());
+            t.max_concurrent_uni_streams(CLIENT_UNI_STREAMS.into());
             // A malicious server (before any pinning) cannot make the client buffer more.
             t.receive_window(STEADY_RECEIVE_WINDOW.into());
             t.stream_receive_window((8u32 * 1024 * 1024).into());
@@ -79,6 +123,8 @@ pub(crate) struct QuicBackend {
     uni: tokio::sync::Mutex<Option<SendStream>>,
     /// Client endpoints must outlive their connection.
     endpoint: Option<quinn::Endpoint>,
+    /// Client: bounds the video bodies held in memory.
+    video_budget: FrameBudget,
 }
 
 /// The certificate chain the peer presented. An identity of an unexpected type is an error,
@@ -173,6 +219,7 @@ impl QuicBackend {
             control: tokio::sync::Mutex::new(control),
             uni: tokio::sync::Mutex::new(uni),
             endpoint,
+            video_budget: FrameBudget::new(VIDEO_BYTES_IN_FLIGHT),
         }
     }
 
@@ -447,6 +494,13 @@ async fn read_video(inner: &Arc<Inner>, mut rs: RecvStream) -> Result<()> {
     }
     let header = MediaHeader::decode(&head)?;
     let want = header.payload_len as usize;
+    // Take the body's share of the in-flight budget first: with many streams open, bodies are
+    // read only as fast as the application takes frames. The permit is held until the frame
+    // is queued for delivery.
+    let Backend::Quic(q) = &inner.backend else {
+        return Ok(());
+    };
+    let _share = q.video_budget.acquire(want).await?;
     // Bounded by the validated `payload_len` (<= 16 MiB); one byte more detects an overlong body.
     let payload = match rs.read_to_end(want + 1).await {
         Ok(p) => p,
@@ -521,4 +575,48 @@ pub(crate) async fn establish(
     let inner = Inner::new(parts, backend);
     spawn_tasks(&inner, control_recv);
     Ok(Connection::from_inner(inner))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn video_bodies_in_flight_are_bounded() {
+        let budget = FrameBudget::new(VIDEO_BYTES_IN_FLIGHT);
+        // Four maximal frames (16 MiB) take the whole budget.
+        let held: Vec<_> = futures_four(&budget).await;
+        assert_eq!(budget.available(), 0);
+        // The fifth waits, and does not read anything, until one is queued.
+        let mut fifth = Box::pin(budget.acquire(1));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut fifth)
+                .await
+                .is_err(),
+            "a frame beyond the budget must wait"
+        );
+        drop(held);
+        let got = tokio::time::timeout(Duration::from_secs(1), fifth)
+            .await
+            .expect("released")
+            .expect("acquired");
+        drop(got);
+        assert_eq!(budget.available(), VIDEO_BYTES_IN_FLIGHT);
+    }
+
+    async fn futures_four(b: &FrameBudget) -> Vec<tokio::sync::OwnedSemaphorePermit> {
+        let mut v = Vec::new();
+        for _ in 0..4 {
+            v.push(b.acquire(16 * 1024 * 1024).await.expect("fits"));
+        }
+        v
+    }
+
+    #[tokio::test]
+    async fn a_frame_larger_than_the_budget_gets_all_of_it() {
+        let budget = FrameBudget::new(1024 * 1024);
+        let p = budget.acquire(10 * 1024 * 1024).await.expect("clamped");
+        assert_eq!(budget.available(), 0);
+        drop(p);
+    }
 }
