@@ -38,6 +38,7 @@
     "x11-utils",
     "x11-xserver-utils",
     "xauth",
+    "xdg-user-dirs",
     "xdg-utils",
     "xfce4-notifyd",
     "xfce4-panel",
@@ -143,6 +144,7 @@
     "settings-timezone",
     "settings-locale",
     "settings-keyboard",
+    "xdg-user-dirs",
     "claude-code",
     "codex-cli"
   ]

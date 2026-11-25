@@ -98,6 +98,11 @@ image CI, see the crate README):
   enabled, so `finish_prebuilt` writes a drop-in that keeps `hx-xsession.service` from starting
   until the post stage is done and removes it before the final restart. A recipe must not start
   the session in the build stage, and the seal removes session state in any case.
+- The user's XDG folders are made by the post stage (`xdg-user-dirs`, right after the settings),
+  not by the session. At the session's first start, xfdesktop and `xdg-user-dirs-update` run side by
+  side; when xfdesktop looked before `user-dirs.dirs` existed, it fell back to an English
+  `~/Desktop` beside the translated one (`~/Schreibtisch` for `de_DE`), on one desktop and not the
+  other. With the folders already listed, every session program finds them.
 
 Every apt invocation is bounded: apt's own HTTP timeouts and retries, a hard `timeout` per attempt
 and several attempts. In S3, `apt-get update` hung for over nine minutes twice.

@@ -14,7 +14,7 @@ desktop = "xfce"
 [apt]
 packages = [
   # base tooling
-  "sudo", "curl", "ca-certificates", "gnupg", "xdg-utils", "locales",
+  "sudo", "curl", "ca-certificates", "gnupg", "xdg-utils", "xdg-user-dirs", "locales",
   # headless X
   "xserver-xorg-core", "xserver-xorg-video-dummy", "xauth", "x11-xserver-utils", "x11-utils", "dbus-x11",
   # session bus and logind integration for the user manager
@@ -256,6 +256,22 @@ context.objects = [
 name = "received-link"
 as_user = true
 run = 'ln -sfn /var/lib/hx-session/received "$HOME/Received"'
+
+# The user's XDG folders, in the language of the chosen locale, before the session first starts
+# (recipes/README.md). This is a post step so that it follows settings-locale (settings.toml is
+# included first) on both paths. /etc/default/locale is what update-locale wrote; without a
+# chosen locale the names stay English (LANG=C.UTF-8). xdg-user-dirs-update only creates what is
+# missing, so the session's own run at its first start finds nothing to do.
+[[post_step]]
+name = "xdg-user-dirs"
+as_user = true
+run = '''
+set -a
+if [ -r /etc/default/locale ]; then . /etc/default/locale; fi
+set +a
+xdg-user-dirs-update
+'''
+timeout_secs = 60
 
 # Last build step: drop apt caches and lists so the published image is smaller.
 # (The post stage runs `apt-get update` itself before upgrading.)
