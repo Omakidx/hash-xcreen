@@ -25,34 +25,61 @@ exist yet (P3, P4); they become real only if those settings are made in the wron
 
 | ID | Severity | Finding | Fix | Status |
 |---|---|---|---|---|
-| P1 | Medium | The images `publish` job runs a workspace-built `hx-imagectl` while holding a `contents: write` token, which can replace `channel-stable/install.sh` | Verify in a job without a write token; `publish` runs only runner tools; `gate.sh` rule | Open |
-| P2 | Medium | The images `sign` job compiles the workspace (`cargo build`, every build script) in the job that later receives the image signing key | Separate secret-free manifest job; `sign` only downloads, signs, uploads; `gate.sh` rule | Open |
-| N1 | Medium | 16 IPv4 addresses (or 4 IPv6 /48s) can hold all 64 pre-authentication slots for 15 s each and block every new login, pairing and revocation | Short pre-TLS phase, reserved slots for known keys, unknown keys refused after TLS when no pairing is open, per-/24 cap | Open |
-| L1 | Medium | Bulk transfers above 64 MiB/s are judged a flood at either end of the session link; repeated faults end in `session_unavailable` for every device | Senders pace below the budget; session-side pending uses real readability; ipc.md §13 first | Open |
-| A1 | Medium | The server can write any number of files into `~/Downloads` without consent, also during management-only sessions where nothing is shown | Refuse incoming files unless the desktop view is active and the files policy is on; caps; no downloads for management sessions | Open |
-| A2 | Medium | The link confirmation can be swapped or clickjacked: a new link replaces an open dialog, and "Open link" works on the first click | Ignore links while a dialog is open, arm the button after a delay and a pointer move, rate limit, default cursor under dialogs | Open |
-| A3 | Medium | Decoded frame size is unchecked: a crafted SPS makes the app allocate several GiB | `max_pixels` on the decoder, reject frames over the cap or the stream size, smaller pool | Open |
-| A4 | Medium | The remote side can overwrite the local clipboard at any time, also with the app in the background; 64 MiB of text freezes the UI | Apply remote clipboard only while focused, 1 MiB text cap, coalesce | Open |
+| P1 | Medium | The images `publish` job runs a workspace-built `hx-imagectl` while holding a `contents: write` token, which can replace `channel-stable/install.sh` | Verify in a job without a write token; `publish` runs only runner tools; `gate.sh` rule | Fixed in `chore/release-pipeline-hardening` |
+| P2 | Medium | The images `sign` job compiles the workspace (`cargo build`, every build script) in the job that later receives the image signing key | Separate secret-free manifest job; `sign` only downloads, signs, uploads; `gate.sh` rule | Fixed in `chore/release-pipeline-hardening` |
+| N1 | Medium | 16 IPv4 addresses (or 4 IPv6 /48s) can hold all 64 pre-authentication slots for 15 s each and block every new login, pairing and revocation | Short pre-TLS phase, reserved slots for known keys, unknown keys refused after TLS when no pairing is open, per-/24 cap | Fixed in `fix/preauth-slots-and-pin-cap` |
+| L1 | Medium | Bulk transfers above 64 MiB/s are judged a flood at either end of the session link; repeated faults end in `session_unavailable` for every device | Senders pace below the budget; session-side pending uses real readability; ipc.md §13 first | Fixed in `fix/session-link-limits` |
+| A1 | Medium | The server can write any number of files into `~/Downloads` without consent, also during management-only sessions where nothing is shown | Refuse incoming files unless the desktop view is active and the files policy is on; caps; no downloads for management sessions | Fixed in `fix/desktop-untrusted-server` |
+| A2 | Medium | The link confirmation can be swapped or clickjacked: a new link replaces an open dialog, and "Open link" works on the first click | Ignore links while a dialog is open, arm the button after a delay and a pointer move, rate limit, default cursor under dialogs | Fixed in `fix/desktop-untrusted-server` |
+| A3 | Medium | Decoded frame size is unchecked: a crafted SPS makes the app allocate several GiB | `max_pixels` on the decoder, reject frames over the cap or the stream size, smaller pool | Fixed in `fix/desktop-untrusted-server` |
+| A4 | Medium | The remote side can overwrite the local clipboard at any time, also with the app in the background; 64 MiB of text freezes the UI | Apply remote clipboard only while focused, 1 MiB text cap, coalesce | Fixed in `fix/desktop-untrusted-server` |
 | P3 | High (settings) | Signing secrets are protected only by environment and ruleset settings that do not exist yet; the "tag is on main" check runs in the tagged commit's own workflow | Maintainer order: environments with policies, tag ruleset, branch protection, then secrets; README wording | Maintainer |
 | P4 | High (settings) | A fork PR can add a job for the `hx-perf` self-hosted runner | Approval for all outside collaborators; ephemeral runner, never the production VPS; `persist-credentials: false` | Maintainer |
-| N2 | Low | Two stolen device keys without the PIN reach privd's global PIN cap (10 an hour) and lock PIN login for everyone until an operator resets it | gatewayd forwards at most `max_pin_failures - 1` wrong checks per device; document in §8.1 | Open |
-| N3 | Low | A malicious server can open up to 1024 video streams, each holding a frame of up to 16 MiB, in the app | Bound frames in flight in the client transport | Open |
-| L2 | Low | A pause in the session's input reader turns queued frames into a burst over the frame-count limit | Session does not close the link for ctl frame-count overage; batch DROPPED reports | Open |
-| L3 | Low | After a takeover the displaced device's clipboard and offered files stay in the desktop (contradicts ipc.md §18) | Withdraw clipboard and clear the file batch on a new epoch | Open |
-| A5 | Low | Auto-reconnect re-sends a rejected PIN, which revokes the device after a PIN change made elsewhere | Stop reconnecting on Wrong, Backoff or NotAvailable and go to the PIN screen | Open |
-| A6 | Low | Incoming transfers and UI events have no client-side bound | Semaphore on transfers, bounded event channel, latest-wins coalescing | Open |
-| A7 | Low | A long host name can hide its real end in the link dialog | Cap host length, wrap the host, emphasise the registrable domain | Open |
-| R1 | Low | Third-party apt sources (Mozilla PPA, Docker, VS Code) are not scoped: any package they publish wins at priority 500 | `Package: *` at low priority per origin host, raise only the intended packages; validator rule | Open |
-| R2 | Low | INTERNAL errors from a failed desktop step now carry container-controlled output to the CLI and the app | Keep step and exit status in the message, the output only in the journal | Open |
-| R3 | Low | The refusal of `--token` on the command line does not say the token is already in logs and history | Message tells the user to make a new token | Open |
-| P5 | Low | Signing jobs collect artifacts by pattern; a known-failing cell leaves a name free for injection | Download by exact name; drop the failing 26.04 desktop cell | Open |
-| P6 | Low | Release build containers are pinned by tag, not digest; `gate.sh` checks only `uses:` | Digest pins; extend the gate check | Open |
-| P7 | Low | Any `v*` tag on `main` drives an image build | Require the release to exist or the tag to match the workspace version | Open |
-| P8 | Low | Nothing stops re-publishing an older version on a channel | `publish` refuses a version not newer than the channel's | Open |
-| L4 | Info | The session accepts resize sizes the gateway then refuses | Pixel cap in `apply_config` and `apply_view` | Open |
-| L5 | Info | The gateway's Annex B check accepts NAL types 13, 15 and 20 unparsed | Refuse 13, 14, 15 and 20 | Open |
-| N3i | Info | `upsert_paired` matches by device id only | Fail when the stored key differs | Open |
-| I | Info | Pinning check not run in CI; no `CODEOWNERS`; xdg-open `$BROWSER` fallback; reinstate password not zeroized; eager clipboard push on focus; in-process FFmpeg | Small fixes where cheap; the rest noted as accepted residual risk | Open |
+| N2 | Low | Two stolen device keys without the PIN reach privd's global PIN cap (10 an hour) and lock PIN login for everyone until an operator resets it | gatewayd forwards at most `max_pin_failures - 1` wrong checks per device; document in §8.1 | Fixed in `fix/preauth-slots-and-pin-cap` |
+| N3 | Low | A malicious server can open up to 1024 video streams, each holding a frame of up to 16 MiB, in the app | Bound frames in flight in the client transport | Fixed in `fix/preauth-slots-and-pin-cap` |
+| L2 | Low | A pause in the session's input reader turns queued frames into a burst over the frame-count limit | Session does not close the link for ctl frame-count overage; batch DROPPED reports | Fixed in `fix/session-link-limits` |
+| L3 | Low | After a takeover the displaced device's clipboard and offered files stay in the desktop (contradicts ipc.md §18) | Withdraw clipboard and clear the file batch on a new epoch | Fixed in `fix/session-link-limits` |
+| A5 | Low | Auto-reconnect re-sends a rejected PIN, which revokes the device after a PIN change made elsewhere | Stop reconnecting on Wrong, Backoff or NotAvailable and go to the PIN screen | Fixed in `fix/desktop-untrusted-server` |
+| A6 | Low | Incoming transfers and UI events have no client-side bound | Semaphore on transfers, bounded event channel, latest-wins coalescing | Fixed in `fix/desktop-untrusted-server` |
+| A7 | Low | A long host name can hide its real end in the link dialog | Cap host length, wrap the host, emphasise the registrable domain | Fixed in `fix/desktop-untrusted-server` |
+| R1 | Low | Third-party apt sources (Mozilla PPA, Docker, VS Code) are not scoped: any package they publish wins at priority 500 | `Package: *` at low priority per origin host, raise only the intended packages; validator rule | Fixed in `fix/provision-hardening` |
+| R2 | Low | INTERNAL errors from a failed desktop step now carry container-controlled output to the CLI and the app | Keep step and exit status in the message, the output only in the journal | Fixed in `fix/provision-hardening` |
+| R3 | Low | The refusal of `--token` on the command line does not say the token is already in logs and history | Message tells the user to make a new token | Fixed in `fix/provision-hardening` |
+| P5 | Low | Signing jobs collect artifacts by pattern; a known-failing cell leaves a name free for injection | Download by exact name; drop the failing 26.04 desktop cell | Fixed in `chore/release-pipeline-hardening` |
+| P6 | Low | Release build containers are pinned by tag, not digest; `gate.sh` checks only `uses:` | Digest pins; extend the gate check | Fixed in `chore/release-pipeline-hardening` |
+| P7 | Low | Any `v*` tag on `main` drives an image build | Require the release to exist or the tag to match the workspace version | Fixed in `chore/release-pipeline-hardening` |
+| P8 | Low | Nothing stops re-publishing an older version on a channel | `publish` refuses a version not newer than the channel's | Fixed in `chore/release-pipeline-hardening` |
+| L4 | Info | The session accepts resize sizes the gateway then refuses | Pixel cap in `apply_config` and `apply_view` | Fixed in `fix/session-link-limits` |
+| L5 | Info | The gateway's Annex B check accepts NAL types 13, 15 and 20 unparsed | Refuse 13, 14, 15 and 20 | Fixed in `fix/session-link-limits` |
+| N3i | Info | `upsert_paired` matches by device id only | Fail when the stored key differs | Fixed in `fix/preauth-slots-and-pin-cap` |
+| I | Info | Pinning check not run in CI; no `CODEOWNERS`; xdg-open `$BROWSER` fallback; reinstate password not zeroized; eager clipboard push on focus; in-process FFmpeg | Small fixes where cheap; the rest noted as accepted residual risk | Partly: pinning check in CI, `CODEOWNERS`, URL encoding for xdg-open and the zeroized password are fixed; eager clipboard push and in-process FFmpeg accepted |
+
+## Fixes
+
+Each workstream is its own branch with its own regression tests. Merged together they pass
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+`cargo nextest run --workspace --locked` (2219 passed, 22 skipped, three runs; one run had a
+single failure of `relay_e2e::video_cursor_and_stream_info_reach_the_client` that passed 5 of 5
+alone and in the next two full runs) and `release/gate.sh --dry-run` with its three tests.
+
+Decisions taken in the fixes:
+
+- **N2:** a device's last PIN attempt still reaches privd, unless privd's hourly PIN cap is one
+  failure away; only then it is judged wrong locally (and revokes). One owner with four typos still
+  logs in; two stolen keys cannot lock PIN login. Three or more can, as before (accepted, operator
+  `ResetLockout`).
+- **N1:** an unknown key with no live pairing secret is refused at its `Hello` (within 3 s of TLS)
+  so the app still shows `PAIRING_CLOSED`; it never takes a pending slot. While a pairing secret is
+  live, unknown keys can still fill the general pool (not the reserved one).
+- **A1:** files from the server are refused entirely in Phase 1; desktop-to-local files wait for a
+  native clipboard with a staging directory, the files policy and caps.
+- **A4:** remote clipboard text applies only while the desktop view has focus and is dropped
+  otherwise.
+- **L1:** bulk is backpressure only at the receiver; both senders pace at 48 MiB/s.
+
+Residual, recorded rather than fixed: the decoder's size gate is the absolute 8192x4320 cap, not the
+current stream size (about 424 MB worst case); real apt behaviour of the new pins needs one desktop
+build on Incus; the new image and release job graph runs for real only on `main` with keys.
 
 ## Checked and found sound
 
