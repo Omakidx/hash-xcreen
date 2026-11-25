@@ -46,7 +46,6 @@ async fn rig() -> Rig {
     let (session, _events) = Session::start(
         conn,
         None,
-        std::env::temp_dir(),
         Arc::new(Stats::default()),
         tokio::runtime::Handle::current(),
     );

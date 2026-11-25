@@ -33,7 +33,6 @@ fn rig() -> Rig {
         Config {
             demo: true,
             config_dir: None,
-            downloads: std::env::temp_dir(),
             backends: demo::backends(demo::Pace::instant()),
             key_store: Arc::new(MemoryKeyStore::default()),
             seed: showcase::demo_servers(),

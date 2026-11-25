@@ -49,14 +49,17 @@ impl DeviceAdmin for RealAdmin {
     ) -> BoxFuture<'_, Result<(), AdminError>> {
         let (host, port, key_hex) = (ctx.host.clone(), ctx.port, ctx.server_key_hex.clone());
         let (device, version) = (ctx.device.clone(), ctx.server_version);
-        let (pw, name) = (password.expose().to_owned(), self.device_name.clone());
+        let (pw, name) = (
+            zeroize::Zeroizing::new(password.expose().to_owned()),
+            self.device_name.clone(),
+        );
         Box::pin(async move {
             let key = crate::session::net::parse_key(&key_hex)
                 .ok_or_else(|| AdminError::Failed("The pinned server key is damaged.".into()))?;
             let target = crate::session::net::target(&host, port)
                 .await
                 .map_err(|_| AdminError::Unreachable)?;
-            let password = Password::new(&pw).map_err(|_| AdminError::Incorrect {
+            let password = Password::new(pw.as_str()).map_err(|_| AdminError::Incorrect {
                 attempts_left: None,
             })?;
             let opts = ReinstateOptions {

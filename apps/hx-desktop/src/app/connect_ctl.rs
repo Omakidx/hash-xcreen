@@ -202,7 +202,7 @@ fn submit(app: &Rc<App>) {
         return;
     };
     let prepared = desktop_ctl::prepare(app);
-    let wiring = prepared.wiring(app);
+    let wiring = prepared.wiring();
     let connector = app.be.connector.clone();
     let l2 = link.clone();
     let p2 = pin.clone();

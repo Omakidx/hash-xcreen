@@ -44,12 +44,11 @@ pub struct Prepared {
 
 impl Prepared {
     /// What the connector needs.
-    pub fn wiring(&self, app: &App) -> Wiring {
+    pub fn wiring(&self) -> Wiring {
         Wiring {
             frames: self.tx.clone(),
             presenter: Some(self.presenter.clone()),
             stats: self.stats.clone(),
-            downloads: app.downloads.clone(),
         }
     }
 }
@@ -135,6 +134,14 @@ pub struct Ctx {
     activities: Vec<(u64, Activity)>,
     clip: clipboard::Sync,
     link: Option<WebLink>,
+    /// When the open link dialog appeared, and whether the pointer has moved since it armed.
+    link_shown: Option<Instant>,
+    link_armed: bool,
+    /// When a link dialog was last shown, and how many were cancelled in this session.
+    link_last: Option<Instant>,
+    link_cancels: u32,
+    /// Whether the desktop view (so the app window) has the keyboard focus.
+    view_focused: bool,
     peer: Option<([u8; 16], String)>,
     resize_gen: u64,
     note_gen: u64,
@@ -218,6 +225,7 @@ pub fn enter(
         c.cursor_shown = None;
         c.activities.clear();
         c.link = None;
+        c.link_armed = false;
         c.remote = (0, 0);
         let g = c.epoch;
         if let Ok(mut s) = prepared.slot.lock() {
@@ -244,6 +252,7 @@ pub fn enter(
     vm.set_menu(0);
     vm.set_toolbar(false);
     vm.set_link_open(false);
+    vm.set_link_armed(false);
     vm.set_activities(model(vec![]));
     vm.set_transfer_note(ss(""));
     vm.set_cursor_visible(false);
@@ -341,6 +350,47 @@ fn push_activities(app: &Rc<App>) {
     app.ui().global::<DesktopVm>().set_activities(model(rows));
 }
 
+/// Time before "Open link" can work, and the least gap between two dialogs.
+const LINK_ARM_DELAY: Duration = Duration::from_secs(1);
+const LINK_MIN_GAP: Duration = Duration::from_secs(5);
+/// After this many cancelled dialogs in a session the desktop is not offered any more.
+const LINK_MAX_CANCELS: u32 = 3;
+
+/// A link request from the desktop: ignored while a dialog is open (it could swap the address
+/// under the user's click), rate limited, and not offered at all after repeated Cancels.
+fn on_link_request(app: &Rc<App>, body: &[u8]) {
+    let vm = app.ui().global::<DesktopVm>();
+    {
+        let c = app.desk.borrow();
+        if c.link.is_some()
+            || vm.get_link_open()
+            || c.link_cancels >= LINK_MAX_CANCELS
+            || c.link_last.is_some_and(|t| t.elapsed() < LINK_MIN_GAP)
+        {
+            return;
+        }
+    }
+    match links::from_uri_list(body) {
+        Ok(l) => {
+            vm.set_link_prefix(ss(&l.prefix));
+            vm.set_link_host(ss(&l.host));
+            vm.set_link_rest(ss(&l.rest));
+            vm.set_link_domain(ss(&l.domain));
+            vm.set_link_armed(false);
+            vm.set_link_open(true);
+            let mut c = app.desk.borrow_mut();
+            c.link = Some(l);
+            c.link_shown = Some(Instant::now());
+            c.link_last = c.link_shown;
+            c.link_armed = false;
+        }
+        Err(_) => set_note(
+            app,
+            "The desktop asked to open a link that was not offered: only http and https links can be opened.",
+        ),
+    }
+}
+
 fn on_event(app: &Rc<App>, epoch: u64, e: Event) {
     if app
         .desk
@@ -381,29 +431,19 @@ fn on_event(app: &Rc<App>, epoch: u64, e: Event) {
         }
         Event::Cursor(c) => on_cursor(app, c),
         Event::ClipboardText(t) => {
-            if clipboard::classify_incoming(&app.clip_policy(), "text/plain") == Incoming::Text {
+            // The local clipboard changes only while this window has the focus (a remote
+            // program cannot overwrite it behind the user's back); anything that arrives
+            // unfocused is dropped, and text over 1 MiB is never applied.
+            let focused = app.desk.borrow().view_focused;
+            if focused
+                && t.len() as u64 <= crate::session::net::MAX_CLIPBOARD_TEXT
+                && clipboard::classify_incoming(&app.clip_policy(), "text/plain") == Incoming::Text
+            {
                 app.desk.borrow_mut().clip.received(&t);
                 app.set_clipboard(&t);
             }
         }
-        Event::ClipboardImage(_) => {
-            tracing::debug!(
-                "the desktop copied an image; a native clipboard is needed to paste it here"
-            );
-        }
-        Event::LinkRequest(body) => match links::from_uri_list(&body) {
-            Ok(l) => {
-                vm.set_link_prefix(ss(&l.prefix));
-                vm.set_link_host(ss(&l.host));
-                vm.set_link_rest(ss(&l.rest));
-                vm.set_link_open(true);
-                app.desk.borrow_mut().link = Some(l);
-            }
-            Err(_) => set_note(
-                app,
-                "The desktop asked to open a link that was not offered: only http and https links can be opened.",
-            ),
-        },
+        Event::LinkRequest(body) => on_link_request(app, &body),
         Event::Transfer {
             id,
             activity,
@@ -561,6 +601,12 @@ fn leave_to_connect(app: &Rc<App>, id: &str) {
 /// Closes the connection and forgets the session (and its PIN).
 pub fn teardown(app: &Rc<App>) {
     let a = app.desk.borrow_mut().active.take();
+    {
+        let mut c = app.desk.borrow_mut();
+        c.view_focused = false;
+        c.link_cancels = 0;
+        c.link_last = None;
+    }
     if let Some(a) = a {
         let d = a.desk.clone();
         app.rt.spawn(async move { d.close().await });
@@ -661,48 +707,93 @@ fn try_reconnect(app: &Rc<App>, epoch: u64) {
         (a.link.clone(), a.pin.clone(), a.server_id.clone())
     };
     let prepared = prepare(app);
-    let wiring = prepared.wiring(app);
+    let wiring = prepared.wiring();
     let connector = app.be.connector.clone();
     let l2 = link.clone();
     let p2 = pin.clone();
     spawn_ui(
         app,
         async move { connector.connect(&l2, &p2, Box::new(|| {}), wiring).await },
-        move |a, r| {
-            if a.desk
-                .borrow()
-                .active
-                .as_ref()
-                .is_none_or(|x| x.epoch != epoch)
-            {
-                return;
+        move |a, r| finish_reconnect(a, epoch, &id, link, pin, prepared, r),
+    );
+}
+
+/// What a failed reconnect attempt leads to.
+#[derive(Debug, PartialEq, Eq)]
+enum AfterFailure {
+    /// The device was removed: the revoked state.
+    Revoked,
+    /// The server's key changed: the identity screen.
+    Identity,
+    /// The server rejected the cached PIN (wrong, too soon, or unavailable): stop, forget the
+    /// PIN and ask again. Sending it again could revoke the device after a PIN change elsewhere.
+    AskPin,
+    /// A network failure: keep trying on the schedule.
+    Retry,
+}
+
+fn after_failure(o: &Outcome) -> AfterFailure {
+    match o {
+        Outcome::Revoked => AfterFailure::Revoked,
+        Outcome::IdentityChanged => AfterFailure::Identity,
+        Outcome::Wrong { .. } | Outcome::Backoff { .. } | Outcome::NotAvailable { .. } => {
+            AfterFailure::AskPin
+        }
+        Outcome::Accepted | Outcome::Unreachable(_) | Outcome::Failed(_) => AfterFailure::Retry,
+    }
+}
+
+fn finish_reconnect(
+    a: &Rc<App>,
+    epoch: u64,
+    id: &str,
+    link: Link,
+    pin: Zeroizing<String>,
+    prepared: Prepared,
+    r: Result<Established, Outcome>,
+) {
+    if a.desk
+        .borrow()
+        .active
+        .as_ref()
+        .is_none_or(|x| x.epoch != epoch)
+    {
+        return;
+    }
+    match r {
+        Ok(est) => {
+            // The same screen, a new connection: the old plumbing goes with `active`.
+            let old = a.desk.borrow_mut().active.take();
+            if let Some(o) = old {
+                let d = o.desk.clone();
+                a.rt.spawn(async move { d.close().await });
             }
-            match r {
-                Ok(est) => {
-                    // The same screen, a new connection: the old plumbing goes with `active`.
-                    let old = a.desk.borrow_mut().active.take();
-                    if let Some(o) = old {
-                        let d = o.desk.clone();
-                        a.rt.spawn(async move { d.close().await });
-                    }
-                    enter(a, &id, link, est, prepared, pin);
-                }
-                Err(Outcome::Revoked) => {
-                    let _ = a.store.borrow_mut().set_lifecycle(
-                        &id,
-                        crate::servers::Lifecycle::Revoked,
-                        super::now_unix(),
-                    );
-                    leave_to_connect(a, &id);
-                }
-                Err(Outcome::IdentityChanged) => leave_to_connect(a, &id),
-                Err(_) => {
-                    drop(prepared);
-                    next_attempt(a, epoch);
-                }
+            enter(a, id, link, est, prepared, pin);
+        }
+        Err(o) => match after_failure(&o) {
+            AfterFailure::Revoked => {
+                let _ = a.store.borrow_mut().set_lifecycle(
+                    id,
+                    crate::servers::Lifecycle::Revoked,
+                    super::now_unix(),
+                );
+                leave_to_connect(a, id);
+            }
+            AfterFailure::Identity => leave_to_connect(a, id),
+            AfterFailure::AskPin => {
+                // The cached PIN is dropped with the session; the PIN screen says why.
+                drop((pin, prepared));
+                teardown(a);
+                super::connect_ctl::open(a, id);
+                a.conn.borrow_mut().machine.outcome(o);
+                super::connect_ctl::show(a);
+            }
+            AfterFailure::Retry => {
+                drop(prepared);
+                next_attempt(a, epoch);
             }
         },
-    );
+    }
 }
 
 fn retry_now(app: &Rc<App>) {
@@ -736,7 +827,6 @@ fn revoke_peer(app: &Rc<App>) {
     vm.set_takeover_note(ss("Signing in to revoke that device…"));
     let connector = app.be.connector.clone();
     let stats = Arc::new(Stats::default());
-    let downloads = app.downloads.clone();
     spawn_ui(
         app,
         async move {
@@ -746,7 +836,6 @@ fn revoke_peer(app: &Rc<App>) {
                 frames: None,
                 presenter: None,
                 stats,
-                downloads,
             };
             let est = connector
                 .connect(&link, &pin, Box::new(|| {}), w)
@@ -984,6 +1073,7 @@ pub fn wire(app: &Rc<App>) {
     });
     let a = app.clone();
     vm.on_view_focus(move |f| {
+        a.desk.borrow_mut().view_focused = f;
         if f {
             clipboard_to_desktop(&a);
         } else {
@@ -1041,9 +1131,32 @@ pub fn wire(app: &Rc<App>) {
         send_file(&a, path);
     });
     let a = app.clone();
+    vm.on_link_pointer_moved(move || {
+        let arm = {
+            let mut c = a.desk.borrow_mut();
+            let ready = c.link.is_some()
+                && !c.link_armed
+                && c.link_shown.is_some_and(|t| t.elapsed() >= LINK_ARM_DELAY);
+            if ready {
+                c.link_armed = true;
+            }
+            ready
+        };
+        if arm {
+            a.ui().global::<DesktopVm>().set_link_armed(true);
+        }
+    });
+    let a = app.clone();
     vm.on_open_link(move || {
+        // A click before the dialog was armed (a pause and a pointer move) does nothing.
+        if !a.desk.borrow().link_armed {
+            return;
+        }
         let l = a.desk.borrow_mut().link.take();
-        a.ui().global::<DesktopVm>().set_link_open(false);
+        a.desk.borrow_mut().link_armed = false;
+        let vm = a.ui().global::<DesktopVm>();
+        vm.set_link_armed(false);
+        vm.set_link_open(false);
         if let Some(l) = l
             && links::open_in_browser(&l).is_err()
         {
@@ -1055,8 +1168,16 @@ pub fn wire(app: &Rc<App>) {
     });
     let a = app.clone();
     vm.on_cancel_link(move || {
-        a.desk.borrow_mut().link = None;
-        a.ui().global::<DesktopVm>().set_link_open(false);
+        {
+            let mut c = a.desk.borrow_mut();
+            if c.link.take().is_some() {
+                c.link_cancels += 1;
+            }
+            c.link_armed = false;
+        }
+        let vm = a.ui().global::<DesktopVm>();
+        vm.set_link_armed(false);
+        vm.set_link_open(false);
     });
     let a = app.clone();
     vm.on_copy_link(move || {
@@ -1134,5 +1255,232 @@ mod tests {
         let v = build_view(0, 0, 2, (10, 99_999), false, true);
         assert_eq!((v.width, v.height), (64, 16384));
         assert_eq!(v.codec, VideoCodec::H264 as i32);
+    }
+
+    // ------------------------------------------------------------------ controller tests
+
+    use crate::AppWindow;
+    use crate::app::{Config, showcase};
+    use crate::backend::demo;
+    use crate::keys::MemoryKeyStore;
+
+    struct Rig {
+        ui: AppWindow,
+        app: Rc<App>,
+        rt: tokio::runtime::Runtime,
+    }
+
+    fn rig() -> Rig {
+        i_slint_backend_testing::init_no_event_loop();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let ui = AppWindow::new().unwrap();
+        let app = App::start(
+            &ui,
+            rt.handle().clone(),
+            Config {
+                demo: true,
+                config_dir: None,
+                backends: demo::backends(demo::Pace::instant()),
+                key_store: Arc::new(MemoryKeyStore::default()),
+                seed: showcase::demo_servers(),
+            },
+        );
+        Rig { ui, app, rt }
+    }
+
+    /// An active demo connection, without going through `enter`.
+    fn activate(r: &Rig) -> (String, u64) {
+        // The demo servers carry placeholder keys, so the link gets a fresh one.
+        let srv = r.app.server("ws").expect("demo server");
+        let id = srv.id.clone();
+        let link = Link {
+            host: srv.host.clone(),
+            port: srv.port,
+            server_key: hx_crypto::IdentityKey::generate().unwrap().public(),
+            device: r.app.key.clone(),
+            device_name: "test".into(),
+        };
+        let prepared = prepare(&r.app);
+        let wiring = prepared.wiring();
+        let est =
+            r.rt.block_on(r.app.be.connector.connect(
+                &link,
+                crate::backend::demo_desk::DEMO_PIN,
+                Box::new(|| {}),
+                wiring,
+            ))
+            .unwrap_or_else(|_| panic!("demo connects"));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut c = r.app.desk.borrow_mut();
+        c.epoch += 1;
+        let epoch = c.epoch;
+        c.active = Some(Active {
+            server_id: id.clone(),
+            link,
+            desk: est.desk,
+            _prepared: prepared,
+            pin: Zeroizing::new(crate::backend::demo_desk::DEMO_PIN.to_owned()),
+            epoch,
+            outage: None,
+            events: tx,
+        });
+        (id, epoch)
+    }
+
+    fn uri(u: &str) -> Event {
+        Event::LinkRequest(u.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn a_second_link_request_cannot_swap_an_open_dialog() {
+        let r = rig();
+        let (_, epoch) = activate(&r);
+        on_event(&r.app, epoch, uri("https://first.test/a"));
+        let vm = r.ui.global::<DesktopVm>();
+        assert!(vm.get_link_open());
+        on_event(&r.app, epoch, uri("https://second.test/b"));
+        assert_eq!(vm.get_link_host().as_str(), "first.test");
+        assert_eq!(
+            r.app.desk.borrow().link.as_ref().unwrap().host,
+            "first.test"
+        );
+    }
+
+    #[test]
+    fn open_link_does_nothing_until_armed() {
+        let r = rig();
+        let (_, epoch) = activate(&r);
+        on_event(&r.app, epoch, uri("https://first.test/a"));
+        let vm = r.ui.global::<DesktopVm>();
+        // A click at once: no-op, the dialog stays.
+        vm.invoke_open_link();
+        assert!(vm.get_link_open());
+        assert!(r.app.desk.borrow().link.is_some());
+        // A pointer move before the pause does not arm it either.
+        vm.invoke_link_pointer_moved();
+        assert!(!vm.get_link_armed());
+        vm.invoke_open_link();
+        assert!(vm.get_link_open());
+        // Cancel is always available, and counts.
+        vm.invoke_cancel_link();
+        assert!(!vm.get_link_open());
+        assert_eq!(r.app.desk.borrow().link_cancels, 1);
+    }
+
+    #[test]
+    fn a_pause_and_a_pointer_move_arm_the_dialog() {
+        let r = rig();
+        let (_, epoch) = activate(&r);
+        on_event(&r.app, epoch, uri("https://first.test/a"));
+        r.app.desk.borrow_mut().link_shown = Instant::now().checked_sub(Duration::from_secs(2));
+        let vm = r.ui.global::<DesktopVm>();
+        vm.invoke_link_pointer_moved();
+        assert!(vm.get_link_armed());
+    }
+
+    #[test]
+    fn link_requests_are_rate_limited_and_stop_after_cancels() {
+        let r = rig();
+        let (_, epoch) = activate(&r);
+        let vm = r.ui.global::<DesktopVm>();
+        on_event(&r.app, epoch, uri("https://one.test/"));
+        vm.invoke_cancel_link();
+        // Within 5 s of the last dialog: ignored.
+        on_event(&r.app, epoch, uri("https://two.test/"));
+        assert!(!vm.get_link_open());
+        for _ in 0..3 {
+            r.app.desk.borrow_mut().link_last = Instant::now().checked_sub(Duration::from_secs(6));
+            on_event(&r.app, epoch, uri("https://again.test/"));
+            if vm.get_link_open() {
+                vm.invoke_cancel_link();
+            }
+        }
+        // Three Cancels: no more offers in this session.
+        r.app.desk.borrow_mut().link_last = Instant::now().checked_sub(Duration::from_secs(60));
+        on_event(&r.app, epoch, uri("https://late.test/"));
+        assert!(!vm.get_link_open());
+    }
+
+    #[test]
+    fn remote_clipboard_text_needs_the_window_focus() {
+        let r = rig();
+        let (_, epoch) = activate(&r);
+        r.app.set_clipboard("mine");
+        assert_eq!(r.app.get_clipboard(), "mine");
+        let vm = r.ui.global::<DesktopVm>();
+        vm.invoke_view_focus(false);
+        on_event(&r.app, epoch, Event::ClipboardText("theirs".into()));
+        assert_eq!(r.app.get_clipboard(), "mine");
+        vm.invoke_view_focus(true);
+        on_event(&r.app, epoch, Event::ClipboardText("theirs".into()));
+        assert_eq!(r.app.get_clipboard(), "theirs");
+        // Over 1 MiB is never applied.
+        let big = "x".repeat((crate::session::net::MAX_CLIPBOARD_TEXT as usize) + 1);
+        on_event(&r.app, epoch, Event::ClipboardText(big));
+        assert_eq!(r.app.get_clipboard(), "theirs");
+    }
+
+    #[test]
+    fn a_rejected_cached_pin_is_not_sent_again() {
+        assert_eq!(
+            after_failure(&Outcome::Wrong {
+                attempts_left: 3,
+                retry_after: Duration::ZERO
+            }),
+            AfterFailure::AskPin
+        );
+        assert_eq!(
+            after_failure(&Outcome::Backoff {
+                retry_after: Duration::from_secs(2)
+            }),
+            AfterFailure::AskPin
+        );
+        assert_eq!(
+            after_failure(&Outcome::NotAvailable {
+                retry_after: Duration::from_secs(60)
+            }),
+            AfterFailure::AskPin
+        );
+        assert_eq!(
+            after_failure(&Outcome::Unreachable("x".into())),
+            AfterFailure::Retry
+        );
+        assert_eq!(after_failure(&Outcome::Revoked), AfterFailure::Revoked);
+    }
+
+    #[test]
+    fn reconnect_with_a_wrong_pin_stops_and_shows_the_pin_screen() {
+        let r = rig();
+        let (id, epoch) = activate(&r);
+        let (link, pin) = {
+            let c = r.app.desk.borrow();
+            let a = c.active.as_ref().unwrap();
+            (a.link.clone(), a.pin.clone())
+        };
+        let prepared = prepare(&r.app);
+        finish_reconnect(
+            &r.app,
+            epoch,
+            &id,
+            link,
+            pin,
+            prepared,
+            Err(Outcome::Wrong {
+                attempts_left: 4,
+                retry_after: Duration::ZERO,
+            }),
+        );
+        // No session, no cached PIN, no retry timer: the Connect screen with the message.
+        assert!(r.app.desk.borrow().active.is_none());
+        assert_eq!(r.ui.global::<crate::Nav>().get_screen(), Screen::Connect);
+        assert!(
+            r.ui.global::<crate::ConnectVm>()
+                .get_notice_title()
+                .starts_with("Incorrect PIN")
+        );
     }
 }

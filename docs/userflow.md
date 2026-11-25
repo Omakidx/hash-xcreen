@@ -118,9 +118,10 @@ The one-liner installs only the **agent**. Everything about the desktop (distro,
   - Keyboard: capture all keys on or off; send `Ctrl+Alt+Del` and other combinations.
   - Transfers: clipboard and file activity.
   - Disconnect.
-- **Clipboard**: copying text, images or files on one side and pasting on the other just works, in both directions.
-- **Links**: when the desktop asks the local computer to open a link, nothing opens until the user agrees. The dialog shows the full address with the host in bold, **Cancel** is the default, there is no "always allow", and only `http` and `https` links are offered; other kinds are refused without a prompt. *(Approved 2026-11-22.)*
-- **Files**: drag files from the local machine into the desktop window; a progress bar shows large transfers. A file above the 4 GiB limit is refused before sending, with the reason.
+- **Clipboard**: copying text on one side and pasting on the other just works, in both directions. The local clipboard is only changed while the app window is focused, and only by text up to 1 MiB. Images and files from the desktop are not pasted locally in Phase 1 (they need a native clipboard).
+- **Links**: when the desktop asks the local computer to open a link, nothing opens until the user agrees. The dialog shows the full address with the host in bold, **Cancel** is the default, there is no "always allow", and only `http` and `https` links are offered; other kinds are refused without a prompt. The dialog takes no new request while it is open, **Open link** only becomes active after a short pause and a pointer move inside the dialog, requests are limited to one every 5 seconds, and after three Cancels in a session the desktop is not offered any more. The pointer is the system arrow while the dialog is shown. A long address wraps and the registrable domain is emphasised; an address whose host is longer than 253 characters (or a label longer than 63) is refused. *(Approved 2026-11-22; hardened after the Gate 1 review.)*
+- **Files**: files go from the local machine into the desktop only (drag them into the desktop window). The desktop app never accepts files from the desktop or the server in Phase 1: incoming file transfers are refused, so nothing from the remote side is written to the local disk.
+  Drag files from the local machine into the desktop window; a progress bar shows large transfers. A file above the 4 GiB limit is refused before sending, with the reason.
 
 ## 7. Backups *(Phase 2: hidden in the Phase 1 app)*
 

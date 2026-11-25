@@ -236,7 +236,7 @@ export component DesktopScreen inherits Rectangle {
             enabled: !root.blocked;
             // The remote shape as the system pointer: it moves with the mouse and a move
             // redraws nothing (architecture 6.3).
-            mouse-cursor: DesktopVm.cursor-visible ? MouseCursor.custom(DesktopVm.cursor, DesktopVm.cursor-hot-x, DesktopVm.cursor-hot-y) : MouseCursor.default;
+            mouse-cursor: DesktopVm.cursor-visible && !DesktopVm.link-open && DesktopVm.overlay == 0 ? MouseCursor.custom(DesktopVm.cursor, DesktopVm.cursor-hot-x, DesktopVm.cursor-hot-y) : MouseCursor.default;
             changed has-hover => {
                 DesktopVm.pointer-inside = self.has-hover;
             }
@@ -854,6 +854,9 @@ export component DesktopScreen inherits Rectangle {
         dismissed => {
             DesktopVm.cancel-link();
         }
+        pointer-moved => {
+            DesktopVm.link-pointer-moved();
+        }
         Label {
             text: "The remote desktop asked this computer to open a link. Nothing opens until you say so.";
             color: Tokens.text-2;
@@ -866,41 +869,33 @@ export component DesktopScreen inherits Rectangle {
             border-color: Tokens.border;
             height: lk.preferred-height + 2 * Tokens.sp-3;
             accessible-role: AccessibleRole.text;
-            accessible-label: "Link " + DesktopVm.link-prefix + DesktopVm.link-host + DesktopVm.link-rest;
+            accessible-label: "Link to " + DesktopVm.link-domain + ", " + DesktopVm.link-prefix + DesktopVm.link-host + DesktopVm.link-rest;
             lk := VerticalLayout {
                 x: Tokens.sp-3;
                 y: Tokens.sp-3;
                 width: parent.width - 2 * Tokens.sp-3;
-                HorizontalLayout {
-                    alignment: start;
-                    Text {
-                        text: DesktopVm.link-prefix;
-                        color: Tokens.text-2;
-                        font-family: Tokens.font-mono;
-                        font-size: Tokens.fs-sm;
-                    }
-
-                    Text {
-                        text: DesktopVm.link-host;
-                        color: Tokens.text;
-                        font-family: Tokens.font-mono;
-                        font-size: Tokens.fs-sm;
-                        font-weight: 700;
-                    }
+                spacing: Tokens.sp-2;
+                Text {
+                    text: "Site: " + DesktopVm.link-domain;
+                    color: Tokens.text;
+                    font-family: Tokens.font-mono;
+                    font-size: Tokens.fs-md;
+                    font-weight: 700;
+                    wrap: char-wrap;
                 }
 
                 Text {
-                    text: DesktopVm.link-rest;
+                    text: DesktopVm.link-prefix + DesktopVm.link-host + DesktopVm.link-rest;
                     color: Tokens.text-2;
                     font-family: Tokens.font-mono;
                     font-size: Tokens.fs-sm;
-                    wrap: word-wrap;
+                    wrap: char-wrap;
                 }
             }
         }
 
         Muted {
-            text: "It opens in your default browser, outside hash-xcreen. Only continue if you expected it.";
+            text: DesktopVm.link-armed ? "It opens in your default browser, outside hash-xcreen. Only continue if you expected it." : "Check the address. Open link unlocks in a moment, once you move the pointer.";
         }
 
         ButtonRow {
@@ -923,6 +918,7 @@ export component DesktopScreen inherits Rectangle {
             Btn {
                 text: "Open link";
                 kind: "primary";
+                enabled: DesktopVm.link-armed;
                 clicked => {
                     DesktopVm.open-link();
                 }

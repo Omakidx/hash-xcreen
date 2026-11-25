@@ -231,15 +231,13 @@ pub enum Event {
     ClipboardText(String),
     /// A clipboard transfer that is a list of links (`text/uri-list`).
     LinkRequest(Vec<u8>),
-    /// A clipboard image (PNG), kept for a native clipboard to take.
-    ClipboardImage(Vec<u8>),
     /// A transfer started, advanced or ended.
     Transfer {
         /// Transfer id.
         id: u64,
         /// The row.
         activity: Activity,
-        /// Where a received file was saved.
+        /// Where a file was saved (the desktop app never saves incoming files: always `None`).
         saved: Option<PathBuf>,
     },
     /// The device list changed on the server.
@@ -294,7 +292,6 @@ impl Session {
     pub fn start(
         conn: Connection,
         frames: Option<SyncSender<VideoFrame>>,
-        downloads: PathBuf,
         stats: Arc<Stats>,
         handle: tokio::runtime::Handle,
     ) -> (Session, mpsc::UnboundedReceiver<Event>) {
@@ -365,6 +362,44 @@ impl Session {
             });
         }
 
+        // What the server can flood (cursor, clipboard, statistics, stream info) goes through a
+        // latest-wins slot with a minimum gap, so the event queue and the UI's event loop stay
+        // bounded whatever the server sends (security review A6).
+        let stream_l: Arc<Latest<pb::StreamInfo>> = Arc::default();
+        forward_latest(
+            &handle,
+            stream_l.clone(),
+            ev_tx.clone(),
+            GAP_STREAM,
+            Event::Stream,
+        );
+        let stats_l: Arc<Latest<pb::ServerStats>> = Arc::default();
+        forward_latest(
+            &handle,
+            stats_l.clone(),
+            ev_tx.clone(),
+            GAP_STATS,
+            Event::Stats,
+        );
+        let cursor_l: Arc<CursorSlot> = Arc::default();
+        forward_cursor(&handle, cursor_l.clone(), ev_tx.clone(), GAP_CURSOR);
+        let clip_l: Arc<Latest<String>> = Arc::default();
+        forward_latest(
+            &handle,
+            clip_l.clone(),
+            ev_tx.clone(),
+            GAP_CLIPBOARD,
+            Event::ClipboardText,
+        );
+        let link_l: Arc<Latest<Vec<u8>>> = Arc::default();
+        forward_latest(
+            &handle,
+            link_l.clone(),
+            ev_tx.clone(),
+            GAP_CLIPBOARD,
+            Event::LinkRequest,
+        );
+
         // Control in.
         let (c, tx, pend, pend_srv, gb) = (
             conn.clone(),
@@ -376,12 +411,8 @@ impl Session {
         handle.spawn(async move {
             while let Ok(m) = c.recv_control().await {
                 match m.message {
-                    Some(Ctl::StreamInfo(s)) => {
-                        let _ = tx.send(Event::Stream(s));
-                    }
-                    Some(Ctl::ServerStats(s)) => {
-                        let _ = tx.send(Event::Stats(s));
-                    }
+                    Some(Ctl::StreamInfo(s)) => stream_l.put(s),
+                    Some(Ctl::ServerStats(s)) => stats_l.put(s),
                     Some(Ctl::Goodbye(g)) => {
                         if let Ok(mut slot) = gb.lock() {
                             *slot = Some(g);
@@ -416,27 +447,32 @@ impl Session {
         });
 
         // Cursor in.
-        let (c, tx) = (conn.clone(), ev_tx.clone());
+        let c = conn.clone();
         handle.spawn(async move {
             while let Ok(e) = c.recv_cursor().await {
-                if tx.send(Event::Cursor(e)).is_err() {
-                    break;
-                }
+                cursor_l.put(e);
             }
         });
 
-        // Transfers in.
-        let (c, tx, ids) = (
-            conn.clone(),
-            ev_tx.clone(),
-            Arc::new(AtomicU32::new(1 << 20)),
-        );
-        let limit = negotiated.max_file_bytes;
-        let dl = downloads.clone();
+        // Transfers in: only clipboard text and link requests are taken, a few at a time; files
+        // and everything else are refused (see `plan_incoming`).
+        let c = conn.clone();
+        let slots = Arc::new(tokio::sync::Semaphore::new(MAX_INCOMING));
+        let sinks = Sinks {
+            text: clip_l,
+            link: link_l,
+        };
         handle.spawn(async move {
             while let Ok(t) = c.accept_transfer().await {
-                let id = u64::from(ids.fetch_add(1, Relaxed));
-                tokio::spawn(receive_transfer(t, id, tx.clone(), dl.clone(), limit));
+                let plan = plan_incoming(t.kind, &t.header.mime, t.header.size);
+                let permit = match (plan, slots.clone().try_acquire_owned()) {
+                    (Incoming::Refuse, _) | (_, Err(_)) => {
+                        t.reject();
+                        continue;
+                    }
+                    (_, Ok(p)) => p,
+                };
+                tokio::spawn(receive_transfer(t, plan, sinks.clone(), permit));
             }
         });
 
@@ -793,105 +829,309 @@ impl Session {
     }
 }
 
-async fn receive_transfer(
-    mut t: hx_transport::IncomingTransfer,
-    id: u64,
+/// Most incoming transfers read at once; the rest are refused.
+pub const MAX_INCOMING: usize = 4;
+/// Longest remote clipboard text taken (1 MiB).
+pub const MAX_CLIPBOARD_TEXT: u64 = 1 << 20;
+/// Longest link request taken.
+pub const MAX_LINK_REQUEST: u64 = 4096;
+/// How long a transfer may take to arrive before it is dropped.
+const INCOMING_TIMEOUT: Duration = Duration::from_secs(10);
+
+const GAP_CURSOR: Duration = Duration::from_millis(8);
+const GAP_STATS: Duration = Duration::from_millis(500);
+const GAP_STREAM: Duration = Duration::from_millis(100);
+const GAP_CLIPBOARD: Duration = Duration::from_millis(250);
+
+/// What to do with an incoming transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Incoming {
+    /// Clipboard text.
+    Text,
+    /// A link request.
+    Link,
+    /// Refuse it (`reject()`): files, images, other types, anything too large.
+    Refuse,
+}
+
+/// Decides before a byte is read. Files are never accepted: the desktop app has no
+/// desktop-to-local file path in Phase 1 (architecture 6.4), so a compromised server cannot
+/// write to the local disk, whatever the settings or the kind of session.
+pub fn plan_incoming(kind: TransferKind, mime: &str, size: u64) -> Incoming {
+    if kind != TransferKind::Clipboard {
+        return Incoming::Refuse;
+    }
+    let m = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match m.as_str() {
+        "text/plain" if size <= MAX_CLIPBOARD_TEXT => Incoming::Text,
+        "text/uri-list" if size <= MAX_LINK_REQUEST => Incoming::Link,
+        _ => Incoming::Refuse,
+    }
+}
+
+/// The newest value of something the server can send faster than the UI needs it.
+struct Latest<T> {
+    slot: Mutex<Option<T>>,
+    wake: tokio::sync::Notify,
+}
+
+impl<T> Default for Latest<T> {
+    fn default() -> Self {
+        Self {
+            slot: Mutex::new(None),
+            wake: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+impl<T> Latest<T> {
+    /// Replaces the waiting value.
+    fn put(&self, v: T) {
+        if let Ok(mut s) = self.slot.lock() {
+            *s = Some(v);
+        }
+        self.wake.notify_one();
+    }
+
+    fn take(&self) -> Option<T> {
+        self.slot.lock().ok().and_then(|mut s| s.take())
+    }
+}
+
+/// Moves the newest value of `latest` into the event channel at most once per `gap`.
+fn forward_latest<T: Send + 'static>(
+    handle: &tokio::runtime::Handle,
+    latest: Arc<Latest<T>>,
     tx: mpsc::UnboundedSender<Event>,
-    downloads: PathBuf,
-    limit: u64,
+    gap: Duration,
+    wrap: fn(T) -> Event,
 ) {
-    let name = crate::files::safe_file_name(&t.header.name);
-    let total = t.header.size;
-    match t.kind {
-        TransferKind::Clipboard => {
-            let mime = t.header.mime.clone();
-            let Ok(body) = t.read_to_end(hx_proto::channel::MAX_CLIPBOARD_SIZE).await else {
-                return;
-            };
-            let m = mime
-                .split(';')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_ascii_lowercase();
-            let ev = match m.as_str() {
-                "text/plain" => Event::ClipboardText(String::from_utf8_lossy(&body).into_owned()),
-                "text/uri-list" => Event::LinkRequest(body.to_vec()),
-                "image/png" => Event::ClipboardImage(body.to_vec()),
-                _ => return,
-            };
-            let _ = tx.send(ev);
-        }
-        TransferKind::File => {
-            let act = |done, state| Activity {
-                name: name.clone(),
-                dir: Direction::Down,
-                done,
-                total,
-                state,
-            };
-            if t.header.validate_file(limit).is_err() {
-                t.reject();
-                let _ = tx.send(Event::Transfer {
-                    id,
-                    activity: act(
-                        0,
-                        TransferState::Failed(crate::files::refusal_text(&name, limit)),
-                    ),
-                    saved: None,
-                });
-                return;
+    handle.spawn(async move {
+        loop {
+            tokio::select! {
+                () = latest.wake.notified() => {}
+                () = tx.closed() => break,
             }
-            let _ = std::fs::create_dir_all(&downloads);
-            let path = crate::files::unique_path(&downloads, &name);
-            let res: Result<(), String> = async {
-                use tokio::io::AsyncWriteExt;
-                let mut f = tokio::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let mut done = 0u64;
-                let mut last = std::time::Instant::now();
-                let _ = tx.send(Event::Transfer {
-                    id,
-                    activity: act(0, TransferState::Running),
-                    saved: None,
-                });
-                while let Some(chunk) = t.next_chunk().await.map_err(|e| e.to_string())? {
-                    f.write_all(&chunk).await.map_err(|e| e.to_string())?;
-                    done += chunk.len() as u64;
-                    if last.elapsed() > Duration::from_millis(200) {
-                        last = std::time::Instant::now();
-                        let _ = tx.send(Event::Transfer {
-                            id,
-                            activity: act(done, TransferState::Running),
-                            saved: None,
-                        });
+            if let Some(v) = latest.take()
+                && tx.send(wrap(v)).is_err()
+            {
+                break;
+            }
+            tokio::time::sleep(gap).await;
+        }
+    });
+}
+
+/// Shape definitions kept in order (never coalesced: a position refers to a shape by id), at
+/// most as many as the UI caches; the newest position wins.
+const MAX_SHAPES_QUEUED: usize = 65;
+
+#[derive(Default)]
+struct CursorState {
+    shapes: std::collections::VecDeque<pb::CursorEvent>,
+    position: Option<pb::CursorEvent>,
+}
+
+#[derive(Default)]
+struct CursorSlot {
+    state: Mutex<CursorState>,
+    wake: tokio::sync::Notify,
+}
+
+impl CursorSlot {
+    fn put(&self, e: pb::CursorEvent) {
+        use pb::cursor_event::Event as C;
+        if let Ok(mut st) = self.state.lock() {
+            match e.event {
+                Some(C::Shape(_)) => {
+                    if st.shapes.len() >= MAX_SHAPES_QUEUED {
+                        st.shapes.pop_front();
                     }
+                    st.shapes.push_back(e);
                 }
-                f.flush().await.map_err(|e| e.to_string())?;
-                Ok(())
-            }
-            .await;
-            match res {
-                Ok(()) => {
-                    let _ = tx.send(Event::Transfer {
-                        id,
-                        activity: act(total, TransferState::Done),
-                        saved: Some(path),
-                    });
-                }
-                Err(e) => {
-                    let _ = std::fs::remove_file(&path);
-                    let _ = tx.send(Event::Transfer {
-                        id,
-                        activity: act(0, TransferState::Failed(super::connect::sanitize(&e))),
-                        saved: None,
-                    });
-                }
+                _ => st.position = Some(e),
             }
         }
+        self.wake.notify_one();
+    }
+
+    /// Queued shapes first, then the newest position: a shape always precedes the positions
+    /// that name it.
+    fn take(&self) -> Vec<pb::CursorEvent> {
+        let Ok(mut st) = self.state.lock() else {
+            return vec![];
+        };
+        let mut out: Vec<_> = st.shapes.drain(..).collect();
+        out.extend(st.position.take());
+        out
+    }
+}
+
+fn forward_cursor(
+    handle: &tokio::runtime::Handle,
+    slot: Arc<CursorSlot>,
+    tx: mpsc::UnboundedSender<Event>,
+    gap: Duration,
+) {
+    handle.spawn(async move {
+        loop {
+            tokio::select! {
+                () = slot.wake.notified() => {}
+                () = tx.closed() => break,
+            }
+            for e in slot.take() {
+                if tx.send(Event::Cursor(e)).is_err() {
+                    return;
+                }
+            }
+            tokio::time::sleep(gap).await;
+        }
+    });
+}
+
+#[derive(Clone)]
+struct Sinks {
+    text: Arc<Latest<String>>,
+    link: Arc<Latest<Vec<u8>>>,
+}
+
+async fn receive_transfer(
+    t: hx_transport::IncomingTransfer,
+    plan: Incoming,
+    sinks: Sinks,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    let limit = match plan {
+        Incoming::Text => MAX_CLIPBOARD_TEXT,
+        Incoming::Link => MAX_LINK_REQUEST,
+        Incoming::Refuse => {
+            t.reject();
+            return;
+        }
+    };
+    let Ok(Ok(body)) = tokio::time::timeout(INCOMING_TIMEOUT, t.read_to_end(limit)).await else {
+        return;
+    };
+    match plan {
+        Incoming::Text => sinks.text.put(String::from_utf8_lossy(&body).into_owned()),
+        Incoming::Link => sinks.link.put(body.to_vec()),
+        Incoming::Refuse => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn files_are_never_accepted() {
+        // Whatever the type, size or the clipboard policy, a file is refused: nothing the
+        // remote side sends reaches the local disk.
+        for mime in [
+            "",
+            "text/plain",
+            "application/octet-stream",
+            "text/uri-list",
+        ] {
+            for size in [0, 1, 1 << 20, 4 << 30] {
+                assert_eq!(
+                    plan_incoming(TransferKind::File, mime, size),
+                    Incoming::Refuse
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clipboard_transfers_are_capped_and_typed() {
+        let c = TransferKind::Clipboard;
+        assert_eq!(
+            plan_incoming(c, "text/plain; charset=utf-8", 10),
+            Incoming::Text
+        );
+        assert_eq!(
+            plan_incoming(c, "text/plain", MAX_CLIPBOARD_TEXT),
+            Incoming::Text
+        );
+        assert_eq!(
+            plan_incoming(c, "text/plain", MAX_CLIPBOARD_TEXT + 1),
+            Incoming::Refuse
+        );
+        assert_eq!(plan_incoming(c, "text/uri-list", 100), Incoming::Link);
+        assert_eq!(
+            plan_incoming(c, "text/uri-list", MAX_LINK_REQUEST + 1),
+            Incoming::Refuse
+        );
+        // Images are not used by the desktop app: refused before 64 MiB are buffered.
+        assert_eq!(plan_incoming(c, "image/png", 10), Incoming::Refuse);
+    }
+
+    #[tokio::test]
+    async fn latest_wins_and_is_rate_limited() {
+        let l: Arc<Latest<u32>> = Arc::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        forward_latest(
+            &tokio::runtime::Handle::current(),
+            l.clone(),
+            tx,
+            Duration::from_millis(50),
+            |n| {
+                Event::Stats(pb::ServerStats {
+                    frames: n,
+                    ..Default::default()
+                })
+            },
+        );
+        for n in 0..1000 {
+            l.put(n);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut seen = vec![];
+        while let Ok(Event::Stats(s)) = rx.try_recv() {
+            seen.push(s.frames);
+        }
+        assert!(seen.len() <= 2, "{seen:?}");
+        assert_eq!(seen.last(), Some(&999));
+    }
+
+    #[tokio::test]
+    async fn a_shape_is_never_lost_to_the_position_that_follows() {
+        use pb::cursor_event::Event as C;
+        let slot: Arc<CursorSlot> = Arc::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        forward_cursor(
+            &tokio::runtime::Handle::current(),
+            slot.clone(),
+            tx,
+            Duration::from_millis(50),
+        );
+        slot.put(pb::CursorEvent {
+            event: Some(C::Shape(pb::CursorShape {
+                id: 7,
+                ..Default::default()
+            })),
+        });
+        for i in 0..100 {
+            slot.put(pb::CursorEvent {
+                event: Some(C::Position(pb::CursorPosition {
+                    shape_id: 7,
+                    x: i,
+                    ..Default::default()
+                })),
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut seen = vec![];
+        while let Ok(Event::Cursor(e)) = rx.try_recv() {
+            seen.push(e);
+        }
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(matches!(&seen[0].event, Some(C::Shape(s)) if s.id == 7));
+        assert!(matches!(&seen[1].event, Some(C::Position(p)) if p.x == 99 && p.shape_id == 7));
     }
 }

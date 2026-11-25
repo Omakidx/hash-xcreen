@@ -93,6 +93,12 @@ impl KnownHosts {
         };
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
+            #[cfg(unix)]
+            {
+                // The list of hosts and keys is the user's own business: 0700 directory.
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+            }
         }
         let data = serde_json::to_vec_pretty(&self.map)
             .map_err(|e| KnownHostsError::Corrupt(e.to_string()))?;
@@ -160,6 +166,12 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
+            let dir = std::fs::metadata(p.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir, 0o700);
         }
     }
 

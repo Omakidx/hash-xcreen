@@ -750,6 +750,8 @@ pub fn apply(app: &Rc<App>, name: &str) -> bool {
             vm.set_link_prefix(ss("https://"));
             vm.set_link_host(ss("docs.example.test"));
             vm.set_link_rest(ss("/guide/getting-started?ref=desktop"));
+            vm.set_link_domain(ss("example.test"));
+            vm.set_link_armed(true);
             vm.set_link_open(true);
         }
         "details-overview" | "details-problems" | "details-offline" => {

@@ -118,7 +118,7 @@ impl Desk for Session {
     }
 }
 
-/// What a connection needs from the app: where video goes and where files land.
+/// What a connection needs from the app: where video goes. Incoming files are never saved.
 pub struct Wiring {
     /// The decoder's input; `None` for a management-only session.
     pub frames: Option<SyncSender<VideoFrame>>,
@@ -126,8 +126,6 @@ pub struct Wiring {
     pub presenter: Option<Arc<dyn Presenter>>,
     /// Shared counters.
     pub stats: Arc<Stats>,
-    /// Where received files are saved.
-    pub downloads: PathBuf,
 }
 
 /// An authorized connection and its events.
@@ -185,8 +183,7 @@ impl Connector for RealConnector {
                     return Err(o);
                 }
             };
-            let (session, events) =
-                Session::start(conn, wiring.frames, wiring.downloads, wiring.stats, handle);
+            let (session, events) = Session::start(conn, wiring.frames, wiring.stats, handle);
             Ok(Established {
                 server_version: version,
                 desk: Arc::new(session),

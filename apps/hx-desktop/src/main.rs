@@ -81,7 +81,6 @@ fn main() -> Result<(), slint::PlatformError> {
         Config {
             demo: true,
             config_dir: None,
-            downloads: std::env::temp_dir().join("hx-desktop-demo-downloads"),
             backends: demo::backends(demo::Pace::slow()),
             key_store: Arc::new(MemoryKeyStore::default()),
             seed: showcase::demo_servers(),
@@ -92,7 +91,6 @@ fn main() -> Result<(), slint::PlatformError> {
         Config {
             demo: false,
             config_dir: dir,
-            downloads: hx_desktop::files::download_dir(),
             backends: real::backends(rt.handle().clone(), name),
             key_store: Arc::new(KeyringStore),
             seed: Vec::new(),

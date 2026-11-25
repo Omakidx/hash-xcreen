@@ -38,8 +38,6 @@ pub struct Config {
     pub demo: bool,
     /// Where servers, settings and known hosts live; `None` keeps everything in memory.
     pub config_dir: Option<PathBuf>,
-    /// Where received files are saved.
-    pub downloads: PathBuf,
     /// The backends.
     pub backends: Backends,
     /// Where the device key lives.
@@ -62,7 +60,6 @@ pub struct App {
     pub(crate) prefs: RefCell<Prefs>,
     pub(crate) prefs_path: Option<PathBuf>,
     pub(crate) hosts: RefCell<known_hosts::KnownHosts>,
-    pub(crate) downloads: PathBuf,
     pub(crate) reachable: RefCell<HashMap<String, bool>>,
     pub(crate) unavailable: RefCell<HashSet<String>>,
     pub(crate) wiz: RefCell<wizard_ctl::Ctx>,
@@ -166,7 +163,6 @@ impl App {
             prefs: RefCell::new(prefs),
             prefs_path,
             hosts: RefCell::new(hosts),
-            downloads: cfg.downloads,
             reachable: RefCell::default(),
             unavailable: RefCell::default(),
             wiz: RefCell::default(),
