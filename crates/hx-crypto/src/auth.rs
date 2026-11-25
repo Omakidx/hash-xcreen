@@ -206,14 +206,14 @@ pub trait PinVerifier: Send + Sync + 'static {
         true
     }
 
-    /// True if the verifier's `Wrong` answers are charged to a failure budget **shared by
-    /// every device** (privd's global PIN cap). The authenticator then never asks it about the
-    /// attempt that reaches the revocation limit (the last one): that attempt is judged
-    /// [`PinVerdict::Wrong`] locally, so one device key without the PIN charges the shared
-    /// budget at most `max_pin_failures - 1` times, and a correct PIN typed as that last
-    /// attempt is refused (protocol §11.4, rule 4a). Default false: every attempt is checked.
-    fn shares_failure_budget(&self) -> bool {
-        false
+    /// Whether the attempt that reaches the revocation limit (a device's last one) may be sent
+    /// to the verifier. A verifier whose `Wrong` answers are charged to a budget **shared by
+    /// every device** (privd's global PIN cap) answers false when sending it could exhaust that
+    /// budget; the authenticator then judges the attempt [`PinVerdict::Wrong`] locally (it still
+    /// revokes). Earlier attempts are always sent. Default true: every attempt is checked
+    /// (protocol §11.4, rule 4a).
+    fn allow_last_attempt(&self) -> bool {
+        true
     }
 
     /// Check `pin` for `device`.
@@ -1624,9 +1624,9 @@ impl Authenticator {
             let counted = this.reg(move |r| r.begin_pin_attempt(&id)).await?;
             // An earlier attempt at the limit was cut off before its verdict: it counted.
             // A malformed PIN is a failure without a check.
-            // With a shared failure budget the last attempt (the one that revokes) is not sent
-            // to the verifier either, so a device charges it at most `max - 1` times.
-            let last_unchecked = counted >= max && verifier.shares_failure_budget();
+            // The last attempt (the one that revokes) is judged locally only when the verifier
+            // says that asking could exhaust a failure budget shared by every device.
+            let last_unchecked = counted >= max && !verifier.allow_last_attempt();
             let verdict = if counted > max || last_unchecked || Pin::from_bytes(&pin).is_err() {
                 PinVerdict::Wrong
             } else {

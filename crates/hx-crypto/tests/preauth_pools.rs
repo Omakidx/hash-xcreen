@@ -70,8 +70,9 @@ impl SharedBudget {
 }
 
 impl PinVerifier for SharedBudget {
-    fn shares_failure_budget(&self) -> bool {
-        true
+    // The gateway's rule: the last attempt is not sent if it could reach privd's cap.
+    fn allow_last_attempt(&self) -> bool {
+        self.failures() + 1 < self.cap
     }
 
     fn verify<'a>(
@@ -228,9 +229,10 @@ async fn two_devices_without_the_pin_cannot_lock_the_shared_budget() {
             .expect("device");
         assert!(rec.is_revoked(), "{name} is revoked");
     }
-    // Each device charged 4 failures, not 5: 8 of 10, and the budget is not locked.
-    assert_eq!(privd.failures(), 8);
-    assert_eq!(privd.calls.load(Ordering::SeqCst), 8);
+    // A's last attempt was sent (4 + 1 = 5 charged); B's 1..4 brought it to 9, so B's last one
+    // would have reached the cap of 10 and was judged locally: 9 charged, not locked.
+    assert_eq!(privd.failures(), 9);
+    assert_eq!(privd.calls.load(Ordering::SeqCst), 9);
     assert!(!privd.locked());
 
     // A third device with the right PIN gets in.
@@ -245,7 +247,39 @@ async fn two_devices_without_the_pin_cannot_lock_the_shared_budget() {
     .await
     .expect("the third device logs in");
     drop(conn);
-    assert_eq!(privd.failures(), 8);
+    assert_eq!(privd.failures(), 9);
+}
+
+#[tokio::test]
+async fn four_typos_then_the_right_pin_still_logs_in() {
+    let privd = SharedBudget::new(10);
+    let env = Env::new(privd.clone()).await;
+    let dev = env.paired_device("owner");
+    let opts = Env::session_opts();
+    let wrong = Pin::new("000000").expect("pin");
+    for _ in 0..4 {
+        env.clock.advance(Duration::from_secs(60));
+        let mut c = within(connect_session(
+            &env.target(),
+            &dev,
+            env.server_key.public(),
+            &opts,
+        ))
+        .await
+        .expect("connects");
+        within(c.submit(&wrong)).await.expect("reply");
+    }
+    env.clock.advance(Duration::from_secs(60));
+    within(connect_with_pin(
+        &env.target(),
+        &dev,
+        env.server_key.public(),
+        &Pin::new(PIN).expect("pin"),
+        &opts,
+    ))
+    .await
+    .expect("the 5th attempt is sent and right");
+    assert_eq!(privd.failures(), 4);
 }
 
 #[tokio::test]
