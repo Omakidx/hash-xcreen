@@ -285,6 +285,9 @@ export global DesktopVm {
     in property <string> link-prefix;
     in property <string> link-host;
     in property <string> link-rest;
+    in property <string> link-domain;
+    // "Open link" works only after a pause and a pointer move inside the dialog
+    in property <bool> link-armed: false;
 
     // the remote pointer shape, shown as the system pointer over the desktop view
     in property <image> cursor;
@@ -311,6 +314,7 @@ export global DesktopVm {
     callback send-file();
     callback open-link();
     callback cancel-link();
+    callback link-pointer-moved();
     callback copy-link();
     callback overlay-back();
     callback overlay-retry();

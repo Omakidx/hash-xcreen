@@ -31,6 +31,21 @@ pub enum DecodeError {
     /// A pixel format the converter does not handle.
     #[error("unsupported pixel format")]
     Format,
+    /// The picture is larger than the decoder accepts (a hostile stream could otherwise make
+    /// the app allocate gigabytes).
+    #[error("picture of {0}x{1} pixels is too large")]
+    TooLarge(u32, u32),
+}
+
+/// Most pixels in one decoded picture (8K UHD).
+pub const MAX_PIXELS: u64 = 8192 * 4320;
+
+/// Refuses a picture size before any buffer is allocated for it.
+pub fn check_size(width: u32, height: u32) -> Result<(), DecodeError> {
+    if u64::from(width) * u64::from(height) > MAX_PIXELS || width > 16384 || height > 16384 {
+        return Err(DecodeError::TooLarge(width, height));
+    }
+    Ok(())
 }
 
 /// The H.264 decoder.
@@ -46,14 +61,21 @@ impl Decoder {
         ffmpeg_next::init().map_err(|e| DecodeError::Unavailable(e.to_string()))?;
         let codec = ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::H264)
             .ok_or_else(|| DecodeError::Unavailable("no H.264 decoder".into()))?;
-        let dec = ffmpeg_next::codec::context::Context::new_with_codec(codec)
+        let mut ctx = ffmpeg_next::codec::context::Context::new_with_codec(codec);
+        // SAFETY: `ctx` owns a valid, not yet opened `AVCodecContext`; `max_pixels` is a plain
+        // integer field that FFmpeg reads when the stream announces its size, so an oversized
+        // stream fails to open instead of allocating.
+        unsafe {
+            (*ctx.as_mut_ptr()).max_pixels = MAX_PIXELS as i64;
+        }
+        let dec = ctx
             .decoder()
             .video()
             .map_err(|e| DecodeError::Unavailable(e.to_string()))?;
         Ok(Self {
             dec,
             frame: ffmpeg_next::frame::Video::empty(),
-            pool: FramePool::new(4),
+            pool: FramePool::new(3),
         })
     }
 
@@ -78,6 +100,7 @@ impl Decoder {
         if w == 0 || h == 0 {
             return Ok(None);
         }
+        check_size(w, h)?;
         let buf = self.pool.take(w, h);
         let out = buf.make_mut_bytes();
         let img = YuvPlanarImage {
@@ -150,6 +173,20 @@ mod tests {
                 assert_eq!(px[3], 255);
             }
         }
+    }
+
+    #[test]
+    fn oversized_pictures_are_refused_before_allocating() {
+        assert!(check_size(1920, 1080).is_ok());
+        assert!(check_size(8192, 4320).is_ok());
+        assert!(matches!(
+            check_size(8192, 4321),
+            Err(DecodeError::TooLarge(8192, 4321))
+        ));
+        // 65535 x 65535 would be 16 GiB of RGBA; u32 overflow must not wrap it into range.
+        assert!(check_size(65535, 65535).is_err());
+        assert!(check_size(u32::MAX, u32::MAX).is_err());
+        assert!(check_size(20000, 1).is_err());
     }
 
     #[test]

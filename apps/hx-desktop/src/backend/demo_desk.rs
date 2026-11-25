@@ -433,7 +433,6 @@ mod tests {
             frames: None,
             presenter: None,
             stats: Arc::new(Stats::default()),
-            downloads: std::env::temp_dir(),
         }
     }
 

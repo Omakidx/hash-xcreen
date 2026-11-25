@@ -12,8 +12,11 @@ pub struct Link {
     pub url: String,
     /// `https://`, shown before the host.
     pub prefix: String,
-    /// The host (and port), shown in bold.
+    /// The host (and port).
     pub host: String,
+    /// The registrable domain of the host (last two labels, three under a short second-level
+    /// suffix such as `co.uk`; the whole host for an IP address), shown emphasised.
+    pub domain: String,
     /// Path, query and fragment, shown after the host.
     pub rest: String,
 }
@@ -31,6 +34,61 @@ pub enum Refusal {
 
 /// Longest link accepted.
 pub const MAX_LINK: usize = 2048;
+/// Longest host name (DNS limit) and longest label.
+pub const MAX_HOST: usize = 253;
+/// Longest label of a host name.
+pub const MAX_LABEL: usize = 63;
+
+/// Percent-encodes what a shell or a glob would treat specially, in the part after the host.
+/// The result is both what is shown and what is opened, so the two never differ.
+fn encode_rest(rest: &str) -> String {
+    let mut out = String::with_capacity(rest.len());
+    for c in rest.chars() {
+        if matches!(
+            c,
+            '\'' | '"'
+                | '`'
+                | '\\'
+                | '$'
+                | '*'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '('
+                | ')'
+                | '<'
+                | '>'
+                | '|'
+                | ';'
+                | '^'
+                | '!'
+        ) {
+            out.push_str(&format!("%{:02X}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The registrable domain of a host without port: the last two labels, or three when the
+/// second-level label is a common suffix word (`co.uk`, `com.au`). An address is returned whole.
+fn registrable_domain(name: &str) -> String {
+    let labels: Vec<&str> = name.split('.').collect();
+    if labels.iter().all(|l| l.chars().all(|c| c.is_ascii_digit())) || labels.len() <= 2 {
+        return name.to_owned();
+    }
+    let n = labels.len();
+    let second = labels[n - 2];
+    let short_suffix = labels[n - 1].len() == 2
+        && matches!(
+            second,
+            "co" | "com" | "org" | "net" | "gov" | "edu" | "ac" | "or" | "ne"
+        );
+    let take = if short_suffix && n >= 3 { 3 } else { 2 };
+    labels[n - take..].join(".")
+}
 
 /// Validates one link.
 pub fn classify(raw: &str) -> Result<Link, Refusal> {
@@ -62,15 +120,40 @@ pub fn classify(raw: &str) -> Result<Link, Refusal> {
     }
     if !host
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':'))
     {
         return Err(Refusal::Malformed);
     }
+    let (name, port) = match host.split_once(':') {
+        Some((n, p)) => (n, Some(p)),
+        None => (host, None),
+    };
+    if let Some(p) = port
+        && (p.is_empty() || p.len() > 5 || !p.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Err(Refusal::Malformed);
+    }
+    let name_trimmed = name.strip_suffix('.').unwrap_or(name);
+    if name_trimmed.is_empty()
+        || name.len() > MAX_HOST
+        || name_trimmed
+            .split('.')
+            .any(|l| l.is_empty() || l.len() > MAX_LABEL)
+    {
+        return Err(Refusal::Malformed);
+    }
+    let mut domain = registrable_domain(&name_trimmed.to_ascii_lowercase());
+    if let Some(p) = port {
+        domain = format!("{domain}:{p}");
+    }
+    let rest = encode_rest(&after[host_end..]);
+    let prefix = s[..prefix_len].to_owned();
     Ok(Link {
-        url: s.to_owned(),
-        prefix: s[..prefix_len].to_owned(),
+        url: format!("{prefix}{host}{rest}"),
+        prefix,
         host: host.to_owned(),
-        rest: after[host_end..].to_owned(),
+        domain,
+        rest,
     })
 }
 
@@ -137,6 +220,45 @@ mod tests {
             classify(&format!("https://a/{}", "x".repeat(MAX_LINK))),
             Err(Refusal::Malformed)
         );
+    }
+
+    #[test]
+    fn host_limits_and_domain() {
+        let ok = format!("{0}.{0}.{0}.{1}", "a".repeat(63), "a".repeat(61));
+        assert_eq!(ok.len(), 253);
+        assert!(classify(&format!("https://{ok}/")).is_ok());
+        // 254 bytes, and a 64-byte label, are refused.
+        assert_eq!(
+            classify(&format!("https://{ok}a/")),
+            Err(Refusal::Malformed)
+        );
+        assert_eq!(
+            classify(&format!("https://{}.test/", "b".repeat(64))),
+            Err(Refusal::Malformed)
+        );
+        assert_eq!(classify("https://a..test/"), Err(Refusal::Malformed));
+        assert_eq!(classify("https://a.test:99999x/"), Err(Refusal::Malformed));
+        assert_eq!(classify("https://[::1]/"), Err(Refusal::Malformed));
+        let l = classify("https://paypal.com.evil.test:8443/x").unwrap();
+        assert_eq!(l.domain, "evil.test:8443");
+        assert_eq!(
+            classify("https://www.shop.example.co.uk/").unwrap().domain,
+            "example.co.uk"
+        );
+        assert_eq!(classify("http://10.0.0.1/").unwrap().domain, "10.0.0.1");
+    }
+
+    #[test]
+    fn shell_characters_are_encoded_and_shown_url_is_the_opened_one() {
+        let l = classify("https://a.test/it's/*[x]?q=$(id)&r=`z`;|").unwrap();
+        for bad in ['\'', '*', '[', ']', '$', '(', ')', '`', ';', '|'] {
+            assert!(!l.url.contains(bad), "{bad} in {}", l.url);
+        }
+        assert!(
+            l.url
+                .contains("it%27s/%2A%5Bx%5D?q=%24%28id%29&r=%60z%60%3B%7C")
+        );
+        assert_eq!(l.url, format!("{}{}{}", l.prefix, l.host, l.rest));
     }
 
     #[test]

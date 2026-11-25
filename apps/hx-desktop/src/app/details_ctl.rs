@@ -523,7 +523,6 @@ fn unlock(app: &Rc<App>, pin: String) {
         frames: None,
         presenter: None,
         stats: Arc::new(Stats::default()),
-        downloads: app.downloads.clone(),
     };
     let epoch = app.det.borrow().epoch;
     let pin = zeroize::Zeroizing::new(pin);

@@ -97,7 +97,6 @@ async fn vm_latency() {
     let (session, mut events) = Session::start(
         conn,
         Some(tx),
-        std::env::temp_dir(),
         stats.clone(),
         tokio::runtime::Handle::current(),
     );

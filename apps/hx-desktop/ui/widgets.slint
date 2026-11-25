@@ -807,13 +807,22 @@ export component Dialog inherits Rectangle {
     in property <length> card-width: 480px;
     in property <bool> danger: false;
     callback dismissed();
+    // The pointer moved over the dialog (used to arm a risky default action).
+    callback pointer-moved();
     visible: open;
     background: Tokens.scrim;
     accessible-role: AccessibleRole.groupbox;
     accessible-label: title;
 
     // Swallow pointer events below the dialog.
-    TouchArea { }
+    TouchArea {
+        mouse-cursor: MouseCursor.default;
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.move) {
+                root.pointer-moved();
+            }
+        }
+    }
 
     FocusScope {
         key-pressed(e) => {

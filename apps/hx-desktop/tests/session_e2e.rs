@@ -75,7 +75,6 @@ async fn pair_pin_first_frame_type_and_disconnect() {
     let (session, mut events) = Session::start(
         conn,
         Some(tx),
-        std::env::temp_dir(),
         stats.clone(),
         tokio::runtime::Handle::current(),
     );
