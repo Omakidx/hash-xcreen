@@ -429,7 +429,7 @@ Sent separately as shape (cached by hash) and position, and shown by the client,
 
 - Audio: PipeWire capture in the container, Opus 10 ms frames with in-band FEC, sent as datagrams.
 - Clipboard: both directions for text, images and files; can be switched off per paired device. X11 side: XFixes owner notifications, `TARGETS` probed lazily, data read only when the other side asks, `INCR` both ways, 64 MiB limit, text must be UTF-8 and images PNG, PRIMARY off by default. Files are a transfer list (validated names, sizes, race-safe open); client files are staged in a session-owned 0700 directory when a local application pastes, and the paste receives `file://` URIs (also as `x-special/gnome-copied-files`).
-- Files: copy and paste or drag and drop; each transfer on its own low-priority stream with progress.
+- Files: copy and paste or drag and drop; each transfer on its own low-priority stream with progress. **Desktop app, Phase 1:** files travel local machine to desktop only. The app offers `FILE_TRANSFER` (it is needed to upload) but refuses every incoming file transfer (`reject()`), whatever the clipboard policy, in every session including management sessions; desktop-to-local files and clipboard images arrive with the native clipboard, where they will be staged in a session-owned 0700 directory, gated by the `files` policy, with caps on concurrent transfers and bytes per session and a free-space check. Incoming clipboard text is capped at 1 MiB, applied only while the app window is focused (a change that arrives unfocused is dropped; latest wins), and incoming transfers are bounded (a few at a time, extras rejected).
 
 ### 6.5 Clients
 
@@ -551,6 +551,7 @@ Out of scope: the VPS provider, or anyone with root on the host.
 
 - Device key in the system keyring (Secret Service on Linux); server keys pinned.
 - The remote side can never execute anything locally; links open only after confirmation.
+- The server and the desktop it forwards are untrusted (Gate 1 review): the desktop app writes nothing the remote side sends to disk (incoming file transfers are refused, §6.4); the local clipboard changes only while its window is focused; link requests are rate-limited, ignored while a dialog is open, and the dialog's "Open link" arms after a pause and a pointer move; hosts over 253 bytes are refused and the registrable domain is emphasised; the opened URL is percent-encoded for shell-glob characters and equals the shown one; decoded video frames are capped (8192x4320 and the announced stream size); a PIN the server rejected is never re-sent by auto-reconnect (Wrong, Backoff and NotAvailable stop it and show the PIN screen); the event queue from the connection is bounded with latest-wins for cursor and clipboard.
 
 ## 9. Backup and restore
 
