@@ -29,12 +29,16 @@ suite = "{{codename}}"
 components = "main"
 pin = '''
 Package: firefox*
-Pin: release o=LP-PPA-mozillateam
+Pin: origin ppa.launchpadcontent.net
 Pin-Priority: 1001
 
 Package: firefox*
 Pin: release o=Ubuntu
 Pin-Priority: -1
+
+Package: *
+Pin: origin ppa.launchpadcontent.net
+Pin-Priority: 100
 '''
 
 [apt]

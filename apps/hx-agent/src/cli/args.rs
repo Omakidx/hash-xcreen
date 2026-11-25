@@ -148,9 +148,11 @@ const TOKEN_OPT_IN: &str = "--token-on-command-line";
 fn check_token_opt_in(token_given: bool, opted_in: bool) -> Result<(), CliError> {
     match (token_given, opted_in) {
         (true, false) => Err(usage(
-            "--token puts the token on the command line, where the process list, your shell \
-             history and the sudo auth log keep it. Type it at a hidden prompt instead (--pair, \
-             or `pairing token` without --token), or add --token-on-command-line to accept that",
+            "refused: --token puts the token on the command line, so the token you just typed is \
+             already exposed (process list, your shell history, the sudo auth log and the \
+             journal). Treat it as compromised: create a new token in the app and give it at a \
+             hidden prompt instead (--pair, or `pairing token` without --token). Only if you accept \
+             that exposure, add --token-on-command-line",
         )),
         (false, true) => Err(usage(
             "--token-on-command-line is only meaningful with --token",
@@ -879,6 +881,9 @@ mod tests {
             !e.to_string().contains("abc"),
             "the refusal never echoes the token"
         );
+        // It says the token is already exposed and what to do about it.
+        let m = e.to_string();
+        assert!(m.contains("already exposed") && m.contains("new token") && m.contains("--pair"));
         assert!(p(&["pairing", "token", "--token-on-command-line"]).is_err());
         assert!(p(&["pairing", "code", "--ttl", "10"]).is_err());
         assert!(p(&["pairing", "code", "--ttl", "20m"]).is_err());
@@ -953,6 +958,7 @@ mod tests {
             !e.to_string().contains("hxt1-abc"),
             "the refusal never echoes the token"
         );
+        assert!(e.to_string().contains("already exposed"), "{e}");
         assert!(p(&["install", "--pair", "--token-on-command-line"]).is_err());
         let Cmd::Install(t) = p(&["install", "--token", "hxt1-abc", "--token-on-command-line"])
             .unwrap()

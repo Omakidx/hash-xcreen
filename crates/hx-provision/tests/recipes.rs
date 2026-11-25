@@ -530,7 +530,7 @@ fn includes_cannot_escape_or_be_absolute_and_depth_is_bounded() {
 fn missing_and_malformed_variables() {
     let e = err(
         with_main(
-            "[[apt_repo]]\nname=\"r\"\nkey_url=\"https://x/k\"\nkey_fingerprint=\"0123456789ABCDEF0123456789ABCDEF01234567\"\nuri=\"https://x\"\nsuite=\"{{nosuch}}\"\ncomponents=\"main\"\n",
+            "[[apt_repo]]\nname=\"r\"\nkey_url=\"https://x/k\"\nkey_fingerprint=\"0123456789ABCDEF0123456789ABCDEF01234567\"\nuri=\"https://x\"\nsuite=\"{{nosuch}}\"\ncomponents=\"main\"\npin=\"\"\"Package: *\nPin: origin x\nPin-Priority: 100\n\"\"\"\n",
         ),
         "main.toml",
     );
@@ -583,7 +583,7 @@ fn field_validation_messages() {
             "https",
         ),
         (
-            "[[apt_repo]]\nname=\"r\"\nkey_url=\"https://x/k\"\nkey_fingerprint=\"0123456789ABCDEF0123456789ABCDEF01234567\"\nuri=\"https://x\"\nsuite=\"s\"\ncomponents=\"main\"\n[[apt_repo]]\nname=\"r\"\nkey_url=\"https://x/k\"\nkey_fingerprint=\"0123456789ABCDEF0123456789ABCDEF01234567\"\nuri=\"https://x\"\nsuite=\"s\"\ncomponents=\"main\"\n",
+            "[[apt_repo]]\nname=\"r\"\nkey_url=\"https://x/k\"\nkey_fingerprint=\"0123456789ABCDEF0123456789ABCDEF01234567\"\nuri=\"https://x\"\nsuite=\"s\"\ncomponents=\"main\"\npin=\"\"\"Package: *\nPin: origin x\nPin-Priority: 100\n\"\"\"\n[[apt_repo]]\nname=\"r\"\nkey_url=\"https://x/k\"\nkey_fingerprint=\"0123456789ABCDEF0123456789ABCDEF01234567\"\nuri=\"https://x\"\nsuite=\"s\"\ncomponents=\"main\"\npin=\"\"\"Package: *\nPin: origin x\nPin-Priority: 100\n\"\"\"\n",
             "apt_repo[1].name",
             "duplicate",
         ),
@@ -1005,7 +1005,7 @@ fn every_curl_invocation_restricts_protocols_to_https() {
 }
 
 #[test]
-fn the_mozilla_pin_only_covers_firefox_packages() {
+fn the_mozilla_pin_raises_only_firefox_and_scopes_the_rest_of_the_ppa() {
     for d in [Distro::Ubuntu2404, Distro::Ubuntu2604] {
         let p = Catalog::embedded()
             .resolve(id(d, Preset::Basic), &[])
@@ -1020,9 +1020,58 @@ fn the_mozilla_pin_only_covers_firefox_packages() {
             .unwrap();
         let pin = repo.pin.unwrap();
         assert!(
-            pin.contains("Package: firefox*") && !pin.contains("Package: *\n"),
+            pin.contains(
+                "Package: firefox*\nPin: origin ppa.launchpadcontent.net\nPin-Priority: 1001"
+            ),
             "{pin}"
         );
+        // Everything else the PPA offers stays at 100: it never replaces a distro package.
+        assert!(
+            pin.contains("Package: *\nPin: origin ppa.launchpadcontent.net\nPin-Priority: 100"),
+            "{pin}"
+        );
+        assert!(!pin.contains("o=LP-PPA"), "{pin}");
+    }
+}
+
+#[test]
+fn every_apt_repo_must_scope_its_origin_to_priority_100() {
+    let repo = |pin: &str| {
+        format!(
+            "[[apt_repo]]\nname=\"r\"\nkey_url=\"https://x/k\"\nkey_fingerprint=\"0123456789ABCDEF0123456789ABCDEF01234567\"\nuri=\"https://repo.example/deb\"\nsuite=\"s\"\ncomponents=\"main\"\n{pin}"
+        )
+    };
+    let bad = [
+        "".to_string(),
+        "pin = \'\'\'\nPackage: foo\nPin: origin repo.example\nPin-Priority: 100\n\'\'\'\n".into(),
+        "pin = \'\'\'\nPackage: *\nPin: origin repo.example\nPin-Priority: 500\n\'\'\'\n".into(),
+        "pin = \'\'\'\nPackage: *\nPin: origin other.example\nPin-Priority: 100\n\'\'\'\n".into(),
+        "pin = \'\'\'\nPackage: *\nPin: release o=Repo\nPin-Priority: 100\n\'\'\'\n".into(),
+    ];
+    for pin in &bad {
+        let e = err(with_main(&repo(pin)), "main.toml");
+        assert!(e.to_string().contains("apt_repo[0].pin"), "{pin}: {e}");
+    }
+    let good = "pin = \'\'\'\nPackage: foo\nPin: origin repo.example\nPin-Priority: 500\n\nPackage: *\nPin: origin \"repo.example\"\nPin-Priority: 100\n\'\'\'\n";
+    resolve(&with_main(&repo(good)), "main.toml", &[]).unwrap();
+}
+
+#[test]
+fn docker_and_vscode_repos_are_scoped_too() {
+    let plan = Catalog::embedded()
+        .resolve(id(Distro::Debian13, Preset::Developer), &[Addon::Docker])
+        .unwrap();
+    let pins: Vec<_> = plan
+        .build
+        .iter()
+        .filter_map(|s| match s {
+            Step::AptRepo(r) => Some((r.name.clone(), r.pin.clone().unwrap_or_default())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(pins.len(), 2, "{pins:?}");
+    for (n, pin) in &pins {
+        assert!(pin.contains("Package: *\nPin: origin "), "{n}: {pin}");
     }
 }
 
