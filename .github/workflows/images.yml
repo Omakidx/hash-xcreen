@@ -9,10 +9,15 @@ name: Images
 #            and settings; any drift fails the cell and blocks signing and publishing)
 #   rehearse pull requests and non-publish runs: build the manifest, sign it with a per-run TEST key
 #            and prove `hx-imagectl verify` accepts it (and refuses a tampered one)
-#   sign     environment `image-signing` (main only, no per-run approval): build the manifest with the
-#            previous one's still-wanted entries, sign it with the image key, verify the result
+#   manifest no secrets: build hx-imagectl and the manifest (previous one's still-wanted entries plus
+#            this run's cells), upload the manifest file
+#   sign     environment `image-signing` (main only, no per-run approval): downloads the manifest,
+#            installs minisign from apt, signs, uploads the signature. Runs NO workspace code
+#   verify   no secrets, read-only token: `hx-imagectl verify` of the signature and every image file;
+#            records the SHA-256 of what it verified
 #   attest   build provenance of the image files (audit only)
-#   publish  contents: write, only here: the release `images-<build_id>` first, then the manifest
+#   publish  contents: write, only here, and no workspace-built code: it checks its downloads against
+#            the SHA-256 list of `verify`, then the release `images-<build_id>` first, then the manifest
 #            and its signature on the moving release `images`, then prune
 #
 # Publishing needs the maintainer's image key pair. While apps/hx-agent/image-keys/{current,next}.pub
@@ -141,6 +146,8 @@ jobs:
         env:
           PUBLISH: ${{ steps.mode.outputs.publish }}
           RUN_NUMBER: ${{ github.run_number }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
           set -eu
           bin="$PWD/target/release/hx-imagectl"
@@ -162,15 +169,28 @@ jobs:
             # pushed from any branch, so only code that went through main review is ever built.
             git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null ||
               { echo "::error::origin/main is not available: cannot tell which tags are on main"; exit 1; }
-            # newest_on_main <ERE on the tag name>: the first tag by -v:refname that matches and is on main
+            # newest_on_main <ERE on the tag name>: the first tag by -v:refname that matches, is on
+            # main, and is a real release: the tag equals "v" + the workspace version in Cargo.toml
+            # AT THAT TAG, or a GitHub release of that name exists (a stray v* tag on main is not
+            # a release and is never built).
             newest_on_main() {
               git tag --list 'v*' --sort=-v:refname | grep -E -- "$1" | while read -r t; do
                 c=$(git rev-parse "refs/tags/$t^{commit}")
-                if git merge-base --is-ancestor "$c" refs/remotes/origin/main; then
+                if ! git merge-base --is-ancestor "$c" refs/remotes/origin/main; then
+                  echo "::warning::tag $t ($c) is not on main: skipped" >&2
+                  continue
+                fi
+                tv=$(git show "$c:Cargo.toml" 2>/dev/null |
+                  sed -n '/^\[workspace.package\]/,/^\[/s/^version *= *"\(.*\)"$/\1/p' | head -n 1)
+                if [ -n "$tv" ] && [ "$t" = "v$tv" ]; then
                   echo "$t"
                   break
                 fi
-                echo "::warning::tag $t ($c) is not on main: skipped" >&2
+                if gh release view "$t" --repo "$REPO" >/dev/null 2>&1; then
+                  echo "$t"
+                  break
+                fi
+                echo "::warning::tag $t is not v<workspace version> and has no release: skipped" >&2
               done
             }
             stable=$(newest_on_main '^[^-]*$')
@@ -382,8 +402,8 @@ jobs:
             jq -r '.images[] | "- \(.recipe) \(.build_id): \(.size) bytes, \(.parts | length) part(s)"' manifest.json
           } >>"$GITHUB_STEP_SUMMARY"
 
-  sign:
-    name: Sign
+  manifest:
+    name: Manifest (no secrets)
     needs: [plan, image]
     # Runs after partial failures too (a failed cell keeps its previous entry); it needs a publish
     # run on main, both image keys provisioned, and something to publish: an image of this run, or a
@@ -392,9 +412,14 @@ jobs:
       always() && needs.plan.result == 'success' && needs.plan.outputs.publish == 'true'
       && needs.plan.outputs.keys == 'true' && (needs.plan.outputs.count != '0' || inputs.drop != '')
     runs-on: ubuntu-24.04
-    environment: image-signing
+    # No environment and no secret here: this job builds and RUNS workspace code (rustup, cargo,
+    # hx-imagectl). The signing job only receives the manifest file this job produces.
+    permissions:
+      contents: read
+      actions: read
     outputs:
-      cells: ${{ steps.sign.outputs.cells }}
+      t: ${{ steps.manifest.outputs.t }}
+      cells: ${{ steps.manifest.outputs.cells }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -407,17 +432,30 @@ jobs:
         with:
           name: plan
           path: plan
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          pattern: image-*
-          path: cells
-      - name: Install minisign
+      - name: Download the cell artifacts by exact name
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          MATRIX: ${{ needs.plan.outputs.matrix }}
+          IMAGE_RESULT: ${{ needs.image.result }}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends minisign
-      - name: Build the manifest (no secrets)
+          set -eu
+          # Exact names derived from the plan, never a pattern: a name that no successful cell
+          # owns (a failed cell uploads nothing) cannot be filled by another job.
+          mkdir cells
+          while read -r n; do
+            if gh run download "$RUN_ID" --repo "$REPO" --name "$n" --dir "cells/$n"; then
+              continue
+            fi
+            if [ "$IMAGE_RESULT" = success ]; then
+              echo "::error::artifact $n is missing although every cell succeeded"
+              exit 1
+            fi
+            echo "::warning::artifact $n is missing (its cell failed): skipped"
+          done < <(jq -r '.include[] | "image-\(.recipe)-\(.label)"' <<<"$MATRIX")
+      - name: Build the manifest
         id: manifest
-        # No secret in this step: it runs the binary that was just built from the workspace.
         env:
           DROP: ${{ inputs.drop }}
         run: |
@@ -446,7 +484,7 @@ jobs:
             # shellcheck disable=SC2086
             prev="--previous plan/prev/images-manifest-x86_64.json --previous-sig plan/prev/images-manifest-x86_64.json.minisig --pubkey $keys"
           fi
-          mkdir signed
+          mkdir to-sign
           # timestamp = signing time (privd refuses a manifest older than the last one it accepted)
           entries=()
           if [ "${#cells[@]}" != 0 ]; then entries=(--entries "${cells[@]}"); fi
@@ -454,18 +492,43 @@ jobs:
           if [ "${#drops[@]}" != 0 ]; then dropargs=(--drop "${drops[@]}"); fi
           # shellcheck disable=SC2086
           "$bin" manifest "${entries[@]}" $prev --wanted plan/wanted.txt "${dropargs[@]}" \
-            --timestamp "$t" --out signed/images-manifest-x86_64.json
-          cat signed/images-manifest-x86_64.json
+            --timestamp "$t" --out to-sign/images-manifest-x86_64.json
+          cat to-sign/images-manifest-x86_64.json
           echo
           echo "t=$t" >>"$GITHUB_OUTPUT"
-      # The only step with the signing secrets. It runs nothing from the workspace (only the
-      # minisign installed from the distribution on the runner's PATH) and its inputs are the
-      # manifest file written above.
-      - name: Sign the manifest (secrets, signing command only)
+          if [ "${#cells[@]}" != 0 ]; then echo "cells=true" >>"$GITHUB_OUTPUT"; else echo "cells=false" >>"$GITHUB_OUTPUT"; fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: manifest
+          path: to-sign/images-manifest-x86_64.json
+          if-no-files-found: error
+          retention-days: 3
+
+  sign:
+    name: Sign
+    needs: [plan, manifest]
+    if: needs.manifest.result == 'success'
+    runs-on: ubuntu-24.04
+    environment: image-signing
+    # The ONLY job with the signing secrets. It checks out nothing and runs nothing from the
+    # workspace or from a build: it downloads the manifest file, installs minisign from the
+    # distribution, signs, and uploads the signature. The signature is verified by the later
+    # secret-free `verify` job.
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: manifest
+          path: signed
+      - name: Install minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends minisign
+      - name: Sign the manifest
         env:
           IMAGE_MINISIGN_SECRET_KEY: ${{ secrets.IMAGE_MINISIGN_SECRET_KEY }}
           IMAGE_MINISIGN_KEY_PASSWORD: ${{ secrets.IMAGE_MINISIGN_KEY_PASSWORD }}
-          SIGN_TIME: ${{ steps.manifest.outputs.t }}
+          SIGN_TIME: ${{ needs.manifest.outputs.t }}
         run: |
           set -eu
           umask 077
@@ -477,12 +540,65 @@ jobs:
             -m signed/images-manifest-x86_64.json \
             -x signed/images-manifest-x86_64.json.minisig \
             -t "hx-images-manifest schema=1 arch=x86_64 timestamp=$SIGN_TIME"
-      - name: Verify the signature and stage the publish inputs (no secrets)
-        id: sign
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: manifest-sig
+          path: signed/images-manifest-x86_64.json.minisig
+          if-no-files-found: error
+          retention-days: 3
+
+  verify:
+    name: Verify the signed manifest (no secrets)
+    needs: [plan, image, manifest, sign]
+    if: needs.sign.result == 'success'
+    runs-on: ubuntu-24.04
+    # The workspace-built verifier runs HERE, with a read-only token: it can gate `publish` (which
+    # needs this job) but cannot publish anything itself.
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - name: Build hx-imagectl
+        run: cargo build --release --locked -p hx-imagectl
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: manifest
+          path: signed
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: manifest-sig
+          path: signed
+      - name: Download the cell artifacts by exact name
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          MATRIX: ${{ needs.plan.outputs.matrix }}
+          IMAGE_RESULT: ${{ needs.image.result }}
+        run: |
+          set -eu
+          # Exact names derived from the plan, never a pattern: a name that no successful cell
+          # owns (a failed cell uploads nothing) cannot be filled by another job.
+          mkdir cells
+          while read -r n; do
+            if gh run download "$RUN_ID" --repo "$REPO" --name "$n" --dir "cells/$n"; then
+              continue
+            fi
+            if [ "$IMAGE_RESULT" = success ]; then
+              echo "::error::artifact $n is missing although every cell succeeded"
+              exit 1
+            fi
+            echo "::warning::artifact $n is missing (its cell failed): skipped"
+          done < <(jq -r '.include[] | "image-\(.recipe)-\(.label)"' <<<"$MATRIX")
+      - name: Verify the signature and every image file
         run: |
           set -eu
           shopt -s nullglob
-          cells=(cells/image-*/)
           bin="$PWD/target/release/hx-imagectl"
           keys="apps/hx-agent/image-keys/current.pub apps/hx-agent/image-keys/next.pub"
           # The tool that verifies on the host must accept what was just signed, with the keys that
@@ -495,11 +611,10 @@ jobs:
             "$bin" verify --manifest signed/images-manifest-x86_64.json \
               --sig signed/images-manifest-x86_64.json.minisig --pubkey $keys --image "$f"
           done
-          # for the publish job, which builds nothing: the verifier and the keys it checks against
-          mkdir signed/keys
-          cp apps/hx-agent/image-keys/current.pub apps/hx-agent/image-keys/next.pub signed/keys/
-          cp "$bin" signed/hx-imagectl
-          if [ "${#cells[@]}" != 0 ]; then echo "cells=true" >>"$GITHUB_OUTPUT"; else echo "cells=false" >>"$GITHUB_OUTPUT"; fi
+          # What `publish` may upload: the digest of every file that was just verified. `publish`
+          # runs no workspace code; it only checks its own downloads against this list.
+          (cd cells && find . -type f | LC_ALL=C sort | xargs -r sha256sum) >signed/cells.sha256
+          cat signed/cells.sha256
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: signed
@@ -509,9 +624,9 @@ jobs:
 
   attest:
     name: Attest (audit only)
-    needs: [plan, sign]
+    needs: [plan, manifest, verify]
     # nothing to attest in a pure withdrawal
-    if: needs.sign.result == 'success' && needs.sign.outputs.cells == 'true'
+    if: needs.verify.result == 'success' && needs.manifest.outputs.cells == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -529,9 +644,9 @@ jobs:
 
   publish:
     name: Publish
-    needs: [plan, sign, attest]
+    needs: [plan, verify, attest]
     if: >-
-      always() && needs.sign.result == 'success'
+      always() && needs.verify.result == 'success'
       && (needs.attest.result == 'success' || needs.attest.result == 'skipped')
     runs-on: ubuntu-24.04
     permissions:
@@ -554,16 +669,19 @@ jobs:
           set -eu
           # a withdrawal has no cells: every loop over them must then do nothing
           shopt -s nullglob
-          bin="$PWD/signed/hx-imagectl"
-          chmod +x "$bin"
           m=signed/images-manifest-x86_64.json
           sig=signed/images-manifest-x86_64.json.minisig
-          # Publish exactly what was signed: the signature must verify, and every image file of this
-          # run must be listed in the signed manifest with the size and SHA-256 it states.
-          "$bin" verify --manifest "$m" --sig "$sig" --pubkey signed/keys/current.pub signed/keys/next.pub
-          for f in cells/image-*/hx-image-*; do
-            "$bin" verify --manifest "$m" --sig "$sig" --pubkey signed/keys/current.pub signed/keys/next.pub --image "$f"
-          done
+          # This job holds a write token, so it runs no workspace-built code: the signature and every
+          # image file were verified by the read-only `verify` job (which gates this one). Here the
+          # downloaded files must be exactly the files `verify` checked, byte for byte.
+          (cd cells && find . -type f | LC_ALL=C sort) >have.txt
+          sed 's#^[0-9a-f]*  ##' signed/cells.sha256 >want.txt
+          if ! cmp -s have.txt want.txt; then
+            echo "::error::the downloaded image files are not exactly the verified set"
+            diff want.txt have.txt || true
+            exit 1
+          fi
+          (cd cells && sha256sum -c ../signed/cells.sha256)
 
           # One release per build id (two refs of one run get different build ids), created before
           # the manifest points at it.
