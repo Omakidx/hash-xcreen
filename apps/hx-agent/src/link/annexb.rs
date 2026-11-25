@@ -32,7 +32,7 @@ pub const MAX_SPS_PER_FRAME: u32 = 8;
 /// Largest coded picture side the link accepts (`hx_ipc::link::validate::MAX_DIMENSION`).
 pub const MAX_SIDE: u32 = 16_384;
 /// Largest coded picture area the link accepts: 7680 x 4320.
-pub const MAX_PIXELS: u64 = 33_177_600;
+pub const MAX_PIXELS: u64 = hx_ipc::link::validate::MAX_PIXELS;
 
 /// Why a payload was refused. Every variant is a link violation (`docs/ipc.md` 15.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -103,10 +103,13 @@ pub struct Checked {
     pub sps_count: u32,
 }
 
-/// True for the NAL types an H.264 stream may carry: 1 to 15, 19 (auxiliary slice), 20 and 21
-/// (SVC/MVC extensions). 0, the reserved 16 to 18 and 22 to 31 are refused.
+/// True for the NAL types the session's x264 can produce or a plain H.264 stream needs: 1 to 12
+/// (slices, SEI, SPS, PPS, AUD, end markers, filler), 19 (auxiliary slice) and 21. Refused: 0,
+/// 13 (SPS extension), 14 (prefix NAL), 15 (subset SPS), 20 (SVC/MVC slice extension; x264
+/// never emits them, and they are unparsed surface for a client's decoder), the reserved 16 to
+/// 18 and 22 to 31 (review L5).
 pub fn nal_type_is_valid(t: u8) -> bool {
-    matches!(t, 1..=15 | 19..=21)
+    matches!(t, 1..=12 | 19 | 21)
 }
 
 /// Position of the next `00 00 01` at or after `from`, as the index of its first byte.
@@ -738,6 +741,24 @@ mod tests {
                 height: 1088 - 14
             })
         );
+    }
+
+    #[test]
+    fn l5_nal_types_x264_never_emits_are_refused() {
+        // 13 SPS extension, 14 prefix NAL, 15 subset SPS, 20 slice extension (review L5).
+        for t in [13u8, 14, 15, 20] {
+            assert!(!nal_type_is_valid(t), "type {t}");
+            let f = [0, 0, 0, 1, t, 0x80, 0, 0, 1, 0x65, 0x88];
+            assert!(
+                matches!(check_frame(&f, false), Err(AnnexBError::BadNalType(_))),
+                "type {t}: {:?}",
+                check_frame(&f, false)
+            );
+        }
+        // What x264 emits (slice 1 and 5, SEI 6, SPS 7, PPS 8) and AUD 9 stay valid.
+        for t in [1u8, 5, 6, 7, 8, 9, 19, 21] {
+            assert!(nal_type_is_valid(t), "type {t}");
+        }
     }
 
     #[test]

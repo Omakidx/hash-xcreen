@@ -18,10 +18,11 @@
 
 use super::annexb;
 use super::lane::{LaneFail, LaneReader, WriteFail, write_all_stall};
-use super::shared::{BulkOut, InXfer, Pop, Shared, Staged, lock};
+use super::shared::{BulkOut, DROPPED_BATCH_INTERVAL, InXfer, Pop, Shared, Staged, lock};
 use super::types::{
     FailureClass, Frame, LinkEvent, SessionEvent, StreamFormat, TransferChunk, TransferEvent,
 };
+use hx_ipc::link::budget::Pacer;
 use hx_ipc::link::frames::{
     LinkFrame, encode_gateway_message, encode_transfer_abort, encode_transfer_data_prefix, parse,
 };
@@ -355,7 +356,7 @@ async fn on_video(sh: &Arc<Shared>, v: hx_ipc::link::frames::VideoFrame) -> Resu
         if !within || !idr_ok {
             drop(st);
             sh.count(|c| c.rate_limited_frames += 1);
-            sh.report_frames(&[n], pb::FrameOutcome::Dropped);
+            sh.report_dropped(&[n]);
             sh.arm_resync();
             return Ok(());
         }
@@ -372,7 +373,7 @@ async fn on_video(sh: &Arc<Shared>, v: hx_ipc::link::frames::VideoFrame) -> Resu
     );
     if !evicted.is_empty() {
         sh.count(|c| c.evicted_frames += evicted.len() as u64);
-        sh.report_frames(&evicted, pb::FrameOutcome::Dropped);
+        sh.report_dropped(&evicted);
         sh.arm_resync();
     }
     Ok(())
@@ -422,7 +423,7 @@ async fn process_staged(sh: &Arc<Shared>, st: Staged) -> Result<(), Fail> {
     // Only the current client's frames are forwarded.
     if !sh.epoch_set.load(Relaxed) || fmt.epoch != sh.epoch.load(Relaxed) {
         sh.count(|c| c.discarded_frames += 1);
-        sh.report_frames(&[n], pb::FrameOutcome::Dropped);
+        sh.report_dropped(&[n]);
         return Ok(());
     }
     // After a cancel or drop, only a fresh full image restarts the chain.
@@ -431,10 +432,13 @@ async fn process_staged(sh: &Arc<Shared>, st: Staged) -> Result<(), Fail> {
         if st.gate_armed {
             if key && h.is_resync() {
                 st.gate_armed = false;
+                // The image that was asked for has arrived: a refused request waiting for its
+                // retry is moot.
+                st.idr_retry = false;
             } else {
                 drop(st);
                 sh.count(|c| c.discarded_frames += 1);
-                sh.report_frames(&[n], pb::FrameOutcome::Dropped);
+                sh.report_dropped(&[n]);
                 return Ok(());
             }
         }
@@ -448,7 +452,7 @@ async fn process_staged(sh: &Arc<Shared>, st: Staged) -> Result<(), Fail> {
     let evicted = sh.inbox.push_frame(frame, sh.cfg.video_pool_bytes());
     if !evicted.is_empty() {
         sh.count(|c| c.evicted_frames += evicted.len() as u64);
-        sh.report_frames(&evicted, pb::FrameOutcome::Dropped);
+        sh.report_dropped(&evicted);
         sh.arm_resync();
     }
     Ok(())
@@ -726,6 +730,14 @@ fn write_fail(name: &str, e: &WriteFail) -> Fail {
     }
 }
 
+/// Waits until `pacer` allows `n` more bytes.
+async fn pace(pacer: &mut Pacer, n: usize) {
+    let wait = pacer.reserve(n as u64, std::time::Instant::now());
+    if !wait.is_zero() {
+        tokio::time::sleep(wait).await;
+    }
+}
+
 pub(crate) async fn bulk_writer(
     sh: Arc<Shared>,
     stream: Arc<UnixStream>,
@@ -733,6 +745,8 @@ pub(crate) async fn bulk_writer(
 ) {
     let s = sh.clone();
     run(&sh, async move {
+        // Both ends pace bulk below the receiver's budget (docs/ipc.md section 13, review L1).
+        let mut pacer = Pacer::bulk();
         loop {
             // Aborts first, whatever the upload is doing.
             let wake = s.abort_wake.notified();
@@ -752,13 +766,17 @@ pub(crate) async fn bulk_writer(
                 },
             };
             let r = match out {
-                BulkOut::Frame(f) => write_all_stall(&stream, &f, s.cfg.bulk_write_stall).await,
+                BulkOut::Frame(f) => {
+                    pace(&mut pacer, f.len()).await;
+                    write_all_stall(&stream, &f, s.cfg.bulk_write_stall).await
+                }
                 BulkOut::Data { id, data } => {
                     let mut r = Ok(());
                     for chunk in data.chunks(MAX_TRANSFER_CHUNK) {
                         let Ok(prefix) = encode_transfer_data_prefix(id, chunk.len()) else {
                             return violation("cannot encode a transfer data frame");
                         };
+                        pace(&mut pacer, prefix.len() + chunk.len()).await;
                         r = write_all_stall(&stream, &prefix, s.cfg.bulk_write_stall).await;
                         if r.is_ok() {
                             r = write_all_stall(&stream, chunk, s.cfg.bulk_write_stall).await;
@@ -789,7 +807,15 @@ pub(crate) async fn maintenance(sh: Arc<Shared>) {
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            tick.tick().await;
+            tokio::select! {
+                _ = tick.tick() => {}
+                () = s.dropped_wake.notified() => {
+                    // One batched report per interval, however many frames were dropped.
+                    tokio::time::sleep(DROPPED_BATCH_INTERVAL).await;
+                    s.flush_dropped();
+                    continue;
+                }
+            }
             let now = Instant::now();
             let ping = {
                 let mut p = lock(&s.pings);

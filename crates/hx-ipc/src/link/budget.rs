@@ -18,6 +18,11 @@
 //! burst) for three consecutive seconds **while the session still has data to send** is a
 //! violation ([`ByteBudget::violated`]); a pause caused by downstream flow control is not, which
 //! is why the caller reports whether the peer has pending data ([`ByteBudget::note_pending`]).
+//!
+//! **`bulk` is backpressure only** (review L1): an honest transfer from a fast disk offers more
+//! than 64 MiB/s, so an empty `bulk` bucket stops the reader and never counts as starvation
+//! ([`ByteBudget::for_lane`] builds it without the starvation rule). Both ends instead pace their
+//! own sends with [`Pacer`] at [`BULK_SEND_RATE`], below the budget.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -57,6 +62,8 @@ pub struct ByteBudget {
     tokens: i64,
     last: Instant,
     starved_since: Option<Instant>,
+    /// False: an empty bucket only stops reading, it is never a violation (`bulk`).
+    starvation_is_violation: bool,
 }
 
 impl ByteBudget {
@@ -70,13 +77,26 @@ impl ByteBudget {
             tokens: i64::try_from(burst).unwrap_or(i64::MAX),
             last: now,
             starved_since: None,
+            starvation_is_violation: true,
+        }
+    }
+
+    /// Like [`ByteBudget::new`], but an empty bucket is only backpressure: [`ByteBudget::violated`]
+    /// is always false.
+    pub fn backpressure_only(rate_bytes_per_sec: u64, now: Instant) -> Self {
+        Self {
+            starvation_is_violation: false,
+            ..Self::new(rate_bytes_per_sec, now)
         }
     }
 
     /// The budget of the section 13 table for the receiver `role` on `lane`, or `None` for the
-    /// silent direction.
+    /// silent direction. `bulk` is backpressure only.
     pub fn for_lane(receiver: Role, lane: Lane, now: Instant) -> Option<Self> {
-        lane_rate(receiver, lane).map(|r| Self::new(r, now))
+        lane_rate(receiver, lane).map(|r| match lane {
+            Lane::Bulk => Self::backpressure_only(r, now),
+            _ => Self::new(r, now),
+        })
     }
 
     fn refill(&mut self, now: Instant) {
@@ -138,8 +158,52 @@ impl ByteBudget {
     /// True if the bucket stayed empty with data pending for [`STARVATION_LIMIT`]: the session
     /// keeps sending at full speed, a violation (section 13).
     pub fn violated(&self, now: Instant) -> bool {
-        self.starved_since
-            .is_some_and(|s| now.saturating_duration_since(s) >= STARVATION_LIMIT)
+        self.starvation_is_violation
+            && self
+                .starved_since
+                .is_some_and(|s| now.saturating_duration_since(s) >= STARVATION_LIMIT)
+    }
+}
+
+/// The rate at which each end paces its own `bulk` sends: three quarters of the receiver's
+/// budget, so the receiver's bucket does not run dry in normal operation (docs/ipc.md section 13).
+pub const BULK_SEND_RATE: u64 = 3 * (64 * MIB) / 4;
+
+/// A sender-side pacer: sans-I/O, one per lane and direction, shared by all transfers on it.
+///
+/// [`Pacer::reserve`] books `n` bytes and returns how long the caller must wait before writing
+/// them. Idle time earns at most [`Pacer::BURST`] of credit, so a transfer after a pause cannot
+/// burst above the rate for long.
+#[derive(Debug, Clone)]
+pub struct Pacer {
+    rate: u64,
+    next: Option<Instant>,
+}
+
+impl Pacer {
+    /// Credit that idle time earns (10 ms of the rate).
+    pub const BURST: Duration = Duration::from_millis(10);
+
+    /// A pacer at `rate_bytes_per_sec` (at least 1).
+    pub fn new(rate_bytes_per_sec: u64) -> Self {
+        Self {
+            rate: rate_bytes_per_sec.max(1),
+            next: None,
+        }
+    }
+
+    /// The pacer for the `bulk` lane ([`BULK_SEND_RATE`]).
+    pub fn bulk() -> Self {
+        Self::new(BULK_SEND_RATE)
+    }
+
+    /// Books `n` bytes; wait this long, then write them.
+    pub fn reserve(&mut self, n: u64, now: Instant) -> Duration {
+        let floor = now.checked_sub(Self::BURST).unwrap_or(now);
+        let start = self.next.map_or(floor, |t| t.max(floor));
+        let cost_ns = u128::from(n) * 1_000_000_000 / u128::from(self.rate);
+        self.next = Some(start + Duration::from_nanos(u64::try_from(cost_ns).unwrap_or(u64::MAX)));
+        start.saturating_duration_since(now)
     }
 }
 
@@ -226,6 +290,11 @@ pub mod limits {
     /// gateway's own cap is 2 000 per second) plus motion (1 000) plus feedback and stats
     /// (about 20): 4 000.
     pub const CTL_FRAMES_FROM_GATEWAY: usize = 4_000;
+    /// The ceiling above which the session closes the link for `ctl` G → S frame counts.
+    /// Frames are counted when read, so a reader that stalled (an XTest flush for up to the
+    /// gateway's 2 s write-stall bound) sees the queued frames as a burst; going above
+    /// [`CTL_FRAMES_FROM_GATEWAY`] is only counted and logged, going above this is a violation.
+    pub const CTL_FRAMES_FROM_GATEWAY_HARD: usize = 5 * CTL_FRAMES_FROM_GATEWAY;
     /// All frames on `bulk` per second, per direction. A full-speed transfer is 64 MiB/s in
     /// 64 KiB chunks, 1 024 data frames per second; opens, ends and aborts are bounded by 4
     /// concurrent transfers. Twice the data rate: 2 048.
@@ -385,13 +454,67 @@ mod tests {
         // ready is flagged after three seconds of an empty bucket.
         assert!(violated, "sustained full speed must be a violation");
         assert!(bytes <= rate * (2 + 6) + 4 * MIB, "{bytes}");
-        // The same for the small-frame lanes.
-        for lane in [Lane::Ctl, Lane::Bulk] {
-            let rate = lane_rate(Role::Gateway, lane).unwrap();
-            let (bytes, violated) = flood(rate, 64 * 1024, 10);
-            assert!(violated, "{lane:?}");
-            assert!(bytes <= rate * 9 + 64 * 1024, "{lane:?} {bytes}");
+        // The same for the small-frame `ctl` lane.
+        let rate = lane_rate(Role::Gateway, Lane::Ctl).unwrap();
+        let (bytes, violated) = flood(rate, 64 * 1024, 10);
+        assert!(violated);
+        assert!(bytes <= rate * 9 + 64 * 1024, "{bytes}");
+    }
+
+    #[test]
+    fn bulk_is_backpressure_only_but_stays_bounded() {
+        // Review L1: a sender at line speed is slowed (the bucket stops reading), never flagged.
+        let t0 = Instant::now();
+        let rate = lane_rate(Role::Gateway, Lane::Bulk).unwrap();
+        let mut b = ByteBudget::for_lane(Role::Gateway, Lane::Bulk, t0).unwrap();
+        let mut now = t0;
+        let mut bytes = 0u64;
+        while now < t0 + Duration::from_secs(30) {
+            if b.allowance(now) == 0 {
+                b.note_pending(true, now);
+                assert!(!b.violated(now), "bulk overage is never a violation");
+                now += Duration::from_millis(10);
+                continue;
+            }
+            b.note_pending(true, now);
+            b.consume(64 * 1024 + 5, now);
+            bytes += 64 * 1024 + 5;
         }
+        assert!(
+            bytes <= rate * 32 + 64 * 1024,
+            "still rate limited: {bytes}"
+        );
+        assert!(bytes >= rate * 28, "and not starved: {bytes}");
+    }
+
+    #[test]
+    fn the_pacer_stays_under_the_receiver_budget() {
+        let t0 = Instant::now();
+        let mut p = Pacer::bulk();
+        let mut now = t0;
+        let mut sent = 0u64;
+        // A sender that writes as fast as it is allowed for 20 s of virtual time.
+        while now < t0 + Duration::from_secs(20) {
+            now += p.reserve(64 * 1024, now);
+            sent += 64 * 1024;
+        }
+        let rate = BULK_SEND_RATE as f64;
+        let achieved = sent as f64 / 20.0;
+        assert!(achieved <= rate * 1.01, "{achieved}");
+        assert!(achieved >= rate * 0.95, "{achieved}");
+        assert!(BULK_SEND_RATE < lane_rate(Role::Gateway, Lane::Bulk).unwrap());
+        // Idle credit is capped: after a long pause only about BURST worth goes out at once.
+        let later = now + Duration::from_secs(60);
+        let mut waits = 0;
+        let mut t = later;
+        for _ in 0..16 {
+            let w = p.reserve(64 * 1024, t);
+            if w > Duration::ZERO {
+                waits += 1;
+            }
+            t += w;
+        }
+        assert!((6..=10).contains(&waits), "{waits}");
     }
 
     #[test]

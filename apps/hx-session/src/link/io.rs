@@ -9,7 +9,7 @@
 
 use hx_ipc::ReadError;
 use hx_ipc::frame::{Decoder, RawFrame};
-use hx_ipc::link::budget::{ByteBudget, RateWindow, lane_frame_limit};
+use hx_ipc::link::budget::{ByteBudget, RateWindow, lane_frame_limit, limits};
 use hx_ipc::link::{Lane, LinkPolicy, Role};
 use hx_ipc::recv::NoCmsgReader;
 use std::collections::VecDeque;
@@ -66,6 +66,11 @@ pub(crate) struct LaneReader {
     decoder: Decoder<LinkPolicy>,
     budget: Option<ByteBudget>,
     frame_rate: Option<RateWindow>,
+    /// `ctl` only: the ceiling above which the frame count is a violation. Below it, going over
+    /// `frame_rate` is only counted (review L2: frames are counted when read, so a stalled
+    /// reader sees the queued frames as a burst).
+    hard_rate: Option<RateWindow>,
+    soft_overage: u64,
     frame_started: Option<Instant>,
     frame_deadline: Duration,
     last_byte: Instant,
@@ -89,6 +94,9 @@ impl LaneReader {
             decoder: Decoder::new(policy),
             budget: ByteBudget::for_lane(Role::Session, lane, now),
             frame_rate: lane_frame_limit(Role::Session, lane).map(RateWindow::per_second),
+            hard_rate: (lane == Lane::Ctl)
+                .then(|| RateWindow::per_second(limits::CTL_FRAMES_FROM_GATEWAY_HARD)),
+            soft_overage: 0,
             frame_started: None,
             frame_deadline: BODY_BASE,
             last_byte: now,
@@ -100,6 +108,12 @@ impl LaneReader {
 
     pub(crate) fn policy(&self) -> &LinkPolicy {
         &self.policy
+    }
+
+    /// Frames over the soft per-second limit that were accepted (`ctl` only).
+    #[allow(dead_code)]
+    pub(crate) fn soft_overage(&self) -> u64 {
+        self.soft_overage
     }
 
     /// True if the socket has data (or an end of stream) waiting. Never blocks.
@@ -120,20 +134,29 @@ impl LaneReader {
                 return Err(LaneError::Closed);
             }
             let now = Instant::now();
-            if let Some(b) = &mut self.budget {
+            if self.budget.is_some() {
                 // Beyond the budget the session stops reading: backpressure, not discard. A lane
-                // that keeps data waiting at an empty bucket for 3 s is a violation.
-                if self.decoder.at_boundary() && b.allowance(now) == 0 {
-                    b.note_pending(true, now);
-                    if b.violated(now) {
-                        return Err(LaneError::Violation("byte budget exceeded".into()));
+                // that keeps data waiting at an empty bucket for 3 s is a violation (`bulk`
+                // excepted: its budget is backpressure only).
+                let empty = self.decoder.at_boundary()
+                    && self.budget.as_mut().is_some_and(|b| b.allowance(now) == 0);
+                if empty {
+                    // Only data actually waiting counts: a peer that went quiet is not starving.
+                    let pending = self.readable_now();
+                    if let Some(b) = &mut self.budget {
+                        b.note_pending(pending, now);
+                        if b.violated(now) {
+                            return Err(LaneError::Violation("byte budget exceeded".into()));
+                        }
                     }
                     std::thread::sleep(Duration::from_millis(10));
                     continue;
                 }
                 // Positive allowance: no verdict. Only an idle peer or a recovered bucket resets
                 // the starvation clock, not merely touching zero between two frames.
-                b.note_pending(true, now);
+                if let Some(b) = &mut self.budget {
+                    b.note_pending(true, now);
+                }
             }
             let want = self.decoder.wants().min(self.buf.len());
             let n = match NoCmsgReader(&self.stream).read(&mut self.buf[..want]) {
@@ -172,7 +195,22 @@ impl LaneReader {
                 if let Some(b) = &mut self.budget {
                     b.consume(len + 4, now);
                 }
-                if let Some(rate) = &mut self.frame_rate
+                if let Some(hard) = &mut self.hard_rate {
+                    if !hard.allow(now) {
+                        return Err(LaneError::Violation("frame-count limit exceeded".into()));
+                    }
+                    if let Some(rate) = &mut self.frame_rate
+                        && !rate.allow(now)
+                    {
+                        self.soft_overage += 1;
+                        if self.soft_overage == 1 {
+                            eprintln!(
+                                "hx-session: ctl frames above {} per second (a stalled reader's backlog); counting only",
+                                limits::CTL_FRAMES_FROM_GATEWAY
+                            );
+                        }
+                    }
+                } else if let Some(rate) = &mut self.frame_rate
                     && !rate.allow(now)
                 {
                     return Err(LaneError::Violation("frame-count limit exceeded".into()));
@@ -344,6 +382,53 @@ mod tests {
 
     fn pair() -> (UnixStream, UnixStream) {
         UnixStream::pair().unwrap()
+    }
+
+    /// Writes `n` copies of a tiny valid ctl frame from another thread.
+    fn flood(mut b: UnixStream, n: usize) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let one = encode_frame(KIND_GATEWAY_TO_SESSION, &[0x32, 0x00], 16_384).unwrap();
+            let burst: Vec<u8> = one.iter().copied().cycle().take(one.len() * n).collect();
+            let _ = b.write_all(&burst);
+        })
+    }
+
+    #[test]
+    fn a_stalled_ctl_readers_backlog_is_counted_not_a_violation() {
+        // Review L2: the gateway sends at its documented maximum, the reader stalls for a
+        // second, and the queued frames arrive as one burst of 10 000 in a window.
+        let (a, b) = pair();
+        let mut r = LaneReader::new(a, Lane::Ctl, session_policy(Lane::Ctl), None).unwrap();
+        let closed = AtomicBool::new(false);
+        let t = flood(b, 10_000);
+        for i in 0..10_000 {
+            r.next(&closed)
+                .unwrap_or_else(|e| panic!("frame {i}: {e:?}"));
+        }
+        assert!(r.soft_overage() >= 5_000, "{}", r.soft_overage());
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn a_ctl_flood_far_above_the_ceiling_is_still_a_violation() {
+        let (a, b) = pair();
+        let mut r = LaneReader::new(a, Lane::Ctl, session_policy(Lane::Ctl), None).unwrap();
+        let closed = AtomicBool::new(false);
+        let t = flood(b, 30_000);
+        let mut violated = false;
+        for _ in 0..30_000 {
+            match r.next(&closed) {
+                Ok(_) => {}
+                Err(LaneError::Violation(_)) => {
+                    violated = true;
+                    break;
+                }
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+        assert!(violated, "20 000 per second is the ceiling");
+        drop(r);
+        let _ = t.join();
     }
 
     #[test]

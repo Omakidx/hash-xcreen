@@ -85,6 +85,20 @@ fn write_frames(ctx: &LinkCtx, parts: &[&[u8]]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Waits until the pacer allows `n` more bytes on the lane (all transfers share one pacer), in
+/// short steps so a closing link is noticed.
+fn pace(ctx: &LinkCtx, n: usize) {
+    let mut wait = {
+        let mut p = ctx.bulk_pacer.lock().unwrap_or_else(|e| e.into_inner());
+        p.reserve(n as u64, std::time::Instant::now())
+    };
+    while !wait.is_zero() && !ctx.is_closed() {
+        let step = wait.min(Duration::from_millis(50));
+        std::thread::sleep(step);
+        wait -= step;
+    }
+}
+
 fn send_abort(ctx: &LinkCtx, id: u32, code: u32) {
     if let Ok(f) = encode_transfer_abort(id, code)
         && write_frames(ctx, &[&f]).is_err()
@@ -98,6 +112,7 @@ pub(crate) fn reader_loop(ctx: &Arc<LinkCtx>, mut reader: LaneReader) {
     let mut incoming: HashMap<u32, Incoming> = HashMap::new();
     let mut recent: VecDeque<u32> = VecDeque::new();
     let mut batch = Batch::default();
+    let mut seen_gen = ctx.takeover_gen.load(Relaxed);
     loop {
         let raw = match reader.next(&ctx.closed) {
             Ok(r) => r,
@@ -107,6 +122,13 @@ pub(crate) fn reader_loop(ctx: &Arc<LinkCtx>, mut reader: LaneReader) {
                 break;
             }
         };
+        // A takeover happened: the files the displaced client sent are not part of the new
+        // client's paste (docs/ipc.md section 18).
+        let gen_now = ctx.takeover_gen.load(Relaxed);
+        if gen_now != seen_gen {
+            seen_gen = gen_now;
+            batch = Batch::default();
+        }
         // The size limit is applied below (a refusal, not a violation).
         let frame = match parse(reader.policy(), raw, u64::MAX) {
             Ok(f) => f,
@@ -504,6 +526,8 @@ fn send_chunks(ctx: &LinkCtx, id: u32, mut src: impl Read, size: u64) -> Result<
         }
         let prefix =
             encode_transfer_data_prefix(id, n).map_err(|e| SendError::Invalid(e.to_string()))?;
+        // Below the receiver's budget, so an honest transfer never drains its bucket.
+        pace(ctx, n + prefix.len());
         write_frames(ctx, &[&prefix, &buf[..n]]).map_err(SendError::Io)?;
         sent += n as u64;
     }

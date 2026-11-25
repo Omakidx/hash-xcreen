@@ -77,6 +77,17 @@ pub(super) struct ClientRelay {
     started: AtomicU64,
 }
 
+/// The size the session is asked for: the view's own when both sides are set, at most 16 384 and
+/// within the shared pixel cap; `(0, 0)` (keep the current size) otherwise (docs/ipc.md 13).
+pub(super) fn view_size(width: u32, height: u32) -> (u32, u32) {
+    let ok = width != 0
+        && height != 0
+        && width <= 16_384
+        && height <= 16_384
+        && u64::from(width) * u64::from(height) <= hx_ipc::link::validate::MAX_PIXELS;
+    if ok { (width, height) } else { (0, 0) }
+}
+
 impl ClientRelay {
     pub(super) fn new(
         core: Arc<Core>,
@@ -146,7 +157,7 @@ impl ClientRelay {
             view.stats_enabled && self.features.contains(Features::SERVER_STATS),
             Relaxed,
         );
-        let size_set = view.width != 0 && view.height != 0;
+        let (width, height) = view_size(view.width, view.height);
         pb::StreamConfig {
             codec: codec as i32,
             max_fps: if view.max_fps <= 240 { view.max_fps } else { 0 },
@@ -154,16 +165,8 @@ impl ClientRelay {
                 0 => 0,
                 k => k.clamp(100, 100_000),
             },
-            width: if size_set && view.width <= 16_384 && view.height <= 16_384 {
-                view.width
-            } else {
-                0
-            },
-            height: if size_set && view.width <= 16_384 && view.height <= 16_384 {
-                view.height
-            } else {
-                0
-            },
+            width,
+            height,
             scale_percent: match view.scale_percent {
                 0 => 0,
                 s => s.clamp(50, 400),
@@ -410,5 +413,25 @@ impl GatewayHandle for ClientRelay {
             }
             self.core.keeper.detach(&self.link);
         })
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::view_size;
+
+    #[test]
+    fn a_view_above_the_pixel_cap_or_the_side_limit_is_not_sent_on() {
+        assert_eq!(view_size(1920, 1080), (1920, 1080));
+        assert_eq!(view_size(7680, 4320), (7680, 4320), "exactly the cap");
+        assert_eq!(view_size(7681, 4320), (0, 0), "one pixel row over the cap");
+        assert_eq!(
+            view_size(16_384, 16_384),
+            (0, 0),
+            "within the side limit, over the cap"
+        );
+        assert_eq!(view_size(16_385, 100), (0, 0));
+        assert_eq!(view_size(0, 100), (0, 0));
+        assert_eq!(view_size(100, 0), (0, 0));
     }
 }

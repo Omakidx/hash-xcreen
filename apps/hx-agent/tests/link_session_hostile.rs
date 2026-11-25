@@ -254,7 +254,7 @@ fn the_session_closes_the_link_for_a_hostile_gateway() {
     );
     drop(r);
 
-    // A flood of tiny ctl frames: more than 4 000 per second.
+    // A flood of tiny ctl frames far above the 20 000 per second ceiling closes the link.
     let mut r = raw_link(&sock, [5; 16]);
     let one = gw_frame(pb::gateway_to_session::Message::ClientStats(
         Default::default(),
@@ -263,7 +263,7 @@ fn the_session_closes_the_link_for_a_hostile_gateway() {
         .iter()
         .copied()
         .cycle()
-        .take(one.len() * 5_000)
+        .take(one.len() * 30_000)
         .collect();
     let _ = r.ctl.write_all(&burst);
     assert!(
@@ -320,6 +320,47 @@ fn the_session_closes_the_link_for_a_hostile_gateway() {
     assert!(matches!(
         msg.message,
         Some(pb::session_to_gateway::Message::Pong(p)) if p.nonce == 77
+    ));
+}
+
+#[test]
+fn a_stalled_ctl_readers_backlog_does_not_close_the_link() {
+    // Review L2: the session's ctl reader pauses for a second (an XTest flush) while the gateway
+    // keeps sending at its documented maximum (3 652 frames per second); the queued frames
+    // reach the reader as one burst of about 7 000. Above the soft 4 000 per second that is
+    // only counted, never a closed link (and never a fault that ends in RestartSession).
+    let Some(env) = Env::start(|_| {}) else {
+        return;
+    };
+    let mut r = raw_link(&env.sock, [30; 16]);
+    let one = gw_frame(pb::gateway_to_session::Message::ClientStats(
+        Default::default(),
+    ));
+    let chunk = |n: usize| -> Vec<u8> { one.iter().copied().cycle().take(one.len() * n).collect() };
+    // The backlog of a one-second stall plus the second that follows it.
+    r.ctl.write_all(&chunk(3_652 * 2)).unwrap();
+    for _ in 0..3 {
+        std::thread::sleep(Duration::from_secs(1));
+        r.ctl.write_all(&chunk(3_652)).unwrap();
+    }
+    assert!(
+        !closes(&mut r.ctl, Duration::from_millis(500)),
+        "the link lives"
+    );
+    r.ctl
+        .write_all(&gw_frame(pb::gateway_to_session::Message::Ping(pb::Ping {
+            nonce: 5,
+        })))
+        .unwrap();
+    r.ctl
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let (kind, body) = read_frame(&mut r.ctl);
+    assert_eq!(kind, KIND_SESSION_TO_GATEWAY);
+    let msg = pb::SessionToGateway::decode(&body[..]).unwrap();
+    assert!(matches!(
+        msg.message,
+        Some(pb::session_to_gateway::Message::Pong(p)) if p.nonce == 5
     ));
 }
 

@@ -32,7 +32,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
 use hx_capture::clipboard::Selection;
 use hx_capture::{CursorEvent, Size, X11Input, mono_ns};
 use hx_codec::EncodedFrame;
-use hx_ipc::link::budget::{RateWindow, limits};
+use hx_ipc::link::budget::{Pacer, RateWindow, limits};
 use hx_ipc::link::frames::{LinkFrame, encode_session_message, encode_video_prefix, parse};
 use hx_ipc::link::{Lane, pb};
 use hx_ipc::text::sanitize_text;
@@ -129,6 +129,11 @@ pub(crate) struct LinkCtx {
     lanes: Mutex<Vec<UnixStream>>,
     pub out: CtlOut,
     pub bulk_tx: Mutex<UnixStream>,
+    /// Paces every bulk send of this link below the receiver's budget (docs/ipc.md section 13).
+    pub bulk_pacer: Mutex<Pacer>,
+    /// Bumped when a `start` brings a new epoch (a takeover): the bulk reader forgets the batch
+    /// of files offered to the displaced client.
+    pub takeover_gen: AtomicU64,
     pub next_tid: AtomicU32,
     pub aborted_out: Mutex<VecDeque<u32>>,
     pub received: Arc<super::received::ReceivedStore>,
@@ -146,6 +151,25 @@ pub(crate) struct LinkCtx {
     stream: RwLock<Option<Arc<StreamRt>>>,
     generation: AtomicU64,
     events_rl: Mutex<RateWindow>,
+}
+
+impl LinkCtx {
+    /// Forgets what belonged to the previous client: its clipboard offer and the received-files
+    /// batch (the files themselves stay in the received directory).
+    fn reset_per_client_state(&self) {
+        if let Some(m) = &self.manager {
+            let _ = m.withdraw(Selection::Clipboard);
+        }
+        self.takeover_gen.fetch_add(1, Relaxed);
+    }
+}
+
+/// A remote size the session accepts: 16 to 8 192 per side and at most the shared pixel cap
+/// (docs/ipc.md 13), the same area the gateway accepts in a `stream_format`.
+fn resize_allowed(w: u32, h: u32) -> bool {
+    (16..=8192).contains(&w)
+        && (16..=8192).contains(&h)
+        && u64::from(w) * u64::from(h) <= hx_ipc::link::validate::MAX_PIXELS
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -198,6 +222,8 @@ impl LinkCtx {
             ]),
             out: CtlOut::new(),
             bulk_tx: Mutex::new(lanes.bulk.try_clone()?),
+            bulk_pacer: Mutex::new(Pacer::bulk()),
+            takeover_gen: AtomicU64::new(0),
             next_tid: AtomicU32::new(2),
             aborted_out: Mutex::new(VecDeque::new()),
             received,
@@ -500,7 +526,11 @@ fn handle_ctl(
     let Some(m) = m.message else { return Ok(()) };
     match m {
         M::Start(s) => {
-            ctx.epoch.store(s.epoch, Relaxed);
+            // A new epoch is a new client (takeover): clipboard and transfers are per client
+            // and are not carried across (docs/ipc.md section 18).
+            if ctx.epoch.swap(s.epoch, Relaxed) != s.epoch {
+                ctx.reset_per_client_state();
+            }
             ctx.started.store(true, Relaxed);
             // A start carries the whole configuration: an older waiting change is moot.
             lock(&ctx.pending_reconf).take();
@@ -795,10 +825,13 @@ impl Engine {
         if cfg.width != 0 && cfg.height != 0 {
             // Rounded down to even; the encoder takes 16 to 8192 per side.
             let (w, h) = (cfg.width & !1, cfg.height & !1);
-            if (16..=8192).contains(&w) && (16..=8192).contains(&h) {
+            if resize_allowed(w, h) {
                 self.pending_resize = Some((w, h));
             } else {
-                ctx.event(pb::EventKind::ResizeRefused, "size outside 16 to 8192");
+                ctx.event(
+                    pb::EventKind::ResizeRefused,
+                    "size outside 16 to 8192 per side or above 33177600 pixels",
+                );
             }
         }
         // `scale_percent` is validated and accepted but has no session-side effect in Phase 1.
@@ -1108,5 +1141,23 @@ mod reconfigure_tests {
         };
         let m = merge_config(m, c);
         assert_eq!((m.width, m.height), (640, 360));
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::resize_allowed;
+
+    #[test]
+    fn a_resize_above_the_pixel_cap_is_refused() {
+        assert!(resize_allowed(1920, 1080));
+        assert!(resize_allowed(7680, 4320), "exactly the cap");
+        assert!(!resize_allowed(7682, 4320), "just over the cap");
+        assert!(
+            !resize_allowed(8192, 8192),
+            "within the side limit, over the cap"
+        );
+        assert!(!resize_allowed(8194, 16));
+        assert!(!resize_allowed(10, 100));
     }
 }

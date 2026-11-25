@@ -647,6 +647,11 @@ pub(crate) enum BulkOut {
     Data { id: u32, data: Bytes },
 }
 
+/// At most one batched `DROPPED` report per this interval.
+pub(crate) const DROPPED_BATCH_INTERVAL: Duration = Duration::from_millis(50);
+/// Frame numbers held for the next batched `DROPPED` report (four messages of 64).
+const DROPPED_PENDING_MAX: usize = 256;
+
 pub(crate) struct Shared {
     pub cfg: LinkConfig,
     pub info: SessionInfo,
@@ -674,6 +679,9 @@ pub(crate) struct Shared {
     /// fail (review L1).
     aborts: Mutex<VecDeque<Vec<u8>>>,
     pub abort_wake: Notify,
+    /// Frames the link layer dropped, waiting for the next batched `DROPPED` report.
+    dropped: Mutex<Vec<u32>>,
+    pub dropped_wake: Notify,
     pub events_rl: Mutex<EventRates>,
     pub cursor_rl: Mutex<CursorRates>,
 }
@@ -750,6 +758,8 @@ impl Shared {
             bulk_tx,
             aborts: Mutex::new(VecDeque::new()),
             abort_wake: Notify::new(),
+            dropped: Mutex::new(Vec::new()),
+            dropped_wake: Notify::new(),
             events_rl: Mutex::new(EventRates {
                 stats: RateWindow::per_second(limits::STATS),
                 event: RateWindow::per_second(limits::EVENT),
@@ -859,6 +869,28 @@ impl Shared {
             self.send_p1(pb::gateway_to_session::Message::FrameFeedback(
                 pb::FrameFeedback { results },
             ));
+        }
+    }
+
+    /// Notes frames the link layer dropped. They are reported as one batched `DROPPED`
+    /// `frame_feedback` per [`DROPPED_BATCH_INTERVAL`] by the maintenance task, so that a client
+    /// provoking drops (a flood of `RequestKeyframe`) cannot multiply `ctl` frames toward the
+    /// session (docs/ipc.md section 13). Past [`DROPPED_PENDING_MAX`] waiting numbers the rest
+    /// are not reported: the report is advisory, the resync is what repairs the chain.
+    pub(crate) fn report_dropped(&self, numbers: &[u32]) {
+        {
+            let mut d = lock(&self.dropped);
+            let room = DROPPED_PENDING_MAX.saturating_sub(d.len());
+            d.extend(numbers.iter().copied().take(room));
+        }
+        self.dropped_wake.notify_one();
+    }
+
+    /// Sends what [`Shared::report_dropped`] collected.
+    pub(crate) fn flush_dropped(&self) {
+        let batch = std::mem::take(&mut *lock(&self.dropped));
+        if !batch.is_empty() {
+            self.report_frames(&batch, pb::FrameOutcome::Dropped);
         }
     }
 

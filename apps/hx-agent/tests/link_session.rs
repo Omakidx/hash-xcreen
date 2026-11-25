@@ -1277,3 +1277,131 @@ async fn a_clipboard_that_cannot_start_is_reported_not_silently_off() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn takeover_withdraws_the_displaced_clients_clipboard() {
+    // Review L3: clipboard and transfers are per client (docs/ipc.md 18).
+    let Some(env) = Env::start(|_| {}) else {
+        return;
+    };
+    let (link, _ev) = env.connect().await;
+    link.start(1, stream_config()).unwrap();
+    let app = app(&env.x);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let text = "offered by the first client";
+    let mut sender = link
+        .begin_transfer(
+            pb::TransferChannel::Clipboard,
+            TransferHeader {
+                mime: "text/plain;charset=utf-8".into(),
+                name: String::new(),
+                size: text.len() as u64,
+            },
+        )
+        .await
+        .unwrap();
+    sender
+        .write(Bytes::from(text.as_bytes().to_vec()))
+        .await
+        .unwrap();
+    sender.finish().await.unwrap();
+    let end = Instant::now() + Duration::from_secs(5);
+    while app.fetch_local(Selection::Clipboard, MIME_TEXT).is_err() && Instant::now() < end {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        app.fetch_local(Selection::Clipboard, MIME_TEXT).unwrap(),
+        text.as_bytes(),
+        "the first client's clipboard is on offer"
+    );
+
+    // A second client takes over: a start with the next epoch.
+    link.start(2, stream_config()).unwrap();
+    let end = Instant::now() + Duration::from_secs(5);
+    while app.fetch_local(Selection::Clipboard, MIME_TEXT).is_ok() && Instant::now() < end {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        app.fetch_local(Selection::Clipboard, MIME_TEXT).is_err(),
+        "the displaced client's clipboard offer is withdrawn"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bulk_at_line_speed_both_ways_never_ends_the_link() {
+    // Review L1: an honest transfer as fast as the sockets allow is paced by both senders below
+    // the receivers' 64 MiB/s budget, so neither end sees a starved lane, a violation or a fault.
+    const TOTAL: u64 = 512 * 1024 * 1024;
+    let Some(env) = Env::start(|cfg| cfg.max_file_bytes = 1 << 30) else {
+        return;
+    };
+    let (link, mut ev) = env.connect().await;
+    link.start(1, stream_config()).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Session to gateway: a sparse 512 MiB file.
+    let src = env.dir.join("sparse.bin");
+    std::fs::File::create(&src).unwrap().set_len(TOTAL).unwrap();
+    let sender = env.server.as_ref().unwrap().sender();
+    let send = tokio::task::spawn_blocking(move || sender.send_file(&src));
+
+    // Gateway to session: 512 MiB of zeros as fast as the writer accepts them.
+    let started = Instant::now();
+    let upload = async {
+        let mut s = link
+            .begin_transfer(
+                pb::TransferChannel::File,
+                TransferHeader {
+                    mime: "application/octet-stream".into(),
+                    name: "up.bin".into(),
+                    size: TOTAL,
+                },
+            )
+            .await
+            .unwrap();
+        let mib = Bytes::from(vec![0u8; 1024 * 1024]);
+        for _ in 0..(TOTAL / (1024 * 1024)) {
+            s.write(mib.clone()).await.unwrap();
+        }
+        s.finish().await.unwrap();
+    };
+    // The consumer drains instantly.
+    let consume = async {
+        let mut got = 0u64;
+        let mut ended = false;
+        while !ended {
+            match timeout(Duration::from_secs(60), ev.next()).await {
+                Ok(LinkEvent::Transfer(TransferEvent::Data(c))) => got += c.data.len() as u64,
+                Ok(LinkEvent::Transfer(TransferEvent::End { .. })) => ended = true,
+                Ok(LinkEvent::Closed(c)) => panic!("the link ended: {c:?}"),
+                Ok(_) => {}
+                Err(_) => panic!("no progress; {got} bytes received"),
+            }
+        }
+        got
+    };
+    let (_, got) = tokio::join!(upload, consume);
+    assert_eq!(got, TOTAL);
+    send.await.unwrap().expect("the session sent the file");
+    let up = env.received().join("up.bin");
+    let end = Instant::now() + Duration::from_secs(30);
+    while std::fs::metadata(&up).map(|m| m.len()).unwrap_or(0) != TOTAL && Instant::now() < end {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(std::fs::metadata(&up).unwrap().len(), TOTAL);
+    // Paced below 64 MiB/s: 512 MiB cannot be done in under 8 s.
+    assert!(
+        started.elapsed() >= Duration::from_secs(8),
+        "{:?}",
+        started.elapsed()
+    );
+    // Both ends are still healthy: no Closed event is waiting.
+    assert!(
+        !matches!(
+            timeout(Duration::from_millis(100), ev.next()).await,
+            Ok(LinkEvent::Closed(_))
+        ),
+        "the link is alive"
+    );
+}
