@@ -9,6 +9,16 @@ key_fingerprint = "BC528686B50D79E339D3721CEB3E94ADBE1229CF"
 uri = "https://packages.microsoft.com/repos/code"
 suite = "stable"
 components = "main"
+# Only `code` may come from Microsoft's repository (see the docker add-on for the rule).
+pin = '''
+Package: code
+Pin: origin packages.microsoft.com
+Pin-Priority: 500
+
+Package: *
+Pin: origin packages.microsoft.com
+Pin-Priority: 100
+'''
 
 # The `code` postinst offers to add Microsoft's repository a second time; we already did.
 [[pre_step]]

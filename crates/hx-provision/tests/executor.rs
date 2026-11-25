@@ -368,7 +368,8 @@ fn repo_step_verifies_the_pinned_fingerprint_and_pushes_the_pin() {
     };
     assert_eq!(f.path, "/etc/apt/preferences.d/mozillateam.pref");
     let pin = String::from_utf8_lossy(&f.content);
-    assert!(pin.contains("Pin-Priority: 1001"));
+    assert!(pin.contains("Pin: origin ppa.launchpadcontent.net\nPin-Priority: 1001"));
+    assert!(pin.contains("Package: *\nPin: origin ppa.launchpadcontent.net\nPin-Priority: 100"));
     // Ubuntu's snap-installing transitional firefox is never a candidate, PPA reachable or not.
     assert!(
         pin.contains("Pin: release o=Ubuntu\nPin-Priority: -1"),

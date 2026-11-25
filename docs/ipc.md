@@ -170,7 +170,7 @@ Progress is lossy and bounded: at most 10 per second per request, at most 256 bu
 | `DEADLINE_EXCEEDED` / `CANCELLED` | Deadline hit or `Cancel` received. |
 | `UNAVAILABLE` | Incus (or another dependency) cannot be reached. Retryable. |
 | `UNIMPLEMENTED` | Command reserved or not available in this release. |
-| `INTERNAL` | A bug or unexpected dependency failure; the detail is in the journal, not in the message. |
+| `INTERNAL` | A bug or unexpected dependency failure; the detail is in the journal, not in the message. For a failed recipe step the message holds the stage, the step number and kind and the exit status plus `details: journalctl -u hx-privd`, never the step's output (the container may have run user code); the output is in the journal. |
 
 A *domain outcome* that the caller must act on is a successful `Response`, not an `Error` (for example Docker's `SelfTestFailed`, §6.9). Container-originated text is sanitized by `hx-provision` (control and ANSI characters removed, truncated) and is still untrusted: callers escape it for any UI.
 

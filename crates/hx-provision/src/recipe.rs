@@ -125,6 +125,44 @@ struct RawMeta {
     base_image: String,
 }
 
+/// Host part of a repository URI (no scheme, userinfo or port), lower-cased.
+fn uri_host(uri: &str) -> String {
+    let rest = uri.split_once("://").map_or(uri, |(_, r)| r);
+    let auth = rest.split('/').next().unwrap_or("");
+    let auth = auth.rsplit('@').next().unwrap_or("");
+    let host = auth.split(':').next().unwrap_or("");
+    host.to_ascii_lowercase()
+}
+
+/// True if the apt preferences `pin` holds a `Package: *` stanza that pins `origin <host of uri>`
+/// at priority 100 or lower.
+fn pin_scopes_origin(uri: &str, pin: &str) -> bool {
+    let host = uri_host(uri);
+    if host.is_empty() {
+        return false;
+    }
+    pin.replace("\r\n", "\n").split("\n\n").any(|stanza| {
+        let (mut pkg, mut origin, mut prio) = (None, None, None);
+        for line in stanza.lines() {
+            let Some((k, v)) = line.split_once(':') else {
+                continue;
+            };
+            let v = v.trim();
+            match k.trim().to_ascii_lowercase().as_str() {
+                "package" => pkg = Some(v.to_string()),
+                "pin" => origin = Some(v.to_string()),
+                "pin-priority" => prio = v.parse::<i32>().ok(),
+                _ => {}
+            }
+        }
+        let origin_ok = origin.is_some_and(|o| {
+            o.strip_prefix("origin")
+                .is_some_and(|h| h.trim().trim_matches('"').eq_ignore_ascii_case(&host))
+        });
+        pkg.as_deref() == Some("*") && origin_ok && prio.is_some_and(|p| p <= 100)
+    })
+}
+
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 struct RawAptRepo {
@@ -737,6 +775,15 @@ fn table_to_plan(
             .is_some_and(|p| p.trim().is_empty() || p.contains('\0'))
         {
             return Err(RecipeError::invalid(f("pin"), "must not be empty"));
+        }
+        // A third-party origin must not be able to replace distro packages: the pin has to keep
+        // everything the origin offers at priority 100 or lower (security review R1).
+        if !pin_scopes_origin(&r.uri, r.pin.as_deref().unwrap_or("")) {
+            return Err(RecipeError::invalid(
+                f("pin"),
+                "must contain a `Package: *` stanza with `Pin: origin <host of uri>` and a \
+                 `Pin-Priority` of 100 or lower, then raise only the intended packages",
+            ));
         }
         repos.push(AptRepo {
             name: r.name,

@@ -18,6 +18,18 @@ key_fingerprint = "9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
 uri = "https://download.docker.com/linux/{{distro}}"
 suite = "{{codename}}"
 components = "stable"
+# Scope: only Docker's own packages may come from this origin; everything else it might offer
+# stays at priority 100 and never replaces a distro package on `apt-get upgrade`. Specific
+# stanzas first: apt uses the first stanza that matches a package.
+pin = '''
+Package: docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+Pin: origin download.docker.com
+Pin-Priority: 500
+
+Package: *
+Pin: origin download.docker.com
+Pin-Priority: 100
+'''
 
 [apt]
 packages = ["docker-ce", "docker-ce-cli", "containerd.io", "docker-buildx-plugin", "docker-compose-plugin"]

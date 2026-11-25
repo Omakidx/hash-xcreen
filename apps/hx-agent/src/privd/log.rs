@@ -9,7 +9,7 @@ use std::io::Write;
 use hx_ipc::text::sanitize_text;
 
 fn emit(level: &str, msg: &str) {
-    let line = sanitize_text(msg, 1000);
+    let line = sanitize_text(msg, super::error::JOURNAL_LINE_MAX);
     let _ = writeln!(std::io::stderr().lock(), "hx-privd {level}: {line}");
 }
 
