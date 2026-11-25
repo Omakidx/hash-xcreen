@@ -42,6 +42,34 @@ pub trait H3Handler: Send + Sync + 'static {
     fn handle(&self, connecting: quinn::Connecting) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 }
 
+/// What the application knows about a client key, decided right after TLS and before the
+/// `Hello` (protocol §1, pre-authentication bounds). It only picks the pool a connection waits
+/// in; the application still decides every [`PendingSession`] with the full checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreAuthClass {
+    /// A known, active paired device. The bytes identify the key (at most
+    /// [`ServerOptions::max_reserved_per_key`] connections per key); the connection takes a
+    /// slot of the reserved pool.
+    Paired(Vec<u8>),
+    /// Anything else that may legitimately proceed (for example an unknown key while a pairing
+    /// secret is live): the general pool.
+    Unknown,
+    /// No hello from this key can succeed. The `Hello` is read (so the answer can follow the
+    /// intent) and the connection is refused at once: `pairing` is the reason for an
+    /// `INTENT_PAIR` hello, every other intent is answered `UNAUTHORIZED`.
+    Refuse {
+        /// Reason sent to a pairing hello.
+        pairing: RefuseReason,
+    },
+}
+
+/// Classifies a client key from the certificates it presented in TLS. Must be cheap and must
+/// not block (an in-memory lookup): it runs on the accept path.
+pub trait PreAuthClassifier: Send + Sync + 'static {
+    /// Classify the peer.
+    fn classify(&self, peer_certs: Option<&[CertificateDer<'static>]>) -> PreAuthClass;
+}
+
 /// Server tunables.
 #[derive(Clone)]
 pub struct ServerOptions {
@@ -49,19 +77,32 @@ pub struct ServerOptions {
     pub quic: bool,
     /// Serve the WebSocket-over-TLS fallback on TCP (same port number).
     pub websocket: bool,
-    /// Time allowed from transport accept to a valid `Hello` (protocol §1: 10 s).
+    /// Time allowed from the end of TLS to a valid `Hello` (protocol §1: 3 s).
     pub handshake_timeout: Duration,
     /// Time allowed for TLS and (WebSocket) the HTTP upgrade, counted from the transport
-    /// accept; must not exceed `handshake_timeout` (default 5 s).
+    /// accept (default 3 s).
     pub transport_timeout: Duration,
-    /// Connections that may be unauthenticated at once: from transport accept until
-    /// `Connection::authorize` (or refusal/close). Protocol §1: 64.
+    /// Connections between transport accept and the end of TLS (the handshaking pool).
+    /// Default 256.
+    pub max_handshaking: usize,
+    /// Connections that may be pending at once in the general pool: after TLS, until
+    /// `Connection::authorize` (or refusal/close), for keys not known to be paired.
+    /// Protocol §1: 64.
     pub max_pending: usize,
+    /// The reserved pool for known paired keys (see [`PreAuthClassifier`]). Default 16.
+    pub max_reserved: usize,
+    /// At most this many reserved slots per key (default 2).
+    pub max_reserved_per_key: usize,
     /// The same limit per source address (IPv6: per /64). Default 4.
     pub max_pending_per_ip: usize,
     /// The same limit per IPv6 /48 (a site), so one network cannot hold every slot with many
-    /// /64s. Default 16. IPv4 is limited per address only.
+    /// /64s. Default 16.
     pub max_pending_per_v6_48: usize,
+    /// The same limit per IPv4 /24, so a handful of neighbouring addresses cannot hold every
+    /// slot. Default 16.
+    pub max_pending_per_v4_24: usize,
+    /// Classifies client keys right after TLS; `None` treats every key as unknown.
+    pub classifier: Option<Arc<dyn PreAuthClassifier>>,
     /// How long the application may take to accept or refuse a [`PendingSession`] before the
     /// transport refuses it with `BUSY` (default 10 s).
     pub decision_timeout: Duration,
@@ -81,11 +122,16 @@ impl Default for ServerOptions {
         Self {
             quic: true,
             websocket: true,
-            handshake_timeout: Duration::from_secs(10),
-            transport_timeout: Duration::from_secs(5),
+            handshake_timeout: Duration::from_secs(3),
+            transport_timeout: Duration::from_secs(3),
+            max_handshaking: 256,
             max_pending: 64,
+            max_reserved: 16,
+            max_reserved_per_key: 2,
             max_pending_per_ip: 4,
             max_pending_per_v6_48: 16,
+            max_pending_per_v4_24: 16,
+            classifier: None,
             decision_timeout: Duration::from_secs(10),
             auth_timeout: Some(Duration::from_secs(30)),
             require_retry: true,
@@ -106,7 +152,13 @@ pub struct ServerHello {
 
 pub(crate) struct ServerCtx {
     pub opts: ServerOptions,
+    /// The handshaking pool.
+    pub tls_sem: Arc<Semaphore>,
+    /// The general pending pool.
     pub sem: Arc<Semaphore>,
+    /// The reserved pending pool.
+    pub reserved_sem: Arc<Semaphore>,
+    pub keys: Arc<StdMutex<HashMap<Vec<u8>, usize>>>,
     pub ips: Arc<StdMutex<HashMap<IpKey, usize>>>,
     pub tx: mpsc::Sender<PendingSession>,
     pub ws_tls: RwLock<Arc<rustls::ServerConfig>>,
@@ -262,7 +314,10 @@ impl Server {
         }
         let (tx, rx) = mpsc::channel(16);
         let ctx = Arc::new(ServerCtx {
+            tls_sem: Arc::new(Semaphore::new(opts.max_handshaking.max(1))),
             sem: Arc::new(Semaphore::new(opts.max_pending.max(1))),
+            reserved_sem: Arc::new(Semaphore::new(opts.max_reserved)),
+            keys: Arc::new(StdMutex::new(HashMap::new())),
             ips: Arc::new(StdMutex::new(HashMap::new())),
             tx,
             ws_tls: RwLock::new(Arc::new(alpn_config(
@@ -416,25 +471,52 @@ pub(crate) enum PendingInner {
     Ws(Box<WsPending>),
 }
 
-/// Pre-authentication resources held by one connection: a global slot and a per-source slot.
-/// Released when the connection is authorized, refused, closed or dropped.
+/// Pre-authentication resources held by one connection: a pool slot (handshaking, general or
+/// reserved), and a per-source or per-key count. Released when the connection is authorized,
+/// refused, closed or dropped.
 pub(crate) struct PreAuthSlot {
     _permit: OwnedSemaphorePermit,
-    _ip: IpGuard,
+    _ip: Option<IpGuard>,
+    _key: Option<KeyGuard>,
+}
+
+struct KeyGuard {
+    map: Arc<StdMutex<HashMap<Vec<u8>, usize>>>,
+    key: Vec<u8>,
+}
+
+impl Drop for KeyGuard {
+    fn drop(&mut self) {
+        if let Ok(mut m) = self.map.lock()
+            && let Some(c) = m.get_mut(&self.key)
+        {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                m.remove(&self.key);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct IpKey(u128);
 
 /// The counters a source address is charged to, with each one's limit: an IPv4 address
-/// individually; an IPv6 address per /64 and per /48 (one site must not hold every slot).
-fn ip_keys(ip: IpAddr, per_64: usize, per_48: usize) -> Vec<(IpKey, usize)> {
+/// individually and per /24; an IPv6 address per /64 and per /48 (one site must not hold
+/// every slot).
+fn ip_keys(ip: IpAddr, per_addr: usize, per_48: usize, per_24: usize) -> Vec<(IpKey, usize)> {
     match ip.to_canonical() {
-        IpAddr::V4(a) => vec![(IpKey(u128::from(u32::from(a))), per_64)],
+        IpAddr::V4(a) => {
+            let bits = u32::from(a);
+            vec![
+                (IpKey(u128::from(bits)), per_addr),
+                (IpKey(u128::from(bits >> 8) | (1 << 66)), per_24),
+            ]
+        }
         IpAddr::V6(a) => {
             let bits = u128::from(a);
             vec![
-                (IpKey((bits >> 64) | (1 << 64)), per_64),
+                (IpKey((bits >> 64) | (1 << 64)), per_addr),
                 (IpKey((bits >> 80) | (1 << 65)), per_48),
             ]
         }
@@ -462,13 +544,14 @@ impl Drop for IpGuard {
 }
 
 impl ServerCtx {
-    /// Take a pre-authentication slot for a new connection from `ip`, or `None` if the global
-    /// or the per-source limit is reached.
+    /// Take a handshaking slot for a new connection from `ip`, or `None` if the pool or the
+    /// per-source limit is reached.
     pub(crate) fn acquire(&self, ip: IpAddr) -> Option<PreAuthSlot> {
         let limits = ip_keys(
             ip,
             self.opts.max_pending_per_ip.max(1),
             self.opts.max_pending_per_v6_48.max(1),
+            self.opts.max_pending_per_v4_24.max(1),
         );
         {
             let mut m = self.ips.lock().ok()?;
@@ -486,11 +569,105 @@ impl ServerCtx {
             map: self.ips.clone(),
             keys: limits.iter().map(|(k, _)| *k).collect(),
         };
-        let permit = self.sem.clone().try_acquire_owned().ok()?;
+        let permit = self.tls_sem.clone().try_acquire_owned().ok()?;
         Some(PreAuthSlot {
             _permit: permit,
-            _ip: guard,
+            _ip: Some(guard),
+            _key: None,
         })
+    }
+
+    /// Decide, right after TLS, which pool the connection waits in (see [`PreAuthClass`]).
+    pub(crate) fn admit(
+        &self,
+        slot: PreAuthSlot,
+        certs: Option<&[CertificateDer<'static>]>,
+    ) -> Admission {
+        let class = match &self.opts.classifier {
+            Some(c) => c.classify(certs),
+            None => PreAuthClass::Unknown,
+        };
+        match class {
+            PreAuthClass::Refuse { pairing } => Admission::Refuse { slot, pairing },
+            PreAuthClass::Paired(key) => match self.promote_reserved(slot, key) {
+                Ok(s) => Admission::Pending(s),
+                // The key already has its share, or the pool is full: wait with everyone.
+                Err(slot) => self.promote_general(slot),
+            },
+            PreAuthClass::Unknown => self.promote_general(slot),
+        }
+    }
+
+    fn promote_general(&self, mut slot: PreAuthSlot) -> Admission {
+        match self.sem.clone().try_acquire_owned() {
+            Ok(permit) => Admission::Pending(PreAuthSlot {
+                _permit: permit,
+                _ip: slot._ip.take(),
+                _key: None,
+            }),
+            Err(_) => Admission::Full,
+        }
+    }
+
+    fn promote_reserved(
+        &self,
+        mut slot: PreAuthSlot,
+        key: Vec<u8>,
+    ) -> Result<PreAuthSlot, PreAuthSlot> {
+        let Ok(mut m) = self.keys.lock() else {
+            return Err(slot);
+        };
+        if m.get(&key).copied().unwrap_or(0) >= self.opts.max_reserved_per_key.max(1) {
+            return Err(slot);
+        }
+        let Ok(permit) = self.reserved_sem.clone().try_acquire_owned() else {
+            return Err(slot);
+        };
+        *m.entry(key.clone()).or_insert(0) += 1;
+        drop(m);
+        // The per-address counts end here: a paired device must not be held back by whoever
+        // shares its network (its own share is per key).
+        drop(slot._ip.take());
+        Ok(PreAuthSlot {
+            _permit: permit,
+            _ip: None,
+            _key: Some(KeyGuard {
+                map: self.keys.clone(),
+                key,
+            }),
+        })
+    }
+}
+
+/// The result of [`ServerCtx::admit`].
+pub(crate) enum Admission {
+    /// Wait for the `Hello` and the application's decision, holding this slot.
+    Pending(PreAuthSlot),
+    /// Read the `Hello`, then refuse it (`pairing` for an `INTENT_PAIR` hello), holding only
+    /// the handshaking slot.
+    Refuse {
+        slot: PreAuthSlot,
+        pairing: RefuseReason,
+    },
+    /// No pending slot is free: close with `BUSY`.
+    Full,
+}
+
+/// The refusal for a [`PreAuthClass::Refuse`] connection, from its `Hello`.
+pub(crate) fn class_refusal(hello: &pb::Hello, pairing: RefuseReason) -> RefuseReason {
+    if hello.intent == pb::Intent::Pair as i32 {
+        pairing
+    } else {
+        RefuseReason::Unauthorized
+    }
+}
+
+/// The text that goes with [`class_refusal`]: the authenticator's own texts.
+pub(crate) fn class_refusal_text(reason: RefuseReason) -> &'static str {
+    if reason == RefuseReason::PairingClosed {
+        "pairing is closed"
+    } else {
+        "not authorized"
     }
 }
 
@@ -834,9 +1011,7 @@ async fn quic_incoming(
     slot: PreAuthSlot,
 ) -> Result<()> {
     let start = Instant::now();
-    let deadline = start + ctx.opts.handshake_timeout;
-    // TLS must complete sooner than the whole hello exchange.
-    let tls_deadline = start + ctx.opts.handshake_timeout.min(ctx.opts.transport_timeout);
+    let tls_deadline = start + ctx.opts.transport_timeout;
     let mut connecting = incoming.accept().map_err(transport)?;
     let hd = tokio::time::timeout_at(tls_deadline, connecting.handshake_data())
         .await
@@ -869,6 +1044,16 @@ async fn quic_incoming(
         .map_err(transport)?;
     let remote = conn.remote_address();
     let peer_certs = quic::peer_certs(&conn)?;
+    // TLS is done: the Hello budget starts now, and the connection moves to its pool.
+    let deadline = Instant::now() + ctx.opts.handshake_timeout;
+    let (slot, refusing) = match ctx.admit(slot, peer_certs.as_deref()) {
+        Admission::Pending(s) => (s, None),
+        Admission::Refuse { slot, pairing } => (slot, Some(pairing)),
+        Admission::Full => {
+            conn.close(quic_code(CloseCode::Busy), b"server busy");
+            return Err(Error::Timeout("no free pending slot"));
+        }
+    };
 
     let hello_phase = async {
         let (send, mut recv) = conn.accept_bi().await.map_err(transport)?;
@@ -915,6 +1100,11 @@ async fn quic_incoming(
             return Err(e);
         }
     };
+    if let Some(pairing) = refusing {
+        let reason = class_refusal(&hello, pairing);
+        let body = message::encode(&refuse_message(reason, class_refusal_text(reason)))?;
+        return refuse_quic(&conn, send, &body, close_code_for(reason)).await;
+    }
 
     let pending = PendingSession::new(
         ctx,
@@ -941,6 +1131,10 @@ mod tests {
     use super::*;
 
     fn ctx() -> ServerCtx {
+        ctx_with(ServerOptions::default())
+    }
+
+    fn ctx_with(opts: ServerOptions) -> ServerCtx {
         let (tx, _rx) = mpsc::channel(1);
         let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
@@ -950,12 +1144,126 @@ mod tests {
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(rustls::server::ResolvesServerCertUsingSni::new()));
         ServerCtx {
-            opts: ServerOptions::default(),
-            sem: Arc::new(Semaphore::new(64)),
+            tls_sem: Arc::new(Semaphore::new(opts.max_handshaking)),
+            sem: Arc::new(Semaphore::new(opts.max_pending)),
+            reserved_sem: Arc::new(Semaphore::new(opts.max_reserved)),
+            keys: Arc::new(StdMutex::new(HashMap::new())),
             ips: Arc::new(StdMutex::new(HashMap::new())),
             tx,
             ws_tls: RwLock::new(Arc::new(tls)),
+            opts,
         }
+    }
+
+    /// Answers with a class that names the key by the first byte of the certificate.
+    struct ByCert;
+
+    impl PreAuthClassifier for ByCert {
+        fn classify(&self, certs: Option<&[CertificateDer<'static>]>) -> PreAuthClass {
+            match certs.and_then(|c| c.first()).map(|c| c.as_ref()) {
+                Some([b'p', rest @ ..]) => PreAuthClass::Paired(rest.to_vec()),
+                Some([b'r']) => PreAuthClass::Refuse {
+                    pairing: RefuseReason::PairingClosed,
+                },
+                _ => PreAuthClass::Unknown,
+            }
+        }
+    }
+
+    fn cert(bytes: &[u8]) -> Vec<CertificateDer<'static>> {
+        vec![CertificateDer::from(bytes.to_vec())]
+    }
+
+    fn pending(a: Admission) -> PreAuthSlot {
+        match a {
+            Admission::Pending(s) => s,
+            Admission::Refuse { .. } => panic!("refused"),
+            Admission::Full => panic!("full"),
+        }
+    }
+
+    #[test]
+    fn ipv4_slash_24_aggregate_cap_applies() {
+        let ctx = ctx();
+        // Four per address, sixteen per /24: five addresses cannot hold more than sixteen.
+        let mut held = Vec::new();
+        for host in 1..=5u8 {
+            for _ in 0..4 {
+                if let Some(s) = ctx.acquire(format!("198.51.100.{host}").parse().expect("v4")) {
+                    held.push(s);
+                }
+            }
+        }
+        assert_eq!(held.len(), 16, "the /24 holds at most 16");
+        assert!(ctx.acquire("198.51.100.200".parse().expect("v4")).is_none());
+        // A neighbouring /24 is unaffected, and a release frees a place.
+        assert!(ctx.acquire("198.51.101.1".parse().expect("v4")).is_some());
+        held.pop();
+        assert!(ctx.acquire("198.51.100.200".parse().expect("v4")).is_some());
+    }
+
+    #[test]
+    fn paired_keys_use_a_reserved_pool_that_unknown_floods_cannot_take() {
+        let ctx = ctx_with(ServerOptions {
+            max_pending: 3,
+            max_reserved: 3,
+            max_reserved_per_key: 2,
+            classifier: Some(Arc::new(ByCert)),
+            ..Default::default()
+        });
+        let at = |n: u8| -> IpAddr { format!("203.0.{n}.1").parse().expect("v4") };
+        // Unknown keys fill the general pool.
+        let unknown: Vec<_> = (0..3u8)
+            .map(|n| pending(ctx.admit(ctx.acquire(at(n)).expect("slot"), Some(&cert(b"u")))))
+            .collect();
+        assert!(matches!(
+            ctx.admit(ctx.acquire(at(3)).expect("slot"), Some(&cert(b"u"))),
+            Admission::Full
+        ));
+        // A paired key still gets in, and releases the per-address count it was charged.
+        let k1 = pending(ctx.admit(ctx.acquire(at(4)).expect("slot"), Some(&cert(b"pk1"))));
+        let k1b = pending(ctx.admit(ctx.acquire(at(4)).expect("slot"), Some(&cert(b"pk1"))));
+        // A third connection of the same key is over its share and falls back to the (full)
+        // general pool.
+        assert!(matches!(
+            ctx.admit(ctx.acquire(at(4)).expect("slot"), Some(&cert(b"pk1"))),
+            Admission::Full
+        ));
+        // Another key has its own share.
+        let _k2 = pending(ctx.admit(ctx.acquire(at(5)).expect("slot"), Some(&cert(b"pk2"))));
+        // Releasing one of the first key's slots lets it back in.
+        drop(k1);
+        let _k1c = pending(ctx.admit(ctx.acquire(at(4)).expect("slot"), Some(&cert(b"pk1"))));
+        drop((k1b, unknown));
+        // A refused class keeps its handshaking slot and takes no pending slot.
+        let a = ctx.admit(ctx.acquire(at(6)).expect("slot"), Some(&cert(b"r")));
+        assert!(matches!(
+            a,
+            Admission::Refuse {
+                pairing: RefuseReason::PairingClosed,
+                ..
+            }
+        ));
+        assert_eq!(ctx.sem.available_permits(), 3);
+    }
+
+    #[test]
+    fn a_refusal_follows_the_intent_of_the_hello() {
+        let pair = pb::Hello {
+            intent: pb::Intent::Pair as i32,
+            ..Default::default()
+        };
+        let session = pb::Hello {
+            intent: pb::Intent::Session as i32,
+            ..Default::default()
+        };
+        let closed = RefuseReason::PairingClosed;
+        assert_eq!(class_refusal(&pair, closed), RefuseReason::PairingClosed);
+        assert_eq!(class_refusal(&session, closed), RefuseReason::Unauthorized);
+        assert_eq!(
+            class_refusal_text(RefuseReason::Unauthorized),
+            "not authorized"
+        );
     }
 
     fn v6(site: u16, subnet: u16) -> IpAddr {

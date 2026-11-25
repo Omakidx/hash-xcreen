@@ -59,8 +59,8 @@ use crate::{
     },
     error::{CloseInfo, Error, Result, transport},
     server::{
-        HelloCheck, PendingInner, PendingSession, PreAuthSlot, ServerCtx, check_hello,
-        refuse_message,
+        Admission, HelloCheck, PendingInner, PendingSession, PreAuthSlot, ServerCtx, check_hello,
+        class_refusal, class_refusal_text, close_code_for, refuse_message,
     },
     transfer::{
         IncomingBody, IncomingTransfer, SenderBody, TransferKind, TransferSender, WsReceiver,
@@ -960,9 +960,7 @@ async fn incoming(
     slot: PreAuthSlot,
 ) -> Result<()> {
     let start = Instant::now();
-    let deadline = start + ctx.opts.handshake_timeout;
-    // TLS and the HTTP upgrade must finish sooner than the whole hello exchange.
-    let tls_deadline = start + ctx.opts.handshake_timeout.min(ctx.opts.transport_timeout);
+    let tls_deadline = start + ctx.opts.transport_timeout;
     let _ = tcp.set_nodelay(true);
     let tls_cfg = ctx.ws_tls.read().map_err(|_| Error::ChannelClosed)?.clone();
     let tls = tokio::time::timeout_at(tls_deadline, TlsAcceptor::from(tls_cfg).accept(tcp))
@@ -980,6 +978,17 @@ async fn incoming(
     .map_err(|_| Error::Timeout("WebSocket upgrade"))?
     .map_err(transport)?;
 
+    // TLS and the upgrade are done: the Hello budget starts now, and the connection moves to
+    // its pool.
+    let deadline = Instant::now() + ctx.opts.handshake_timeout;
+    let (slot, refusing) = match ctx.admit(slot, certs.as_deref()) {
+        Admission::Pending(s) => (s, None),
+        Admission::Refuse { slot, pairing } => (slot, Some(pairing)),
+        Admission::Full => {
+            let _ = ws.send(close_frame(CloseCode::Busy, "server busy")).await;
+            return Err(Error::Timeout("no free pending slot"));
+        }
+    };
     let first = match tokio::time::timeout_at(deadline, read_first_control(&mut ws)).await {
         Ok(Ok(b)) => b,
         Ok(Err(e)) => {
@@ -1014,6 +1023,11 @@ async fn incoming(
             return Err(e);
         }
     };
+    if let Some(pairing) = refusing {
+        let reason = class_refusal(&hello, pairing);
+        let body = message::encode(&refuse_message(reason, class_refusal_text(reason)))?;
+        return refuse_server(WsPending { ws }, body, close_code_for(reason)).await;
+    }
     let pending = PendingSession::new(
         ctx,
         hello,

@@ -430,6 +430,12 @@ impl PinVerifier for PrivdPinVerifier {
         self.store.pin_for(device).is_some()
     }
 
+    /// privd counts PIN failures globally: the last attempt of a device is judged locally
+    /// (ipc.md section 5.3, protocol 11.4 rule 4a).
+    fn shares_failure_budget(&self) -> bool {
+        true
+    }
+
     fn verify<'a>(
         &'a self,
         device: &'a DeviceId,
