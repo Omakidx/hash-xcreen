@@ -4,13 +4,14 @@ Scripts behind `.github/workflows/release.yml` (design D7 of the 1E installer). 
 
 | Script | Purpose |
 |---|---|
-| `gate.sh [--tag vX] [--dry-run] [--workflow FILE]` | The release gate: tag equals the workspace version, both release keys provisioned and embedded in `installer/install.sh`, **both image keys (`apps/hx-agent/image-keys/{current,next}.pub`) provisioned, valid, different from each other and from the release keys** (skipped only while that directory does not exist), no test-hook feature in the workflow, every action pinned to a commit SHA, no build cache. |
+| `gate.sh [--tag vX] [--dry-run] [--workflow FILE]` | The release gate: tag equals the workspace version, both release keys provisioned and embedded in `installer/install.sh`, **both image keys (`apps/hx-agent/image-keys/{current,next}.pub`) provisioned, valid, different from each other and from the release keys** (skipped only while that directory does not exist), no test-hook feature in the workflow, every action pinned to a commit SHA and every `container:`/`image:` pinned by `@sha256:` digest, no build cache, job isolation (check 8). The offline checks also run in `ci.yml` (`sh release/gate.sh --dry-run` and the three `release/tests/gate-*.sh`). |
 | `assemble.sh` | Deterministic ustar release tarball. |
 | `manifest.sh` | Canonical one-line manifest. |
 | `make-test-release.sh` | A TEST-keyed release directory for local and CI tests (never a real release). |
 | `openssl-minisign.sh` | minisign-compatible test keys and signatures with openssl only (test use). |
 | `verify-with-installer.sh` | Verifies a signature with a shipped `install.sh`'s own function. |
 | `tests/gate-pinning.sh` | Test of the SHA-pinning check of `gate.sh` over every workflow file (`sh release/tests/gate-pinning.sh`). |
+| `tests/gate-isolation.sh` | Test of check 6b (container/image digests) and check 8 (job isolation) of `gate.sh` (`sh release/tests/gate-isolation.sh`). |
 | `tests/gate-image-keys.sh` | Test of the image-key check of `gate.sh` on a synthetic tree with per-run test keys (`sh release/tests/gate-image-keys.sh`). |
 
 ## Supply-chain rules (enforced by `gate.sh`)
@@ -104,6 +105,8 @@ sudo sh install.sh --pair ...
   runner-image tools (`gh`, `jq`, `sha256sum`, coreutils).
 - `container:` / `image:` values are pinned by `@sha256:` digest, like actions.
 - Signing jobs collect artifacts by exact name, never by `pattern:`.
+- `.github/CODEOWNERS` covers `.github/`, `release/`, `installer/`, `apps/hx-imagectl/`,
+  `crates/hx-provision/` and `recipes/`; branch protection on `main` must require code-owner review.
 - `release.yml` `publish` refuses a version that is not strictly newer than the current channel manifest.
 
 ## Desktop packages (`hx-desktop`)
@@ -130,10 +133,11 @@ How the release workflow handles them:
   signatures to `v<version>`, in the same `gh release create` as the agent tarball. The moving
   `channel-*` release does not carry them: nothing on a server reads the desktop app from a channel.
 - The release fails if the `ubuntu-24.04`, `debian-12` or `debian-13` `.deb` or the AppImage is missing.
-  **Known gap:** Ubuntu 26.04 ships FFmpeg 8 and the workspace pins `ffmpeg-next` 7.1, so its cells run with
-  `continue-on-error`, and the `assemble` job prints a warning when the release has no 26.04 package.
-  The pull-request workflow `desktop-packages.yml` has no 26.04 cell. Once the pin moves, remove
-  `known_gap` here and add the cell back there.
+  **Known gap:** Ubuntu 26.04 ships FFmpeg 8 and the workspace pins `ffmpeg-next` 7.1, so `release.yml` and
+  `desktop-packages.yml` have NO 26.04 desktop cell (a cell that is expected to fail leaves its artifact
+  name free for another job to fill, and `assemble` would then collect and `sign` would sign it; the
+  `assemble` job downloads every artifact by exact name and prints a notice). Once the pin moves, add the
+  cell back in both workflows and its exact `desktop-deb-ubuntu-26.04` download and required-file check in `assemble`.
 
 Verify a download (the public key is the one of `apps/hx-agent/release-keys/current.pub`):
 
@@ -158,8 +162,11 @@ Jobs: `plan` (which cells are missing or at least 7 days old, from the published
 `image` (one cell each: build, seal, `incus publish --compression zstd`, export, then the
 equivalence check; any drift fails the cell) -> `rehearse` (pull requests and non-publish runs: a
 manifest signed with a per-run test key, which `hx-imagectl verify` must accept and must refuse
-when tampered) or `sign` (environment `image-signing`) -> `attest` -> `publish` (`contents: write`
-only here). The same supply-chain rules as `release.yml` hold: every action is pinned to a commit
+when tampered) or `manifest` (no secrets: builds `hx-imagectl` and the manifest) -> `sign` (environment
+`image-signing`: downloads the manifest, installs minisign from apt, signs; runs no workspace code) ->
+`verify` (no secrets, read-only token: `hx-imagectl verify`, records the SHA-256 of every verified file)
+-> `attest` -> `publish` (`contents: write` only here; runs no workspace-built code, it checks its
+downloads against `verify`'s list). The same supply-chain rules as `release.yml` hold: every action is pinned to a commit
 SHA (`gh api repos/<owner>/<repo>/commits/<tag> --jq .sha`), and no build cache is used anywhere.
 
 What is published: the release `images-<build_id>` first (the image files and a `SHA256SUMS`), then
@@ -188,14 +195,15 @@ Once, before the first publish:
       `IMAGE_MINISIGN_KEY_PASSWORD` live in this environment only, never as repository or
       organisation secrets. Use a password-protected secret key.
 - [ ] **Anything that can change `images.yml` on `main` can publish images**: require a pull
-      request and a review for `main`, and add `.github/workflows/images.yml`, `apps/hx-imagectl/`
-      and `crates/hx-provision/` to CODEOWNERS (or a ruleset with the same effect).
+      request and a review from code owners for `main` (`.github/CODEOWNERS` already lists
+      `.github/`, `apps/hx-imagectl/`, `crates/hx-provision/` and `recipes/`).
 - [ ] **Do not enable repository-wide "immutable releases"**: `images` (and `channel-*`) are moving
       releases whose assets are replaced. The `images-<build_id>` releases are immutable by
       convention: the workflow only adds to them, and refuses (fails) when an asset of that name
       already exists; it never uses `--clobber` on them.
 - [ ] **`image-signing` and tags**: `images.yml` only builds `v*` tags whose commit is an ancestor of
-      `main` (others are skipped with a warning), and `release.yml` fails its gate for a tag that is
+      `main` and that are real releases (the tag equals `v` + the workspace version at that tag, or a
+      GitHub release of that name exists); others are skipped with a warning, and `release.yml` fails its gate for a tag that is
       not on `main`; also restrict `v*` tag creation with a tag ruleset (above) so that tags cannot
       be pushed from arbitrary branches at all.
 - [ ] **Actions permissions**: the default `GITHUB_TOKEN` stays read-only (each job asks for what it
