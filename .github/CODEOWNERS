@@ -1,0 +1,8 @@
+# Everything that can change what gets built, signed or published needs the owner's review.
+# Pair with branch protection on main: "Require review from Code Owners" (release/README.md).
+/.github/ @Omakidx
+/release/ @Omakidx
+/installer/ @Omakidx
+/apps/hx-imagectl/ @Omakidx
+/crates/hx-provision/ @Omakidx
+/recipes/ @Omakidx

@@ -120,6 +120,10 @@ jobs:
           sh installer/tests/run.sh dash
           sh installer/tests/handoff.sh dash
           sh release/tests/gate-image-keys.sh
+          sh release/tests/gate-pinning.sh
+          sh release/tests/gate-isolation.sh
+      - name: Release gate offline checks (pinning, job isolation) over every workflow
+        run: sh release/gate.sh --dry-run
       - name: Signature KATs under posh (strict POSIX)
         # posh was not available where this was written: informative until it has run green once.
         continue-on-error: true

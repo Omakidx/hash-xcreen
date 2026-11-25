@@ -202,18 +202,19 @@ The performance workflow (`.github/workflows/perf.yml`) targets `runs-on: [self-
 
 ### 4.1 Machine requirements
 
+* **Ephemeral or JIT, and never the production VPS**: the runner executes workflow code, so it must be a disposable machine registered just in time (or re-imaged after each job), never the VPS that serves real sessions and never a host holding secrets or keys. The label `hx-perf` is claimable by ANY workflow of the repository, including one in a pull request, so the repository's **Fork pull request workflows** approval must be set to **all outside collaborators**.
 * **Dedicated and quiet**: nothing else runs on it (no Docker workloads, no other runner, no builds); the workflow's first step refuses to run while the 1-minute load average is above 0.5 (waiting up to 15 minutes). A VM on a shared host is acceptable only if its CPU is not oversubscribed (steal time near 0).
 * **Hardware like the target**: 4 vCPU, 8 GB RAM, 20 GB free disk, no GPU (Gate 1 is stated for a 4 vCPU server without a GPU). A fixed CPU frequency policy (`performance` governor or a VM without frequency scaling).
 * **OS**: Ubuntu 24.04 (the supported host). Packages: `build-essential clang libclang-dev pkg-config libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libx264-dev xvfb iproute2 iputils-ping util-linux python3 git curl`.
 * **Unprivileged user namespaces** for the runner's user: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`, persisted in `/etc/sysctl.d/`. The suite itself never uses root, never touches the host's network or firewall, and creates only namespaces that vanish with its processes.
 * A non-root user (for example `hxperf`) that owns the runner and a persistent `target/` directory (the build cache is the runner's work directory, so repeated runs are fast), with Rust installed through rustup (the workflow runs `rustup toolchain install` for the pinned toolchain) and outbound HTTPS to crates.io, GitHub and the Ubuntu mirrors.
 
-### 4.2 Registering a machine (for example the VPS)
+### 4.2 Registering a machine (a disposable machine, never the production VPS)
 
 1. Make the machine meet section 4.1; stop other services on it.
 2. In the repository: **Settings, Actions, Runners, New self-hosted runner**, Linux x64. Follow the commands shown there as the unprivileged user, and when running `./config.sh` pass the label and a dedicated group: `./config.sh --url https://github.com/Omakidx/hash-xcreen --token <the token shown> --labels hx-perf --name hx-perf-1 --work /home/hxperf/_work`. (The registration token is single-use; never put it in a file in the repository.)
 3. Install it as a service so that it survives reboots: `sudo ./svc.sh install hxperf && sudo ./svc.sh start`.
-4. Restrict what runs on it: **Settings, Actions, General, Fork pull request workflows**: require approval, and keep the runner out of any runner group that public forks can use. The performance workflow only runs from `workflow_dispatch` and the schedule on the default branch, never from pull requests.
+4. Restrict what runs on it: **Settings, Actions, General, Fork pull request workflows**: require approval for **all outside collaborators**, and keep the runner out of any runner group that public forks can use. The performance workflow only runs from `workflow_dispatch` and the schedule on the default branch, but this is not a control: any pull request's own workflow can target the `hx-perf` label, hence the approval setting and the ephemeral runner.
 5. Set the repository variable: **Settings, Secrets and variables, Actions, Variables**: `HX_PERF_RUNNER` = `true`.
 6. Record the reference. On the runner, in a checkout of `main`, as the runner's user and with the machine quiet (`sh perf/quiet.sh`): `perf/run.sh --update --reference`. Review the diff of `perf/baseline.json` (it must say `reference: true`, `noisy: false`, `release_build: true`, and the macro numbers must be inside the Gate 1 gates), commit it on a `chore/` branch and merge it. From then on the nightly run checks regressions against it; re-record after a deliberate performance change or a change of hardware.
 7. To deactivate: set `HX_PERF_RUNNER` to anything else, or remove the runner.
