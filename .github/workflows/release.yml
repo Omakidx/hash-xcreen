@@ -155,10 +155,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { distro: ubuntu-24.04, image: "ubuntu:24.04" }
-          - { distro: ubuntu-26.04, image: "ubuntu:26.04" }
-          - { distro: debian-12, image: "debian:12" }
-          - { distro: debian-13, image: "debian:13" }
+          - { distro: ubuntu-24.04, image: "ubuntu:24.04@sha256:562111b88caa79c71391c0c4d3c2114a7d5c35915c20561fd893cb1e07929e6b" }
+          - { distro: ubuntu-26.04, image: "ubuntu:26.04@sha256:d66b366dac61b575bee2aef07e9c26e8070096fbe84a3d4d3eb0da069b5d76db" }
+          - { distro: debian-12, image: "debian:12@sha256:1d04200c2ece1d4d75a2a6f8e11ebce7d86a2ae28b34bb2c9cbb3ee9f4953e75" }
+          - { distro: debian-13, image: "debian:13@sha256:3cda3ca472ce45507a5109c6a3907093e24d9ae67d55954c9a07a45665dafba2" }
     steps:
       - name: Install build dependencies
         env:
@@ -224,10 +224,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { distro: ubuntu-24.04, image: "ubuntu:24.04" }
-          - { distro: ubuntu-26.04, image: "ubuntu:26.04" }
-          - { distro: debian-12, image: "debian:12" }
-          - { distro: debian-13, image: "debian:13" }
+          - { distro: ubuntu-24.04, image: "ubuntu:24.04@sha256:562111b88caa79c71391c0c4d3c2114a7d5c35915c20561fd893cb1e07929e6b" }
+          - { distro: ubuntu-26.04, image: "ubuntu:26.04@sha256:d66b366dac61b575bee2aef07e9c26e8070096fbe84a3d4d3eb0da069b5d76db" }
+          - { distro: debian-12, image: "debian:12@sha256:1d04200c2ece1d4d75a2a6f8e11ebce7d86a2ae28b34bb2c9cbb3ee9f4953e75" }
+          - { distro: debian-13, image: "debian:13@sha256:3cda3ca472ce45507a5109c6a3907093e24d9ae67d55954c9a07a45665dafba2" }
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -251,18 +251,17 @@ jobs:
     needs: gate
     runs-on: ubuntu-24.04
     container: ${{ matrix.image }}
-    # ubuntu-26.04 ships FFmpeg 8 and the workspace pins ffmpeg-next 7.1 (FFmpeg up to 7.1): a KNOWN
-    # GAP (packaging/hx-desktop/README.md). The cell stays visible; the release goes out without a
-    # 26.04 desktop package until ffmpeg-next supports FFmpeg 8, and the assemble job says so.
-    continue-on-error: ${{ matrix.known_gap }}
+    # No ubuntu-26.04 cell: it ships FFmpeg 8 and the workspace pins ffmpeg-next 7.1 (a KNOWN GAP,
+    # packaging/hx-desktop/README.md). A cell that is expected to fail would leave its artifact name
+    # free for any other job to fill, and that artifact would then be signed; so there is none until
+    # it builds. Every artifact the assemble job collects is downloaded by exact name.
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { distro: ubuntu-24.04, image: "ubuntu:24.04", known_gap: false }
-          - { distro: ubuntu-26.04, image: "ubuntu:26.04", known_gap: true }
-          - { distro: debian-12, image: "debian:12", known_gap: false }
-          - { distro: debian-13, image: "debian:13", known_gap: false }
+          - { distro: ubuntu-24.04, image: "ubuntu:24.04@sha256:562111b88caa79c71391c0c4d3c2114a7d5c35915c20561fd893cb1e07929e6b" }
+          - { distro: debian-12, image: "debian:12@sha256:1d04200c2ece1d4d75a2a6f8e11ebce7d86a2ae28b34bb2c9cbb3ee9f4953e75" }
+          - { distro: debian-13, image: "debian:13@sha256:3cda3ca472ce45507a5109c6a3907093e24d9ae67d55954c9a07a45665dafba2" }
     steps:
       - name: Install build dependencies
         env:
@@ -310,15 +309,13 @@ jobs:
     needs: [gate, desktop-deb]
     runs-on: ubuntu-24.04
     container: ${{ matrix.image }}
-    continue-on-error: ${{ matrix.known_gap }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { distro: ubuntu-24.04, image: "ubuntu:24.04", known_gap: false }
-          - { distro: ubuntu-26.04, image: "ubuntu:26.04", known_gap: true }
-          - { distro: debian-12, image: "debian:12", known_gap: false }
-          - { distro: debian-13, image: "debian:13", known_gap: false }
+          - { distro: ubuntu-24.04, image: "ubuntu:24.04@sha256:562111b88caa79c71391c0c4d3c2114a7d5c35915c20561fd893cb1e07929e6b" }
+          - { distro: debian-12, image: "debian:12@sha256:1d04200c2ece1d4d75a2a6f8e11ebce7d86a2ae28b34bb2c9cbb3ee9f4953e75" }
+          - { distro: debian-13, image: "debian:13@sha256:3cda3ca472ce45507a5109c6a3907093e24d9ae67d55954c9a07a45665dafba2" }
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -437,27 +434,47 @@ jobs:
           path: in/agent
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: session-*
-          path: in/session
+          name: session-ubuntu-24.04
+          path: in/session/session-ubuntu-24.04
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: desktop-*
-          path: in/desktop
+          name: session-ubuntu-26.04
+          path: in/session/session-ubuntu-26.04
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: session-debian-12
+          path: in/session/session-debian-12
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: session-debian-13
+          path: in/session/session-debian-13
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: desktop-deb-ubuntu-24.04
+          path: in/desktop/desktop-deb-ubuntu-24.04
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: desktop-deb-debian-12
+          path: in/desktop/desktop-deb-debian-12
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: desktop-deb-debian-13
+          path: in/desktop/desktop-deb-debian-13
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: desktop-appimage
+          path: in/desktop/desktop-appimage
       - name: Collect the desktop packages
         env:
           VERSION: ${{ needs.gate.outputs.version }}
         run: |
           set -eu
           mkdir desktop
-          for d in in/desktop/desktop-deb-*; do
-            [ -d "$d" ] || continue
-            n=${d#in/desktop/desktop-deb-}
-            cp "$d/hx-desktop.deb" "desktop/hx-desktop_${VERSION}_${n}_amd64.deb"
+          for n in ubuntu-24.04 debian-12 debian-13; do
+            cp "in/desktop/desktop-deb-$n/hx-desktop.deb" "desktop/hx-desktop_${VERSION}_${n}_amd64.deb"
           done
           cp in/desktop/desktop-appimage/*.AppImage desktop/
-          # the known gap: say so instead of silently shipping fewer packages
-          [ -f "desktop/hx-desktop_${VERSION}_ubuntu-26.04_amd64.deb" ] ||
-            echo "::warning::no Ubuntu 26.04 hx-desktop .deb in this release (known gap: FFmpeg 8 vs ffmpeg-next 7.1)"
+          echo "::notice::no Ubuntu 26.04 hx-desktop .deb in this release (known gap: FFmpeg 8 vs ffmpeg-next 7.1)"
           for n in ubuntu-24.04 debian-12 debian-13; do
             [ -f "desktop/hx-desktop_${VERSION}_${n}_amd64.deb" ] || { echo "::error::the $n hx-desktop .deb is missing"; exit 1; }
           done
@@ -479,6 +496,18 @@ jobs:
           sh release/assemble.sh --version "$VERSION" --bin-dir in/agent --session-dir sessions \
             --out dist --source-date-epoch "$SDE"
           cp installer/install.sh dist/install.sh
+      - name: Manifest
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+          CHANNEL: ${{ needs.gate.outputs.channel }}
+        run: |
+          set -eu
+          # Written here, in a job without secrets, so that the signing job runs no workspace script.
+          # The timestamp is this job's clock; privd needs it only to grow from release to release.
+          sh release/manifest.sh --version "$VERSION" --channel "$CHANNEL" \
+            --artifact "dist/hx-$VERSION-x86_64.tar.gz" --timestamp "$(date +%s)" \
+            --out dist/manifest-x86_64.json
+          cat dist/manifest-x86_64.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: assembled
@@ -493,10 +522,12 @@ jobs:
     needs: [gate, assemble]
     runs-on: ubuntu-24.04
     environment: release-signing
+    # The ONLY job with the signing secrets. It checks out nothing and runs nothing from the
+    # workspace or from a build: it downloads the assembled files, installs minisign from the
+    # distribution, signs, and uploads. The shipped signature is checked by the secret-free
+    # `verify` job.
+    permissions: {}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: assembled
@@ -505,17 +536,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends minisign
-      - name: Manifest
-        env:
-          VERSION: ${{ needs.gate.outputs.version }}
-          CHANNEL: ${{ needs.gate.outputs.channel }}
-        run: |
-          set -eu
-          # timestamp = signing time (privd rejects a manifest older than the last one it accepted)
-          sh release/manifest.sh --version "$VERSION" --channel "$CHANNEL" \
-            --artifact "assembled/dist/hx-$VERSION-x86_64.tar.gz" --timestamp "$(date +%s)" \
-            --out assembled/dist/manifest-x86_64.json
-          cat assembled/dist/manifest-x86_64.json
       - name: Sign the manifest and install.sh
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
@@ -553,11 +573,6 @@ jobs:
               -t "hx-desktop v$VERSION $(basename "$f")"
           done
           ls -l assembled/desktop
-      - name: The shipped install.sh must accept the shipped signature
-        run: |
-          sh release/verify-with-installer.sh assembled/dist/install.sh \
-            assembled/dist/manifest-x86_64.json assembled/dist/manifest-x86_64.json.minisig
-          cmp installer/install.sh assembled/dist/install.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: signed
@@ -567,9 +582,29 @@ jobs:
             assembled/desktop
           if-no-files-found: error
 
+  verify:
+    name: Verify the signed release (no secrets)
+    needs: [gate, sign]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: signed
+          path: signed
+      - name: The shipped install.sh must accept the shipped signature
+        run: |
+          sh release/verify-with-installer.sh signed/dist/install.sh \
+            signed/dist/manifest-x86_64.json signed/dist/manifest-x86_64.json.minisig
+          cmp installer/install.sh signed/dist/install.sh
+
   attest:
     name: Attest (audit only)
-    needs: sign
+    needs: verify
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -593,7 +628,7 @@ jobs:
 
   publish:
     name: Publish
-    needs: [gate, attest]
+    needs: [gate, verify, attest]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -612,6 +647,29 @@ jobs:
         run: |
           set -eu
           d=signed/dist
+          # Refuse unless this version is strictly newer than the one the channel serves now (a
+          # re-run of an old tag, or an older tag, must not roll the channel back). No channel
+          # release yet = the first release of the channel. Only runner-image tools run here.
+          vkey() { # <version> -> a sortable key (alpha < beta < rc < final)
+            printf '%s\n' "$1" | sed -E 's/^([0-9]+)\.([0-9]+)\.([0-9]+)(-(alpha|beta|rc)\.([0-9]+))?$/\1 \2 \3 \5 \6/' |
+              awk '{ r = ($4 == "alpha") ? 1 : ($4 == "beta") ? 2 : ($4 == "rc") ? 3 : 9; printf "%05d%05d%05d%d%05d\n", $1, $2, $3, r, $5 }'
+          }
+          if gh release view "channel-$CHANNEL" --repo "$REPO" >/dev/null 2>&1; then
+            mkdir current
+            gh release download "channel-$CHANNEL" --repo "$REPO" --dir current --pattern manifest-x86_64.json
+            cur=$(sed -n 's/.*"version":"\([^"]*\)".*/\1/p' current/manifest-x86_64.json | head -n 1)
+            if ! printf '%s\n' "$cur" | grep -Eq '^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}(-(alpha|beta|rc)\.[0-9]{1,4})?$'; then
+              echo "::error::cannot read the current version of channel-$CHANNEL"
+              exit 1
+            fi
+            if [ "$(vkey "$VERSION")" \< "$(vkey "$cur")" ] || [ "$(vkey "$VERSION")" = "$(vkey "$cur")" ]; then
+              echo "::error::$VERSION is not newer than $cur, the current $CHANNEL release: refusing to publish"
+              exit 1
+            fi
+            echo "$VERSION is newer than $cur"
+          else
+            echo "::notice::no channel-$CHANNEL release yet: first release of the channel"
+          fi
           pre=''
           [ "$CHANNEL" = beta ] && pre='--prerelease'
           # The version release goes first, so the manifest never points at a missing artifact.
