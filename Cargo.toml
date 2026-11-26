@@ -26,8 +26,9 @@ bytes = "1"
 crossbeam-channel = "0.5"
 # Microbenchmarks (docs/testing.md). No default features: no plotting stack, no rayon.
 criterion = { version = "0.8", default-features = false }
-# Links the system FFmpeg (6.1 on Ubuntu 24.04) through pkg-config; 7.1 is the newest ffmpeg-next that supports it.
-ffmpeg-next = { version = "7.1", default-features = false, features = ["codec", "format"] }
+# Links the system FFmpeg through pkg-config. 8.x builds against FFmpeg 5.1 to 8.0 (Debian 12, Ubuntu 24.04,
+# Debian 13, Ubuntu 26.04); 7.1 failed on FFmpeg 8 (libavcodec/avfft.h is gone).
+ffmpeg-next = { version = "8.1", default-features = false, features = ["codec", "format"] }
 prost = "0.14"
 rustix = { version = "1", default-features = false, features = ["std"] }
 thiserror = "2"
