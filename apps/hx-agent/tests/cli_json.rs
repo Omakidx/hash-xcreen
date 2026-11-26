@@ -145,10 +145,6 @@ fn canned_privd() -> PrivdHandler {
     })
 }
 
-fn canned_admin() -> AdminHandler {
-    canned_admin_with(setup_fields(false, false, apb::SetupJobState::Idle, 0))
-}
-
 /// The canned admin whose `Status` also reports the given setup fields (10 to 14).
 fn canned_admin_with(setup: apb::StatusResult) -> AdminHandler {
     Arc::new(move |req, _s| {
