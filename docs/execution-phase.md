@@ -28,6 +28,8 @@ flowchart LR
 
 Phases 2 and 3 can run in parallel once Phase 1 passes its gate; backups come first if only one can be staffed, because they are the core promise.
 
+**Exception (2026-11-26): Phase 2 started before Gate 1 closed.** Gate 1 waits only on maintainer setup (release and image keys, GitHub environments, rulesets and secrets, a fresh VPS), not on code, so Phase 2 work began while it waits. Gate 1 stays open and its rule is unchanged: Phase 1 is done only when every Gate 1 criterion passes. When the Gate 1 run finds a defect, its fix comes before any Phase 2 work. Phase 2 starts with its contracts (ipc.md §6.14, architecture §9) and workstream 2A; Phase 3 still waits for Gate 1.
+
 ---
 
 ## Phase 0 — Foundations and spikes
