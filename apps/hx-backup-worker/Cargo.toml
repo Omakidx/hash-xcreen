@@ -27,6 +27,7 @@ path = "src/main.rs"
 test-hooks = []
 
 [dependencies]
+bytes.workspace = true # the id fields of the generated messages
 hx-backup = { path = "../../crates/hx-backup", features = ["engine"] }
 hx-ipc = { workspace = true, features = ["repo"] }
 libc = "0.2" # capset, prctl and sigaction in sandbox.rs, and the seccomp syscall numbers
@@ -39,7 +40,6 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 zeroize.workspace = true
 
 [dev-dependencies]
-bytes.workspace = true
 libc = "0.2"
 rustix = { workspace = true, features = ["process"] }
 hx-backup-worker = { path = ".", features = ["test-hooks"] }

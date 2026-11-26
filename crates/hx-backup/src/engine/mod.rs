@@ -53,7 +53,7 @@ use crate::rules::{self, ResolvedRules, RuleSet, RulesError};
 
 pub use link::{BackendFault, JobStart, Link, LinkBackend, LinkFailure, LinkOptions};
 pub use progress::{CancelToken, NullSink, Phase, ProgressEvent, ProgressSink, ProgressUnit};
-pub use rustic_core::{FileType, ReadBackend, RepositoryBackends, WriteBackend};
+pub use rustic_core::{FileType, Id, ReadBackend, RepositoryBackends, WriteBackend};
 
 pub use integrity::DUPLICATE_VERIFY_FLOOR_BYTES;
 use integrity::IndexGuard;
@@ -807,7 +807,7 @@ impl Engine {
         );
         let globs = resolved.rustic_globs(&source)?;
         for p in &globs.skipped_non_utf8 {
-            tracing::warn!(path = %p.display(), "excluded path is not UTF-8; it stays in the backup");
+            tracing::debug!(path = %p.display(), "excluded path is not UTF-8; it stays in the backup");
         }
         cancel.check()?;
 

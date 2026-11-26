@@ -144,6 +144,24 @@ fn probe_child() {
         parked.join().unwrap()
     });
 
+    // prlimit64: reading is allowed, setting a new limit is not
+    let mut lim = [0u64; 2];
+    let lim_ptr = lim.as_mut_ptr() as libc::c_long;
+    e(
+        "prlimit_read",
+        try_syscall(
+            libc::SYS_prlimit64,
+            [0, libc::RLIMIT_NOFILE as _, 0, lim_ptr],
+        ),
+    );
+    e(
+        "prlimit_set",
+        try_syscall(
+            libc::SYS_prlimit64,
+            [0, libc::RLIMIT_NOFILE as _, lim_ptr, 0],
+        ),
+    );
+
     // file writes: only RESTORE may create files, and set extended attributes
     let path = format!("{tmp}/probe-{name}\0");
     // SAFETY: a valid NUL-terminated path, plain flags.
@@ -250,6 +268,8 @@ fn common_expectations(r: &std::collections::HashMap<String, String>) {
         expect(r, k, "true");
     }
     expect(r, "caps_before_nonzero", "true");
+    expect(r, "prlimit_read", "0");
+    expect(r, "prlimit_set", EPERM);
     for k in [
         "socket",
         "socket_inet",

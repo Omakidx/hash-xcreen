@@ -80,6 +80,18 @@ pub struct Behavior {
     pub fail_list: Option<(T, pb::ErrorClass)>,
     /// Never answer anything after the job and its secrets (the worker must give up).
     pub go_silent: bool,
+    /// Sleep this long before answering each request (a slow Drive).
+    pub answer_delay: Option<Duration>,
+    /// Answer the first `PACK` write with this error only after its `END` has arrived (the `Error`
+    /// and the `END` crossed on the wire).
+    pub error_after_end: Option<pb::ErrorClass>,
+    /// Send `Cancel` between the `Job` and its secrets.
+    pub cancel_before_secrets: bool,
+    /// Never deliver the rest of a held download (the worker's `Bye` wait must time out).
+    pub never_release_held: bool,
+    /// Hold read-like requests until six are waiting (or the link goes idle), so that many are
+    /// outstanding at once.
+    pub defer_reads: bool,
 }
 
 /// What the fake saw.
@@ -98,6 +110,11 @@ pub struct Outcome {
     pub bye: bool,
     pub pongs: Vec<u64>,
     pub packs_written: usize,
+    /// Most requests, and most writes, outstanding at once as privd's state saw them.
+    pub max_outstanding: usize,
+    pub max_writes: usize,
+    /// How many requests had been seen when `Cancel` was sent.
+    pub ops_at_cancel: Option<usize>,
 }
 
 struct Upload {
@@ -124,6 +141,7 @@ pub struct Fake {
     out: Outcome,
     uploads: HashMap<u64, Upload>,
     held: Vec<Held>,
+    deferred: Vec<pb::RepoRequest>,
     cancel_sent: bool,
     violated: bool,
     abort_used: bool,
@@ -183,6 +201,7 @@ impl Fake {
             out: Outcome::default(),
             uploads: HashMap::new(),
             held: Vec::new(),
+            deferred: Vec::new(),
             cancel_sent: false,
             violated: false,
             abort_used: false,
@@ -278,6 +297,9 @@ impl Fake {
         }
         let job = self.job.clone();
         self.send(frame(F::Job(job)));
+        if self.b.cancel_before_secrets {
+            self.send_cancel();
+        }
         let secrets = self.secrets.clone();
         for (slot, s) in secrets.iter().enumerate() {
             self.state.sent_secret(0, slot as u8, s.len()).unwrap();
@@ -313,7 +335,15 @@ impl Fake {
                         Incoming::Secret(_) => unreachable!("workers send no secrets"),
                     }
                 }
-                Read::Idle => {}
+                Read::Idle => {
+                    self.flush_deferred();
+                    // a worker that skips `Bye` leaves its end open (in-process); stop waiting
+                    if let Some(t) = self.out.result_at
+                        && t.elapsed() > Duration::from_secs(13)
+                    {
+                        return self.out;
+                    }
+                }
                 Read::Eof => return self.out,
             }
         }
@@ -341,7 +371,12 @@ impl Fake {
                 self.out.result = Some(r);
                 self.out.result_at = Some(Instant::now());
                 // the held downloads finish now
-                for h in std::mem::take(&mut self.held) {
+                let held = if self.b.never_release_held {
+                    Vec::new()
+                } else {
+                    std::mem::take(&mut self.held)
+                };
+                for h in held {
                     for (end, chunk) in h.rest {
                         self.send_data(h.req_id, end, &chunk);
                     }
@@ -361,6 +396,34 @@ impl Fake {
     fn request(&mut self, r: pb::RepoRequest) {
         let op = r.op.clone().unwrap();
         self.out.ops.push(op_name(&op));
+        self.out.max_outstanding = self.out.max_outstanding.max(self.state.outstanding());
+        self.out.max_writes = self.out.max_writes.max(self.state.outstanding_writes());
+        if self.b.defer_reads
+            && matches!(
+                op,
+                Op::ReadFull(_) | Op::ReadPartial(_) | Op::List(_) | Op::Remove(_)
+            )
+        {
+            self.deferred.push(r);
+            if self.deferred.len() >= 6 {
+                self.flush_deferred();
+            }
+            return;
+        }
+        self.handle(r);
+    }
+
+    fn flush_deferred(&mut self) {
+        for r in std::mem::take(&mut self.deferred) {
+            self.handle(r);
+        }
+    }
+
+    fn handle(&mut self, r: pb::RepoRequest) {
+        let op = r.op.clone().unwrap();
+        if let Some(d) = self.b.answer_delay {
+            std::thread::sleep(d);
+        }
         if self.b.violate == Some(Violation::DoneForUnknownRequest) && !self.violated {
             self.violated = true;
             // bypass the state machine: this is the violation
@@ -489,6 +552,7 @@ impl Fake {
         if !self.cancel_sent {
             self.cancel_sent = true;
             self.out.cancel_sent_at = Some(Instant::now());
+            self.out.ops_at_cancel = Some(self.out.ops.len());
             self.send(frame(F::Cancel(pb::Cancel {})));
         }
     }
@@ -561,6 +625,12 @@ impl Fake {
             return;
         }
         let u = self.uploads.remove(&stream_id).unwrap();
+        if u.ty == T::Pack as i32
+            && let Some(class) = self.b.error_after_end.take()
+        {
+            self.error(stream_id, class);
+            return;
+        }
         let ok = u.ty == T::Config as i32 || Sha256::digest(&u.buf).as_slice() == u.id.as_slice();
         if !ok {
             self.error(stream_id, pb::ErrorClass::Integrity);
@@ -662,6 +732,13 @@ pub fn backup_job(excludes: &[&str], tags: &[&str]) -> JobSpec {
         ),
         secrets: vec![PASSWORD.to_vec()],
     }
+}
+
+pub fn with_docker(mut j: JobSpec, enabled: bool) -> JobSpec {
+    if let Some(pb::job::Spec::Backup(b)) = &mut j.job.spec {
+        b.docker_enabled = enabled;
+    }
+    j
 }
 
 pub fn simple_job(kind: pb::JobKind, spec: pb::job::Spec) -> JobSpec {
@@ -960,5 +1037,43 @@ pub fn assert_same_tree(src: &Path, dst: &Path) {
                 path.display()
             );
         }
+    }
+}
+
+/// A directory chain whose path is longer than `PATH_MAX` (made with `mkdirat` steps, as no single
+/// path can name it), with a file at the bottom.
+pub fn make_deep_chain(base: &Path, links: usize) {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    fs::create_dir_all(base).unwrap();
+    let c = CString::new(base.to_str().unwrap()).unwrap();
+    // SAFETY: valid NUL-terminated paths and descriptors owned here.
+    let mut fd =
+        unsafe { OwnedFd::from_raw_fd(libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY)) };
+    let name = CString::new("d".repeat(200)).unwrap();
+    for _ in 0..links {
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(libc::mkdirat(fd.as_raw_fd(), name.as_ptr(), 0o755), 0);
+            let next = libc::openat(
+                fd.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY,
+            );
+            assert!(next >= 0);
+            fd = OwnedFd::from_raw_fd(next);
+        }
+    }
+    let f = CString::new("bottom").unwrap();
+    // SAFETY: as above.
+    unsafe {
+        let x = libc::openat(
+            fd.as_raw_fd(),
+            f.as_ptr(),
+            libc::O_CREAT | libc::O_WRONLY,
+            0o644,
+        );
+        assert!(x >= 0);
+        libc::close(x);
     }
 }

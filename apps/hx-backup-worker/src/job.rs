@@ -12,9 +12,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use hx_backup::engine::{
-    BackupRequest, CancelToken, Engine, EngineError, EngineOptions, FileType, JobStart, KeyId,
-    Link, LinkBackend, OpenMode, Ownership, ProgressSink, ReadBackend, ReadData, RepoKey,
-    RestoreRequest, SnapshotId, SnapshotSelector, WriteBackend,
+    BackendFault, BackupRequest, CancelToken, Engine, EngineError, EngineOptions, FileType,
+    JobStart, KeyId, Link, LinkBackend, OpenMode, Ownership, ProgressSink, ReadBackend, ReadData,
+    RepoKey, RestoreRequest, SnapshotId, SnapshotSelector, WriteBackend,
 };
 use hx_backup::manifest::{CURRENT_FORMAT_VERSION, Distro, ManifestInput};
 use hx_backup::rules::{DockerMode, RuleSet};
@@ -64,6 +64,8 @@ pub struct Facts {
 enum Fail {
     Engine(EngineError),
     Worker(pb::WorkerError),
+    /// A failed `KEYS` job that had already added these keys (ipc.md §28).
+    Added(Box<Fail>, Vec<bytes::Bytes>),
 }
 
 impl From<EngineError> for Fail {
@@ -84,6 +86,19 @@ fn backend_caused(e: &EngineError) -> bool {
     )
 }
 
+/// Does the error's source chain hold a failure of the link backend (as opposed to a local one)?
+fn has_backend_fault(e: &EngineError) -> bool {
+    use std::error::Error;
+    let mut cur: Option<&(dyn Error + 'static)> = Some(e);
+    while let Some(err) = cur {
+        if err.downcast_ref::<BackendFault>().is_some() {
+            return true;
+        }
+        cur = err.source();
+    }
+    false
+}
+
 /// Chooses the `WorkerError` of a failed engine call (ipc.md §31, "How the worker chooses"): the
 /// first rule that matches.
 #[must_use]
@@ -101,8 +116,10 @@ pub fn classify(f: &Facts, e: &EngineError) -> pb::WorkerError {
         EngineError::RepositoryNotFound => W::NoRepository,
         // Q-S1 HOOK: when `EngineError::Integrity` lands, map it here: `EngineError::Integrity { .. } => W::Integrity,`
         EngineError::SnapshotNotFound(_) => W::SnapshotNotFound,
-        EngineError::Io { .. } => match f.kind {
-            K::Backup => W::SourceUnreadable,
+        // Only the source itself failing to open is fatal to a backup; unreadable entries below it
+        // are counted (ipc.md §28).
+        EngineError::Io { context, .. } => match f.kind {
+            K::Backup if *context == "resolving the backup source" => W::SourceUnreadable,
             K::Restore => W::TargetUnwritable,
             _ => W::Engine,
         },
@@ -117,6 +134,7 @@ pub fn classify(f: &Facts, e: &EngineError) -> pb::WorkerError {
         // A restore that fails inside rustic with the link healthy failed on the local side.
         EngineError::Repository { operation, .. }
             if f.kind == K::Restore
+                && !has_backend_fault(e)
                 && matches!(
                     *operation,
                     "preparing the restore target" | "preparing the restore" | "restoring"
@@ -180,6 +198,7 @@ fn key(secrets: &[(u8, Secret)], slot: u8) -> Result<RepoKey, Fail> {
 }
 
 struct Ctx<'a> {
+    link: Arc<Link>,
     backend: Arc<LinkBackend>,
     cancel: CancelToken,
     sink: Arc<dyn ProgressSink>,
@@ -228,6 +247,7 @@ pub fn run(
     let JobStart { job, secrets, .. } = start;
     let kind = pb::JobKind::try_from(job.kind).unwrap_or(pb::JobKind::Unspecified);
     let ctx = Ctx {
+        link: Arc::clone(link),
         backend: Arc::new(link.backend()),
         cancel: link.cancel_token(),
         sink,
@@ -242,14 +262,7 @@ pub fn run(
     };
     let result = match outcome {
         Ok(Ok(r)) => r,
-        Ok(Err(Fail::Worker(w))) => failed(w),
-        Ok(Err(Fail::Engine(e))) => {
-            let w = classify(&facts, &e);
-            // The detail: the console log only, never the link. `EngineError` text never holds
-            // key material (ipc.md §34); paths of the user's files are only at `debug`.
-            tracing::warn!(error = %e, worker_error = ?w, "the job failed");
-            failed(w)
-        }
+        Ok(Err(fail)) => fail_result(&facts, fail),
         Err(_) => {
             // `rustic_core` unwraps the result of a backend call inside its restore threads, so a
             // refused call (after `Cancel`) or a repository error from privd arrives here as a
@@ -261,7 +274,7 @@ pub fn run(
             } else {
                 pb::WorkerError::Engine
             };
-            tracing::error!(worker_error = ?w, "the job panicked");
+            tracing::warn!(worker_error = ?w, "the job panicked");
             failed(w)
         }
     };
@@ -273,6 +286,27 @@ pub fn run(
             tracing::warn!(rule, "the result does not fit the link; failing the job");
             failed(pb::WorkerError::Engine)
         }
+    }
+}
+
+fn fail_result(facts: &Facts, fail: Fail) -> pb::JobResult {
+    match fail {
+        Fail::Worker(w) => {
+            tracing::warn!(worker_error = ?w, "the job failed");
+            failed(w)
+        }
+        Fail::Engine(e) => {
+            let w = classify(facts, &e);
+            // The detail is for the console log at debug level: engine text can name files of the
+            // user's desktop. Key material never appears in it (ipc.md §34).
+            tracing::warn!(worker_error = ?w, "the job failed");
+            tracing::debug!(error = %e, "the job failed: detail");
+            failed(w)
+        }
+        Fail::Added(inner, key_ids) => pb::JobResult {
+            key_ids,
+            ..fail_result(facts, *inner)
+        },
     }
 }
 
@@ -371,8 +405,7 @@ fn backup(ctx: &Ctx<'_>, spec: &pb::BackupSpec) -> Result<pb::JobResult, Fail> {
         source: ctx.opts.src.clone(),
         rules,
         manifest,
-        // The spec always carries a Docker mode; it is recorded in the manifest.
-        docker_enabled: true,
+        docker_enabled: spec.docker_enabled,
         tags: spec.tags.clone(),
         host: SNAPSHOT_HOST.to_owned(),
         time: None,
@@ -380,14 +413,13 @@ fn backup(ctx: &Ctx<'_>, spec: &pb::BackupSpec) -> Result<pb::JobResult, Fail> {
     let mut engine = ctx.open(&key, OpenMode::OpenExisting)?;
     // `Engine::backup` runs `repair index` first (ipc.md §28).
     let out = engine.backup(&req, &ctx.cancel)?;
-    if out.is_partial() {
-        // The snapshot was written but is not complete: reported as a failure without it (§28).
-        tracing::warn!(
-            errors = out.summary.error_count,
-            unreadable = out.manifest.source_sizes.unreadable_entries,
-            "the source was only partly readable"
-        );
-        return Err(Fail::Worker(pb::WorkerError::SourceUnreadable));
+    // Entries that could not be read are skipped and counted, never fatal (ipc.md §28).
+    let unreadable = out
+        .summary
+        .error_count
+        .saturating_add(out.manifest.source_sizes.unreadable_entries);
+    if unreadable > 0 {
+        tracing::warn!(unreadable, "some entries of the source could not be read");
     }
     let id = unhex32(out.snapshot_id.as_str()).ok_or(Fail::Worker(pb::WorkerError::Engine))?;
     Ok(pb::JobResult {
@@ -397,6 +429,7 @@ fn backup(ctx: &Ctx<'_>, spec: &pb::BackupSpec) -> Result<pb::JobResult, Fail> {
         files_unmodified: out.summary.files_unmodified,
         bytes_processed: out.summary.total_bytes,
         bytes_added: out.summary.data_added_packed,
+        entries_unreadable: unreadable,
         ..success()
     })
 }
@@ -519,13 +552,17 @@ fn check(ctx: &Ctx<'_>, spec: &pb::CheckSpec) -> Result<pb::JobResult, Fail> {
     };
     let report = engine.check(read, &ctx.cancel)?;
     for f in &report.findings {
-        tracing::info!(finding = %f, "check");
+        tracing::debug!(finding = %f, "check");
     }
     if report.ok {
         Ok(success())
+    } else if ctx.link.is_cancelled() {
+        // A cancelled check stops reading and reports what it saw: not a damaged repository.
+        Err(Fail::Worker(pb::WorkerError::Cancelled))
+    } else if ctx.link.first_repo_error().is_some() {
+        Err(Fail::Worker(pb::WorkerError::Repo))
     } else {
         // v1 has no distinct code for "the repository has errors" (ipc.md §28).
-        tracing::warn!("the check found errors");
         Err(Fail::Worker(pb::WorkerError::Engine))
     }
 }
@@ -533,7 +570,7 @@ fn check(ctx: &Ctx<'_>, spec: &pb::CheckSpec) -> Result<pb::JobResult, Fail> {
 fn keys(ctx: &Ctx<'_>, spec: &pb::KeysSpec) -> Result<pb::JobResult, Fail> {
     let key0 = key(ctx.secrets, 0)?;
     let engine = ctx.open(&key0, OpenMode::OpenExisting)?;
-    let mut key_ids = Vec::new();
+    let mut key_ids: Vec<bytes::Bytes> = Vec::new();
     if spec.add {
         let new = key(ctx.secrets, 1)?;
         let id = engine.add_key(&new)?;
@@ -544,8 +581,13 @@ fn keys(ctx: &Ctx<'_>, spec: &pb::KeysSpec) -> Result<pb::JobResult, Fail> {
                 .into(),
         );
     }
+    // Add before remove: the key that opens the repository is never at risk. A failure from here on
+    // still reports the key that was added.
     for raw in &spec.remove_key_ids {
-        engine.remove_key(&KeyId::from_str(&hex(raw))?)?;
+        let removed = KeyId::from_str(&hex(raw)).and_then(|id| engine.remove_key(&id));
+        if let Err(e) = removed {
+            return Err(Fail::Added(Box::new(Fail::Engine(e)), key_ids));
+        }
     }
     Ok(pb::JobResult {
         key_ids,
@@ -601,7 +643,7 @@ mod tests {
         assert_eq!(classify(&f, &EngineError::Cancelled), W::Cancelled);
         assert_eq!(classify(&f, &repo_err()), W::Engine);
         let io = || EngineError::Io {
-            context: "x",
+            context: "resolving the backup source",
             source: std::io::Error::other("x"),
         };
         assert_eq!(classify(&f, &io()), W::SourceUnreadable);

@@ -15,12 +15,17 @@ use std::time::{Duration, Instant};
 use common::*;
 use hx_backup_worker::role::{EXIT_DRIVE_NOT_IMPLEMENTED, EXIT_ROLE};
 
-const BIN: &str = env!("CARGO_BIN_EXE_hx-backup-worker");
+/// The binary under test: the one Cargo built, or `HX_WORKER_BIN` (CI runs this file against the
+/// static musl build).
+fn bin() -> String {
+    std::env::var("HX_WORKER_BIN")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_hx-backup-worker").to_owned())
+}
 
 #[test]
 fn the_role_fails_closed_and_the_drive_role_is_a_stub() {
     let run = |role: Option<&str>, args: &[&str]| {
-        let mut c = Command::new(BIN);
+        let mut c = Command::new(bin());
         c.args(args).stdin(Stdio::null());
         c.env_remove("HX_BACKUP_ROLE");
         if let Some(r) = role {
@@ -55,7 +60,7 @@ fn spawn(root: &Path) -> (Child, UnixStream) {
         cmd.args(["strace", "-f", "-o"]).arg(log).arg("--");
     }
     let child = cmd
-        .arg(BIN)
+        .arg(bin())
         .env_remove("HX_BACKUP_ROLE")
         .env("HX_WORKER_RUN_DIR", &run_dir)
         .env("HX_WORKER_SRC", root.join("src"))

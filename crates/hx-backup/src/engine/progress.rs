@@ -284,8 +284,8 @@ impl RusticProgress for Item {
     }
 
     fn error(&self, item: Option<&str>, during: &str, message: &str) {
-        // Item names are paths from the user's desktop: logged at warn, never forwarded.
-        tracing::warn!(
+        // Item names are paths from the user's desktop: logged at debug, never forwarded.
+        tracing::debug!(
             item = item.unwrap_or(""),
             during,
             message,

@@ -64,6 +64,31 @@ jobs:
           HX_REQUIRE_XVFB: "1"
         run: cargo nextest run --workspace --locked --no-tests=pass
 
+  worker-musl:
+    name: Backup worker (static musl)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned toolchain and the musl target
+        run: |
+          rustup toolchain install
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          # zstd (rustic) needs a C compiler for musl
+          sudo apt-get install -y --no-install-recommends musl-tools
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Build the worker with the test hooks, for musl
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: |
+          cargo build -p hx-backup-worker --features test-hooks --locked --target x86_64-unknown-linux-musl
+          readelf -l target/x86_64-unknown-linux-musl/debug/hx-backup-worker | grep -q INTERP && { echo "::error::the musl worker is dynamically linked"; exit 1; } || true
+      - name: Run the binary tests against the musl worker
+        # tests/binary.rs skips itself, with a message, where user namespaces are unavailable.
+        env:
+          HX_WORKER_BIN: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/debug/hx-backup-worker
+        run: cargo test -p hx-backup-worker --locked --test binary -- --nocapture
+
   deny:
     name: Licences and advisories (cargo-deny)
     runs-on: ubuntu-24.04

@@ -126,6 +126,10 @@ jobs:
           # (docs/ipc.md section 36): a separate invocation, never one `cargo build` for both, which
           # would unify their features.
           cargo build -p hx-backup-worker --release --locked --target x86_64-unknown-linux-musl
+          # a shipped worker honours no test override (docs/ipc.md section 24)
+          if strings -a target/x86_64-unknown-linux-musl/release/hx-backup-worker | grep -q HX_WORKER_RUN_DIR; then
+            echo "::error::the release worker contains the test hooks"; exit 1
+          fi
       - name: Collect and check the binaries
         run: |
           set -eu

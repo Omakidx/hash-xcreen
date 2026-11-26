@@ -31,6 +31,12 @@ pub const SOFTWARE: &str = concat!("hx-backup-worker-", env!("CARGO_PKG_VERSION"
 /// Runs the binary: picks the role, runs it, returns the process exit code (ipc.md §24).
 pub fn run(args: &[std::ffi::OsString], env_role: Option<&std::ffi::OsStr>) -> i32 {
     init_logging();
+    // A release binary honours no test override: any HX_WORKER_* variable fails closed.
+    #[cfg(not(feature = "test-hooks"))]
+    if std::env::vars_os().any(|(k, _)| k.to_string_lossy().starts_with("HX_WORKER_")) {
+        eprintln!("hx-backup-worker: unexpected HX_WORKER_* variable");
+        return role::EXIT_ROLE;
+    }
     match role::select(args, env_role) {
         Ok(role::Role::Worker) => session::run_worker(&session::WorkerConfig::production()),
         Ok(role::Role::Drive) => {

@@ -335,13 +335,22 @@ impl Inner {
         st.sent_message(&frame)
             .map_err(|e| BackendFault::Link(self.violation(e.0)))?;
         let (tx, rx) = mpsc::sync_channel(EVENT_DEPTH);
-        lock(&self.pending).insert(
-            req_id,
-            Pending {
-                tx,
-                download_begun: false,
-            },
-        );
+        {
+            // `fail` sets the failure before it clears `pending` under this lock, so a request
+            // registered after the clear sees the failure here and never waits for an answer
+            // that cannot come.
+            let mut pending = lock(&self.pending);
+            if let Some(f) = self.failed() {
+                return Err(BackendFault::Link(f));
+            }
+            pending.insert(
+                req_id,
+                Pending {
+                    tx,
+                    download_begun: false,
+                },
+            );
+        }
         drop(st);
         if !self.outbox.push_control(wire) {
             return Err(BackendFault::Link(
@@ -355,9 +364,13 @@ impl Inner {
     fn send_data(&self, req_id: u64, end: bool, payload: Bytes) -> Result<(), BackendFault> {
         let header = repo::encode_data_header(req_id, end, payload.len())
             .map_err(|e| BackendFault::Refused(refusal(&e)))?;
-        lock(&self.state)
+        let disp = lock(&self.state)
             .sent_data(req_id, end, payload.len())
             .map_err(|e| BackendFault::Link(self.violation(e.0)))?;
+        if disp.done == Some(req_id) {
+            // The `END` that closes an aborted upload finishes the request: free its slot.
+            self.finished(req_id);
+        }
         if self.outbox.push_data(header, payload) {
             Ok(())
         } else {
@@ -618,6 +631,10 @@ impl Inner {
                 true
             }
             Some(F::Ping(p)) => {
+                if self.closed.load(Ordering::SeqCst) {
+                    // `Bye` is queued or sent: a `Pong` would be refused, and nothing needs it.
+                    return true;
+                }
                 let pong = pb::RepoFrame {
                     frame: Some(F::Pong(pb::Pong { nonce: p.nonce })),
                 };
@@ -975,11 +992,12 @@ impl Link {
             let blocking = if ok {
                 outstanding
             } else {
-                outstanding
-                    - lock(&inner.pending)
+                outstanding.saturating_sub(
+                    lock(&inner.pending)
                         .values()
                         .filter(|p| p.download_begun)
-                        .count()
+                        .count(),
+                )
             };
             if blocking == 0 {
                 break;
@@ -1023,6 +1041,9 @@ impl Link {
         let bye = pb::RepoFrame {
             frame: Some(pb::repo_frame::Frame::Bye(pb::Bye {})),
         };
+        // From here on the end of the connection is expected (privd closes it after `Bye`) and a
+        // `Pong` would be refused: set before the `Bye` is accounted, not after.
+        inner.closed.store(true, Ordering::SeqCst);
         if st.outstanding() == 0
             && inner.failed().is_none()
             && let Ok(wire) = repo::encode_message(&bye, Endpoint::PrivdWorkerLink)
@@ -1031,10 +1052,9 @@ impl Link {
             inner.outbox.push_control(wire);
         }
         drop(st);
-        // From here on the end of the connection is expected (privd closes it after `Bye`): the
-        // reader's end-of-stream is no failure. A failed write still closes the outbox.
-        inner.closed.store(true, Ordering::SeqCst);
         let flushed = inner.outbox.flush();
+        // Nothing more will be written: let the writer thread end.
+        inner.outbox.close();
         if flushed {
             Ok(())
         } else {

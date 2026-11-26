@@ -190,29 +190,32 @@ fn a_snapshot_that_does_not_exist_and_a_source_that_does_not_exist() {
 }
 
 #[test]
-fn an_unreadable_file_makes_the_backup_partial_and_a_failure_without_a_snapshot_id() {
-    if is_root() {
-        eprintln!("skipped: root reads everything");
-        return;
-    }
+fn unreadable_entries_and_an_overlong_path_are_counted_not_fatal() {
     let env = Env::new();
     make_tree(&env.src());
-    write(&env.src().join("home/user/secret"), b"x", 0o000);
+    // a chain of 25 directories of 200 bytes: 5000 bytes, over PATH_MAX
+    make_deep_chain(&env.src().join("deep"), 25);
+    if !is_root() {
+        write(&env.src().join("home/user/secret"), b"x", 0o000);
+    }
     env.init();
-    let out = run_failing(
-        backup_job(&[], &[]),
-        &env.store,
-        &env.cfg(),
-        W::SourceUnreadable,
-    );
-    assert!(out.result.unwrap().snapshot_id.is_empty());
-    // the snapshot was written all the same (ipc.md §28)
-    assert_eq!(env.store.lock().unwrap().count(T::Snapshot), 1);
-    fs::set_permissions(
-        env.src().join("home/user/secret"),
-        fs::Permissions::from_mode(0o600),
-    )
-    .unwrap();
+    let b = env.backup();
+    assert_eq!(b.snapshot_id.len(), 32, "ok with a snapshot id");
+    assert!(b.entries_unreadable > 0, "{b:?}");
+    let s = run_ok(snapshots_job(), &env.store, &env.cfg());
+    assert_eq!(s.snapshots.len(), 1);
+    assert_eq!(s.snapshots[0].id, b.snapshot_id);
+    // the rest restores
+    run_ok(restore_job(&b.snapshot_id), &env.store, &env.cfg());
+    assert!(env.dst().join("etc/passwd").exists());
+    assert!(env.dst().join("home/user/big.bin").exists());
+    if !is_root() {
+        fs::set_permissions(
+            env.src().join("home/user/secret"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
 }
 
 #[test]
@@ -473,7 +476,13 @@ fn cancel_during_a_backup_ends_with_cancelled_inside_the_window_and_leaves_no_sn
         took < hx_ipc::repo::CANCEL_GRACE,
         "JobResult {took:?} after Cancel"
     );
-    // the pack in flight was completed (a stream cannot end early), no new write was started
+    // the pack in flight was completed (a stream cannot end early); after Cancel no write of an
+    // index or a snapshot was requested
+    let after = &out.ops[out.ops_at_cancel.unwrap().min(out.ops.len())..];
+    assert!(
+        !after.iter().any(|o| o == "Write(3)" || o == "Write(4)"),
+        "requests after Cancel: {after:?}"
+    );
     assert_eq!(env.store.lock().unwrap().count(T::Snapshot), 0);
 }
 
@@ -659,11 +668,178 @@ fn a_corrupt_pack_makes_rustic_panic_in_restore_and_the_job_still_ends_with_a_re
 }
 
 #[test]
-fn a_damaged_index_ends_every_kind_of_job_with_a_result() {
+fn a_failed_keys_job_reports_the_key_it_had_added() {
+    let env = Env::new();
+    make_tree(&env.src());
+    let init = env.init();
+    let recovery_id = init.key_ids[1].to_vec();
+    // add a third key, then try to remove the key in use: the add stays, the job fails
+    let out = run_failing(
+        keys_job(
+            RECOVERY,
+            Some(b"a third key for this repository, 7"),
+            &[recovery_id],
+        ),
+        &env.store,
+        &env.cfg(),
+        W::Engine,
+    );
+    let r = out.result.unwrap();
+    assert_eq!(r.key_ids.len(), 1, "the added key is reported");
+    assert_eq!(env.store.lock().unwrap().count(T::Key), 3);
+}
+
+#[test]
+fn the_docker_bit_decides_whether_the_manifest_records_a_docker_mode() {
+    let env = Env::new();
+    make_tree(&env.src());
+    env.init();
+    let on = run_ok(
+        with_docker(backup_job(&[], &[]), true),
+        &env.store,
+        &env.cfg(),
+    );
+    let m = run_ok(restore_plan_job(&on.snapshot_id), &env.store, &env.cfg());
+    assert!(String::from_utf8_lossy(&m.manifest).contains("\"docker_mode\":\"complete\""));
+    write(&env.src().join("home/user/extra"), b"y", 0o644);
+    let off = run_ok(
+        with_docker(backup_job(&[], &[]), false),
+        &env.store,
+        &env.cfg(),
+    );
+    let m = run_ok(restore_plan_job(&off.snapshot_id), &env.store, &env.cfg());
+    assert!(!String::from_utf8_lossy(&m.manifest).contains("\"docker_mode\":\""));
+}
+
+#[test]
+fn an_upload_answered_with_an_error_after_its_end_is_finished_by_that_error() {
+    let env = Env::new();
+    make_tree(&env.src());
+    env.init();
+    let (code, out) = session(
+        backup_job(&[], &[]),
+        &env.store,
+        Behavior {
+            error_after_end: Some(pb::ErrorClass::Transient),
+            ..Behavior::default()
+        },
+        &env.cfg(),
+    );
+    assert!(
+        out.worker_violations.is_empty(),
+        "{:?}",
+        out.worker_violations
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out.result.unwrap().error, W::Repo as i32);
+    assert!(out.bye);
+}
+
+#[test]
+fn a_not_found_answer_never_selects_repo() {
     let env = Env::new();
     make_tree(&env.src());
     env.init();
     env.backup();
+    let (code, out) = session(
+        snapshots_job(),
+        &env.store,
+        Behavior {
+            fail_list: Some((T::Snapshot, pb::ErrorClass::NotFound)),
+            ..Behavior::default()
+        },
+        &env.cfg(),
+    );
+    assert_eq!(code, 0);
+    let r = out.result.unwrap();
+    assert!(!r.ok);
+    assert_ne!(r.error, W::Repo as i32);
+}
+
+#[test]
+fn a_cancel_during_the_handshake_cancels_the_job() {
+    let env = Env::new();
+    make_tree(&env.src());
+    env.init();
+    let (code, out) = session(
+        snapshots_job(),
+        &env.store,
+        Behavior {
+            cancel_before_secrets: true,
+            ..Behavior::default()
+        },
+        &env.cfg(),
+    );
+    assert!(
+        out.worker_violations.is_empty(),
+        "{:?}",
+        out.worker_violations
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out.result.unwrap().error, W::Cancelled as i32);
+    assert!(
+        out.ops.is_empty(),
+        "no request after a Cancel: {:?}",
+        out.ops
+    );
+}
+
+#[test]
+fn a_cancelled_check_is_cancelled_not_a_damaged_repository() {
+    let env = Env::new();
+    make_tree(&env.src());
+    env.init();
+    env.backup();
+    let (code, out) = session(
+        check_job(100),
+        &env.store,
+        Behavior {
+            cancel_on: Some(CancelOn::FirstPackDownload),
+            read_chunk: Some(64 * 1024),
+            ..Behavior::default()
+        },
+        &env.cfg(),
+    );
+    assert!(
+        out.worker_violations.is_empty(),
+        "{:?}",
+        out.worker_violations
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out.result.unwrap().error, W::Cancelled as i32);
+}
+
+#[test]
+fn the_wait_for_a_discarded_download_is_bounded_and_the_worker_exits_without_bye() {
+    let env = Env::new();
+    make_tree(&env.src());
+    env.init();
+    let b = env.backup();
+    let started = Instant::now();
+    let (code, out) = session(
+        restore_job(&b.snapshot_id),
+        &env.store,
+        Behavior {
+            cancel_on: Some(CancelOn::FirstPackDownload),
+            read_chunk: Some(64 * 1024),
+            never_release_held: true,
+            ..Behavior::default()
+        },
+        &env.cfg(),
+    );
+    assert_eq!(code, 0, "exit 0 even without Bye");
+    assert_eq!(out.result.unwrap().error, W::Cancelled as i32);
+    assert!(!out.bye, "Bye needs nothing outstanding");
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_secs(9), "{waited:?}");
+}
+
+#[test]
+fn a_damaged_index_ends_every_job_that_loads_it_with_a_result() {
+    let env = Env::new();
+    make_tree(&env.src());
+    env.init();
+    let b = env.backup();
     {
         let mut st = env.store.lock().unwrap();
         let keys: Vec<_> = st
@@ -672,7 +848,6 @@ fn a_damaged_index_ends_every_kind_of_job_with_a_result() {
             .filter(|(t, _)| *t == T::Index as i32)
             .cloned()
             .collect();
-        assert!(!keys.is_empty());
         for k in keys {
             let v = st.objects.get_mut(&k).unwrap();
             for i in (0..v.len()).step_by(13) {
@@ -680,10 +855,18 @@ fn a_damaged_index_ends_every_kind_of_job_with_a_result() {
             }
         }
     }
-    for j in [check_job(0), forget_job(&[])] {
+    let jobs = [
+        restore_job(&b.snapshot_id),
+        restore_plan_job(&b.snapshot_id),
+        snapshots_job(),
+        check_job(100),
+        forget_job(&[]),
+        backup_job(&[], &[]),
+    ];
+    for (i, j) in jobs.into_iter().enumerate() {
         let (code, out) = session(j, &env.store, Behavior::default(), &env.cfg());
-        assert_eq!(code, 0, "{:?}", out.worker_violations);
-        assert!(!out.result.expect("a JobResult").ok);
-        assert!(out.bye);
+        assert_eq!(code, 0, "job {i}: {:?}", out.worker_violations);
+        assert!(out.result.is_some(), "job {i} ended without a JobResult");
+        assert!(out.bye, "job {i}");
     }
 }

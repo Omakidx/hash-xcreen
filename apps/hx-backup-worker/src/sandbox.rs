@@ -272,7 +272,6 @@ fn common() -> Vec<(i64, &'static str)> {
         // read-only: lets a test (and a curious operator) see what was kept
         SYS_capget,
         SYS_uname,
-        SYS_prlimit64,
         SYS_sysinfo,
     ]);
     #[cfg(target_arch = "x86_64")]
@@ -346,7 +345,13 @@ fn writes() -> Vec<(i64, &'static str)> {
 #[must_use]
 pub fn allowed_names(kind: pb::JobKind) -> Vec<&'static str> {
     let mut names: Vec<&'static str> = common().into_iter().map(|(_, n)| n).collect();
-    names.extend(["SYS_openat", "SYS_ioctl", "SYS_clone", "SYS_prctl"]);
+    names.extend([
+        "SYS_openat",
+        "SYS_ioctl",
+        "SYS_clone",
+        "SYS_prctl",
+        "SYS_prlimit64",
+    ]);
     #[cfg(target_arch = "x86_64")]
     names.push("SYS_open");
     if kind == pb::JobKind::Restore {
@@ -473,6 +478,18 @@ pub fn program(kind: pb::JobKind, mode: Mode) -> Result<BpfProgram, SandboxError
                 0,
             )?,
         ])?],
+    );
+
+    // prlimit64: read limits only. A call with a new limit (argument 2, a pointer) is refused, so a
+    // compromised worker cannot raise its own limits.
+    rules.insert(
+        libc::SYS_prlimit64,
+        vec![rule(vec![cond(
+            2,
+            SeccompCmpArgLen::Qword,
+            SeccompCmpOp::Eq,
+            0,
+        )?])?],
     );
 
     // prctl: name a thread, and clear (never set) the dumpable flag.
