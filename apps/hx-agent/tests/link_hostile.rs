@@ -1748,9 +1748,12 @@ async fn a_key_frame_waiting_for_its_format_never_pauses_the_media_lane() {
     let wrote = tokio::task::spawn_blocking(move || rx.recv().unwrap())
         .await
         .unwrap();
+    // A reader stuck in the format wait could not take the 3 MiB before that wait (2 s,
+    // FORMAT_WAIT) gave up, since the format is announced only after the write; a drained lane
+    // takes well under a second even on a loaded machine.
     assert!(
-        wrote < Duration::from_millis(400),
-        "the lane was drained while the key frame waited: wrote in {wrote:?}"
+        wrote < Duration::from_millis(1500),
+        "the lane was not drained while the key frame waited: wrote in {wrote:?}"
     );
     // Once the format arrives everything comes out in order, with the right formats.
     let mut got = Vec::new();
@@ -1776,9 +1779,14 @@ async fn a_key_frame_waiting_for_its_format_never_pauses_the_media_lane() {
         w.extend(video(1, 1 | 2, 1, &sps_for(80, 45)));
         l.media.write_all(&w).unwrap();
         for n in 2..28u32 {
-            l.media
+            // The test ends as soon as it has seen an eviction and closes the link: a write
+            // after that fails, which is not an error of the fake.
+            if l.media
                 .write_all(&video(n, 0, 1, &p_payload(1024 * 1024)))
-                .unwrap();
+                .is_err()
+            {
+                return;
+            }
         }
         std::thread::sleep(Duration::from_millis(500));
     });
@@ -1786,8 +1794,16 @@ async fn a_key_frame_waiting_for_its_format_never_pauses_the_media_lane() {
     link.start(1, start_config()).unwrap();
     let first = next_frame(&mut ev).await;
     assert_eq!(first.number(), 0);
-    tokio::time::sleep(Duration::from_millis(900)).await;
-    let c = link.counters();
-    assert!(c.evicted_frames >= 1, "{c:?}");
-    assert!(link.queued_video_bytes() <= 12 * 1024 * 1024 + 256 * 4);
+    // Eviction starts once the fake has written more than the pool holds (12 MiB), which takes
+    // a while on a loaded machine: wait for it, and check the bound on every look.
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(link.queued_video_bytes() <= 12 * 1024 * 1024 + 256 * 4);
+        let c = link.counters();
+        if c.evicted_frames >= 1 {
+            break;
+        }
+        assert!(Instant::now() < end, "no frame was evicted: {c:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
