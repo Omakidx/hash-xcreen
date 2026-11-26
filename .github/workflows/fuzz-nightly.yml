@@ -53,6 +53,7 @@ jobs:
           - { target: crypto_secrets, seconds: 900, max_len: 1024 }
           - { target: crypto_registry, seconds: 900, max_len: 4096 }
           - { target: ipc_link, seconds: 900, max_len: 16384 }
+          - { target: ipc_repo, seconds: 900, max_len: 16384 }
           - { target: agent_link_session, seconds: 900, max_len: 16384 }
           - { target: agent_annexb, seconds: 900, max_len: 16384 }
           # Everything else that takes bytes from outside a trust boundary: 5 minutes.
@@ -213,7 +214,7 @@ jobs:
         env:
           FUZZ_RESULT: ${{ needs.fuzz.result }}
         run: |
-          total=23
+          total=24
           shopt -s nullglob
           files=(results/*.json)
           failed=0

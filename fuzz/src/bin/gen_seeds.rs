@@ -27,6 +27,7 @@ use hx_ipc::{
         pb as lpb,
     },
     privd::{self, Side, pb as ppb},
+    repo::{self, Endpoint, pb as rpb},
 };
 use hx_proto::{
     VideoCodec,
@@ -365,6 +366,409 @@ fn tar_gz_parts() -> (Vec<u8>, Vec<u8>) {
     let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     gz.write_all(&raw).expect("gzip");
     (raw, gz.finish().expect("gzip"))
+}
+
+/// The repository link seeds (`ipc_repo`): `selector | chunk | whole frames`. The selector is the
+/// receiving endpoint (0 worker, 1 privd on the worker link, 2 privd on the Drive link, 3 Drive
+/// helper), plus 4 to make the harness answer requests.
+mod repo_seeds {
+    use super::*;
+    use bytes::Bytes;
+    use rpb::repo_frame::Frame as F;
+
+    fn msg(to: Endpoint, f: F) -> Vec<u8> {
+        repo::encode_message(&rpb::RepoFrame { frame: Some(f) }, to).expect("repo frame")
+    }
+
+    fn id(b: u8) -> Bytes {
+        Bytes::from(vec![b; 32])
+    }
+
+    fn req(to: Endpoint, req_id: u64, op: rpb::repo_request::Op) -> Vec<u8> {
+        msg(
+            to,
+            F::Request(rpb::RepoRequest {
+                req_id,
+                op: Some(op),
+            }),
+        )
+    }
+
+    fn resp(to: Endpoint, req_id: u64, r: rpb::repo_response::Result) -> Vec<u8> {
+        msg(
+            to,
+            F::Response(rpb::RepoResponse {
+                req_id,
+                result: Some(r),
+            }),
+        )
+    }
+
+    fn write_op(ty: rpb::ObjectType, size: u32) -> rpb::repo_request::Op {
+        rpb::repo_request::Op::Write(rpb::Write {
+            object_type: ty as i32,
+            id: id(7),
+            size,
+        })
+    }
+
+    fn job(kind: rpb::JobKind) -> rpb::Job {
+        use rpb::job::Spec;
+        let spec = match kind {
+            rpb::JobKind::Init => Spec::Init(rpb::InitSpec {
+                compression: 3,
+                datapack_size_limit: 64 << 20,
+                treepack_size_limit: 16 << 20,
+            }),
+            rpb::JobKind::Backup => Spec::Backup(rpb::BackupSpec {
+                manifest: Some(rpb::ManifestInput {
+                    agent_version: "0.1.0".into(),
+                    distro: Some(rpb::Distro {
+                        id: "ubuntu".into(),
+                        version_id: "24.04".into(),
+                        pretty_name: "Ubuntu 24.04 LTS".into(),
+                    }),
+                    desktop: "xfce4".into(),
+                    preset: "basic".into(),
+                    container_config: vec![rpb::ConfigEntry {
+                        key: "limits.cpu".into(),
+                        value: "2".into(),
+                    }],
+                    format_version: 1,
+                }),
+                excludes: vec!["/home/*/.cache".into()],
+                docker_mode: rpb::DockerMode::Light as i32,
+                tags: vec!["hx-backup-20261126T101500Z-0a1b".into()],
+            }),
+            rpb::JobKind::ForgetPrune => Spec::ForgetPrune(rpb::ForgetPruneSpec {
+                forget: vec![id(1), id(2)],
+                instant: true,
+            }),
+            rpb::JobKind::Keys => Spec::Keys(rpb::KeysSpec {
+                add: true,
+                remove_key_ids: vec![id(3)],
+            }),
+            _ => Spec::Check(rpb::CheckSpec {
+                read_data_percent: 5,
+            }),
+        };
+        let slots = |n: u32| {
+            (0..n)
+                .map(|slot| rpb::SecretSlot {
+                    slot,
+                    kind: if slot == 0 {
+                        rpb::SecretKind::RepoPassword
+                    } else {
+                        rpb::SecretKind::NewKeyPassword
+                    } as i32,
+                    length: 32,
+                })
+                .collect()
+        };
+        let (kind, spec, secret_slots) = match kind {
+            rpb::JobKind::Init | rpb::JobKind::Keys => (kind, spec, slots(2)),
+            rpb::JobKind::Backup | rpb::JobKind::ForgetPrune => (kind, spec, slots(1)),
+            _ => (rpb::JobKind::Check, spec, slots(1)),
+        };
+        rpb::Job {
+            job_id: Bytes::from(vec![7u8; 16]),
+            kind: kind as i32,
+            secret_slots,
+            spec: Some(spec),
+        }
+    }
+
+    pub fn put(o: &mut Out) {
+        use rpb::{ObjectType as T, repo_request::Op, repo_response::Result as R};
+        let hello = || {
+            F::Hello(rpb::Hello {
+                major: 1,
+                minor: 0,
+                job_id: Bytes::from(vec![7u8; 16]),
+            })
+        };
+        let ack = || {
+            F::HelloAck(rpb::HelloAck {
+                major: 1,
+                minor: 0,
+                software: "hx-backup-worker 0.1.0".into(),
+            })
+        };
+        let list = |t: T| {
+            Op::List(rpb::List {
+                object_type: t as i32,
+            })
+        };
+        let page = R::ListPage(rpb::ListPage {
+            entries: vec![
+                rpb::ListEntry {
+                    id: id(1),
+                    size: 4096,
+                },
+                rpb::ListEntry {
+                    id: id(2),
+                    size: 100,
+                },
+            ],
+            last: true,
+        });
+        let result = rpb::JobResult {
+            ok: true,
+            snapshot_id: id(0x11),
+            files_new: 5,
+            bytes_added: 99,
+            ..Default::default()
+        };
+        let selector = |e: Endpoint, answer: bool| (e as u8) | if answer { 4 } else { 0 };
+        let seed = |o: &mut Out, name: &str, e: Endpoint, answer: bool, frames: &[Vec<u8>]| {
+            let mut v = vec![selector(e, answer), 64];
+            v.extend(frames.concat());
+            o.put("ipc_repo", name, &v);
+        };
+        let w = Endpoint::Worker;
+        let pw = Endpoint::PrivdWorkerLink;
+        let pd = Endpoint::PrivdDriveLink;
+        let dh = Endpoint::DriveHelper;
+
+        // One frame per kind of message, at the first endpoint that receives it.
+        for kind in [
+            rpb::JobKind::Init,
+            rpb::JobKind::Backup,
+            rpb::JobKind::ForgetPrune,
+            rpb::JobKind::Keys,
+            rpb::JobKind::Check,
+        ] {
+            let name = format!("job_{kind:?}").to_lowercase();
+            seed(o, &name, w, false, &[msg(w, F::Job(job(kind)))]);
+        }
+        seed(o, "hello", w, false, &[msg(w, hello())]);
+        seed(o, "hello_ack", pw, false, &[msg(pw, ack())]);
+        seed(o, "request_list", pw, true, &[req(pw, 1, list(T::Pack))]);
+        seed(
+            o,
+            "request_write",
+            pw,
+            true,
+            &[req(pw, 1, write_op(T::Pack, 1000))],
+        );
+        seed(
+            o,
+            "request_read_partial",
+            pw,
+            true,
+            &[req(
+                pw,
+                1,
+                Op::ReadPartial(rpb::ReadPartial {
+                    object_type: T::Pack as i32,
+                    id: id(7),
+                    offset: 100,
+                    length: 200,
+                }),
+            )],
+        );
+        seed(
+            o,
+            "request_open_repo",
+            dh,
+            true,
+            &[req(
+                dh,
+                1,
+                Op::OpenRepo(rpb::OpenRepo {
+                    folder: "hx-backup-0a1b2c3d-main".into(),
+                    create: true,
+                    server_id: Bytes::from(vec![9u8; 16]),
+                    takeover: false,
+                }),
+            )],
+        );
+        seed(
+            o,
+            "request_quota",
+            dh,
+            true,
+            &[req(dh, 2, Op::Quota(rpb::Quota {}))],
+        );
+        seed(
+            o,
+            "response_list_page",
+            w,
+            false,
+            &[resp(w, 1, page.clone())],
+        );
+        seed(
+            o,
+            "response_quota_result",
+            pd,
+            false,
+            &[resp(
+                pd,
+                1,
+                R::QuotaResult(rpb::QuotaResult {
+                    limit: 15 << 30,
+                    usage: 3 << 30,
+                    usage_in_trash: 1 << 20,
+                }),
+            )],
+        );
+        seed(
+            o,
+            "progress",
+            pw,
+            false,
+            &[msg(
+                pw,
+                F::Progress(rpb::Progress {
+                    phase: rpb::ProgressPhase::ScanAndUpload as i32,
+                    files_done: 1,
+                    files_total: 10,
+                    bytes_done: 100,
+                    bytes_total: 1000,
+                }),
+            )],
+        );
+        seed(
+            o,
+            "job_result",
+            pw,
+            false,
+            &[msg(pw, F::Result(result.clone()))],
+        );
+        seed(
+            o,
+            "event",
+            pd,
+            false,
+            &[msg(
+                pd,
+                F::Event(rpb::Event {
+                    kind: rpb::EventKind::PausedDailyLimit as i32,
+                    until_ms: 1_764_000_000_000,
+                }),
+            )],
+        );
+        seed(
+            o,
+            "cancel_request",
+            dh,
+            false,
+            &[msg(dh, F::CancelRequest(rpb::CancelRequest { req_id: 3 }))],
+        );
+        let secret = repo::encode_secret(0, 0, &[0x5A; 32]).expect("secret");
+        seed(o, "secret", w, false, &[secret.to_vec()]);
+        let payload = vec![0x42u8; 1000];
+        seed(
+            o,
+            "data",
+            pw,
+            false,
+            &[repo::encode_data(1, true, &payload).expect("data")],
+        );
+
+        // Whole conversations, as each end reads them.
+        let data =
+            |id: u64, end: bool, n: usize| repo::encode_data(id, end, &payload[..n]).expect("data");
+        seed(
+            o,
+            "talk_worker",
+            w,
+            false,
+            &[
+                msg(w, hello()),
+                msg(w, F::Job(job(rpb::JobKind::Init))),
+                repo::encode_secret(0, 0, &[1; 32]).expect("s0").to_vec(),
+                repo::encode_secret(0, 1, &[2; 32]).expect("s1").to_vec(),
+                resp(w, 1, page.clone()),
+                resp(w, 2, R::ReadBegin(rpb::ReadBegin { size: 1000 })),
+                data(2, false, 600),
+                data(2, true, 400),
+                msg(w, F::Ping(rpb::Ping { nonce: 9 })),
+                msg(w, F::Bye(rpb::Bye {})),
+            ],
+        );
+        seed(
+            o,
+            "talk_privd_worker",
+            pw,
+            true,
+            &[
+                msg(pw, ack()),
+                req(pw, 1, list(T::Config)),
+                req(pw, 2, write_op(T::Pack, 1000)),
+                data(2, false, 600),
+                data(2, true, 400),
+                req(
+                    pw,
+                    3,
+                    Op::Remove(rpb::Remove {
+                        object_type: T::Index as i32,
+                        id: id(4),
+                    }),
+                ),
+                msg(
+                    pw,
+                    F::Progress(rpb::Progress {
+                        phase: 2,
+                        ..Default::default()
+                    }),
+                ),
+                msg(pw, F::Result(result)),
+                msg(pw, F::Bye(rpb::Bye {})),
+            ],
+        );
+        seed(
+            o,
+            "talk_privd_drive",
+            pd,
+            false,
+            &[
+                msg(pd, ack()),
+                resp(pd, 1, R::Done(rpb::Done {})),
+                resp(pd, 2, R::ReadBegin(rpb::ReadBegin { size: 8 })),
+                data(2, true, 8),
+                msg(
+                    pd,
+                    F::Event(rpb::Event {
+                        kind: 3,
+                        until_ms: 0,
+                    }),
+                ),
+                msg(pd, F::Bye(rpb::Bye {})),
+            ],
+        );
+        seed(
+            o,
+            "talk_drive_helper",
+            dh,
+            true,
+            &[
+                msg(dh, hello()),
+                req(
+                    dh,
+                    1,
+                    Op::OpenRepo(rpb::OpenRepo {
+                        folder: "hx-backup-0a1b2c3d-main".into(),
+                        create: false,
+                        server_id: Bytes::from(vec![9u8; 16]),
+                        takeover: true,
+                    }),
+                ),
+                req(dh, 2, write_op(T::Index, 300)),
+                data(2, false, 100),
+                data(2, true, 200),
+                req(
+                    dh,
+                    3,
+                    Op::SetUploadRate(rpb::SetUploadRate {
+                        bytes_per_s: 1 << 20,
+                    }),
+                ),
+                msg(dh, F::CancelRequest(rpb::CancelRequest { req_id: 2 })),
+                msg(dh, F::Bye(rpb::Bye {})),
+            ],
+        );
+    }
 }
 
 fn main() {
@@ -723,6 +1127,7 @@ fn main() {
             &[&[0u8, 7][..], &wire].concat(),
         );
     }
+    repo_seeds::put(&mut o);
     // A kind-2 secret frame: kind byte 2 and a few bytes of body.
     o.put("ipc_privd_admin", "secret", &[0, 2, b's', b'e', b'c']);
 
