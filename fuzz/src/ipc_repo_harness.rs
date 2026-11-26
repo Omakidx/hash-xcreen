@@ -84,6 +84,7 @@ pub fn job(kind: pb::JobKind) -> pb::Job {
             excludes: vec!["/home/*/.cache".into()],
             docker_mode: pb::DockerMode::Light as i32,
             tags: vec!["hx-backup-20261126T101500Z-0a1b".into()],
+            docker_enabled: true,
         }),
         pb::JobKind::Snapshots => Spec::Snapshots(pb::SnapshotsSpec {}),
         pb::JobKind::RestorePlan => Spec::RestorePlan(pb::RestorePlanSpec { snapshot_id: id(5) }),

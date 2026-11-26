@@ -656,6 +656,7 @@ pub fn backup_job(excludes: &[&str], tags: &[&str]) -> JobSpec {
                 excludes: excludes.iter().map(|s| (*s).to_owned()).collect(),
                 docker_mode: pb::DockerMode::Complete as i32,
                 tags: tags.iter().map(|s| (*s).to_owned()).collect(),
+                docker_enabled: true,
             }),
             &[(0, PW, PASSWORD.len())],
         ),

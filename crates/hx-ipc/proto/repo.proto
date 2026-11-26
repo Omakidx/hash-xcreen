@@ -212,6 +212,8 @@ message BackupSpec {
   // At most 4, each 1 to 64 bytes of [A-Za-z0-9._-]: the hx-backup-... snapshot name and the
   // schedule kind.
   repeated string tags = 4;
+  // The manifest records the Docker mode only when true.
+  bool docker_enabled = 5;
 }
 
 message ManifestInput {
@@ -396,12 +398,14 @@ message JobResult {
   uint64 bytes_added = 7;
   // 32 bytes, BACKUP.
   bytes snapshot_id = 8;
-  // INIT, KEYS; at most 4, 32 bytes each.
+  // INIT, KEYS (also a failed KEYS: the keys it added); at most 4, 32 bytes each.
   repeated bytes key_ids = 9;
   // RESTORE_PLAN; at most 61 440 bytes. privd validates it as untrusted.
   bytes manifest = 10;
   // SNAPSHOTS; at most 4096 (and what fits the frame).
   repeated SnapshotInfo snapshots = 11;
+  // BACKUP, successful: source entries skipped because they could not be read.
+  uint64 entries_unreadable = 12;
 }
 
 message SnapshotInfo {
