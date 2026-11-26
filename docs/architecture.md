@@ -72,7 +72,8 @@ crates/
   hx-provision  declarative desktop recipe, Incus orchestration, image import/build
   hx-backup     rustic_core + Google Drive backend, scheduling, retention, verification
 apps/
-  hx-agent      hx-gatewayd, hx-privd, backup worker, the hx-agent CLI and the installer engine (`hx-agent install`, `hx-privd-rescue`)
+  hx-agent      hx-gatewayd, hx-privd, the hx-agent CLI and the installer engine (`hx-agent install`, `hx-privd-rescue`); never links rustic
+  hx-backup-worker  the backup worker and the Drive helper (two roles of one binary); the only package that builds `hx-backup`'s `engine` feature, kept apart from `hx-agent` so that no `hx-agent` binary contains rustic (ipc.md §36)
   hx-session    in-container session daemon
   hx-pwcheck    in-container current-password checker (dynamically linked, ships in the `hx-session` package)
   hx-desktop    Slint client
