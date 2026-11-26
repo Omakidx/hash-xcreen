@@ -235,7 +235,7 @@ Notes (design approved 2026-11-22, written before the code):
 
 ### Tasks
 - [ ] Backup worker spawned by `hx-privd`; snapshot → read-only mount → rustic → manifest → cleanup
-- [ ] Exclude rules and protected list; property test that protected paths are never excluded
+- [x] Exclude rules and protected list; property test that protected paths are never excluded (`hx_backup::rules`; the property test covers random trees and user exclude lists)
 - [ ] Docker backup modes: Complete and Light
 - [ ] Recovery key generation and display; Drive token sealed with `systemd-creds`
 - [ ] Scheduler: fixed times, jitter, catch-up, no overlap; nice/ionice; 50% upload cap during sessions
