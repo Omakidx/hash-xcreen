@@ -12,6 +12,8 @@ nothing about Google Drive, Incus, HTTP or `hx-privd`; it is handed a rustic bac
 | `manifest` | The versioned, strictly parsed backup manifest stored with each snapshot. |
 | `engine` | `Engine`: open-or-init a repository, backup, restore (with resume), forget, prune, check, snapshot listing; progress sink and cancellation token; the zeroizing `RepoKey`. |
 
+`Engine::prune` does not believe the index: it first rebuilds it from the pack headers and refuses (`EngineError::Integrity`, nothing deleted) if a pack file is in no index or a blob is stored in two packs, because a compromised `BACKUP` worker can forge indexes that make `rustic_core`'s prune delete real packs (docs/ipc.md section 36, decision 10; `tests/prune_safety.rs`).
+
 ## Features
 
 `default = []`: the default build is `rules` and `manifest` only, with no rustic dependency, which
