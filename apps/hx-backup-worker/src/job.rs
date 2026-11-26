@@ -114,7 +114,8 @@ pub fn classify(f: &Facts, e: &EngineError) -> pb::WorkerError {
     match e {
         EngineError::WrongKey | EngineError::InvalidKey(_) => W::WrongPassword,
         EngineError::RepositoryNotFound => W::NoRepository,
-        // Q-S1 HOOK: when `EngineError::Integrity` lands, map it here: `EngineError::Integrity { .. } => W::Integrity,`
+        // The prune's index verification refused (ipc.md §36 decision 10): nothing was deleted.
+        EngineError::Integrity { .. } => W::Integrity,
         EngineError::SnapshotNotFound(_) => W::SnapshotNotFound,
         // Only the source itself failing to open is fatal to a backup; unreadable entries below it
         // are counted (ipc.md §28).
@@ -535,10 +536,8 @@ fn forget_prune(ctx: &Ctx<'_>, spec: &pb::ForgetPruneSpec) -> Result<pb::JobResu
         }
     }
     engine.delete_snapshots(&ids, &ctx.cancel)?;
-    // Q-S1 (docs/ipc.md §36, open): a step that makes prune safe against removed or forged indexes
-    // belongs HERE, before `prune`: for example `repair index`, or a check that no pack is dropped
-    // that is unreferenced only because an index is missing. `Engine::prune` is deliberately called
-    // as it is until that is decided.
+    // `Engine::prune` verifies the index before it deletes anything (docs/ipc.md §36 decision 10) and
+    // fails with `EngineError::Integrity`, mapped to `WorkerError::INTEGRITY` by `classify`.
     engine.prune(&ctx.cancel)?;
     Ok(success())
 }

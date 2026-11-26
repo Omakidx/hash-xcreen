@@ -39,8 +39,7 @@ thiserror.workspace = true
 tracing = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }
 # The index trust checks (engine/integrity.rs) decrypt, decompress and hash blobs that are stored in
-# more than one pack with the primitives rustic_core uses (all already in the lock file).
-bytes = { workspace = true, optional = true }
+# more than one pack with the primitives rustic_core uses (all already in the lock file; `bytes` above).
 aes256ctr_poly1305aes = { version = "0.2.1", features = ["std"], optional = true }
 sha2 = { version = "0.10", optional = true }
 zstd = { version = "0.14.3", optional = true }

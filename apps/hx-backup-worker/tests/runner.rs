@@ -355,6 +355,48 @@ fn forget_prune_removes_exactly_the_named_snapshots_and_is_idempotent() {
 }
 
 #[test]
+fn a_prune_refused_by_the_index_verification_is_integrity_and_removes_no_pack() {
+    use sha2::{Digest, Sha256};
+    let env = Env::new();
+    make_tree(&env.src());
+    env.init();
+    let first = env.backup();
+    write(
+        &env.src().join("home/user/new.bin"),
+        &noise(11, 600_000),
+        0o644,
+    );
+    let second = env.backup();
+
+    // A pack with no readable header, as a compromised BACKUP worker may upload (its id is the
+    // SHA-256 of its bytes, so privd's write check accepts it). After the header rebuild it is in
+    // no index, so the prune must refuse before deleting anything (docs/ipc.md §36 decision 10).
+    let junk = noise(12, 4096);
+    let id = Sha256::digest(&junk).to_vec();
+    let packs_before = {
+        let mut st = env.store.lock().unwrap();
+        st.objects.insert((T::Pack as i32, id), junk);
+        st.ids(T::Pack)
+    };
+
+    let out = run_failing(
+        forget_job(&[first.snapshot_id.to_vec()]),
+        &env.store,
+        &env.cfg(),
+        pb::WorkerError::Integrity,
+    );
+    assert!(out.denied.is_empty(), "denied: {:?}", out.denied);
+    let st = env.store.lock().unwrap();
+    assert_eq!(st.ids(T::Pack), packs_before, "a pack was removed");
+    assert_eq!(
+        st.count(T::Snapshot),
+        1,
+        "only the named snapshot is forgotten"
+    );
+    assert_eq!(st.ids(T::Snapshot), vec![second.snapshot_id.to_vec()]);
+}
+
+#[test]
 fn a_listing_in_small_pages_and_pings_in_the_middle_of_a_job() {
     let env = Env::new();
     make_tree(&env.src());
