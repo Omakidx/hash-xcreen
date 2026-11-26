@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use gateway_common::setup::*;
 use gateway_common::{PIN, new_key, within};
+use hx_agent::privd::clock::Clock as _;
 use hx_crypto::server_admin::ServerAdmin;
 use hx_crypto::setup::Password;
 use hx_crypto::{IdentityKey, Pin};
@@ -111,6 +112,55 @@ async fn the_overview_reports_the_server_the_desktop_and_the_host() {
     assert!(o.privd_version.len() <= 64);
     // Nothing to report as the attention list of a fresh server.
     assert!(o.host_attention.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_overview_carries_live_usage_of_a_running_desktop_and_omits_what_is_unknown() {
+    let (e, phone, _) = env().await;
+    let started = e.h.clock.unix_secs() - 3600;
+    let set = |cpu_s: u64, running: bool| {
+        e.h.incus.with(|s| {
+            let i = s.instances.get_mut("hx-main").unwrap();
+            i.status = if running { "Running" } else { "Stopped" }.into();
+            i.last_used_at = hx_agent::privd::timefmt::rfc3339(started);
+            // No disk entry: a driver without usage accounting.
+            i.state_extra = serde_json::json!({
+                "cpu": {"usage": cpu_s * 1_000_000_000},
+                "memory": {"usage": 1536u64 << 20},
+            });
+        });
+    };
+    let mut a = mgmt(&e, &phone, PIN).await;
+    set(50, true);
+    let u = within(a.overview())
+        .await
+        .unwrap()
+        .desktop
+        .unwrap()
+        .usage
+        .expect("usage of a running desktop");
+    assert_eq!(u.cpu_percent, None, "the first sample has no rate");
+    assert_eq!(u.memory_used_mib, Some(1536));
+    assert_eq!(u.disk_used_mib, None, "the driver reports no disk usage");
+    assert_eq!(u.uptime_s, Some(3600));
+
+    // limits.cpu is 2: 4 CPU-seconds over 4 s on 2 cores is 50 %.
+    e.h.clock.advance_secs(4);
+    set(54, true);
+    let u = within(a.overview())
+        .await
+        .unwrap()
+        .desktop
+        .unwrap()
+        .usage
+        .unwrap();
+    assert_eq!(u.cpu_percent, Some(50));
+    assert_eq!(u.uptime_s, Some(3604));
+
+    set(54, false);
+    let d = within(a.overview()).await.unwrap().desktop.unwrap();
+    assert_eq!(d.state, pb::ServerDesktopState::Stopped as i32);
+    assert!(d.usage.is_none(), "a stopped desktop has no usage");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

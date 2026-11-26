@@ -158,6 +158,8 @@ pub struct Daemon<T: Transport + Clone + 'static> {
     suppressed: std::sync::atomic::AtomicU64,
     /// `(unix ms, docker_on_host, host_firewall_loaded)` of the last host probe.
     pub(crate) host_probe: Mutex<Option<(u64, bool, bool)>>,
+    /// The last CPU sample of each desktop, for the CPU percent of `GetDesktop`.
+    pub(crate) cpu_samples: Mutex<super::usage::CpuTracker>,
     /// The collaborators of self-update (keys, systemd, health probes); replaceable in tests.
     update_deps: Mutex<Arc<UpdateDeps>>,
     /// The collaborators of the prebuilt-image path (keys, systemd); replaceable in tests.
@@ -240,6 +242,7 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
             conns: Arc::new(ConnCounter::default()),
             suppressed: std::sync::atomic::AtomicU64::new(0),
             host_probe: Mutex::new(None),
+            cpu_samples: Mutex::new(super::usage::CpuTracker::default()),
             update_deps: Mutex::new(Arc::new(update_deps)),
             image_deps: Mutex::new(Arc::new(image_deps)),
             image_state_gate: Mutex::new(()),

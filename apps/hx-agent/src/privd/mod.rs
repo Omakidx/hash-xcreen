@@ -42,6 +42,7 @@ pub mod server;
 pub mod state;
 pub mod timefmt;
 pub mod update;
+pub mod usage;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;

@@ -171,6 +171,8 @@ The user clicks **Back up now**; progress shows on the timeline.
 
 **Server details → Desktop**:
 
+- **Overview** of the running desktop shows live **CPU** (percent of its allowance), **Memory** (used of its limit), **Disk** (used of its limit, or of the storage pool when unlimited) and **Uptime** (since its last start), refreshed with the overview. A number the server cannot know (a stopped desktop, a storage driver without disk usage, the first CPU reading, an older agent) is left out, not shown as zero.
+
 - **Docker** switch: turning it on shows the isolation warning, then restarts the desktop with Docker installed. Backup mode *(Phase 2)*: **Complete** (default) or **Light**.
 - Resource limits; **Restart desktop**; **Update agent** (also automatic on the chosen channel).
 

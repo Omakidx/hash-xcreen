@@ -105,6 +105,13 @@ fn every_request_and_answer_roundtrips_and_validates() {
                     username: "alice".into(),
                     limits: Some(limits()),
                     needs_attention: vec![pb::ServerAttention::PinLocked as i32],
+                    // A present zero and an absent number stay different on the wire.
+                    usage: Some(pb::ServerDesktopUsage {
+                        cpu_percent: Some(0),
+                        memory_used_mib: Some(1536),
+                        disk_used_mib: None,
+                        uptime_s: Some(90),
+                    }),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -318,6 +325,12 @@ fn the_largest_overview_stays_below_the_control_message_limit() {
                 docker: 3,
                 needs_attention: vec![7; 8],
                 created_unix: u64::MAX,
+                usage: Some(pb::ServerDesktopUsage {
+                    cpu_percent: Some(u32::MAX),
+                    memory_used_mib: Some(u64::MAX),
+                    disk_used_mib: Some(u64::MAX),
+                    uptime_s: Some(u64::MAX),
+                }),
             }),
             host: Some(pb::SetupHostFacts {
                 cpu_count: u32::MAX,
