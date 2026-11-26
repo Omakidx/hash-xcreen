@@ -23,10 +23,14 @@ engine = [
     "dep:aes256ctr_poly1305aes",
     "dep:sha2",
     "dep:zstd",
+    "dep:hx-ipc",
 ]
 
 [dependencies]
 rustic_core = { workspace = true, optional = true }
+# The link backend (`engine::link`) speaks the repository link of ipc.md Part 3 to hx-privd.
+bytes = { workspace = true, optional = true }
+hx-ipc = { workspace = true, features = ["repo"], optional = true }
 jiff = { version = "0.2", default-features = false, features = ["std"] }
 globset.workspace = true
 serde = { version = "1", features = ["derive"] }

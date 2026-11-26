@@ -26,7 +26,9 @@
 //! password as a `String`, so a copy of it lives inside rustic for as long as the repository is
 //! open and is not wiped by this crate.
 
+mod delete;
 mod integrity;
+pub mod link;
 mod progress;
 mod scan;
 
@@ -49,8 +51,9 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::manifest::{Manifest, ManifestError, ManifestInput, restorable_container_config};
 use crate::rules::{self, ResolvedRules, RuleSet, RulesError};
 
+pub use link::{BackendFault, JobStart, Link, LinkBackend, LinkFailure, LinkOptions};
 pub use progress::{CancelToken, NullSink, Phase, ProgressEvent, ProgressSink, ProgressUnit};
-pub use rustic_core::{ReadBackend, RepositoryBackends, WriteBackend};
+pub use rustic_core::{FileType, ReadBackend, RepositoryBackends, WriteBackend};
 
 pub use integrity::DUPLICATE_VERIFY_FLOOR_BYTES;
 use integrity::IndexGuard;
