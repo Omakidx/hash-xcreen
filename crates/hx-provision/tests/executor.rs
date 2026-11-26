@@ -438,7 +438,7 @@ fn user_commands_run_through_runuser_with_a_home_directory() {
     let cmd = p
         .post
         .iter()
-        .find(|s| matches!(s, Step::Command(c) if c.as_user.is_some()))
+        .find(|s| matches!(s, Step::Command(c) if c.as_user.is_some() && c.optional))
         .unwrap();
     let Action::Exec(r) = &lower(cmd, &Secrets::none()).unwrap()[0] else {
         panic!()
