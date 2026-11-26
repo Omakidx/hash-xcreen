@@ -1779,9 +1779,256 @@ fn m1_headers_that_stay_unreadable_refuse_the_prune_and_keep_the_old_index() {
         .repository()
         .list(FileType::Index)
         .unwrap();
-    for id in &index_before {
-        assert!(index_after.contains(id), "old index file {id:?} removed");
-    }
+    let mut a = index_before.clone();
+    let mut b = index_after.clone();
+    a.sort();
+    b.sort();
+    assert_eq!(
+        a, b,
+        "the old index files stay and the files the rebuild wrote are removed"
+    );
     assert_eq!(n_files(&fx, FileType::Pack), packs_before);
     assert!(all_restore(&fx, &fx.snaps));
+}
+
+// ---------------------------------------------------------------------------------------------
+// The invariant behind the duplicate verification (second review of Q-S1)
+// ---------------------------------------------------------------------------------------------
+
+fn unhex(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+/// One pack header entry (rustic's binary form) for blob `b` (an index JSON entry) stored `len`
+/// bytes long; compressed blobs keep their declared uncompressed length.
+fn header_entry(b: &Value, len: u32) -> Vec<u8> {
+    let tree = b["type"] == "tree";
+    let mut e = Vec::new();
+    match b.get("uncompressed_length").and_then(Value::as_u64) {
+        Some(u) => {
+            e.push(if tree { 3 } else { 2 });
+            e.extend_from_slice(&len.to_le_bytes());
+            e.extend_from_slice(&u32::try_from(u).unwrap().to_le_bytes());
+        }
+        None => {
+            e.push(if tree { 1 } else { 0 });
+            e.extend_from_slice(&len.to_le_bytes());
+        }
+    }
+    e.extend_from_slice(&unhex(b["id"].as_str().unwrap()));
+    e
+}
+
+/// What a forged pack lists for each blob of the real pack it imitates.
+#[derive(Clone, Copy, Debug)]
+enum Layout {
+    /// A byte-exact copy of the real ciphertext: it verifies.
+    Good,
+    /// 64 bytes of junk.
+    Junk,
+    /// The same blob twice in one pack, the good copy first.
+    GoodThenJunk,
+    /// The same blob twice in one pack, the junk first.
+    JunkThenGood,
+}
+
+/// A pack with `layout` for every blob of `target`, a filler blob so that its id can be varied, and
+/// an id that sorts after (or before) the real pack's. Returns its id.
+fn forged_pack(a: &Attacker, target: &Value, layout: Layout, after_real: bool) -> Id {
+    let b_id: Id = target["id"].as_str().unwrap().parse().unwrap();
+    let raw = a.read(FileType::Pack, &b_id);
+    for seed in 1_u64.. {
+        let mut body = Vec::new();
+        let mut header = Vec::new();
+        for b in target["blobs"].as_array().unwrap() {
+            let off = b["offset"].as_u64().unwrap() as usize;
+            let len = b["length"].as_u64().unwrap() as usize;
+            let good = |body: &mut Vec<u8>, header: &mut Vec<u8>| {
+                body.extend_from_slice(&raw[off..off + len]);
+                header.extend(header_entry(b, u32::try_from(len).unwrap()));
+            };
+            let junk = |body: &mut Vec<u8>, header: &mut Vec<u8>| {
+                body.extend_from_slice(&noise(seed * 7919 + off as u64, 64));
+                header.extend(header_entry(b, 64));
+            };
+            match layout {
+                Layout::Good => good(&mut body, &mut header),
+                Layout::Junk => junk(&mut body, &mut header),
+                Layout::GoodThenJunk => {
+                    good(&mut body, &mut header);
+                    junk(&mut body, &mut header);
+                }
+                Layout::JunkThenGood => {
+                    junk(&mut body, &mut header);
+                    good(&mut body, &mut header);
+                }
+            }
+        }
+        // A filler blob (a fake id) gives every seed another pack id.
+        body.extend_from_slice(&noise(seed, 64));
+        header.push(0);
+        header.extend_from_slice(&64_u32.to_le_bytes());
+        header.extend_from_slice(&Sha256::digest(format!("filler{seed}")));
+        let enc = a.encrypt(&header);
+        body.extend_from_slice(&enc);
+        body.extend_from_slice(&u32::try_from(enc.len()).unwrap().to_le_bytes());
+        let gt = id_of(&body).to_hex().as_str() > b_id.to_hex().as_str();
+        if gt == after_real {
+            return a.put(FileType::Pack, body);
+        }
+    }
+    unreachable!()
+}
+
+/// The smallest real data pack (its blobs are all needed by a snapshot that stays).
+fn smallest_data_pack(a: &Attacker) -> Value {
+    a.data_entries()
+        .into_iter()
+        .min_by_key(|e| {
+            e["blobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|b| b["length"].as_u64().unwrap())
+                .sum::<u64>()
+        })
+        .unwrap()
+}
+
+/// After a refused prune the real packs are all there; with the attacker's packs removed and the
+/// index rebuilt, everything restores.
+fn assert_refused_and_recoverable(
+    fx: &Fx,
+    real_packs: &[Id],
+    r: Result<(), EngineError>,
+    what: &str,
+) {
+    assert!(
+        matches!(r, Err(EngineError::Integrity { .. })),
+        "{what}: expected Integrity, got {r:?}"
+    );
+    let be = raw_backends(fx.repo.path()).repository();
+    let now = be.list(FileType::Pack).unwrap();
+    for p in real_packs {
+        assert!(
+            now.contains(p),
+            "{what}: real pack {} was removed",
+            p.to_hex().as_str()
+        );
+    }
+    for id in &now {
+        if fx.decoys.contains(&id.to_hex().as_str().to_owned()) {
+            be.remove(FileType::Pack, id, false).unwrap();
+        }
+    }
+    rustic_repo(be)
+        .repair_index(&RepairIndexOptions::default().read_all(true), false)
+        .unwrap();
+    assert!(
+        all_restore(fx, &fx.snaps[2..]),
+        "{what}: restores after recovery"
+    );
+}
+
+/// The invariant, generically: whatever a decoy pack lists for a real pack's blobs (a good copy and
+/// junk in one pack or in two, junk first or last, ids sorting either way), the prune ends in
+/// `Integrity` and removes no real pack.
+#[test]
+fn xs_adversarial_duplicate_layouts_never_remove_a_real_pack() {
+    for (name, layouts) in [
+        ("good-then-junk", vec![Layout::GoodThenJunk]),
+        ("junk-then-good", vec![Layout::JunkThenGood]),
+        (
+            "good copy in one pack, junk in another",
+            vec![Layout::Good, Layout::Junk],
+        ),
+    ] {
+        for after_real in [true, false] {
+            let mut fx = fixture();
+            forget_oldest_two(&fx);
+            let a = Attacker::new(fx.repo.path());
+            let target = smallest_data_pack(&a);
+            let real: Vec<Id> = a.list(FileType::Pack);
+            for l in &layouts {
+                let _ = forged_pack(&a, &target, *l, after_real);
+            }
+            a.assert_in_policy();
+            fx.decoys = a.written.lock().unwrap().clone();
+            drop(a);
+            let r = open_raw(fx.repo.path())
+                .prune(&CancelToken::new())
+                .map(|_| ());
+            assert_refused_and_recoverable(
+                &fx,
+                &real,
+                r,
+                &format!("{name}, after_real={after_real}"),
+            );
+        }
+    }
+}
+
+/// XS1 of the second review: a decoy that lists each blob of a real pack twice (a verbatim copy
+/// first, then junk) with an id after the real pack's, next to a big pack so that the plan keeps
+/// the decoy. One verified copy per pack used to be enough to let the real pack be deleted.
+#[test]
+fn xs1_same_pack_duplicate_hides_junk_behind_a_verified_copy() {
+    let mut fx = fixture();
+    let src = tempfile::tempdir().unwrap();
+    fs::create_dir_all(src.path().join("big")).unwrap();
+    fs::write(src.path().join("big/f"), noise(999, 24 << 20)).unwrap();
+    open_raw(fx.repo.path())
+        .backup(
+            &request(src.path(), "2026-01-05T00:00:00Z"),
+            &CancelToken::new(),
+        )
+        .unwrap();
+    forget_oldest_two(&fx);
+    let a = Attacker::new(fx.repo.path());
+    let target = smallest_data_pack(&a);
+    let real: Vec<Id> = a.list(FileType::Pack);
+    let _ = forged_pack(&a, &target, Layout::GoodThenJunk, true);
+    a.assert_in_policy();
+    fx.decoys = a.written.lock().unwrap().clone();
+    drop(a);
+    let r = open_raw(fx.repo.path())
+        .prune(&CancelToken::new())
+        .map(|_| ());
+    assert_refused_and_recoverable(&fx, &real, r, "xs1");
+}
+
+/// M3: a decoy copy whose plaintext is a zstd bomb (a few KB that expand to 128 MiB) while the
+/// header declares 100 bytes must be refused without expanding it.
+#[test]
+fn m3_a_zstd_bomb_copy_is_refused_by_its_declared_length() {
+    let mut fx = fixture();
+    let a = Attacker::new(fx.repo.path());
+    let target = smallest_data_pack(&a);
+    let blob = target["blobs"][0].clone();
+    let bomb = zstd::bulk::compress(&vec![0_u8; 128 << 20], 3).unwrap();
+    assert!(bomb.len() < 1 << 20);
+    let ct = a.encrypt(&bomb);
+    let mut b = blob.clone();
+    b["uncompressed_length"] = json!(100);
+    let mut header = header_entry(&b, u32::try_from(ct.len()).unwrap());
+    // header_entry writes the declared length of `b`; make it a compressed data entry.
+    assert_eq!(header[0], 2);
+    header.shrink_to_fit();
+    let mut body = ct.clone();
+    let enc = a.encrypt(&header);
+    body.extend_from_slice(&enc);
+    body.extend_from_slice(&u32::try_from(enc.len()).unwrap().to_le_bytes());
+    let _ = a.put(FileType::Pack, body);
+    a.assert_in_policy();
+    fx.decoys = a.written.lock().unwrap().clone();
+    drop(a);
+    let started = std::time::Instant::now();
+    let r = open_raw(fx.repo.path())
+        .prune(&CancelToken::new())
+        .map(|_| ());
+    assert!(matches!(r, Err(EngineError::Integrity { .. })), "{r:?}");
+    assert!(started.elapsed().as_secs() < 60);
 }

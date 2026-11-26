@@ -52,8 +52,8 @@ use crate::rules::{self, ResolvedRules, RuleSet, RulesError};
 pub use progress::{CancelToken, NullSink, Phase, ProgressEvent, ProgressSink, ProgressUnit};
 pub use rustic_core::{ReadBackend, RepositoryBackends, WriteBackend};
 
+pub use integrity::DUPLICATE_VERIFY_FLOOR_BYTES;
 use integrity::IndexGuard;
-pub use integrity::MAX_DUPLICATE_VERIFY_BYTES;
 use progress::{Bars, Shared};
 
 /// zstd level used for new repositories (architecture 9.4: level 9 cost about 70% more CPU for
@@ -1128,8 +1128,9 @@ impl Engine {
     ///    files were written or removed, and a kill in between loses nothing;
     /// 3. refuses if a pack file is in no index (an unreadable pack would be deleted as
     ///    unreferenced);
-    /// 4. reads every copy of every blob that is stored in more than one pack (ranged reads of
-    ///    those blobs only) and refuses unless each decrypts, decompresses and hashes to its blob id.
+    /// 4. refuses if a pack lists a blob id twice (the packer never writes that), then reads every
+    ///    index entry of every blob that has more than one (ranged reads of those blobs only) and
+    ///    refuses unless each decrypts, decompresses to its declared length and hashes to the blob id.
     ///    A decoy has to list real blobs to win over a real pack, so it always shows up here, and
     ///    only a copy that verifies passes. `check --read-data` cannot settle it: it reads only the
     ///    one copy per blob that the index lookup picks, while prune keeps the copy in the pack with
@@ -1137,7 +1138,8 @@ impl Engine {
     ///    packs) verify and are harmless; the prune then removes the extra copies.
     ///
     /// The cost is one header read per pack and one listing, plus a read of the duplicated blobs
-    /// (at most [`MAX_DUPLICATE_VERIFY_BYTES`], else the prune is refused) and about 100 bytes of
+    /// (at most the larger of [`DUPLICATE_VERIFY_FLOOR_BYTES`] and a quarter of the pack bytes, else
+    /// the prune is refused) and about 100 bytes of
     /// memory per blob while the index is scanned. The repository format does not change.
     ///
     /// # Errors

@@ -7,9 +7,14 @@
 //!   the new index before the old ones go (a kill or a read error in between leaves the old index).
 //! * [`Engine::prepare_index`] finds index files that cannot be read and hides or removes them.
 //! * [`Engine::rebuild_index_from_headers`] is `repair index --read-all-packs` with that order.
-//! * [`Engine::verify_index_before_prune`] adds the checks that make prune safe: every pack file is
-//!   in an index, and every copy of a blob that is stored in more than one pack decrypts, decompresses
-//!   and hashes to its id.
+//! * [`Engine::verify_index_before_prune`] adds the checks that make prune safe.
+//!
+//! **Invariant** established before a prune plans: after the rebuild, every pack file is in an
+//! index; no pack lists a blob id twice (rustic's packer never writes that); and every index entry
+//! of every blob that has more than one entry decrypts, decompresses to its declared length and
+//! hashes to the blob id. rustic's prune keeps the copy in the pack processed last and its index
+//! lookup picks any entry, so a decoy can only win if it shares a blob id with a real pack; the
+//! invariant leaves a decoy no entry that is not a faithful copy.
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
@@ -29,9 +34,15 @@ use zeroize::Zeroizing;
 
 use super::{CancelToken, Engine, EngineError, Phase, rustic};
 
-/// The most duplicated blob data a prune reads to verify, in bytes (all copies together). Beyond it
-/// the prune is refused: a repository with that much duplication needs an operator.
-pub const MAX_DUPLICATE_VERIFY_BYTES: u64 = 2 << 30;
+/// The least duplicated blob data a prune is willing to read to verify, in bytes (all copies
+/// together). The limit is the larger of this and a quarter of the bytes of all pack files; beyond it
+/// the prune is refused, because a repository with that much duplication needs an operator.
+pub const DUPLICATE_VERIFY_FLOOR_BYTES: u64 = 2 << 30;
+
+/// Largest blob (stored or decompressed) and largest index file the engine will decompress while
+/// verifying. rustic's chunker produces blobs of a few MiB at most.
+const MAX_BLOB_BYTES: u64 = 64 << 20;
+const MAX_INDEX_FILE_BYTES: u64 = 256 << 20;
 
 /// Longest single ranged read when verifying duplicates.
 const MAX_RUN_BYTES: u64 = 8 << 20;
@@ -176,16 +187,63 @@ fn copy_verifies(key: &[u8; 64], bytes: &[u8], id: &Id, uncompressed: Option<Non
         return false;
     };
     let plain = match uncompressed {
-        Some(n) => match zstd::stream::decode_all(&plain[..]) {
-            Ok(d) if d.len() == n.get() as usize => d,
-            _ => return false,
-        },
+        // The output is bounded by the declared length, itself bounded: a zstd bomb cannot grow.
+        Some(n) if u64::from(n.get()) <= MAX_BLOB_BYTES => {
+            match zstd::bulk::decompress(&plain, n.get() as usize) {
+                Ok(d) if d.len() == n.get() as usize => d,
+                _ => return false,
+            }
+        }
+        Some(_) => return false,
         None => plain,
     };
     hex(&Sha256::digest(&plain)) == id.to_hex().as_str()
 }
 
+/// Can `bytes` (an index file as the backend returned it) be decrypted and parsed? The same rules
+/// as rustic's loading: decrypt, then plain JSON or a `2` byte followed by zstd; the decompressed
+/// size is bounded.
+fn index_file_readable(key: &[u8; 64], bytes: &[u8]) -> bool {
+    use std::io::Read as _;
+    if bytes.len() < 32 {
+        return false;
+    }
+    let cipher = Aes256CtrPoly1305Aes::new(GenericArray::from_slice(key));
+    let Ok(plain) = cipher.decrypt(GenericArray::from_slice(&bytes[..16]), &bytes[16..]) else {
+        return false;
+    };
+    let json = match plain.first() {
+        Some(b'{' | b'[') => plain,
+        Some(2) => {
+            let Ok(dec) = zstd::stream::read::Decoder::new(&plain[1..]) else {
+                return false;
+            };
+            let mut out = Vec::new();
+            if dec
+                .take(MAX_INDEX_FILE_BYTES + 1)
+                .read_to_end(&mut out)
+                .is_err()
+                || out.len() as u64 > MAX_INDEX_FILE_BYTES
+            {
+                return false;
+            }
+            out
+        }
+        _ => return false,
+    };
+    serde_json::from_slice::<IndexFile>(&json).is_ok()
+}
+
 impl Engine {
+    fn cipher_key(&self) -> Result<Zeroizing<[u8; 64]>, EngineError> {
+        let m = self.repo()?.key();
+        let mut key = Zeroizing::new([0u8; 64]);
+        key[..32].copy_from_slice(&m.encrypt);
+        key[32..48].copy_from_slice(&m.mac.k);
+        key[48..].copy_from_slice(&m.mac.r);
+        Ok(key)
+    }
+
     /// Find index files that cannot be read although the backend returns them (junk written by a
     /// compromised worker, or damage), and either remove them (`remove`: jobs that may write; they
     /// hold no data, the pack headers hold everything) or leave them out of every listing (read-only
@@ -204,17 +262,19 @@ impl Engine {
             .list::<IndexId>()
             .map_err(rustic("listing index files"))?
             .collect();
+        let key = self.cipher_key()?;
         let mut bad = Vec::new();
         for id in ids {
-            if repo.get_file::<IndexFile>(&id).is_ok() {
-                continue;
-            }
             let raw = id.into_inner();
-            self.guard
+            // One read: a backend error is an error, the bytes that came back are judged.
+            let bytes = self
+                .guard
                 .inner
                 .read_full(FileType::Index, &raw)
                 .map_err(rustic("reading an index file"))?;
-            bad.push(raw);
+            if !index_file_readable(&key, &bytes) {
+                bad.push(raw);
+            }
         }
         if remove {
             for id in &bad {
@@ -262,10 +322,36 @@ impl Engine {
 
     /// `repair index` for a backup (packs of an interrupted run become part of the index), with the
     /// old index files removed only after the new one is written.
+    ///
+    /// The replaced files are removed only if the index that remains covers every pack file (a pack
+    /// whose header cannot be read keeps the old index that lists it).
     pub(super) fn repair_index_for_backup(&self) -> Result<(), EngineError> {
         self.prepare_index(true)?;
         let (deferred, written) = self.repair_pass(false)?;
-        self.remove_replaced(&deferred, &written)
+        let replaced: HashSet<Id> = deferred
+            .iter()
+            .filter(|i| !written.contains(*i))
+            .copied()
+            .collect();
+        if self.covers_all_packs_without(&replaced)? {
+            self.remove_replaced(&deferred, &written)
+        } else {
+            tracing::warn!("a pack has no readable header: the old index files are kept");
+            Ok(())
+        }
+    }
+
+    /// Would the index files that exist, except `replaced`, list every pack file?
+    fn covers_all_packs_without(&self, replaced: &HashSet<Id>) -> Result<bool, EngineError> {
+        let keep: HashSet<Id> = self
+            .repo()?
+            .list::<IndexId>()
+            .map_err(rustic("listing index files"))?
+            .map(IndexId::into_inner)
+            .filter(|i| !replaced.contains(i))
+            .collect();
+        let covered = self.packs_in(&keep)?;
+        Ok(self.pack_ids_on_disk()?.is_subset(&covered))
     }
 
     fn pack_ids_on_disk(&self) -> Result<HashSet<PackId>, EngineError> {
@@ -300,23 +386,40 @@ impl Engine {
     /// removed and the prune is refused.
     fn rebuild_index_from_headers(&self, cancel: &CancelToken) -> Result<(), EngineError> {
         self.shared.set_phase(Phase::RepairIndex);
-        let mut all_deferred = Vec::new();
-        let mut missing = None;
+        let mut all_deferred: Vec<Id> = Vec::new();
+        let mut all_written: HashSet<Id> = HashSet::new();
         for _ in 0..2 {
             let (deferred, written) = self.repair_pass(true)?;
             all_deferred.extend(deferred);
-            let covered = self.packs_in(&written)?;
-            let on_disk = self.pack_ids_on_disk()?;
-            missing = on_disk.difference(&covered).next().copied();
-            if missing.is_none() {
-                self.remove_replaced(&all_deferred, &written)?;
+            all_written.extend(written.iter().copied());
+            let replaced: HashSet<Id> = all_deferred
+                .iter()
+                .filter(|i| !written.contains(*i))
+                .copied()
+                .collect();
+            if self.covers_all_packs_without(&replaced)? {
                 // Files written by a first pass that a second one replaced are in `all_deferred`.
-                return Ok(());
+                return self.remove_replaced(&all_deferred, &written);
             }
             cancel.check()?;
         }
-        // Give up: the old index files stay, and so do the files this call wrote (they are valid).
-        let pack = missing.map_or_else(String::new, |p| p.to_hex().as_str().to_owned());
+        // Give up: the old index files stay, and the files this call wrote are removed again.
+        for id in &all_written {
+            let _ = self.guard.inner.remove(FileType::Index, id, false);
+        }
+        let on_disk = self.pack_ids_on_disk()?;
+        let listed = self.packs_in(
+            &self
+                .repo()?
+                .list::<IndexId>()
+                .map_err(rustic("listing index files"))?
+                .map(IndexId::into_inner)
+                .collect(),
+        )?;
+        let pack = on_disk
+            .difference(&listed)
+            .next()
+            .map_or_else(String::new, |p| p.to_hex().as_str().to_owned());
         Err(EngineError::Integrity {
             finding: format!("pack {pack} has no readable header and is in no index"),
         })
@@ -362,13 +465,22 @@ impl Engine {
                         }
                         std::collections::hash_map::Entry::Occupied(o) => {
                             let f = *o.get();
-                            if f.pack == c.pack {
-                                continue;
-                            }
+                            // Every entry of the blob is compared with every other: two entries
+                            // in one pack, wherever they come in the order, hide junk behind a
+                            // good copy (rustic's packer never writes a blob twice into a pack).
                             let list = dups.entry(b.id).or_insert_with(|| vec![f]);
-                            if list.iter().all(|x| x.pack != c.pack) {
-                                list.push(c);
+                            if let Some(x) = list.iter().find(|x| x.pack == c.pack) {
+                                if x.offset == c.offset && x.length == c.length {
+                                    continue; // the same entry from two index files
+                                }
+                                return Err(EngineError::Integrity {
+                                    finding: format!(
+                                        "pack {} lists a blob more than once",
+                                        c.pack.to_hex().as_str()
+                                    ),
+                                });
                             }
+                            list.push(c);
                         }
                     }
                 }
@@ -398,15 +510,33 @@ impl Engine {
         if dups.is_empty() {
             return Ok(());
         }
+        if dups
+            .values()
+            .flat_map(|v| v.iter())
+            .any(|c| u64::from(c.length) > MAX_BLOB_BYTES + 64)
+        {
+            return Err(EngineError::Integrity {
+                finding: "a pack lists a blob larger than any the engine writes".to_owned(),
+            });
+        }
         let total: u64 = dups
             .values()
             .flat_map(|v| v.iter())
             .map(|c| u64::from(c.length))
             .sum();
-        if total > MAX_DUPLICATE_VERIFY_BYTES {
+        let pack_bytes: u64 = self
+            .guard
+            .inner
+            .list_with_size(FileType::Pack)
+            .map_err(rustic("listing packs"))?
+            .iter()
+            .map(|(_, s)| u64::from(*s))
+            .sum();
+        let limit = DUPLICATE_VERIFY_FLOOR_BYTES.max(pack_bytes / 4);
+        if total > limit {
             return Err(EngineError::Integrity {
                 finding: format!(
-                    "{} blobs are stored in more than one pack ({total} bytes of copies, over the {MAX_DUPLICATE_VERIFY_BYTES} byte verification limit)",
+                    "{} blobs are stored in more than one pack ({total} bytes of copies, over the {limit} byte verification limit)",
                     dups.len()
                 ),
             });
@@ -417,11 +547,7 @@ impl Engine {
             "blobs are stored in more than one pack: verifying every copy"
         );
         self.shared.set_phase(Phase::ReadData);
-        let m = self.repo()?.key();
-        let mut key = Zeroizing::new([0u8; 64]);
-        key[..32].copy_from_slice(&m.encrypt);
-        key[32..48].copy_from_slice(&m.mac.k);
-        key[48..].copy_from_slice(&m.mac.r);
+        let key = self.cipher_key()?;
 
         let mut by_pack: HashMap<PackId, Vec<(Stored, BlobId)>> = HashMap::new();
         for (id, copies) in dups {
