@@ -1,1 +1,4 @@
-//! Full-desktop backups to Google Drive with rustic_core: scheduling, retention, verification.
+//! Full-desktop backups with rustic_core. See the crate README.
+
+pub mod manifest;
+pub mod rules;
