@@ -32,7 +32,9 @@
 //!             # let _ = f;
 //!         }
 //!         LinkEvent::Closed(why) => break println!("link ended: {:?}", why.class),
-//!         other => { # let _ = other; }
+//!         other => {
+//!             # let _ = other;
+//!         }
 //!     }
 //! }
 //! # Ok(()) }
