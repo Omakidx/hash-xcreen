@@ -12,7 +12,9 @@ nothing about Google Drive, Incus, HTTP or `hx-privd`; it is handed a rustic bac
 | `manifest` | The versioned, strictly parsed backup manifest stored with each snapshot. |
 | `engine` | `Engine`: open-or-init a repository, backup, restore (with resume), forget, prune, check, snapshot listing; progress sink and cancellation token; the zeroizing `RepoKey`. |
 
-`Engine::prune` does not believe the index: it first rebuilds it from the pack headers and refuses (`EngineError::Integrity`, nothing deleted) if a pack file is in no index or a blob is stored in two packs, because a compromised `BACKUP` worker can forge indexes that make `rustic_core`'s prune delete real packs (docs/ipc.md section 36, decision 10; `tests/prune_safety.rs`).
+`Engine::prune` does not believe the index: it first removes unreadable index files, rebuilds the index from the pack headers, and refuses (`EngineError::Integrity`, nothing deleted) if a pack file is in no index or a copy of a blob stored in two packs does not decrypt to its id, because a compromised `BACKUP` worker can forge indexes and decoy packs that make `rustic_core`'s prune delete real packs (docs/ipc.md section 36, decision 10; `tests/prune_safety.rs`).
+
+**Warning: `Engine::forget` must never be used for the `FORGET_PRUNE` job.** It takes the snapshots from the repository listing, and forged snapshots dated in the future can displace every real one from retention. That job deletes exactly the snapshot ids privd chose from its own record of successful backups.
 
 ## Features
 
