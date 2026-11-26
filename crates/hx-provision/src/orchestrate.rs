@@ -383,6 +383,20 @@ pub struct Limits {
 /// Default `limits.processes` of a desktop.
 pub const DEFAULT_PROCESSES: u32 = 8192;
 
+/// The instance config keys privd sets on a desktop itself (`DesktopSpec::to_create`). A restore
+/// target is built from exactly these, the Docker add-on's keys
+/// ([`crate::plan::ALLOWED_INSTANCE_CONFIG`]) and `user.hx.*`, and from nothing else (ipc.md 24).
+/// A test checks that `to_create` sets no key outside this list.
+pub const DESKTOP_CONFIG_KEYS: [&str; 7] = [
+    "security.privileged",
+    "security.guestapi",
+    "security.idmap.isolated",
+    "boot.autostart",
+    "limits.processes",
+    "limits.cpu",
+    "limits.memory",
+];
+
 /// A desktop container to create.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesktopSpec {

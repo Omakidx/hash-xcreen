@@ -30,6 +30,9 @@ pub struct ServerInfo {
     pub firewall: String,
     /// Host kernel version.
     pub kernel_version: String,
+    /// `environment.kernel_features`: feature name to `"true"` or `"false"` (for example
+    /// `idmapped_mounts`, which the backup helpers need, ipc.md 24).
+    pub kernel_features: BTreeMap<String, String>,
 }
 
 impl ServerInfo {
@@ -59,6 +62,15 @@ impl ServerInfo {
                 .unwrap_or_default(),
             firewall: s(env, "firewall"),
             kernel_version: s(env, "kernel_version"),
+            kernel_features: env
+                .get("kernel_features")
+                .and_then(Value::as_object)
+                .map(|o| {
+                    o.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default(),
         };
         if info.server_version.is_empty() {
             return Err(IncusError::Protocol(
@@ -166,6 +178,9 @@ pub struct Instance {
     /// Devices after profiles are applied.
     #[serde(default)]
     pub expanded_devices: BTreeMap<String, BTreeMap<String, String>>,
+    /// Configuration after profiles are applied.
+    #[serde(default)]
+    pub expanded_config: BTreeMap<String, String>,
     /// RFC 3339 time of the last start (Incus sets it at every start; epoch zero when never).
     #[serde(default)]
     pub last_used_at: String,
@@ -243,6 +258,15 @@ pub struct Snapshot {
     /// Whether it includes memory state.
     #[serde(default)]
     pub stateful: bool,
+    /// The instance the snapshot belongs to. Not part of the API object: filled in by
+    /// [`Client::list_snapshots`](super::Client::list_snapshots) with the instance it listed (or
+    /// the `instance/` prefix of the name when the daemon reports one), empty otherwise.
+    #[serde(default, skip)]
+    pub instance: String,
+    /// The instance configuration at the time of the snapshot (includes `volatile.*`, notably
+    /// `volatile.last_state.idmap`, which the backup guard reads).
+    #[serde(default)]
+    pub config: BTreeMap<String, String>,
 }
 
 /// An image in the local image store.

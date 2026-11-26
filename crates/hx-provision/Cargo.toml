@@ -24,6 +24,13 @@ http-body-util = { version = "0.1", features = ["channel"] }
 bytes = "1"
 zeroize.workspace = true
 
+[features]
+# Constructors that exist only for tests (an unchecked mount, a link in another directory). Enabled
+# for this crate's own tests through the self dev-dependency below; never by a production crate.
+test-support = []
+
 [dev-dependencies]
+# Tests always build with the test-only constructors, also in `cargo nextest run --workspace`.
+hx-provision = { path = ".", features = ["test-support"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync"] }
 hyper = { version = "1", features = ["http1", "client", "server"] }

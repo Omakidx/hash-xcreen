@@ -158,10 +158,61 @@ follow; `hx-gatewayd` and everything else unprivileged is never allowed to influ
 
 Every desktop gets `security.privileged=false`, `security.guestapi=false` (no `/dev/incus`
 socket), `security.idmap.isolated=true` and `limits.processes`. With isolated idmaps each
-desktop has its own uid/gid range on the host, so file-level backups taken from a snapshot see
-shifted ids and a restore into a *new* container (which gets a different range) needs the ids
-mapped back (restore through Incus, or `incus` import, which remaps; a plain file copy does not).
-Phase 2 backups must account for this.
+desktop has its own uid/gid range on the host. On Incus 6.0.0 the rootfs is nevertheless stored
+*unshifted* (mounted idmapped), so a backup helper that mounts a snapshot's `rootfs` with
+`shift=true` sees the container's own ids; see "Backup helper" below.
+
+## Backup helper (Phase 2, `incus::backup`)
+
+The Incus side of the per-job helper container of ipc.md 24, for `hx-privd` to call. Nothing in it
+takes a caller-chosen name, path, config key or device; privd is root, so every value is a constant
+or computed from a validated name (the way `SessionLink` is):
+
+- `JobId`, `PoolName`, `DesktopName` (`hx-<id>`), `BackupSnapshotName` (`hx-backup-...`),
+  `RestoreTargetName` (`hx-restore-...`) and `HelperName` (`hx-bkw-<8 hex>`) are the validated names;
+- `SnapshotMount::checked` (device `src`, read-only, `shift=true`, the snapshot's `rootfs`) and
+  `TargetMount::checked` (device `dst`, writable, `shift=true`) are the **only public way to get a
+  mount**: they run the checks before each job (idmapped mounts, btrfs, the desktop or target
+  identity and pool, `volatile.last_state.idmap` `[]`, that the snapshot belongs to the desktop,
+  and for a target that it is `Stopped` and never started) and derive every path from the objects
+  they were given. A failure is a `PreconditionFailed` that privd maps to `FAILED_PRECONDITION`;
+  `check_host_preconditions` is the host half, for failing early. `RepoLink` is the proxy device
+  (`repo`, host socket `/run/hx/backup/<job>.sock`, root, 0600; the `sun_path` limit is checked);
+- `BackupHelperSpec::{backup, restore, repository_only}` is the instance: the config table of
+  ipc.md 24, `ephemeral: true`, `source.type=none`, no profiles, a 256 MiB root disk, no NIC;
+- `RestoreTargetSpec::from_desktop` builds the never-started `init --empty` restore target from
+  the desktop's `get_instance` result **by allowlist** (the keys privd sets on desktops, the hx
+  profiles, the `root` disk; anything else is refused), marked `user.hx.kind=restore-target`,
+  `user.hx.job`, `user.hx.state=restoring`, `boot.autostart=false`;
+- on `Client`: `create_backup_helper` (reads the helper back and deletes it if it is not exactly the
+  spec), `populate_backup_helper`, `start_backup_helper`, `finish_backup_helper` (waits for the
+  ephemeral helper to be deleted, force-deletes after a timeout), `force_delete_backup_helper`,
+  `list_backup_helpers`, `create_restore_target` (read back the same way), `delete_restore_target`
+  and `list_restore_targets`. The helper calls take the `JobId` and require both the kind marker
+  and `user.hx.job`; the target calls require `user.hx.kind=restore-target`.
+- `RepoLink::in_dir` and the unchecked mount constructors exist only under the `test-support`
+  feature, which this crate's own tests enable through a self dev-dependency.
+
+`STORAGE_POOLS_ROOT` (`/var/lib/incus/storage-pools`) is an Incus internal, in one constant.
+
+**What privd still does itself:** remove `/run/hx/backup/<job>.sock` at the end of a job (Incus
+leaves it behind), create `/run/hx/backup` (root 0700), connect to the socket with retries, and
+keep the job record. The helper's socket is a plain byte pipe; no half-close (ipc.md 24).
+
+The storage paths assume Incus's `default` project. `tests/backup_helper.rs` tests all of this against a scripted daemon. `tests/incus_real_backup.rs`
+(`#[ignore]`, objects `hx2w-test-*`, `hx-restore-hx2wtest` and the two helpers `hx-bkw-7e57ba5e`
+and `hx-bkw-7e57ba5f`) repeats the ipc.md 24 probes against a real Incus: a source container with
+ids 1234:4321 and 1000:1000, a v2 file capability, a user xattr, a fifo and a readable
+`/etc/shadow`; the guard; a backup helper that reads them through `src` (and gets `EROFS` on a
+write); a restore into a never-started target whose ids, capability, xattr and fifo are checked
+inside the target after its first start; no NIC in the helper; automatic deletion after PID 1
+exits. The helper's PID 1 is a static fixture (`tests/fixtures/backup_probe.rs`, compiled by the
+test with `rustc -C target-feature=+crt-static`, so glibc's `libc.a` and `rustc` must be on the
+host). It needs a cached Debian 13 container image and uses its own 4 GiB btrfs loop pool:
+
+```text
+sg incus-admin -c 'cargo test -p hx-provision --test incus_real_backup -- --ignored --nocapture --test-threads=1'
+```
 
 ## Output handling
 
