@@ -147,6 +147,67 @@ fn worst_case_bodies_are_rejected_without_amplification() {
     assert!(r.is_err());
     assert!(peak <= SLACK, "admin: {peak}");
 
+    // The same elements split over many occurrences of the enclosing message. Protobuf merges
+    // repeated occurrences of a singular message field and concatenates their repeated fields,
+    // so the limits must hold over the sum, not per occurrence.
+    let merged = |label: &str, body: Vec<u8>, admin_socket: bool| {
+        assert!(body.len() <= 65_535, "{label}: {} bytes", body.len());
+        let raw = RawFrame {
+            kind: privd::KIND_MESSAGE,
+            body: BytesMut::from(&body[..]),
+        };
+        let (failed, peak) = if admin_socket {
+            let (r, p) = peak_during(|| admin::decode(raw, Side::Server));
+            (r.is_err(), p)
+        } else {
+            let (r, p) = peak_during(|| privd::decode(raw, Side::Server));
+            (r.is_err(), p)
+        };
+        assert!(failed, "{label}: accepted");
+        assert!(
+            peak <= SLACK,
+            "{label}: {peak} bytes for a {} byte body",
+            body.len()
+        );
+    };
+    // privd: `request` occurrences of 4 empty slots each (4 is the limit per request).
+    let four_slots = field(3, 2, &repeated(3, &[], 8));
+    merged(
+        "privd secret_slots over many requests",
+        four_slots.repeat(6_553),
+        false,
+    );
+    // Sensitivity: prost alone turns that body into tens of thousands of slots.
+    let body = four_slots.repeat(6_553);
+    let (_, unguarded) =
+        peak_during(|| privd::pb::Frame::decode(&body[..]).map(|f| f.encoded_len()));
+    assert!(
+        unguarded > 10 * body.len(),
+        "prost alone allocates {unguarded} for merged requests"
+    );
+    // privd: `request{setup_host{extra_host_addresses{16 empty addresses}}}` occurrences.
+    let sixteen = field(4, 2, &repeated(1, &[], 32));
+    let host = field(3, 2, &field(15, 2, &sixteen));
+    merged(
+        "extra_host_addresses over many requests",
+        host.repeat(65_000 / host.len()),
+        false,
+    );
+    // The same inside one request, over many `setup_host` occurrences.
+    let hosts = field(15, 2, &sixteen).repeat(60_000 / field(15, 2, &sixteen).len());
+    merged(
+        "extra_host_addresses over many setup_host",
+        field(3, 2, &hosts),
+        false,
+    );
+    // admin: `request` occurrences of one empty slot each.
+    let one_slot = field(3, 2, &field(3, 2, &[]));
+    merged(
+        "admin secret_slots over many requests",
+        one_slot.repeat(65_000 / one_slot.len()),
+        true,
+    );
+
     // link Info with ~320 KB of codecs, unpacked and packed.
     let p = LinkPolicy::new(Role::Gateway, Lane::Ctl);
     let unpacked: Vec<u8> = [0x18u8, 0x01].repeat(160_000);

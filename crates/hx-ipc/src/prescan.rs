@@ -130,14 +130,23 @@ fn too_many(what: &'static str) -> FrameError {
 
 /// privd `Frame`: `request`(3) holds `secret_slots`(3, at most `max_slots`) and, in
 /// `setup_host`(15), `extra_host_addresses`(4) with at most 16 `addresses`(1).
+///
+/// Every count is a **total over all occurrences** of the enclosing messages: protobuf merges
+/// repeated occurrences of a singular message field (`request`, `setup_host`,
+/// `extra_host_addresses`) and concatenates their repeated fields, so a per-occurrence check
+/// would let a body of many small occurrences decode to far more elements than the limit.
 #[cfg(feature = "privd")]
 pub(crate) fn check_privd_frame(frame_body: &[u8], max_slots: usize) -> Result<(), FrameError> {
+    let mut slots = 0usize;
+    let mut addresses = 0usize;
     each_sub(frame_body, 3, |req| {
-        if count(req, 3, false)? > max_slots {
+        slots = slots.saturating_add(count(req, 3, false)?);
+        if slots > max_slots {
             return Err(too_many("secret_slots: too many"));
         }
         each_sub(req, 15, |host| {
-            if count_in(host, 4, 1, false)? > 16 {
+            addresses = addresses.saturating_add(count_in(host, 4, 1, false)?);
+            if addresses > 16 {
                 return Err(too_many("setup_host.extra_host_addresses: too many"));
             }
             Ok(())
@@ -145,11 +154,14 @@ pub(crate) fn check_privd_frame(frame_body: &[u8], max_slots: usize) -> Result<(
     })
 }
 
-/// Admin `Frame`: `request`(3) holds `secret_slots`(3, at most `max_slots`).
+/// Admin `Frame`: `request`(3) holds `secret_slots`(3, at most `max_slots`), counted over all
+/// occurrences of `request` (see [`check_privd_frame`]).
 #[cfg(feature = "privd")]
 pub(crate) fn check_admin_frame(frame_body: &[u8], max_slots: usize) -> Result<(), FrameError> {
+    let mut slots = 0usize;
     each_sub(frame_body, 3, |req| {
-        if count(req, 3, false)? > max_slots {
+        slots = slots.saturating_add(count(req, 3, false)?);
+        if slots > max_slots {
             return Err(too_many("secret_slots: too many"));
         }
         Ok(())
