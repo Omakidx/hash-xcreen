@@ -49,7 +49,10 @@ Dependencies are pinned in the workspace `Cargo.toml`; `rustic_core` is pinned *
   backed up there).
 * **Resolution is safe.** It walks the mounted tree without ever following a symlink (a link can
   be excluded as a node, nothing behind it is read) and within an entry budget
-  (`DEFAULT_ENTRY_BUDGET`, 5 million).
+  (`DEFAULT_ENTRY_BUDGET`, 5 million). Running out of budget or hitting an unreadable directory
+  does not fail the backup: that discovery step is skipped (its paths stay in the backup) and
+  counted in `ResolvedRules::discovery_skipped()`. If the protected paths themselves cannot be
+  discovered, nothing is excluded at all, so the protected guarantees hold.
 * **Output.** `resolve()` returns `ResolvedRules`: the sorted, de-duplicated list of concrete
   excluded paths (nothing inside another entry), the concrete protected paths, and the rejected
   candidates. `rustic_globs(prefix)` turns them into literal, escaped `!`-prefixed override globs
@@ -80,8 +83,19 @@ snapshot; readable from a listing without fetching data; not a file in the resto
   `Engine::read_manifest` and `Engine::snapshots` fill it in when reading back.
 * `source_sizes` is measured by the engine before the backup (apparent sizes, hard links once);
   the exact figures of the run are in `BackupOutcome::summary`.
-* `container_config` is a subset; `restorable_container_config` keeps `limits.*`, `security.*`
-  and `boot.autostart*` and drops `volatile.*`, `image.*`, `user.*`, raw LXC.
+* `container_config` is an **explicit allow-list** (`config_entry_allowed`): `limits.cpu`,
+  `limits.memory`, `limits.processes` (a positive integer, never `unlimited`), `root.size`,
+  `boot.autostart`, `security.nesting`, `security.syscalls.intercept.mknod` and
+  `security.syscalls.intercept.setxattr` (`true`/`false`), each with a strict value grammar.
+  `restorable_container_config` drops everything else and counts it (never fatal);
+  `Manifest::new` applies it, and parsing rejects a manifest carrying anything else.
+  **A restore must still re-validate the manifest's configuration against its own policy and
+  never trust it:** the manifest is writable by anyone holding a repository key.
+* `docker_mode` comes from the backup rules (`rules.docker_mode()`, one source of truth);
+  `BackupRequest::docker_enabled` says whether Docker is in use at all.
+* `Distro::from_os_release` cleans values from the (untrusted) guest instead of failing: control
+  characters are removed, values are cut on a character boundary, and an unusable `PRETTY_NAME` is
+  dropped.
 * **Versioning rule.** `format_version` is read first. Each version has a strict parser
   (`deny_unknown_fields`). A new agent must always read older manifests (restore onto a newer
   agent, architecture 9.8 item 5): any field change bumps `CURRENT_FORMAT_VERSION`, the old
@@ -104,9 +118,15 @@ engine.snapshots() / engine.read_manifest(&SnapshotSelector)
 * **Backend-agnostic.** One `Arc<dyn WriteBackend>` through `open_with_backend` (or any
   `RepositoryBackends` through `open`). No local cache is ever used (`no_cache`), so the worker
   creates no directories.
-* **Repository settings at init.** zstd level 3, data packs capped at 64 MiB and tree packs at
-  16 MiB (`datapack_size_limit` / `treepack_size_limit`; rustic's own limit is `u32::MAX`), so
-  every object fits the 96 MiB cap of the link to the privileged side.
+* **Opening.** The default is `OpenMode::OpenExisting`; a repository is created only when the
+  caller asks for `OpenOrInit`, so a wrong location never becomes a silently new repository.
+* **Repository settings at init.** zstd level 3, `datapack_size_limit` 64 MiB and
+  `treepack_size_limit` 16 MiB (rustic's own limit is `u32::MAX`). These are **soft** limits:
+  rustic saves a pack once its size reaches the limit, so a pack can overshoot by about one blob,
+  and a single tree blob (a directory with a huge number of entries) is not bounded at all. They
+  keep packs near 64 MiB; they do not guarantee that every object fits the 96 MiB cap of the link
+  to the privileged side. The link must refuse an oversize object with a clear `TOO_LARGE` error
+  (follow-up for the link).
 * **Keys.** The repository is opened with a password credential (never a raw master key), so
   stock rustic/restic open it with the same passphrase. `add_key` adds a second key (the recovery
   key) and returns its `KeyId`; `remove_key` removes one by id (never the key in use).
@@ -116,25 +136,40 @@ engine.snapshots() / engine.read_manifest(&SnapshotSelector)
   and a backup after an interrupted run (index and snapshots lost, `repair index` runs) and
   asserts this. Forget removes `SNAPSHOT` files and prune removes/rewrites packs and indexes;
   those are separate operations.
-* **Key.** `RepoKey` zeroizes on drop, is not `Clone`, and prints `RepoKey(<redacted>)`. rustic
-  takes the password as a `String`, so one copy lives inside rustic while the repository is open
-  and is not wiped by this crate. A wrong key is `EngineError::WrongKey` and never triggers an
+* **Key.** `RepoKey` zeroizes on drop, is not `Clone`, and prints `RepoKey(<redacted>)`. The
+  `String` copy the engine builds for rustic is wiped as soon as the repository is open or
+  initialised; rustic keeps its own copy inside the open repository, which this crate cannot
+  wipe. A wrong key is `EngineError::WrongKey` and never triggers an
   init.
 * **Backup** = `repair index` first (architecture 9.4 step 0: an interrupted run's packs are
   reused, not uploaded again), resolve rules, measure the source, build the manifest, back up
   with the resolved excludes, zstd level 3 for new repositories. The source is stored as `/`.
+  The snapshot records the fixed command `hx-backup`, not the worker's argv.
+  **Partial runs.** rustic skips unreadable files and still writes the snapshot; the count is
+  `BackupSummary::error_count`. A non-zero count (or `unreadable_entries` in the manifest's
+  `source_sizes`) means a partial backup: `BackupOutcome::is_partial()`. Callers must not report
+  such a run as a clean success. The pre-backup scan never fails a backup: unreadable directories
+  and entries (EACCES, a path chain longer than `PATH_MAX`) are skipped and counted.
   Snapshots of the same `host` are chained as parents, so keep `host` stable for a desktop. The
   caller holds the single-writer lock (rustic has none).
-* **Restore** keeps numeric uid/gid (`Ownership::Numeric`, needs root), modes, xattrs,
-  symlinks, hard links; sparse files stay sparse (`sparse: true`); then it recreates the mount
+* **Restore** restores modes, xattrs, symlinks and hard links; with `Ownership::Numeric` (the
+  default) it restores the numeric uid/gid from the snapshot, and requires `CAP_CHOWN` in the
+  effective set (checked up front: `EngineError::MissingCapability`), because rustic itself only
+  logs a failed chown, chmod or utime. After the data transfer the engine compares owner (numeric
+  mode only) and permission bits of **every** restored entry with the snapshot and fails with
+  `EngineError::RestoreVerification` on any mismatch. `Ownership::Skip` works unprivileged and
+  leaves files owned by the restoring user. Timestamps and xattrs are not re-verified.  sparse files stay sparse (`sparse: true`); then it recreates the mount
   points backups skip, without following symlinks in the target. Resume: with the default
   `Resume::VerifyContent`, files already in place and matching the snapshot are skipped, damaged
   or partial ones are rewritten. Restoring onto a new server still needs a new hostname and
   `/etc/machine-id`, applied by the caller afterwards.
 * **Forget/prune.** Explicit keep counts; the newest `protect_latest` (default 2) snapshots are
   never removed. Prune deletes immediately so space is freed now, not after rustic's 23 hours.
-* **Check.** Metadata check, or a read-data check of a percentage (random subset; 100 means
-  everything) or all packs. Problems come back as `CheckReport { ok: false, findings }`, not as
+* **Check.** Metadata check, or a read-data check of a percentage or all packs. A percentage
+  reads at least p% of the data rounded up to whole packs and never less than one pack (rustic's
+  own subset logic would read nothing when p% is smaller than a pack and report "ok"); 100 means
+  everything. `CheckReport::bytes_read` says how much pack data was read (rustic does not say how
+  many packs). A subset check is a random sample: it may miss a damaged pack that `All` finds. Problems come back as `CheckReport { ok: false, findings }`, not as
   an `Err`.
 * **Progress and cancellation.** `ProgressSink::event` gets `{phase, unit, title, done, total,
   finished}`; rustic's events are throttled to about ten per second. `CancelToken` is checked
@@ -149,8 +184,7 @@ engine.snapshots() / engine.read_manifest(&SnapshotSelector)
 `cargo nextest run -p hx-backup`: rules unit tests and the property test, manifest tests, and
 engine integration tests against rustic's local backend in a temp directory (offline, no root).
 The test that checks restoring arbitrary numeric owner ids needs root and is `#[ignore]`d; run
-it with `sudo -E cargo nextest run -p hx-backup --run-ignored only`. Key derivation (scrypt) is
-slow in unoptimised builds, so each engine test takes about ten seconds.
+it with `sudo -E cargo nextest run -p hx-backup --run-ignored only`. 
 
 ## Deliberately not here yet
 
@@ -161,3 +195,13 @@ slow in unoptimised builds, so each engine test takes about ten seconds.
 * Scheduling, the retention policy engine (the 12h/24h defaults of 9.7), Drive quota checks,
   alerts, the weekly/monthly verification schedule.
 * Post-restore identity (new hostname, new `/etc/machine-id`) and the single-writer lock.
+
+Known gaps, for later branches:
+
+* `get_all_snapshots` parses every snapshot file before the manifest size cap applies, so a key
+  holder can make it allocate a lot; the privileged helper's 1 GiB limit bounds it.
+* Flatpak browser profiles (`~/.var/app/*`) and Electron `Partitions/*/Cache` or
+  `Service Worker/CacheStorage` outside browser profiles are not recognised as caches.
+* Rootless Docker/Podman data under `~/.local/share` cannot be excluded (it is protected).
+* `ignore_ctime` is off, so a ctime change alone re-reads a file.
+* The restore verification does not compare timestamps or xattrs.

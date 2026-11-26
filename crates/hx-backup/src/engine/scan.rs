@@ -32,43 +32,44 @@ pub(crate) fn scan_source(
     // (real path, rootfs-relative path)
     let mut stack: Vec<(PathBuf, PathBuf)> = vec![(root.to_owned(), PathBuf::from("/"))];
     sizes.directories += 1;
-    while let Some((dir, rel)) = stack.pop() {
-        let rd = fs::read_dir(&dir).map_err(|source| EngineError::Io {
-            context: "scanning the source",
-            source,
-        })?;
+    // A hostile tree (a path chain longer than PATH_MAX, a directory the worker cannot read, more
+    // entries than the cap) must not make the backup impossible: what cannot be read is skipped
+    // and counted, and the backup itself reports its own errors.
+    'walk: while let Some((dir, rel)) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&dir) else {
+            sizes.unreadable_entries += 1;
+            continue;
+        };
         for ent in rd {
             visited += 1;
             if visited > MAX_SCAN_ENTRIES {
-                return Err(EngineError::InvalidInput {
-                    what: "source",
-                    reason: format!("more than {MAX_SCAN_ENTRIES} entries"),
-                });
+                sizes.unreadable_entries += 1;
+                break 'walk;
             }
             if visited.is_multiple_of(1024) {
                 cancel.check()?;
                 on_progress(sizes.files);
             }
-            let ent = ent.map_err(|source| EngineError::Io {
-                context: "scanning the source",
-                source,
-            })?;
+            let Ok(ent) = ent else {
+                sizes.unreadable_entries += 1;
+                continue;
+            };
             let child_rel = rel.join(ent.file_name());
             if excluded.contains(child_rel.as_path()) {
                 continue;
             }
-            let ft = ent.file_type().map_err(|source| EngineError::Io {
-                context: "scanning the source",
-                source,
-            })?;
+            let Ok(ft) = ent.file_type() else {
+                sizes.unreadable_entries += 1;
+                continue;
+            };
             if ft.is_dir() {
                 sizes.directories += 1;
                 stack.push((ent.path(), child_rel));
             } else if ft.is_file() {
-                let md = ent.metadata().map_err(|source| EngineError::Io {
-                    context: "scanning the source",
-                    source,
-                })?;
+                let Ok(md) = ent.metadata() else {
+                    sizes.unreadable_entries += 1;
+                    continue;
+                };
                 if md.nlink() > 1 && !seen_links.insert((md.dev(), md.ino())) {
                     continue;
                 }
@@ -126,4 +127,19 @@ pub(crate) fn recreate_mount_points(target: &Path) -> io::Result<Vec<PathBuf>> {
         }
     }
     Ok(created)
+}
+
+/// Whether the process has `CAP_CHOWN` in its effective set (bit 0 of `CapEff`).
+///
+/// False when it cannot be determined: a restore that must set numeric owners should fail early
+/// rather than discover, file by file, that rustic only logs the `chown` failures.
+pub(crate) fn has_cap_chown() -> bool {
+    let Ok(status) = fs::read_to_string("/proc/self/status") else {
+        return false;
+    };
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("CapEff:"))
+        .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+        .is_some_and(|caps| caps & 1 != 0)
 }

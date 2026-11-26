@@ -59,7 +59,6 @@ fn manifest_input() -> ManifestInput {
         },
         desktop: "xfce4".into(),
         preset: "dev".into(),
-        docker_mode: Some(DockerMode::Complete),
         container_config: BTreeMap::from([("limits.cpu".to_owned(), "4".to_owned())]),
     }
 }
@@ -69,6 +68,7 @@ fn request(source: &Path) -> BackupRequest {
         source: source.to_owned(),
         rules: RuleSet::with_defaults(DockerMode::Complete),
         manifest: manifest_input(),
+        docker_enabled: true,
         tags: vec!["nightly".into()],
         host: "hx-desktop".into(),
         time: None,
@@ -298,6 +298,13 @@ impl ProgressSink for Collect {
     }
 }
 
+/// A restore request that does not touch ownership, so it works without CAP_CHOWN.
+fn rreq(sel: SnapshotSelector, target: impl Into<PathBuf>) -> RestoreRequest {
+    let mut rq = RestoreRequest::new(sel, target);
+    rq.ownership = Ownership::Skip;
+    rq
+}
+
 fn skip_none(_: &Path) -> bool {
     false
 }
@@ -376,8 +383,8 @@ fn backup_and_restore_round_trip() {
     }
 
     // Restore into a fresh directory and compare.
-    let mut rq = RestoreRequest::new(SnapshotSelector::Id(out.snapshot_id.clone()), dst.path());
-    rq.ownership = Ownership::Numeric;
+    let mut rq = rreq(SnapshotSelector::Id(out.snapshot_id.clone()), dst.path());
+    rq.ownership = Ownership::Skip; // numeric ids need CAP_CHOWN; see the ignored root test
     let res = engine.restore(&rq, &cancel).unwrap();
     assert!(res.files_restored > 10);
     assert_eq!(res.files_unchanged + res.files_verified, 0);
@@ -427,7 +434,7 @@ fn backup_and_restore_round_trip() {
         );
         // Control: without the sparse option the same file is written out in full.
         let dense = tempfile::tempdir().unwrap();
-        let mut dq = RestoreRequest::new(SnapshotSelector::Latest, dense.path());
+        let mut dq = rreq(SnapshotSelector::Latest, dense.path());
         dq.sparse = false;
         engine.restore(&dq, &cancel).unwrap();
         let md = fs::metadata(dense.path().join("home/alice/sparse.img")).unwrap();
@@ -452,9 +459,23 @@ fn backup_and_restore_round_trip() {
     assert!(!dst.path().join("home/alice/.local/share/Trash").exists());
 }
 
+fn has_cap_chown() -> bool {
+    fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("CapEff:").map(|v| v.trim().to_owned()))
+        })
+        .and_then(|v| u64::from_str_radix(&v, 16).ok())
+        .is_some_and(|c| c & 1 != 0)
+}
+
 #[test]
-fn numeric_ownership_is_applied_without_name_lookups() {
-    // Without root only the caller's own ids can be restored; they must come back unchanged.
+fn numeric_restore_without_cap_chown_fails_clearly() {
+    if has_cap_chown() {
+        eprintln!("SKIP: this process has CAP_CHOWN");
+        return;
+    }
     let src = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let dst = tempfile::tempdir().unwrap();
@@ -464,11 +485,18 @@ fn numeric_ownership_is_applied_without_name_lookups() {
         .backup(&request(src.path()), &CancelToken::new())
         .unwrap();
     let mut rq = RestoreRequest::new(SnapshotSelector::Latest, dst.path());
-    rq.ownership = Ownership::Numeric;
+    assert_eq!(rq.ownership, Ownership::Numeric, "numeric is the default");
+    assert!(matches!(
+        engine.restore(&rq, &CancelToken::new()),
+        Err(EngineError::MissingCapability("CAP_CHOWN"))
+    ));
+    assert!(!dst.path().join("home").exists(), "nothing was written");
+    // Skipping ownership works unprivileged and leaves files owned by the restoring user.
+    rq.ownership = Ownership::Skip;
     engine.restore(&rq, &CancelToken::new()).unwrap();
-    let want = fs::metadata(src.path().join("home/a/f")).unwrap();
     let got = fs::metadata(dst.path().join("home/a/f")).unwrap();
-    assert_eq!((want.uid(), want.gid()), (got.uid(), got.gid()));
+    let me = fs::metadata(dst.path()).unwrap();
+    assert_eq!((got.uid(), got.gid()), (me.uid(), me.gid()));
 }
 
 #[test]
@@ -490,7 +518,7 @@ fn numeric_owner_ids_survive_a_restore() {
     engine
         .backup(&request(src.path()), &CancelToken::new())
         .unwrap();
-    let mut rq = RestoreRequest::new(SnapshotSelector::Latest, dst.path());
+    let mut rq = rreq(SnapshotSelector::Latest, dst.path());
     rq.ownership = Ownership::Numeric;
     engine.restore(&rq, &CancelToken::new()).unwrap();
     let md = fs::metadata(dst.path().join("home/x/file")).unwrap();
@@ -522,7 +550,7 @@ fn xattrs_survive_a_restore() {
         .unwrap();
     engine
         .restore(
-            &RestoreRequest::new(SnapshotSelector::Latest, dst.path()),
+            &rreq(SnapshotSelector::Latest, dst.path()),
             &CancelToken::new(),
         )
         .unwrap();
@@ -575,7 +603,7 @@ fn restore_resumes_and_repairs_a_partial_target() {
     let mut engine = open(repo_dir.path());
     let cancel = CancelToken::new();
     let out = engine.backup(&request(src.path()), &cancel).unwrap();
-    let rq = RestoreRequest::new(SnapshotSelector::Latest, dst.path());
+    let rq = rreq(SnapshotSelector::Latest, dst.path());
     let full = engine.restore(&rq, &cancel).unwrap();
     let total = full.files_restored;
 
@@ -687,7 +715,7 @@ fn forget_and_prune_remove_data() {
     let dst = tempfile::tempdir().unwrap();
     engine
         .restore(
-            &RestoreRequest::new(SnapshotSelector::Id(ids[1].clone()), dst.path()),
+            &rreq(SnapshotSelector::Id(ids[1].clone()), dst.path()),
             &cancel,
         )
         .unwrap();
@@ -744,8 +772,12 @@ fn check_passes_and_read_data_finds_a_corrupted_pack() {
         Ok(r) => assert!(!r.ok && !r.findings.is_empty(), "corruption missed: {r:?}"),
         Err(e) => panic!("check should report, not fail: {e}"),
     }
-    let rep = engine.check(ReadData::Percent(100.0), &cancel).unwrap();
-    assert!(!rep.ok, "100% subset must also notice");
+    for p in [100.0, 50.0, 5.0] {
+        let rep = engine.check(ReadData::Percent(p), &cancel).unwrap();
+        assert!(!rep.ok, "{p}% must read at least one pack and notice");
+        assert!(rep.bytes_read > 0, "{p}%: nothing was read");
+    }
+    assert_eq!(engine.check(ReadData::None, &cancel).unwrap().bytes_read, 0);
 }
 
 #[test]
@@ -789,7 +821,7 @@ fn keys_and_open_modes() {
     let fresh = tempfile::tempdir().unwrap();
     let o = EngineOptions {
         compression_level: 99,
-        ..EngineOptions::default()
+        open_mode: OpenMode::OpenOrInit,
     };
     assert!(matches!(
         Engine::open(&backends(fresh.path()), &key(), &o, Arc::new(NullSink)),
@@ -837,18 +869,12 @@ fn bad_requests_fail_cleanly() {
     // Restore of what does not exist.
     let dst = tempfile::tempdir().unwrap();
     assert!(matches!(
-        engine.restore(
-            &RestoreRequest::new(SnapshotSelector::Latest, dst.path()),
-            &cancel
-        ),
+        engine.restore(&rreq(SnapshotSelector::Latest, dst.path()), &cancel),
         Err(EngineError::SnapshotNotFound(_))
     ));
     let bogus = "0".repeat(64).parse().unwrap();
     assert!(matches!(
-        engine.restore(
-            &RestoreRequest::new(SnapshotSelector::Id(bogus), dst.path()),
-            &cancel
-        ),
+        engine.restore(&rreq(SnapshotSelector::Id(bogus), dst.path()), &cancel),
         Err(EngineError::SnapshotNotFound(_))
     ));
     assert!(
@@ -863,10 +889,7 @@ fn bad_requests_fail_cleanly() {
     engine.backup(&request(src.path()), &cancel).unwrap();
     assert!(
         engine
-            .restore(
-                &RestoreRequest::new(SnapshotSelector::Latest, &file),
-                &cancel
-            )
+            .restore(&rreq(SnapshotSelector::Latest, &file), &cancel)
             .is_err()
     );
 }
@@ -890,10 +913,7 @@ fn cancellation_stops_between_steps() {
     engine.backup(&request(src.path()), &ok).unwrap();
     let dst = tempfile::tempdir().unwrap();
     assert!(matches!(
-        engine.restore(
-            &RestoreRequest::new(SnapshotSelector::Latest, dst.path()),
-            &cancel
-        ),
+        engine.restore(&rreq(SnapshotSelector::Latest, dst.path()), &cancel),
         Err(EngineError::Cancelled)
     ));
     assert!(matches!(engine.prune(&cancel), Err(EngineError::Cancelled)));
@@ -932,7 +952,7 @@ fn protected_state_survives_a_hostile_exclude_list() {
     assert_eq!(out.resolved.excluded().len(), 1, "{}", out.resolved);
     engine
         .restore(
-            &RestoreRequest::new(SnapshotSelector::Latest, dst.path()),
+            &rreq(SnapshotSelector::Latest, dst.path()),
             &CancelToken::new(),
         )
         .unwrap();
@@ -962,7 +982,7 @@ fn mount_points_do_not_follow_symlinks_in_the_target() {
         .unwrap();
     engine
         .restore(
-            &RestoreRequest::new(SnapshotSelector::Latest, dst.path()),
+            &rreq(SnapshotSelector::Latest, dst.path()),
             &CancelToken::new(),
         )
         .unwrap();
@@ -977,7 +997,10 @@ fn recovery_key_can_replace_the_original() {
     let repo_dir = tempfile::tempdir().unwrap();
     let a = key();
     let b = RepoKey::from_bytes("recovery key B, written on paper").unwrap();
-    let opts = EngineOptions::default();
+    let opts = EngineOptions {
+        open_mode: OpenMode::OpenOrInit,
+        ..EngineOptions::default()
+    };
     let mk = || backends(repo_dir.path());
 
     let engine = Engine::open(&mk(), &a, &opts, Arc::new(NullSink)).unwrap();
@@ -1114,7 +1137,14 @@ fn backup_only_writes_new_pack_index_snapshot_and_removes_index() {
             fs::remove_file(f.unwrap().path()).unwrap();
         }
     }
-    engine.backup(&request(src.path()), &cancel).unwrap();
+    let repaired = engine.backup(&request(src.path()), &cancel).unwrap();
+    // `repair index` made the orphan packs usable again: nothing is stored twice. Without step 0
+    // the whole tree would be uploaded again.
+    assert!(
+        repaired.summary.data_added_packed < 4096,
+        "the repaired index was not used: {} bytes added",
+        repaired.summary.data_added_packed
+    );
 
     let ops = rec.ops.lock().unwrap().clone();
     assert!(ops.iter().any(|o| matches!(
@@ -1150,4 +1180,128 @@ fn backup_only_writes_new_pack_index_snapshot_and_removes_index() {
             Op::Remove { tpe } => assert_eq!(*tpe, FileType::Index, "unexpected remove of {tpe:?}"),
         }
     }
+}
+
+#[test]
+fn open_existing_is_the_default() {
+    assert_eq!(EngineOptions::default().open_mode, OpenMode::OpenExisting);
+    let dir = tempfile::tempdir().unwrap();
+    let r = Engine::open(
+        &backends(dir.path()),
+        &key(),
+        &EngineOptions::default(),
+        Arc::new(NullSink),
+    );
+    assert!(matches!(r, Err(EngineError::RepositoryNotFound)));
+}
+
+#[test]
+fn unreadable_files_make_the_backup_partial_not_silent() {
+    if fs::File::open("/proc/self/status").is_err() {
+        return;
+    }
+    let src = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    put(src.path(), "home/a/ok", b"fine");
+    put(src.path(), "home/a/secret", b"hidden");
+    fs::set_permissions(
+        src.path().join("home/a/secret"),
+        fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    if fs::read(src.path().join("home/a/secret")).is_ok() {
+        eprintln!("SKIP: running as root, mode 000 is still readable");
+        return;
+    }
+    let mut engine = open(repo_dir.path());
+    let out = engine
+        .backup(&request(src.path()), &CancelToken::new())
+        .unwrap();
+    assert!(out.summary.error_count >= 1, "{:?}", out.summary);
+    assert!(out.is_partial());
+    // A clean run is not partial.
+    fs::set_permissions(
+        src.path().join("home/a/secret"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let clean = engine
+        .backup(&request(src.path()), &CancelToken::new())
+        .unwrap();
+    assert_eq!(clean.summary.error_count, 0);
+    assert!(!clean.is_partial());
+}
+
+#[test]
+fn a_path_chain_longer_than_path_max_does_not_disable_backups() {
+    let src = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    put(src.path(), "home/a/ok", b"fine");
+    // 30 levels of 200 characters: 6000 bytes, built with relative `cd` steps so no single path
+    // argument exceeds PATH_MAX.
+    let script = "import os\nos.mkdir('deep')\nos.chdir('deep')\nfor i in range(30):\n    n = 'd%0199d' % i\n    os.mkdir(n)\n    os.chdir(n)\nopen('file', 'w').write('x')\n";
+    let Ok(st) = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .current_dir(src.path())
+        .status()
+    else {
+        eprintln!("SKIP: python3 is not available to build the deep chain");
+        return;
+    };
+    assert!(st.success());
+    let mut engine = open(repo_dir.path());
+    let out = engine
+        .backup(&request(src.path()), &CancelToken::new())
+        .unwrap();
+    assert!(
+        out.manifest.source_sizes.unreadable_entries >= 1,
+        "the scan must have skipped the chain: {:?}",
+        out.manifest.source_sizes
+    );
+    assert!(out.is_partial());
+    // The normal part of the tree is in the snapshot.
+    let dst = tempfile::tempdir().unwrap();
+    let mut rq = rreq(SnapshotSelector::Latest, dst.path());
+    rq.ownership = Ownership::Skip;
+    engine.restore(&rq, &CancelToken::new()).unwrap();
+    assert_eq!(fs::read(dst.path().join("home/a/ok")).unwrap(), b"fine");
+}
+
+#[test]
+fn hostile_container_config_and_os_release_do_not_abort_a_backup() {
+    let src = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    put(src.path(), "f", b"x");
+    let mut engine = open(repo_dir.path());
+    let mut rq = request(src.path());
+    rq.manifest.container_config = BTreeMap::from([
+        ("security.privileged".to_owned(), "true".to_owned()),
+        (
+            "limits.cpu".to_owned(),
+            "4\nsecurity.privileged=true".to_owned(),
+        ),
+        ("limits.processes".to_owned(), "unlimited".to_owned()),
+        ("limits.memory".to_owned(), "2GiB".to_owned()),
+    ]);
+    let out = engine.backup(&rq, &CancelToken::new()).unwrap();
+    assert_eq!(out.config_entries_dropped, 3);
+    assert_eq!(out.manifest.container_config.len(), 1);
+    let back = engine.read_manifest(&SnapshotSelector::Latest).unwrap();
+    assert_eq!(back.container_config["limits.memory"], "2GiB");
+}
+
+#[test]
+fn manifest_docker_mode_follows_the_rules() {
+    let src = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    put(src.path(), "f", b"x");
+    let mut engine = open(repo_dir.path());
+    let mut rq = request(src.path());
+    rq.rules = RuleSet::with_defaults(DockerMode::Light);
+    let out = engine.backup(&rq, &CancelToken::new()).unwrap();
+    assert_eq!(out.manifest.docker_mode, Some(DockerMode::Light));
+    rq.docker_enabled = false;
+    let out = engine.backup(&rq, &CancelToken::new()).unwrap();
+    assert_eq!(out.manifest.docker_mode, None);
 }

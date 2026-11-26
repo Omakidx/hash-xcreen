@@ -432,6 +432,7 @@ pub struct ResolvedRules {
     excluded: Vec<PathBuf>,
     protected: Vec<PathBuf>,
     rejected: Vec<RejectedExclude>,
+    discovery_skipped: u32,
 }
 
 /// Literal ignore globs for rustic plus the entries that could not be expressed.
@@ -455,6 +456,14 @@ impl ResolvedRules {
     #[must_use]
     pub fn protected(&self) -> &[PathBuf] {
         &self.protected
+    }
+
+    /// How many discovery steps were skipped because the entry budget ran out or a directory
+    /// could not be read. Skipping only ever leaves more in the backup. If the protected paths
+    /// themselves could not be discovered, nothing is excluded at all.
+    #[must_use]
+    pub fn discovery_skipped(&self) -> u32 {
+        self.discovery_skipped
     }
 
     /// Candidate excludes refused because of the protected list.
@@ -506,6 +515,7 @@ impl fmt::Display for ResolvedRules {
         for p in &self.protected {
             writeln!(f, "  {}", p.display())?;
         }
+        writeln!(f, "discovery steps skipped: {}", self.discovery_skipped)?;
         writeln!(f, "rejected excludes ({}):", self.rejected.len())?;
         for r in &self.rejected {
             let why = match r.reason {
@@ -737,7 +747,8 @@ fn docker_candidates(w: &mut Walker<'_>, mode: DockerMode) -> Result<Vec<PathBuf
 /// Resolve `rules` against the tree mounted at `root`.
 ///
 /// # Errors
-/// [`RulesError::RootNotDirectory`], [`RulesError::BudgetExceeded`] or [`RulesError::Io`].
+/// [`RulesError::RootNotDirectory`] only. Budget exhaustion and unreadable directories do not fail
+/// the call: they skip discovery steps (see [`ResolvedRules::discovery_skipped`]).
 pub fn resolve(root: &Path, rules: &RuleSet) -> Result<ResolvedRules, RulesError> {
     if !fs::metadata(root).is_ok_and(|m| m.is_dir()) {
         return Err(RulesError::RootNotDirectory {
@@ -746,23 +757,44 @@ pub fn resolve(root: &Path, rules: &RuleSet) -> Result<ResolvedRules, RulesError
     }
     let mut w = Walker::new(root, rules.budget);
 
-    // 1. Concrete protected paths.
+    // 1. Concrete protected paths. If they cannot all be found we cannot tell what an exclude
+    //    would remove, so nothing is excluded: inclusion is always safe for them.
     let mut protected: BTreeSet<PathBuf> = BTreeSet::new();
     for p in protected_patterns() {
-        protected.extend(w.expand(&builtin(&p))?);
+        match w.expand(&builtin(&p)) {
+            Ok(found) => protected.extend(found),
+            Err(e) => {
+                tracing_warn(&e);
+                return Ok(ResolvedRules {
+                    discovery_skipped: 1,
+                    ..ResolvedRules::default()
+                });
+            }
+        }
     }
+
+    // Everything below degrades toward inclusion: a step that fails (budget, unreadable
+    // directory) finds nothing, and what it would have excluded stays in the backup.
+    let mut skipped: u32 = 0;
+    let mut soft = |res: Result<Vec<PathBuf>, RulesError>| -> Vec<PathBuf> {
+        res.unwrap_or_else(|e| {
+            tracing_warn(&e);
+            skipped += 1;
+            Vec::new()
+        })
+    };
 
     // 2. Ordinary candidates: the editable list plus the Docker mode.
     let mut ordinary: BTreeSet<PathBuf> = BTreeSet::new();
     for pat in &rules.excludes {
-        ordinary.extend(w.expand(pat)?);
+        ordinary.extend(soft(w.expand(pat)));
     }
-    ordinary.extend(docker_candidates(&mut w, rules.docker)?);
+    ordinary.extend(soft(docker_candidates(&mut w, rules.docker)));
 
     // 3. Named caches.
     let mut named: BTreeSet<PathBuf> = BTreeSet::new();
     for p in under_homes(&FIXED_NAMED_CACHES) {
-        named.extend(w.expand(&builtin(&p))?);
+        named.extend(soft(w.expand(&builtin(&p))));
     }
     let suffixes: Vec<Vec<Segment>> = PROFILE_CACHE_SUFFIXES
         .iter()
@@ -772,7 +804,7 @@ pub fn resolve(root: &Path, rules: &RuleSet) -> Result<ResolvedRules, RulesError
             pattern: "profile cache suffix".to_owned(),
             reason,
         })?;
-    named.extend(w.profile_caches(&suffixes)?);
+    named.extend(soft(w.profile_caches(&suffixes)));
 
     // 4. Decide.
     let mut accepted: Vec<PathBuf> = Vec::new();
@@ -812,7 +844,14 @@ pub fn resolve(root: &Path, rules: &RuleSet) -> Result<ResolvedRules, RulesError
         excluded,
         protected: protected.iter().map(|p| abs(p)).collect(),
         rejected,
+        discovery_skipped: skipped,
     })
+}
+
+/// The `tracing` dependency belongs to the `engine` feature; the rules stay free of it.
+fn tracing_warn(_e: &RulesError) {
+    #[cfg(feature = "engine")]
+    tracing::warn!(error = %_e, "rule discovery step skipped; its paths stay in the backup");
 }
 
 /// The protected path a candidate conflicts with, if any. `named_cache` candidates may lie
@@ -1116,7 +1155,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_root_and_budget_are_errors() {
+    fn missing_root_is_an_error_and_budget_degrades_toward_inclusion() {
         assert!(matches!(
             resolve(
                 Path::new("/definitely/not/here"),
@@ -1124,14 +1163,44 @@ mod tests {
             ),
             Err(RulesError::RootNotDirectory { .. })
         ));
-        let t = tree(&["a/1", "a/2", "a/3", "a/4"]);
-        let rules = RuleSet::new(DockerMode::Complete, ["/a/*"])
+        let t = tree(&[
+            "a/1",
+            "a/2",
+            "a/3",
+            "a/4",
+            "home/alice/.claude/x",
+            "home/alice/.config/chromium/Default/Cache/y",
+            "home/alice/.cache/z",
+        ]);
+        let mut saw_full = false;
+        for budget in [0, 1, 2, 5, 10, 20, 40, 60, 80, 100, 150, 200, 400, 10_000] {
+            let rules = RuleSet::new(
+                DockerMode::Complete,
+                ["/a/*", "/home/*", "/home/*/.claude", "/home/*/.cache"],
+            )
             .unwrap()
-            .with_entry_budget(2);
-        assert!(matches!(
-            resolve(t.path(), &rules),
-            Err(RulesError::BudgetExceeded { .. })
-        ));
+            .with_entry_budget(budget);
+            // Never an error, and the protected path is never excluded, whatever ran out.
+            let r = resolve(t.path(), &rules).unwrap();
+            assert!(
+                !r.is_excluded(Path::new("/home/alice/.claude/x")),
+                "{budget}: {r}"
+            );
+            assert!(
+                !r.is_excluded(Path::new("/home/alice/.claude")),
+                "{budget}: {r}"
+            );
+            if r.discovery_skipped() == 0 {
+                saw_full = true;
+                assert!(r.is_excluded(Path::new("/a/3")));
+                assert!(r.is_excluded(Path::new("/home/alice/.cache")));
+            }
+            if budget == 0 {
+                // Protected paths could not be discovered: exclude nothing at all.
+                assert!(r.excluded().is_empty() && r.discovery_skipped() == 1);
+            }
+        }
+        assert!(saw_full);
     }
 
     #[test]

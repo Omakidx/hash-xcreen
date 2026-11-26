@@ -26,6 +26,8 @@ pub enum Phase {
     PrepareRestore,
     /// Writing files into the restore target.
     Restore,
+    /// Comparing owners and modes of the restored entries with the snapshot.
+    VerifyRestore,
     /// Recreating the mount-point directories.
     RestoreMountPoints,
     /// Applying retention rules.
@@ -124,6 +126,8 @@ impl CancelToken {
 pub(crate) struct Shared {
     sink: Arc<dyn ProgressSink>,
     phase: Mutex<Phase>,
+    /// Bytes of pack data rustic announced it would read (`reading pack data...`), for `check`.
+    read_data_bytes: AtomicU64,
 }
 
 impl fmt::Debug for Shared {
@@ -137,7 +141,16 @@ impl Shared {
         Arc::new(Self {
             sink,
             phase: Mutex::new(Phase::OpenRepository),
+            read_data_bytes: AtomicU64::new(0),
         })
+    }
+
+    pub(crate) fn reset_read_bytes(&self) {
+        self.read_data_bytes.store(0, Ordering::SeqCst);
+    }
+
+    pub(crate) fn read_bytes(&self) -> u64 {
+        self.read_data_bytes.load(Ordering::SeqCst)
     }
 
     pub(crate) fn set_phase(&self, phase: Phase) {
@@ -245,6 +258,14 @@ impl RusticProgress for Item {
 
     fn set_length(&self, len: u64) {
         self.total.store(len, Ordering::Relaxed);
+        if self
+            .title
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .starts_with("reading pack data")
+        {
+            self.shared.read_data_bytes.fetch_add(len, Ordering::SeqCst);
+        }
         self.send(false, false);
     }
 

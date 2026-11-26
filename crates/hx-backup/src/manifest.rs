@@ -98,8 +98,13 @@ pub struct Distro {
 impl Distro {
     /// Parse the text of an `os-release` file (only the first 16 KiB is considered).
     ///
+    /// The file comes from the (untrusted) guest, so every value is cleaned rather than
+    /// rejected: control characters are removed and the value is cut at
+    /// [`MAX_TEXT_BYTES`] on a character boundary. `PRETTY_NAME` is dropped if nothing usable is
+    /// left of it.
+    ///
     /// # Errors
-    /// [`ManifestError::Field`] when `ID` is missing; a missing `VERSION_ID` (rolling
+    /// [`ManifestError::Field`] when no usable `ID` remains; a missing `VERSION_ID` (rolling
     /// distributions) becomes the empty string.
     pub fn from_os_release(text: &str) -> Result<Self, ManifestError> {
         let mut id = None;
@@ -113,7 +118,7 @@ impl Distro {
             let Some((k, v)) = line.split_once('=') else {
                 continue;
             };
-            let v = v.trim().trim_matches(|c| c == '"' || c == '\'').to_owned();
+            let v = clean_text(v.trim().trim_matches(|c| c == '"' || c == '\''));
             match k.trim() {
                 "ID" => id = Some(v),
                 "VERSION_ID" => version_id = v,
@@ -121,15 +126,28 @@ impl Distro {
                 _ => {}
             }
         }
+        let id = id.filter(|i| !i.is_empty()).ok_or(ManifestError::Field {
+            field: "distro.id",
+            reason: "os-release has no usable ID",
+        })?;
         Ok(Self {
-            id: id.ok_or(ManifestError::Field {
-                field: "distro.id",
-                reason: "os-release has no ID",
-            })?,
+            id,
             version_id,
-            pretty_name: pretty,
+            pretty_name: pretty.filter(|p| !p.is_empty()),
         })
     }
+}
+
+/// Remove control characters and cut at [`MAX_TEXT_BYTES`] on a character boundary.
+fn clean_text(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars().filter(|c| !c.is_control()) {
+        if out.len() + c.len_utf8() > MAX_TEXT_BYTES {
+            break;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Size of the source tree, measured before the backup (the exact figures of the run are in the
@@ -145,6 +163,9 @@ pub struct SourceSizes {
     pub bytes: u64,
     /// Number of concrete excluded paths.
     pub excluded_paths: u64,
+    /// Directories or entries the pre-backup scan could not read (and so did not count).
+    #[serde(default)]
+    pub unreadable_entries: u64,
 }
 
 /// What the caller knows about the desktop; the engine adds the time and the sizes.
@@ -158,9 +179,8 @@ pub struct ManifestInput {
     pub desktop: String,
     /// Preset name.
     pub preset: String,
-    /// Docker data mode, `None` when Docker is not enabled.
-    pub docker_mode: Option<DockerMode>,
-    /// Container configuration subset (see [`restorable_container_config`]).
+    /// Container configuration, filtered by [`restorable_container_config`] when the manifest is
+    /// built (entries outside the allow-list are dropped, not fatal).
     pub container_config: BTreeMap<String, String>,
 }
 
@@ -203,6 +223,7 @@ impl Manifest {
     /// [`ManifestError::Field`] when an input field is not acceptable.
     pub fn new(
         input: ManifestInput,
+        docker_mode: Option<DockerMode>,
         created_at: Timestamp,
         source_sizes: SourceSizes,
     ) -> Result<Self, ManifestError> {
@@ -213,8 +234,8 @@ impl Manifest {
             distro: input.distro,
             desktop: input.desktop,
             preset: input.preset,
-            docker_mode: input.docker_mode,
-            container_config: input.container_config,
+            docker_mode,
+            container_config: restorable_container_config(input.container_config).config,
             source_sizes,
             rustic_snapshot_id: None,
         };
@@ -304,11 +325,8 @@ impl Manifest {
             return bad("container_config", "too many entries");
         }
         for (k, v) in &self.container_config {
-            if k.is_empty() || k.len() > MAX_CONFIG_KEY_BYTES || k.chars().any(char::is_control) {
-                return bad("container_config", "bad key");
-            }
-            if v.len() > MAX_CONFIG_VALUE_BYTES || v.chars().any(char::is_control) {
-                return bad("container_config", "bad value");
+            if !config_entry_allowed(k, v) {
+                return bad("container_config", "entry is not on the allow-list");
             }
         }
         if let Some(id) = &self.rustic_snapshot_id
@@ -333,28 +351,110 @@ fn text(field: &'static str, s: &str, may_be_empty: bool) -> Result<(), Manifest
     Ok(())
 }
 
-/// Keep the container configuration worth restoring: resource limits, security flags and
-/// autostart. Everything else (`volatile.*`, `image.*`, `user.*`, raw LXC, devices) is dropped:
-/// it is either regenerated, host specific, or not something a backup should replay.
-pub fn restorable_container_config<I, K, V>(config: I) -> BTreeMap<String, String>
+/// Whether a container configuration entry is on the allow-list and has an acceptable value.
+///
+/// | Key | Value |
+/// |---|---|
+/// | `limits.cpu` | a count or ranges of CPUs (`4`, `0-3`, `0,2`) |
+/// | `limits.memory` | a size (`4GiB`, `512MB`) or a percentage (`50%`) |
+/// | `limits.processes` | a positive integer, never `unlimited` or `0` |
+/// | `root.size` | a size; the root disk size, flattened from the root device by the caller |
+/// | `boot.autostart` | `true` or `false` |
+/// | `security.nesting`, `security.syscalls.intercept.mknod`, `security.syscalls.intercept.setxattr` | `true` or `false` |
+///
+/// Everything else (`security.privileged`, `security.idmap.*`, `security.guestapi`, other
+/// `security.syscalls.intercept.*`, `raw.*`, `volatile.*`, `image.*`, `user.*`, devices) is
+/// refused: the manifest is writable by anyone holding a repository key, so it must never be able
+/// to widen what a restored container may do.
+#[must_use]
+pub fn config_entry_allowed(key: &str, value: &str) -> bool {
+    let is_bool = matches!(value, "true" | "false");
+    match key {
+        "limits.cpu" => {
+            !value.is_empty()
+                && value.len() <= 64
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || b == b'-' || b == b',')
+                && value.bytes().next().is_some_and(|b| b.is_ascii_digit())
+        }
+        "limits.memory" => is_size(value, true),
+        "root.size" => is_size(value, false),
+        "limits.processes" => {
+            value.len() <= 9
+                && !value.starts_with('0')
+                && !value.is_empty()
+                && value.bytes().all(|b| b.is_ascii_digit())
+        }
+        "boot.autostart"
+        | "security.nesting"
+        | "security.syscalls.intercept.mknod"
+        | "security.syscalls.intercept.setxattr" => is_bool,
+        _ => false,
+    }
+}
+
+fn is_size(v: &str, allow_percent: bool) -> bool {
+    if v.is_empty() || v.len() > 32 {
+        return false;
+    }
+    let digits = v.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 || digits > 15 {
+        return false;
+    }
+    let (num, unit) = v.split_at(digits);
+    if num.starts_with('0') && num.len() > 1 {
+        return false;
+    }
+    if unit == "%" {
+        return allow_percent && num.parse::<u32>().is_ok_and(|n| (1..=100).contains(&n));
+    }
+    matches!(
+        unit,
+        "" | "B"
+            | "kB"
+            | "MB"
+            | "GB"
+            | "TB"
+            | "PB"
+            | "EB"
+            | "KiB"
+            | "MiB"
+            | "GiB"
+            | "TiB"
+            | "PiB"
+            | "EiB"
+    )
+}
+
+/// Result of [`restorable_container_config`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RestorableConfig {
+    /// The entries that passed the allow-list.
+    pub config: BTreeMap<String, String>,
+    /// How many entries were dropped (never fatal).
+    pub dropped: usize,
+}
+
+/// Keep only the container configuration entries on the allow-list ([`config_entry_allowed`]);
+/// count the rest. Never fails: a hostile or odd entry costs that entry, not the backup.
+pub fn restorable_container_config<I, K, V>(config: I) -> RestorableConfig
 where
     I: IntoIterator<Item = (K, V)>,
     K: AsRef<str>,
     V: AsRef<str>,
 {
-    config
-        .into_iter()
-        .filter(|(k, v)| {
-            let k = k.as_ref();
-            let keep = k.starts_with("limits.")
-                || k.starts_with("security.")
-                || k == "boot.autostart"
-                || k == "boot.autostart.priority";
-            keep && k.len() <= MAX_CONFIG_KEY_BYTES && v.as_ref().len() <= MAX_CONFIG_VALUE_BYTES
-        })
-        .take(MAX_CONFIG_ENTRIES)
-        .map(|(k, v)| (k.as_ref().to_owned(), v.as_ref().to_owned()))
-        .collect()
+    let mut out = RestorableConfig::default();
+    for (k, v) in config {
+        if config_entry_allowed(k.as_ref(), v.as_ref()) {
+            let _ = out
+                .config
+                .insert(k.as_ref().to_owned(), v.as_ref().to_owned());
+        } else {
+            out.dropped += 1;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -371,25 +471,27 @@ mod tests {
             },
             desktop: "xfce4".into(),
             preset: "dev".into(),
-            docker_mode: Some(DockerMode::Light),
             container_config: restorable_container_config([
                 ("limits.cpu", "4"),
                 ("security.idmap.isolated", "true"),
                 ("volatile.eth0.hwaddr", "00:16:3e:aa:bb:cc"),
                 ("image.os", "ubuntu"),
-            ]),
+            ])
+            .config,
         }
     }
 
     fn sample() -> Manifest {
         Manifest::new(
             input(),
+            Some(DockerMode::Light),
             "2026-11-26T03:00:00Z".parse().unwrap(),
             SourceSizes {
                 files: 70_575,
                 directories: 9_000,
                 bytes: 2_439_600_000,
                 excluded_paths: 53,
+                unreadable_entries: 0,
             },
         )
         .unwrap()
@@ -435,7 +537,7 @@ mod tests {
         let mut i = input();
         i.preset = "x".repeat(MAX_TEXT_BYTES + 1);
         assert!(matches!(
-            Manifest::new(i, Timestamp::UNIX_EPOCH, SourceSizes::default()),
+            Manifest::new(i, None, Timestamp::UNIX_EPOCH, SourceSizes::default()),
             Err(ManifestError::Field {
                 field: "preset",
                 ..
@@ -513,17 +615,90 @@ mod tests {
     }
 
     #[test]
-    fn container_config_subset() {
-        let m = restorable_container_config([
+    fn container_config_allow_list() {
+        let r = restorable_container_config([
             ("limits.cpu", "2"),
+            ("limits.memory", "4GiB"),
+            ("limits.processes", "4096"),
+            ("root.size", "50GB"),
+            ("boot.autostart", "true"),
+            ("security.nesting", "true"),
+            ("security.syscalls.intercept.mknod", "false"),
+            ("security.syscalls.intercept.setxattr", "true"),
+            // refused keys
+            ("security.privileged", "true"),
+            ("security.idmap.isolated", "false"),
+            ("security.idmap.base", "0"),
+            ("security.guestapi", "true"),
+            ("security.syscalls.intercept.bpf", "true"),
+            ("raw.lxc", "lxc.cap.drop ="),
             ("volatile.base_image", "abc"),
             ("user.foo", "bar"),
-            ("raw.lxc", "lxc.cap.drop ="),
-            ("boot.autostart", "true"),
+            // right keys, refused values
+            ("limits.processes", "unlimited"),
+            ("limits.cpu", "all\nsecurity.privileged=true"),
+            ("limits.memory", "lots"),
         ]);
-        assert_eq!(
-            m.keys().map(String::as_str).collect::<Vec<_>>(),
-            ["boot.autostart", "limits.cpu"]
+        assert_eq!(r.dropped, 11);
+        assert_eq!(r.config.len(), 8);
+        assert_eq!(r.config["limits.processes"], "4096");
+        for bad in ["0", "unlimited", "-1", "", "00", "1000000000", "1 2"] {
+            assert!(!config_entry_allowed("limits.processes", bad), "{bad:?}");
+        }
+        for bad in ["yes", "1", "True", "true\n"] {
+            assert!(!config_entry_allowed("security.nesting", bad), "{bad:?}");
+        }
+        assert!(config_entry_allowed("limits.memory", "50%"));
+        assert!(!config_entry_allowed("limits.memory", "150%"));
+        assert!(!config_entry_allowed("root.size", "50%"));
+    }
+
+    #[test]
+    fn parsing_enforces_the_allow_list() {
+        // The manifest is writable by any key holder: a restore that parses it must not see
+        // dangerous configuration, even in an otherwise valid document.
+        let mut v: serde_json::Value = serde_json::from_str(&sample().to_json().unwrap()).unwrap();
+        v["container_config"]["security.privileged"] = "true".into();
+        assert!(matches!(
+            Manifest::from_slice(v.to_string().as_bytes()),
+            Err(ManifestError::Field {
+                field: "container_config",
+                ..
+            })
+        ));
+        // Building from hostile input drops entries instead of failing.
+        let mut i = input();
+        i.container_config
+            .insert("security.privileged".into(), "true".into());
+        i.container_config
+            .insert("limits.cpu".into(), "a\nb".into());
+        let m = Manifest::new(i, None, Timestamp::UNIX_EPOCH, SourceSizes::default()).unwrap();
+        assert!(!m.container_config.contains_key("security.privileged"));
+        assert!(!m.container_config.contains_key("limits.cpu"));
+    }
+
+    #[test]
+    fn hostile_os_release_is_cleaned_not_fatal() {
+        let long = "é".repeat(500);
+        let text =
+            format!("ID=\"ub\u{7}untu\"\nVERSION_ID={long}\nPRETTY_NAME=\"\u{1b}[31m\u{7}\"\n");
+        let d = Distro::from_os_release(&text).unwrap();
+        assert_eq!(d.id, "ubuntu");
+        assert!(d.version_id.len() <= MAX_TEXT_BYTES && d.version_id.chars().all(|c| c == 'é'));
+        assert_eq!(d.pretty_name.as_deref(), Some("[31m"));
+        let m = Manifest::new(
+            ManifestInput {
+                distro: d,
+                ..input()
+            },
+            None,
+            Timestamp::UNIX_EPOCH,
+            SourceSizes::default(),
         );
+        assert!(m.is_ok());
+        let d = Distro::from_os_release("ID=\"\u{7}\"\nPRETTY_NAME=\u{7}\n");
+        assert!(d.is_err());
+        let d = Distro::from_os_release("ID=x\nPRETTY_NAME=\u{7}\n").unwrap();
+        assert_eq!(d.pretty_name, None);
     }
 }

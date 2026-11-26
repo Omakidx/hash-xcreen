@@ -31,7 +31,8 @@ mod scan;
 
 use std::fmt;
 use std::fs;
-use std::path::PathBuf;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -43,9 +44,9 @@ use rustic_core::{
     RepairIndexOptions, Repository, RepositoryOptions, RestoreOptions, RusticError,
     SnapshotOptions,
 };
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
-use crate::manifest::{Manifest, ManifestError, ManifestInput};
+use crate::manifest::{Manifest, ManifestError, ManifestInput, restorable_container_config};
 use crate::rules::{self, ResolvedRules, RuleSet, RulesError};
 
 pub use progress::{CancelToken, NullSink, Phase, ProgressEvent, ProgressSink, ProgressUnit};
@@ -111,6 +112,19 @@ pub enum EngineError {
         /// The OS error.
         #[source]
         source: std::io::Error,
+    },
+    /// The process lacks a capability the request needs.
+    #[error("missing capability {0}: needed to restore numeric owner ids")]
+    MissingCapability(&'static str),
+    /// A restored entry does not have the owner or mode recorded in the snapshot.
+    #[error(
+        "{mismatches} restored entries differ from the snapshot (owner or mode); first: {examples:?}"
+    )]
+    RestoreVerification {
+        /// How many entries differ.
+        mismatches: usize,
+        /// Up to five paths (lossy), for the log.
+        examples: Vec<String>,
     },
     /// A previous call failed while loading the index and consumed the repository handle;
     /// open the engine again.
@@ -246,11 +260,13 @@ pub enum SnapshotSelector {
 /// Whether to create a missing repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OpenMode {
-    /// Fail with [`EngineError::RepositoryNotFound`] when there is no repository.
-    OpenExisting,
-    /// Create the repository when there is none. A wrong key on an existing repository is still
-    /// an error: it is never re-initialised.
+    /// Fail with [`EngineError::RepositoryNotFound`] when there is no repository. The default:
+    /// a missing repository (wrong location, a listing that came back empty) must not turn into
+    /// a silently created new one.
     #[default]
+    OpenExisting,
+    /// Create the repository when there is none. Ask for it explicitly. A wrong key on an
+    /// existing repository is still an error: it is never re-initialised.
     OpenOrInit,
 }
 
@@ -264,7 +280,7 @@ pub struct EngineOptions {
 }
 
 impl Default for EngineOptions {
-    /// [`OpenMode::OpenOrInit`], zstd level 3.
+    /// [`OpenMode::OpenExisting`], zstd level 3 (used when a repository is created).
     fn default() -> Self {
         Self {
             compression_level: DEFAULT_COMPRESSION_LEVEL,
@@ -280,8 +296,11 @@ pub struct BackupRequest {
     pub source: PathBuf,
     /// Exclude and protected-path rules.
     pub rules: RuleSet,
-    /// What goes into the manifest besides time and sizes.
+    /// What goes into the manifest besides time, sizes and the Docker mode (which always comes
+    /// from `rules`: one source of truth). `docker_enabled` says whether Docker is in use.
     pub manifest: ManifestInput,
+    /// Whether Docker is enabled on the desktop; the manifest records `rules.docker_mode()` if so.
+    pub docker_enabled: bool,
     /// Extra tags (letters, digits, `-`, `_`, `.`, `:`; at most 64 bytes, at most 16 tags).
     /// `hx-backup` is always added.
     pub tags: Vec<String>,
@@ -309,6 +328,10 @@ pub struct BackupSummary {
     pub data_added: u64,
     /// New data added to the repository, as stored (compressed and encrypted).
     pub data_added_packed: u64,
+    /// Files or directories rustic could not read or archive. The snapshot was still written,
+    /// without them: **a non-zero count means a partial backup** and the caller must not report
+    /// it as a clean success.
+    pub error_count: u64,
 }
 
 /// The result of a backup.
@@ -324,6 +347,17 @@ pub struct BackupOutcome {
     pub resolved: ResolvedRules,
     /// Excluded paths that could not be expressed as globs (not UTF-8) and so stayed in the backup.
     pub skipped_non_utf8: Vec<PathBuf>,
+    /// Container configuration entries left out of the manifest by the allow-list.
+    pub config_entries_dropped: usize,
+}
+
+impl BackupOutcome {
+    /// Whether the backup is partial: rustic skipped unreadable files
+    /// ([`BackupSummary::error_count`]) or the pre-backup scan could not read part of the tree.
+    #[must_use]
+    pub fn is_partial(&self) -> bool {
+        self.summary.error_count > 0 || self.manifest.source_sizes.unreadable_entries > 0
+    }
 }
 
 /// How a restore treats files already present in the target (resume).
@@ -484,6 +518,9 @@ pub struct CheckReport {
     pub ok: bool,
     /// Findings, one line each, prefixed with their severity.
     pub findings: Vec<String>,
+    /// Bytes of pack data rustic read to verify (0 for a metadata-only check). rustic does not
+    /// report how many packs that was.
+    pub bytes_read: u64,
 }
 
 /// A snapshot as listed.
@@ -571,13 +608,30 @@ impl Engine {
         let ropts = RepositoryOptions::default().no_cache(true);
         let repo = Repository::new_with_progress(&ropts, backends, Bars(Arc::clone(&shared)))
             .map_err(rustic("opening the repository"))?;
-        let creds = key.credentials()?;
+        let mut creds = key.credentials()?;
+        let opened = Self::open_or_init(repo, &creds, options);
+        // The engine's own copy of the password is wiped; rustic keeps its own while open.
+        if let Credentials::Password(p) = &mut creds {
+            p.zeroize();
+        }
+        let repo = opened?;
+        Ok(Self {
+            repo: Some(repo),
+            shared,
+        })
+    }
+
+    fn open_or_init(
+        repo: Repository<()>,
+        creds: &Credentials,
+        options: &EngineOptions,
+    ) -> Result<Repository<OpenStatus>, EngineError> {
         let exists = repo
             .config_id()
             .map_err(rustic("looking for the repository"))?
             .is_some();
         let repo = if exists {
-            repo.open(&creds).map_err(|e| {
+            repo.open(creds).map_err(|e| {
                 if e.is_incorrect_password() {
                     EngineError::WrongKey
                 } else {
@@ -606,13 +660,10 @@ impl Engine {
                 what: "repository configuration",
                 reason: e.to_string(),
             })?;
-            repo.init(&creds, &KeyOptions::default(), &cfg)
+            repo.init(creds, &KeyOptions::default(), &cfg)
                 .map_err(rustic("initialising the repository"))?
         };
-        Ok(Self {
-            repo: Some(repo),
-            shared,
-        })
+        Ok(repo)
     }
 
     /// Open (or create) a repository on a single backend.
@@ -765,11 +816,22 @@ impl Engine {
         );
 
         let time = req.time.unwrap_or_else(Timestamp::now);
-        let manifest = Manifest::new(req.manifest.clone(), time, sizes)?;
+        let docker_mode = req.docker_enabled.then(|| req.rules.docker_mode());
+        let config_entries_dropped =
+            restorable_container_config(&req.manifest.container_config).dropped;
+        if config_entries_dropped > 0 {
+            tracing::warn!(
+                dropped = config_entries_dropped,
+                "container configuration entries are not on the allow-list; left out of the manifest"
+            );
+        }
+        let manifest = Manifest::new(req.manifest.clone(), docker_mode, time, sizes)?;
         let description = manifest.to_json()?;
 
         let mut snap_opts = SnapshotOptions::default()
             .host(req.host.clone())
+            // A fixed command: the worker's argv must not be recorded in every snapshot.
+            .command("hx-backup".to_owned())
             .description(description)
             .time(time.to_zoned(TimeZone::UTC));
         snap_opts = snap_opts
@@ -817,9 +879,11 @@ impl Engine {
                 total_bytes: s.total_bytes_processed,
                 data_added: s.data_added,
                 data_added_packed: s.data_added_packed,
+                error_count: s.error_count,
             },
             resolved,
             skipped_non_utf8: globs.skipped_non_utf8,
+            config_entries_dropped,
         })
     }
 
@@ -1062,6 +1126,7 @@ impl Engine {
     pub fn check(&self, read: ReadData, cancel: &CancelToken) -> Result<CheckReport, EngineError> {
         cancel.check()?;
         let mut opts = CheckOptions::default();
+        self.shared.reset_read_bytes();
         match read {
             ReadData::None => self.shared.set_phase(Phase::Check),
             ReadData::All => {
@@ -1081,9 +1146,27 @@ impl Engine {
                     });
                 }
                 self.shared.set_phase(Phase::ReadData);
+                // rustic keeps a randomly ordered pack only while the remaining budget is larger
+                // than the pack, so a budget below one pack reads nothing and reports "ok". The
+                // budget is therefore p% plus the largest pack: at least p% of the data, rounded
+                // up to whole packs, and never less than one pack.
+                let info = self
+                    .repo()?
+                    .infos_index()
+                    .map_err(rustic("measuring the repository"))?;
+                let largest = info
+                    .packs
+                    .iter()
+                    .filter_map(|p| p.max_size)
+                    .max()
+                    .unwrap_or(0);
+                let total: u64 = info.blobs.iter().map(|b| b.size).sum();
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let wanted = (total as f64 * p / 100.0) as u64;
+                let budget = wanted.saturating_add(largest).saturating_add(1);
                 opts = opts
                     .read_data(true)
-                    .read_data_subset(ReadSubsetOption::Percentage(p));
+                    .read_data_subset(ReadSubsetOption::Size(budget));
             }
         }
         let results = self
@@ -1096,7 +1179,11 @@ impl Engine {
             .iter()
             .map(|(level, err)| format!("{level:?}: {err}"))
             .collect();
-        Ok(CheckReport { ok, findings })
+        Ok(CheckReport {
+            ok,
+            findings,
+            bytes_read: self.shared.read_bytes(),
+        })
     }
 }
 
@@ -1121,7 +1208,12 @@ fn restore_indexed(
 
     let mut ro = RestoreOptions::default();
     match req.ownership {
-        Ownership::Numeric => ro.numeric_id = true,
+        Ownership::Numeric => {
+            if !scan::has_cap_chown() {
+                return Err(EngineError::MissingCapability("CAP_CHOWN"));
+            }
+            ro.numeric_id = true;
+        }
         Ownership::Skip => ro.no_ownership = true,
     }
     ro.verify_existing = req.resume == Resume::VerifyContent;
@@ -1150,9 +1242,61 @@ fn restore_indexed(
     );
     cancel.check()?;
     shared.set_phase(Phase::Restore);
-    repo.restore(plan, &ro, ls, &dest)
+    repo.restore(plan, &ro, ls.clone(), &dest)
         .map_err(rustic("restoring"))?;
+    // rustic only logs a failed chown, chmod or utime. Check the result against the snapshot.
+    shared.set_phase(Phase::VerifyRestore);
+    verify_restored(
+        Path::new(target_str),
+        ls,
+        req.ownership == Ownership::Numeric,
+    )?;
     Ok(stats)
+}
+
+/// Compare owner (when `check_owner`) and permission bits of every restored entry with the
+/// snapshot's nodes. The root of the restore is not compared (it belongs to the caller).
+fn verify_restored(
+    target: &Path,
+    nodes: impl Iterator<Item = rustic_core::RusticResult<(PathBuf, rustic_core::repofile::Node)>>,
+    check_owner: bool,
+) -> Result<(), EngineError> {
+    let mut mismatches = 0usize;
+    let mut examples = Vec::new();
+    for item in nodes {
+        let (path, node) = item.map_err(rustic("listing the snapshot"))?;
+        let rel = path.strip_prefix("/").unwrap_or(&path);
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        let ok = match fs::symlink_metadata(target.join(rel)) {
+            Err(_) => false,
+            Ok(md) => {
+                let owner_ok = !check_owner
+                    || (node.meta.uid.is_none_or(|u| u == md.uid())
+                        && node.meta.gid.is_none_or(|g| g == md.gid()));
+                let mode_ok = node.is_symlink()
+                    || node
+                        .meta
+                        .mode
+                        .is_none_or(|m| (m & 0o7777) == (md.mode() & 0o7777));
+                owner_ok && mode_ok
+            }
+        };
+        if !ok {
+            mismatches += 1;
+            if examples.len() < 5 {
+                examples.push(rel.display().to_string());
+            }
+        }
+    }
+    if mismatches > 0 {
+        return Err(EngineError::RestoreVerification {
+            mismatches,
+            examples,
+        });
+    }
+    Ok(())
 }
 
 fn snapshot_info(s: &SnapshotFile) -> Result<SnapshotInfo, EngineError> {
