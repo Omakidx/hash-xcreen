@@ -222,6 +222,12 @@ impl LinkState {
         self.live.len()
     }
 
+    /// Is `req_id` an outstanding request (including an aborted upload that still owes its
+    /// `END`)?
+    pub fn is_outstanding(&self, req_id: u64) -> bool {
+        self.live.iter().any(|l| l.req_id == req_id)
+    }
+
     /// Of those, the writes.
     pub fn outstanding_writes(&self) -> usize {
         self.live
