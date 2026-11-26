@@ -9,17 +9,30 @@
 //! 3. bakes an apt and curl proxy configuration into a copy of the distro's base image, and
 //!    returns that copy for the builder and both desktops to start from.
 //!
-//! The proxy lives as long as the process; the baked copy stays in the image store under
-//! `<prefix>-base` until `hx-imagectl cleanup` removes it.
+//! The proxy lives as long as the process; the baked copy stays in the image store until
+//! `hx-imagectl cleanup` removes it.
+//!
+//! ## One baked copy per base image
+//!
+//! The copy is cached under the alias `<prefix>base-<name>-<hash>`, where `<name>` is the remote
+//! base reference of the recipe (`ubuntu/24.04`) reduced to `a-z0-9.` and `-`, and `<hash>` is
+//! the first 8 hex digits of the SHA-256 of the exact reference, so two references never share an
+//! alias even if their readable parts match. The published image also records the reference in
+//! the property [`SOURCE_PROPERTY`]. A cached copy is reused only when its alias matches and its
+//! property equals the recipe's reference; a copy that carries the alias but another (or no)
+//! source is deleted and rebuilt, never used. The older single alias `<prefix>base` (one copy for
+//! every recipe, which let a Debian copy serve an Ubuntu build) is ignored by `prepare` and
+//! removed by `cleanup`, like every alias that starts with `<prefix>base`.
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use hx_provision::Plan;
 use hx_provision::host::Naming;
-use hx_provision::incus::{Client, ImageSource, UnixTransport};
+use hx_provision::incus::{Client, ImageInfo, ImageSource, UnixTransport};
 use hx_provision::orchestrate::{DesktopSpec, destroy_instance};
 use hx_provision::plan::ImageRef;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -38,9 +51,64 @@ fn prefix_of(n: &Naming) -> &str {
     n.pool.strip_suffix("pool").unwrap_or("hxci-")
 }
 
-/// Alias of the baked base copy.
-pub fn base_alias(n: &Naming) -> String {
+/// The image property that records which remote base a baked copy was made from.
+pub const SOURCE_PROPERTY: &str = "user.hx.base_source";
+
+/// Start of every alias of a baked base copy, including the legacy `<prefix>base`.
+pub fn base_alias_prefix(n: &Naming) -> String {
     format!("{}base", prefix_of(n))
+}
+
+/// Alias of the baked copy of the remote base `remote` (for example `ubuntu/24.04`).
+pub fn base_alias(n: &Naming, remote: &str) -> String {
+    let readable: String = remote
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | '0'..='9' | '.' => c,
+            'A'..='Z' => c.to_ascii_lowercase(),
+            _ => '-',
+        })
+        .take(24)
+        .collect();
+    let digest = Sha256::digest(remote.as_bytes());
+    let short: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    format!("{}-{readable}-{short}", base_alias_prefix(n))
+}
+
+/// What the image store holds under the alias of a base copy.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CachedBase {
+    /// A copy made from the expected base: reuse it.
+    Hit(String),
+    /// Something carries the alias but was not made from the expected base: delete, rebuild.
+    Stale,
+    /// Nothing carries the alias.
+    Missing,
+}
+
+/// Look up `alias` in `images` and check that it was made from `remote`.
+pub fn lookup_base(images: &[ImageInfo], alias: &str, remote: &str) -> CachedBase {
+    match images.iter().find(|i| i.aliases.iter().any(|a| a == alias)) {
+        None => CachedBase::Missing,
+        Some(i) if i.properties.get(SOURCE_PROPERTY).map(String::as_str) == Some(remote) => {
+            CachedBase::Hit(i.fingerprint.clone())
+        }
+        Some(_) => CachedBase::Stale,
+    }
+}
+
+/// Every alias in `images` that belongs to a baked base copy of this prefix (any scheme).
+pub fn base_aliases_in(images: &[ImageInfo], n: &Naming) -> Vec<String> {
+    let start = base_alias_prefix(n);
+    let mut v: Vec<String> = images
+        .iter()
+        .flat_map(|i| i.aliases.iter())
+        .filter(|a| a.starts_with(&start))
+        .cloned()
+        .collect();
+    v.sort();
+    v.dedup();
+    v
 }
 
 /// Name of the temporary instance the base copy is made from.
@@ -76,14 +144,25 @@ pub async fn prepare(
     });
     eprintln!("dev proxy: listening on {gateway}:{PORT} (bridge gateway only), bridge ACL cleared");
 
-    let alias = base_alias(n);
-    if let Some(fp) = fingerprint_of_alias(c, &alias).await? {
-        eprintln!("dev proxy: reusing the proxied base copy {fp}");
-        return Ok((ImageSource::LocalFingerprint(fp), handle));
-    }
     let ImageRef::Remote { alias: remote } = &plan.base_image else {
         return Err(failed("the dev proxy expects a remote base image"));
     };
+    let alias = base_alias(n, remote);
+    let images = c
+        .list_images()
+        .await
+        .map_err(|e| failed(format!("list images: {e}")))?;
+    match lookup_base(&images, &alias, remote) {
+        CachedBase::Hit(fp) => {
+            eprintln!("dev proxy: reusing the proxied base copy {fp} of {remote}");
+            return Ok((ImageSource::LocalFingerprint(fp), handle));
+        }
+        CachedBase::Stale => {
+            eprintln!("dev proxy: {alias} was not made from {remote}; deleting it");
+            incus(&["image", "delete", &alias]).await?;
+        }
+        CachedBase::Missing => {}
+    }
     let from = match cached_base(c, remote).await {
         Some(fp) => ImageSource::LocalFingerprint(fp),
         None => ImageSource::official(remote.clone()),
@@ -121,7 +200,8 @@ pub async fn prepare(
         )
         .await
         .map_err(|x| e("push .curlrc", x))?;
-        incus(&["publish", &name, "--alias", &alias]).await?;
+        let source = format!("{SOURCE_PROPERTY}={remote}");
+        incus(&["publish", &name, "--alias", &alias, &source]).await?;
         Ok(())
     }
     .await;
@@ -222,4 +302,111 @@ async fn proxy_conn(mut client: TcpStream) -> std::io::Result<()> {
     }
     let _ = tokio::io::copy_bidirectional(&mut client, &mut up).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn naming() -> Naming {
+        Naming::with_prefix("hxci-").unwrap()
+    }
+
+    fn image(fp: &str, alias: &str, source: Option<&str>) -> ImageInfo {
+        let mut i = ImageInfo {
+            fingerprint: fp.into(),
+            aliases: vec![alias.into()],
+            ..ImageInfo::default()
+        };
+        if let Some(s) = source {
+            i.properties.insert(SOURCE_PROPERTY.into(), s.into());
+        }
+        i
+    }
+
+    #[test]
+    fn different_bases_get_different_aliases() {
+        let n = naming();
+        let deb = base_alias(&n, "debian/13");
+        let ubu = base_alias(&n, "ubuntu/24.04");
+        assert_ne!(deb, ubu);
+        assert_ne!(deb, base_alias_prefix(&n), "never the legacy shared alias");
+        // Same readable form, different reference: the hash keeps them apart.
+        assert_ne!(
+            base_alias(&n, "ubuntu/24.04"),
+            base_alias(&n, "ubuntu-24.04")
+        );
+        assert_eq!(ubu, base_alias(&n, "ubuntu/24.04"), "stable for one base");
+    }
+
+    #[test]
+    fn alias_uses_plain_characters_and_is_bounded() {
+        let n = naming();
+        let a = base_alias(&n, &format!("Ubuntu/24.04 ;rm {}", "x".repeat(300)));
+        assert!(a.len() <= 64, "{a}");
+        assert!(
+            a.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.'),
+            "{a}"
+        );
+    }
+
+    #[test]
+    fn same_base_is_reused() {
+        let n = naming();
+        let alias = base_alias(&n, "ubuntu/24.04");
+        let imgs = [image("f1", &alias, Some("ubuntu/24.04"))];
+        assert_eq!(
+            lookup_base(&imgs, &alias, "ubuntu/24.04"),
+            CachedBase::Hit("f1".into())
+        );
+    }
+
+    #[test]
+    fn another_bases_copy_is_never_returned() {
+        let n = naming();
+        let deb = base_alias(&n, "debian/13");
+        let ubu = base_alias(&n, "ubuntu/24.04");
+        let imgs = [image("fd", &deb, Some("debian/13"))];
+        assert_eq!(
+            lookup_base(&imgs, &ubu, "ubuntu/24.04"),
+            CachedBase::Missing
+        );
+    }
+
+    #[test]
+    fn a_mismatched_or_unmarked_copy_is_stale() {
+        let n = naming();
+        let alias = base_alias(&n, "ubuntu/24.04");
+        let wrong = [image("fd", &alias, Some("debian/13"))];
+        assert_eq!(
+            lookup_base(&wrong, &alias, "ubuntu/24.04"),
+            CachedBase::Stale
+        );
+        let unmarked = [image("fd", &alias, None)];
+        assert_eq!(
+            lookup_base(&unmarked, &alias, "ubuntu/24.04"),
+            CachedBase::Stale
+        );
+    }
+
+    #[test]
+    fn the_legacy_alias_is_ignored_by_lookup_but_found_by_cleanup() {
+        let n = naming();
+        let legacy = base_alias_prefix(&n);
+        let alias = base_alias(&n, "ubuntu/24.04");
+        let imgs = [
+            image("old", &legacy, None),
+            image("new", &alias, Some("ubuntu/24.04")),
+            image("other", "hxci-pub", None),
+            image("foreign", "someone-base", None),
+        ];
+        assert_eq!(
+            lookup_base(&imgs[..1], &alias, "ubuntu/24.04"),
+            CachedBase::Missing
+        );
+        let mut want = vec![legacy, alias];
+        want.sort();
+        assert_eq!(base_aliases_in(&imgs, &n), want);
+    }
 }

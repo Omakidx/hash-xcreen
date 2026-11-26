@@ -40,11 +40,14 @@ pub async fn run(p: &Parsed) -> Result<String, CliError> {
             Err(e) => report.push_str(&format!("instance {inst}: {e}\n")),
         }
     }
-    for alias in [
-        publish_alias(prefix),
-        devproxy::base_alias(&n),
-        import_alias(prefix),
-    ] {
+    // Baked dev-proxy copies: one alias per base, plus the legacy shared `<prefix>base`.
+    let images = c
+        .list_images()
+        .await
+        .map_err(|e| failed(format!("list images: {e}")))?;
+    let mut aliases = vec![publish_alias(prefix), import_alias(prefix)];
+    aliases.extend(devproxy::base_aliases_in(&images, &n));
+    for alias in aliases {
         if fingerprint_of_alias(&c, &alias).await?.is_some() {
             match incus(&["image", "delete", &alias]).await {
                 Ok(_) => report.push_str(&format!("image {alias}: deleted\n")),
