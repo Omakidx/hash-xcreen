@@ -470,3 +470,53 @@ pub fn validate_secret(f: &SecretFrame) -> Check {
         "secret.length",
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pb::repo_frame::Frame as F;
+    use prost::Message;
+
+    /// The wire pre-scan table (`variant_number_travels_to`) and the decoded-variant table
+    /// (`travels_to`) must say the same for every variant and endpoint.
+    #[test]
+    fn the_prescan_and_validation_direction_tables_agree() {
+        let variants = vec![
+            F::Hello(Default::default()),
+            F::HelloAck(Default::default()),
+            F::Job(Default::default()),
+            F::Request(Default::default()),
+            F::Response(Default::default()),
+            F::Progress(Default::default()),
+            F::Result(Default::default()),
+            F::Cancel(Default::default()),
+            F::Ping(Default::default()),
+            F::Pong(Default::default()),
+            F::Bye(Default::default()),
+            F::CancelRequest(Default::default()),
+            F::Event(Default::default()),
+        ];
+        let mut numbers = Vec::new();
+        for v in variants {
+            let wire = pb::RepoFrame {
+                frame: Some(v.clone()),
+            }
+            .encode_to_vec();
+            let number = u32::from(wire[0] >> 3);
+            numbers.push(number);
+            for e in Endpoint::ALL {
+                assert_eq!(
+                    travels_to(&v, e),
+                    variant_number_travels_to(number, e),
+                    "field {number} at {e:?}"
+                );
+            }
+        }
+        numbers.sort_unstable();
+        assert_eq!(
+            numbers,
+            (1..=13).collect::<Vec<_>>(),
+            "all 13 variants covered"
+        );
+    }
+}
