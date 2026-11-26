@@ -62,7 +62,8 @@ hx-imagectl: build, compare, manifest and verify the prebuilt desktop images (CI
 
 Exit status: 0 ok, 1 drift or verification refused, 2 usage, 3 failure while running.
 Incus: HX_INCUS_SOCKET (default /var/lib/incus/unix.socket). HX_IMAGECTL_DEV_PROXY=1 is for local
-development behind a Docker host only (see src/devproxy.rs).
+development behind a Docker host only (see src/devproxy.rs); it caches one proxied copy per base
+image, and `cleanup` removes them all.
 ";
 
 /// `digest`: one line per recipe.
