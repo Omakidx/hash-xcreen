@@ -57,7 +57,7 @@ placed in a writable directory never receives a token, a verifier or a command.
 
 | Command | Calls |
 |---|---|
-| `status` | privd `GetHostInfo`, `ListDesktops`; gatewayd `Status`, `ListDevices`. Reports versions, setup phase and window, desktop state, `needs_attention` flags, lockouts and device counts. Each daemon is reported on its own; exit 3 if either is unreachable. |
+| `status` | privd `GetHostInfo`, `ListDesktops`; gatewayd `Status`, `ListDevices`. Reports versions, setup phase, window, binding (setup device id, installer token waiting) and job (state and id), desktop state, `needs_attention` flags, lockouts and device counts. Each daemon is reported on its own; exit 3 if either is unreachable. |
 | `devices list` | gatewayd `ListDevices` |
 | `devices revoke <id>` | gatewayd `ListDevices` (to resolve the prefix), `RevokeDevice` (closes the device's live sessions) |
 | `devices reinstate <id>` | gatewayd `ListDevices`, `ReinstateDevice` (lifts a revocation or a PIN lockout of that device and resets its failure counter; a revoked device is shown in full and a typed `yes` (or `--yes`) is required) |
@@ -65,7 +65,7 @@ placed in a writable directory never receives a token, a verifier or a command.
 | `pairing token` | gatewayd `CreatePairingToken` (the token as a secret frame). See "Secrets". |
 | `pin set` | hidden prompt (twice); Argon2id in the CLI; privd `PepperEnrol` (purpose `PIN`); gatewayd `ListDevices` (with `--device`), `SetPinVerifier` |
 | `pin reset-lockout` | privd `ResetLockout`. Asks for a typed `yes` unless `--yes`. |
-| `setup begin` / `extend` / `finish` | privd `BeginSetup` / `ExtendSetup` / `FinishSetup`, then gatewayd `SetupWindow` (open / extend / close), so that both agree. If gatewayd cannot be updated the command fails and says privd already changed. |
+| `setup begin` / `extend` / `finish` | privd `BeginSetup` / `ExtendSetup` / `FinishSetup`, then gatewayd `SetupWindow` (open / extend / close), so that both agree. If gatewayd cannot be updated the command fails and says privd already changed. Afterwards gatewayd `Status` is read once, best effort, to show the setup binding and job (see below); if that read fails the line is left out and the command still succeeds. |
 | `desktop start` / `stop` / `restart` | privd `StartDesktop` / `StopDesktop` / `RestartDesktop` |
 | `desktop limits` | privd `GetDesktop`; with a value, `SetLimits` (the fields not given keep their current value). Says when a restart is needed. |
 | `desktop password` | hidden prompt (twice); privd `SetUserPassword` (secret frame; Admin needs no current password), `PepperEnrol` (purpose `PASSWORD`); gatewayd `SetPasswordVerifier`. `--verifier-only` skips the first call: it only refreshes gatewayd's verifier after the password was changed inside the desktop with `passwd`. **privd has no check-only command, so that password is not verified against the desktop**: it is typed twice and the CLI says so; a wrong entry makes re-pairing by password fail until the command is run again (`verified_against_desktop` is false in the JSON). |
@@ -232,6 +232,24 @@ action does. `--yes` answers for scripts; there is no other way around the quest
 no `--yes` is exit 8). `pin reset-lockout` clears the **whole** failure history of the purpose, not
 only the lock, so an attacker's recent guesses stop counting; privd writes it to the audit log with
 the role `admin`.
+
+## Setup state in `status` and `setup`
+
+Both show what gatewayd's `Status` reports in `StatusResult` fields 10 to 14 (`docs/ipc.md` 9, "1G
+additive fields"). Human output, under the `setup window` line:
+
+```
+  setup        device bound 0123456789abcdef0123456789abcdef   (or: no setup device)
+               installer token waiting to be used              (only when pending)
+               job running (id 3)                              (only when not idle)
+```
+
+The device id is the 32-digit lower-case hex used by `devices list`. The job state is lower case
+(`running`, `succeeded`, `failed`, `cancelled`); id 0 (no job yet) is not printed. With `--json`
+the same is a new member `setup` of `data.gatewayd` (`status`) and of `data` (`setup begin`,
+`extend`, `finish`): `{"device_bound": bool, "device_id": "<hex>"|null, "token_pending": bool,
+"job": "IDLE"|"RUNNING"|"SUCCEEDED"|"FAILED"|"CANCELLED", "job_id": n}`. Existing members are
+unchanged. `setup` omits the member when `Status` could not be read.
 
 ## Output and exit codes
 
