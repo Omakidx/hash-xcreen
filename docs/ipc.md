@@ -1121,3 +1121,311 @@ Answers to the open questions of v0.1, taken after the security review.
 - `HOST_NETWORK_ONLY` Docker mode, `UpgradeIncus`, and the Phase 2 commands, which stay named and `UNIMPLEMENTED` (§6.9, §6.13, §6.14).
 - The pairing-exchange hook that delivers privd's recipient key without SSH (1B).
 - An augmented PAKE (SPAKE2+) for pairing, so that a stolen server-side verifier cannot be used to pair (longer-term option for 1B).
+
+---
+
+# Part 3: the repository link
+
+Status: draft v0.5 (2026-11-26), written before any Phase 2 code ("Contracts before consumers"). It specifies what runs between the backup worker, `hx-privd` and the Drive helper, and how a backup or restore job is run, supervised and cleaned up. The decisions behind it are recorded in §36; the commands that start jobs (§6.14) stay reserved until their code lands. Architecture background: [architecture.md](architecture.md) §8.5 and §9.
+
+## 23. Purpose, topology and trust
+
+Phase 2 jobs (backup, restore, check, prune, key management, repository initialisation) run `rustic_core` in the **backup worker**. The worker reads or writes the desktop's files, but it never reaches Google Drive: every repository operation is a request on the **repository link** to `hx-privd`, which checks it against a per-job policy (§30) and forwards it over a second link to the **Drive helper**, the only process that holds the Drive token and speaks HTTPS.
+
+```
+worker (helper container, no network)
+   ⇄ [Incus proxy device: unix ↔ unix byte pipe]
+   ⇄ hx-privd (relay + policy)
+   ⇄ [/run/hx/drive.sock]
+   ⇄ Drive helper (systemd unit: holds the Drive token, the only process that speaks HTTPS)
+```
+
+privd cannot be the Drive endpoint itself: its unit has `IPAddressDeny=any`, and root privd never speaks HTTP (§6.12). privd is also not bypassed by a direct worker-to-Drive-helper pipe, for three reasons. The worker parses hostile desktop data and is the process most likely to be compromised. privd enforces the per-job operation allowlist and verifies SHA-256(body) = id on every write, so a compromised `BACKUP` worker can add objects but cannot overwrite or delete packs, snapshots, keys or the repository config (this is the anti-ransomware property). And a direct pipe would need `AF_UNIX` in the Drive helper's sandbox, or descriptor passing through Incus, which the proxy device cannot do. The cost is two memory copies at up to about 25 MB/s; privd streams in chunks of at most 1 MiB and never buffers a whole pack (it runs under `mlockall`, §5.2).
+
+| Party | Holds | Trust |
+|---|---|---|
+| Backup worker | The repository password for this job (secret slot 0, §34); the snapshot read-only (backup) or the restore target (restore) | Low. It parses container-controlled data; assume that a file in the desktop can compromise it. |
+| Drive helper | The Drive refresh token (`LoadCredentialEncrypted=drive-token`, §2) | Low to medium. It parses Google's responses. It never sees the repository password. |
+| `hx-privd` | The backup key (`LoadCredentialEncrypted=backup-key`, §2), the policy and the job state | The deputy. It never speaks HTTP and never interprets repository content. |
+
+**Goals.** A compromised worker cannot obtain the Drive token, reach any network, read anything but its own job's snapshot, or destroy existing backups in a `BACKUP`, `RESTORE`, `CHECK`, `SNAPSHOTS` or `RESTORE_PLAN` job. A compromised Drive helper cannot decrypt backups. A compromised gatewayd gains nothing here: Part 3 has no gateway-facing surface beyond the reserved commands of §6.14.
+
+## 24. Transport
+
+**The helper container.** For every job privd creates one **ephemeral, empty Incus container**, named `hx-bkw-<8 hex digits of the job id>`, with `ephemeral: true`, no profiles, no image (`init --empty`), on the hx storage pool, root disk 256 MiB, and **no network interface**. privd sets exactly the configuration below and nothing else (§7, rule 4); every value is a constant or is computed from validated names.
+
+| Config key | Value |
+|---|---|
+| `security.idmap.isolated` | `true` (a fresh host uid range per job) |
+| `security.privileged` | `false` |
+| `security.nesting` | `false` |
+| `security.guestapi` | `false` (no `/dev/incus`) |
+| `security.syscalls.deny_compat` | `true` |
+| `limits.memory` / `limits.memory.swap` | `1GiB` / `false` |
+| `limits.cpu` | `2` |
+| `limits.cpu.priority` / `limits.disk.priority` | `0` / `0` (lowest priority; constants) |
+| `limits.processes` | `64` |
+| `boot.autostart` | `false` |
+| `user.hx.kind` / `user.hx.job` | `backup-worker` / the job id |
+
+The container's only content is the static musl `hx-backup-worker` binary, pushed as `/sbin/init` (mode 0755, uid 0) from `/usr/lib/hx/<running version>/` (the push creates parent directories), and the empty directories `/dev`, `/proc`, `/sys`, `/tmp`, `/run` and `/src` or `/dst`. LXC mounts `proc`, `sys` and `dev`; the worker is PID 1 and uid 0 of the helper's own user namespace, which has no capabilities in the initial namespace.
+
+**Devices.** privd adds exactly these devices, through `hx-provision`'s typed constructors (`BackupHelperSpec`, `SnapshotMount`, `TargetMount`, `RepoLink`; §7, rule 4):
+
+| Device | Used by | Definition |
+|---|---|---|
+| `root` | all jobs | The pool's root disk, 256 MiB. |
+| `src` | `BACKUP` | A disk device with `source=/var/lib/incus/storage-pools/<pool>/containers-snapshots/<desktop>/<snapshot>/rootfs`, `path=/src`, `readonly=true`, `shift=true`. The source **must be the snapshot's `rootfs` subdirectory**: the snapshot's top directory is `d--x------` owned by the desktop's host root id, which a helper with a different isolated map sees as 65534 and cannot enter. Through `rootfs` the worker sees the container's exact ids, readable `/etc/shadow` and `security.capability` extended attributes, and every write gives `EROFS`. |
+| `dst` | `RESTORE` | A writable disk device with `source=/var/lib/incus/storage-pools/<pool>/containers/<target>/rootfs`, `path=/dst`, `shift=true`. The target is an instance that privd created with `init --empty` and the desktop's full specification (including its isolated map) and **never starts before the write**. The worker writes container ids; at the target's first start Incus applies the target's own map. |
+| `repo` | all jobs | A proxy device with `bind=host`, `listen=unix:/run/hx/backup/<job>.sock` (uid 0, gid 0, mode 0600), `connect=unix:/run/hx-worker/repo.sock`. Keep both paths short: a long `listen` path is refused by `bind` (the `sun_path` limit). |
+
+Jobs that only touch the repository (§28: `INIT`, `SNAPSHOTS`, `RESTORE_PLAN`, `FORGET_PRUNE`, `CHECK`, `KEYS`) get `root` and `repo` only; in particular a prune helper has no `/src`, so only repository content can reach it. `/run/hx/backup` is root 0700, created from `systemd-tmpfiles` (§2). **There is no cache device in v1**: the worker runs `rustic` with no cache (`no_cache`), and a cache volume is added later only if measured index reads on the nightly Drive test are slow (§36, M3).
+
+**Why this mechanism is correct (verified on Incus 6.0.0, kernel 6.8, a btrfs loop pool).** On this Incus the container's rootfs is stored **unshifted** and mounted with an idmapped mount (`volatile.last_state.idmap='[]'` after start, `idmapped` in the root mountinfo; snapshots also carry `last_state.idmap='[]'`). A `shift=true` disk device on that `rootfs` therefore gives a helper with a different map the container's own ids, in both directions: ids 1234:4321 and 1000:1000, a v2 file capability, a user extended attribute and a fifo written through `/dst` were all correct inside the target after it started. This depends on Incus internals, so **privd checks before each job** that `kernel_features.idmapped_mounts` is `"true"`, that the desktop's and the snapshot's `volatile.last_state.idmap` are `"[]"` and that the pool driver is btrfs, and otherwise fails the job with `FAILED_PRECONDITION` and never backs up wrong ids (architecture §15).
+
+**Worker end of the link.** The worker creates `/run/hx-worker/` (0700) and `repo.sock`, accepts **exactly one** connection and closes the listener. privd connects to the proxy device's host socket, retrying every 200 ms for at most 30 s after the helper starts. A lost connection ends the job; there is no reconnect.
+
+**No half-close.** Observed on Incus 6.0.0: when the host side calls `shutdown(SHUT_WR)`, the forwarder closes the whole connection and the reply is lost. Neither side of any link in Part 3 therefore calls `shutdown(SHUT_WR)` or relies on it. The end of a stream is the `END` flag of a data frame (§25), and the end of a session is `Bye` (§27).
+
+**Drive link.** privd connects to `/run/hx/drive.sock`, a unix socket owned by `hx-drive.socket` (`ListenStream=/run/hx/drive.sock`, `SocketUser=root`, `SocketMode=0600`, `Accept=no`), which activates `hx-drive.service`. That unit runs `hx-backup-worker` with `HX_BACKUP_ROLE=drive` (§6.12) and has the fetcher's hardening: a dynamic user; no capabilities; `RestrictAddressFamilies=AF_INET AF_INET6` (the activated `AF_UNIX` descriptor is inherited, so the unit needs no `AF_UNIX` of its own); the fetcher's `IPAddressDeny`/`IPAddressAllow` and resolver drop-in; the same `SystemCallFilter`; `LoadCredentialEncrypted=drive-token:/etc/hx/creds/drive-token.cred` (privd never loads the token); `MemoryMax=512M`. The binary itself restricts the hosts it will connect to, `www.googleapis.com` and `oauth2.googleapis.com`. The Drive helper serves **one connection at a time**, checks `SO_PEERCRED` for uid 0, and exits 60 s after the last connection closes.
+
+**No descriptors.** Neither link passes file descriptors. Both ends read with `recvmsg` and treat any control message or `MSG_CTRUNC` as a protocol violation (the rule of §3).
+
+**The worker's sandbox.** The helper's isolation (own isolated user namespace, no capabilities in the initial namespace, the default LXC seccomp profile plus `deny_compat`, AppArmor, cgroup limits, no network interface) is the outer layer. As PID 1 the worker then hardens itself, in this order: create the listener, accept the one connection, close the listener; set `PR_SET_NO_NEW_PRIVS` and `PR_SET_DUMPABLE=0`; drop capabilities; install a `seccompiler` allowlist.
+
+| Job kind | Capabilities kept |
+|---|---|
+| `BACKUP` | `CAP_DAC_READ_SEARCH` only |
+| `RESTORE` | `CAP_CHOWN`, `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_FSETID`, `CAP_SETFCAP`, `CAP_MKNOD` |
+| every repository-only kind | none |
+
+The seccomp allowlist has no `socket`, `connect`, `bind`, `execve`, `ptrace` or `mount`, and no extended-attribute writes (`*xattr`) outside `RESTORE`. As PID 1 the worker must handle `SIGTERM` and reap children.
+
+## 25. Framing and limits
+
+privd's framing of §4 applies (`length` u32 LE, `kind` u8, body; `length` is checked before anything is allocated), with three kinds:
+
+| Kind | Body | Maximum `length` | Direction |
+|---|---|---|---|
+| `1` Message | one protobuf `RepoFrame` (§27) | 65 536 | both |
+| `2` Secret | `request_id` u64 (0 for the job) ‖ `slot` u8 ‖ secret bytes (§5.2, §34) | 8 192 | privd → worker only |
+| `3` Data | `stream_id` u64 LE ‖ `flags` u8 (bit 0 `END`, all other bits 0) ‖ payload of 0 to 1 048 576 bytes | 1 048 586 | both |
+
+A data stream's `stream_id` is the `req_id` of the request it belongs to. Streams may interleave; the bytes within one stream are ordered. A data frame for an unknown or finished stream, a stream that exceeds its announced size, and an `END` before `size` bytes have arrived are protocol violations.
+
+| Limit | Value |
+|---|---|
+| Outstanding repository requests per worker link | 8, of which at most 4 writes |
+| Object size | at most 96 MiB (packs are capped at 64 MiB by the repository config, plus one 8 MiB chunk) |
+| Write caps per type | `CONFIG` 64 KiB, `KEY` 64 KiB, `SNAPSHOT` 4 MiB, `INDEX` and `PACK` 96 MiB |
+| `ListPage` | at most 1 024 entries per page, 1 000 000 in total |
+| Repeated fields | counted on the wire before decoding (§8, "Memory") |
+| Buffering in privd | at most 2 data frames per stream; privd reads the next chunk only after it has written the previous one |
+
+A protocol violation makes privd stop the helper and the Drive session, fail the job with `WORKER_PROTOCOL` and audit it.
+
+## 26. Session and job lifecycle
+
+1. privd takes the repository's job slot and writes the job record (§35), creates the snapshot (backup jobs), creates and starts the helper container, and connects to it (§24).
+2. privd sends `Hello` {`major`, `minor`, `job_id` (16 random bytes)} within 5 s of connecting; the worker answers `HelloAck` {`major`, `minor`, `software`}. A different `major` ends the session. The helper must reach `HelloAck` within 30 s of its start.
+3. privd sends `Job` {`job_id`, `kind`, `spec`, `secret_slots`} and then one kind-2 frame per slot.
+4. The worker runs the job, sending `RepoRequest` and `Progress` frames, and ends it with **exactly one** `JobResult`, then `Bye`, then exits. The helper stops and, being ephemeral, is deleted.
+5. privd verifies that the helper is gone (and deletes it if it is not), deletes the snapshot, releases the slot and clears the record.
+
+On the Drive link privd opens a session of its own for the job, starting with `Hello` and `OpenRepo` (§29), and closes it when the job ends.
+
+## 27. Messages
+
+`RepoFrame` is a protobuf `oneof` carried in kind-1 frames; it is `hx.repo.v1` in `hx-ipc` (§36). Exactly one variant is set, else the frame is invalid; unknown fields are ignored and field numbers are never reused (§4).
+
+| Variant | Direction | Meaning |
+|---|---|---|
+| `Hello` / `HelloAck` | privd → worker / back | Version handshake, §26. |
+| `Job` | privd → worker | `job_id`; `kind` ∈ `INIT`, `BACKUP`, `SNAPSHOTS`, `RESTORE_PLAN`, `RESTORE`, `FORGET_PRUNE`, `CHECK`, `KEYS`; `spec` (a `oneof`, §28); `secret_slots` (at most 2). |
+| `RepoRequest` | worker → privd (and privd → Drive helper, with privd's own `req_id`) | `req_id` u64 (non-zero, unique per link); `op` (a `oneof`): `List`{`type`}, `ReadFull`{`type`, `id`}, `ReadPartial`{`type`, `id`, `offset` u32, `length` u32}, `Write`{`type`, `id`, `size` u32} (then data frames), `Remove`{`type`, `id`}, `Create`{}. |
+| `RepoResponse` | privd → worker (and Drive helper → privd) | `req_id`; `result` (a `oneof`): `ListPage`{`entries` [{`id` 32 bytes, `size` u32}], `last` bool}, `ReadBegin`{`size`} (then data frames), `Done`{}, `Error`{`class`, `retry_after_ms`}. |
+| `Progress` | worker → privd | `phase` (enum), `files_done`, `files_total`, `bytes_done`, `bytes_total` (0 = unknown); numbers only; at most 2 per second. |
+| `JobResult` | worker → privd | `ok`; `error` (`WorkerError`, §31); counters (`files_new`, `files_changed`, `files_unmodified`, `bytes_processed`, `bytes_added`); `snapshot_id` (32 bytes, `BACKUP`); `key_ids` (`INIT`, `KEYS`); `manifest` (`RESTORE_PLAN`; privd validates it as untrusted); `snapshots` (`SNAPSHOTS`, at most 4 096: {`id`, `time`, `tags`, `manifest_digest`, `size`}). |
+| `Cancel`{} | privd → worker | Stop at the next safe point (§32). |
+| `Ping`{`nonce`} / `Pong`{`nonce`} | both | Liveness (§32). |
+| `Bye`{} | both | Orderly end of the session. |
+
+`type` ∈ `CONFIG`, `KEY`, `SNAPSHOT`, `INDEX`, `PACK`; `id` is 32 bytes (all zero for `CONFIG`). **No message carries a path, a Drive name or id, a URL, a credential or free text from the worker.**
+
+## 28. Job specs
+
+privd validates the spec before sending it; the worker validates it again.
+
+| Kind | Spec | Secret slots | Devices |
+|---|---|---|---|
+| `INIT` | `compression` = 3, `datapack_size_limit` = 64 MiB, `treepack_size_limit` = 16 MiB | 0: the host key (the backup key); 1: the recovery key | `repo` |
+| `BACKUP` | The manifest input: distro, desktop, preset, container configuration without `volatile.*`, agent version, backup format version. The user's excludes (at most 256, each at most 4 096 bytes, in the `hx_backup::rules` syntax). `docker_mode` ∈ `COMPLETE`, `LIGHT`. Tags: the `hx-backup-…` snapshot name and the schedule kind. A `BACKUP` job always runs `repair index` first. | 0: the repository password | `repo`, `src` |
+| `SNAPSHOTS` | none | 0 | `repo` |
+| `RESTORE_PLAN` | `snapshot_id` | 0 | `repo` |
+| `RESTORE` | `snapshot_id`; `verify_existing` (resume an interrupted restore) | 0 | `repo`, `dst` |
+| `FORGET_PRUNE` | `forget`: the snapshot ids that privd chose from the retention rules and the floor of the two newest successful backups (at most 4 096); `instant` = true | 0 | `repo` |
+| `CHECK` | `read_data_percent` 0 to 100 (0 = metadata only) | 0 | `repo` |
+| `KEYS` | `add` (bool); `remove_key_ids` (at most 4, named by privd) | 0: a key that opens the repository; 1: the new key (when `add`) | `repo` |
+
+## 29. Drive link: privd-only operations
+
+The Drive link uses the same framing, `Hello`, `RepoRequest` and `RepoResponse` as §25 to §27, plus the operations below, which only privd may send. The worker's link has none of them.
+
+| Message | Direction | Meaning |
+|---|---|---|
+| `OpenRepo`{`folder`, `create`, `server_id`, `takeover`} | privd → Drive helper | Names the repository folder (a privd constant per server and desktop; the worker never learns it). It must be the first request of a session. Lease handling is described below. |
+| `Quota`{} → `QuotaResult`{`limit`, `usage`, `usage_in_trash`} | privd → Drive helper and back | From Drive's `about.storageQuota`, which counts the trash (architecture §9.7). |
+| `SetUploadRate`{`bytes_per_s`} | privd → Drive helper | 0 = unlimited. privd sets the 50% cap while a client is connected (architecture §9.5). |
+| `Cancel`{`req_id`} | privd → Drive helper | Abandon one request. |
+| `Event`{`kind` ∈ `PAUSED_DAILY_LIMIT`, `RESUMED`, `RETRYING`; `until_ms`} | Drive helper → privd, unsolicited | Status only. |
+
+**The Drive helper owns** per-request retries (1 s doubling to 64 s, equal jitter, `Retry-After` honoured, at most 8 retries); the daily-limit gate shared by all requests of the session (a pause of one hour, then a probe, at most 26 pauses); per-attempt timeouts (60 s plus 4 s per MiB); the lazy creation of the `data/xx` folders; permanent deletion (`DELETE files/{id}`; it never calls `files.emptyTrash`; folders are deleted leaves first; architecture §9.7); and the lease. This is S4's `HxDrive` and retrier, unchanged. **privd owns** job deadlines, the operation policy (§30), the hash check of every write, cancellation, the upload-rate setting, the persisted "daily limit hit at T" time, progress and the audit log.
+
+**The lease.** Two servers must not write one repository. A lease object `hx-lease.json` sits in the repository's Drive folder, outside rustic's file types; only the Drive helper reads and writes it, and the worker never sees it. Content: `{format: 1, server_id, generation, taken_at, hostname_hint}`, where `server_id` is 16 random bytes in hex (privd creates it once and keeps it in `/var/lib/hx/backup/server-id`), `generation` is a u64, and `hostname_hint` is at most 64 bytes, sanitized.
+
+- `OpenRepo` with **no lease** in the folder writes one, generation 1. A lease that names **this** server is accepted.
+- A lease that names **another** server, with `takeover=false`, is answered with the error `LEASE_HELD` (§31). privd then fails the job and sets `needs_attention=BACKUP_TAKEN_OVER` ("This backup is now used by another server"). Scheduled backups stop until the user re-claims the backup, which is an explicit, owner-authorized action (planned with Phase 2 parts 2C and 2D).
+- `takeover=true` is sent only by the restore-onto-a-new-server flow and by that explicit re-claim. It writes the lease with `generation` + 1.
+- The Drive helper **re-reads the lease before the first write and before every `Remove`**, and may cache it for at most 60 s. A server that has lost the lease gets `LEASE_HELD` and its job ends.
+- After a takeover the new owner starts **no write job for 2 minutes**, longer than the cache window, so that an old owner's in-flight prune cannot delete packs that the new owner reuses. Concurrent appends from an old owner's in-flight backup are harmless, because objects are content-addressed; only removals are dangerous, and those are fenced by the re-read.
+- Drive offers no compare-and-swap for this object, so a small window remains. It is accepted and documented: it takes two takeovers racing each other, which means a user doing two restores at once.
+
+## 30. Policy
+
+privd checks every request from the worker against the job kind before forwarding it. `—` means not allowed.
+
+| Job kind | List | Read | Write | Remove | Create |
+|---|---|---|---|---|---|
+| `INIT` | all types | `CONFIG`, `KEY` | `CONFIG` (only if absent), `KEY` | — | yes |
+| `BACKUP` | all | all | `PACK`, `INDEX`, `SNAPSHOT` | `INDEX` only | — |
+| `SNAPSHOTS`, `RESTORE_PLAN`, `RESTORE`, `CHECK` | all | all | — | — | — |
+| `FORGET_PRUNE` | all | all | `PACK`, `INDEX` | `PACK`, `INDEX`; `SNAPSHOT` only for the ids in the spec | — |
+| `KEYS` | all | all | `KEY` | `KEY` only for the ids in the spec | — |
+
+On every `Write` except `CONFIG`, privd computes SHA-256 over the streamed body and commits the upload (sends `END` to the Drive helper) **only if the digest equals `id`**; otherwise it aborts the upload and answers `INTEGRITY`. A denied operation is answered `POLICY_DENIED`, is audited and fails the job. (The `Create` column is the reading of §36, Q-C1.)
+
+## 31. Errors
+
+`RepoError.class`, as seen by privd and relayed to the worker. privd classifies a failed job by the errors it relayed itself, never by the worker's claim.
+
+| Class | Meaning and handling |
+|---|---|
+| `NOT_FOUND` | The object is absent. An empty `List` of `CONFIG` means there is no repository; this is normal flow, not a failure. |
+| `TRANSIENT` | Network errors, 5xx, 408, 405, after the Drive helper's retries. Fail the run and reschedule. |
+| `RATE_LIMITED` | 429 or a 403 rate-limit reply, after retries. Fail the run and reschedule. |
+| `DAILY_LIMIT` | The daily-limit gate gave up after about a day. Fail the run; start no upload job for one hour. |
+| `QUOTA_EXCEEDED` | Drive is full: the handling of architecture §9.7. |
+| `AUTH_REVOKED` | 401 or `invalid_grant`. Set `needs_attention=DRIVE_RECONNECT` ("Action needed: reconnect Google Drive"). |
+| `PERMISSION` | Any other 403, for example `appNotAuthorizedToFile`. Fail the run and audit it. |
+| `LEASE_HELD` | Another server owns the repository (§29). Set `needs_attention=BACKUP_TAKEN_OVER`; scheduled backups stop until the user re-claims the backup. |
+| `POLICY_DENIED`, `INTEGRITY`, `TOO_LARGE` | privd itself refused the request (§25, §30). Kill the helper, fail the job, audit it and back off. |
+| `UNAVAILABLE` | The Drive helper is unreachable. Fail the run and reschedule. |
+| `CANCELLED` | The job was cancelled (§32). |
+| `INTERNAL` | A bug; detail goes to the journal only. |
+
+`WorkerError` in `JobResult`: `ENGINE`, `SOURCE_UNREADABLE`, `WRONG_PASSWORD`, `NO_REPOSITORY`, `REPOSITORY_EXISTS`, `SNAPSHOT_NOT_FOUND`, `TARGET_UNWRITABLE`, `CANCELLED`, and `REPO` (a relayed repository error; privd uses its own record). **No free text crosses the link.** Detail goes to the worker's console log, which privd never parses. privd's own failure reason for a job is `WORKER_PROTOCOL` for a protocol violation (§25) and otherwise one of the classes above.
+
+## 32. Liveness, timeouts and cancellation
+
+- privd sends `Ping` every 15 s on both links. A peer silent for 45 s is dead: privd force-stops the helper and closes the Drive session. The worker exits after 60 s without anything from privd.
+- The worker sets **no per-request timeout**. privd guarantees each request an answer within the Drive helper's retry budget, which is at most 30 min excluding a `PAUSED_DAILY_LIMIT` period (itself bounded by 26 pauses, about 26 h).
+- Job deadlines:
+
+| Job kind | Deadline |
+|---|---|
+| `INIT` | 30 min |
+| `KEYS`, `SNAPSHOTS`, `RESTORE_PLAN` | 10 min |
+| `CHECK`, `FORGET_PRUNE` | 6 h |
+| `RESTORE` | 12 h |
+| `BACKUP` | 30 h (it must outlast the daily-limit gate) |
+
+- **Cancel.** privd sends `Cancel`; the worker starts no new writes and answers `JobResult{CANCELLED}` within 30 s. Otherwise privd force-stops the helper (ephemeral, so it is deleted), verifies that it is gone, and closes the Drive session. A killed backup leaves orphan packs, which the next `repair index` reuses, and no snapshot file, because rustic writes the snapshot last.
+
+## 33. Progress
+
+The worker sends `Progress` {`phase`, `files_done`, `files_total`, `bytes_done`, `bytes_total`} at most twice per second, numbers only, never a path or text. privd adds its own relay counters and turns the result into §4 `Progress` frames for the caller of `BackupStatus` or `RestoreStatus`, at most 10 per second:
+
+- `stage` is `BACKUP` or `RESTORE`; `CHECK`, `PRUNE` and `INIT` reuse `BACKUP`.
+- `index` and `total` come from privd's fixed phase table below; `step` is privd's own fixed English text for the phase, never worker text; `percent` is computed by privd, 0 to 100, or 255 when unknown.
+- The additive fields `bytes_done`, `bytes_total` and `transfer_bytes` (§4) carry the byte counts, because the restore screen shows bytes and never promises a duration (architecture §9.8, item 6).
+
+| Job | Phases (index from 1) |
+|---|---|
+| Backup | 1 snapshot, 2 start worker, 3 repair index, 4 scan and upload, 5 write snapshot, 6 clean up |
+| Restore | 1 prepare target, 2 plan, 3 download and write, 4 fix-ups, 5 boot check |
+
+## 34. Secrets on the link
+
+Two kinds of repository secret exist, both carried in kind-2 frames under the rules of §5.2 (`Zeroizing` buffers, never in a protobuf field, argv, environment or log): `REPO_PASSWORD` (slot 0) and `NEW_KEY_PASSWORD` (slot 1), each 16 to 1 024 bytes. The Drive helper never receives a repository secret, and the worker never receives a Google credential.
+
+**Keys.** A repository has **one master key** and two rustic key files for it, so stock `rustic` or `restic` can open it with either password:
+
+| Key file | Password | Held by |
+|---|---|---|
+| Backup key (`BACKUP_KEY`) | 32 random bytes, base64url, generated on the server by the installer's `credentials` stage (§2, architecture §5.7); never transmitted | privd, from `LoadCredentialEncrypted=backup-key`. It reads it into a `Zeroizing`, mlocked buffer at job start and sends it as the kind-2 frame for slot 0. |
+| Recovery key | A second password of at least 128 bits, in a human form (for example Crockford base32 in groups), added with `Repository::add_key` | Generated by privd. An `INIT` or `KEYS` job adds it. privd persists **only its rustic key id** (rotation means adding a new key and removing that id) and never the key. |
+
+**Sealing the recovery key to the owner key.** privd seals the recovery key for the client with HPKE **base mode** to the enrolled owner public key (§5.2), with `info` = `hx-recovery-key/v1` and `aad` = `len(desktop_id)` (u8) ‖ `desktop_id` ‖ the 32-byte rustic key id. The sealed box travels through gatewayd as ciphertext it cannot open or substitute, because gatewayd cannot replace the enrolled owner key (unlike a device key). Enrolment of the owner key is therefore a prerequisite for showing the recovery key (§5.2).
+
+**Restoring onto a new server.** The user's recovery key travels to the new server as the sealed kind `RECOVERY_KEY` (§5.2: owner-authenticated, with a privd-issued nonce). privd passes it to the worker as slot 0 of the `RESTORE_PLAN` and `RESTORE` jobs; then a `KEYS` job (slot 0: the recovery key, slot 1: the new server's backup key) adds the new server's `BACKUP_KEY` to the repository. The restore flow takes over the lease with `takeover=true` (§29).
+
+**What the worker does with a key.** It holds it only for the job: `PR_SET_DUMPABLE=0` (§24), a helper with `limits.memory.swap=false`, an ephemeral container deleted at the end. `rustic` keeps unzeroized internal copies of key material; this is accepted and stated (§36).
+
+## 35. Single writer, job record and crash recovery
+
+**One job per repository.** privd holds a per-repository **job slot**: one job of any kind at a time. The scheduler skips a scheduled run while the slot is held (architecture §9.5). A backup holds the desktop lock only while it creates the snapshot (§8). `DestroyDesktop` and `Uninstall` cancel the active job first. Across servers the same guarantee is the lease (§29).
+
+**The job record.** While a job holds the slot, privd keeps `/var/lib/hx/backup/<desktop_id>/job.json` (root, 0600, written atomically): the job id, the kind, the start time, the helper's name, the snapshot's name and, for a restore, the target. It is written before the helper is created and removed only after cleanup (§26, step 5).
+
+**Crash recovery at privd start, before any backup command is admitted:**
+
+1. force-delete every instance marked as a backup helper (`user.hx.kind=backup-worker`, `hx-bkw-*`);
+2. remove every `/run/hx/backup/*.sock`;
+3. delete every `hx-backup-*` snapshot;
+4. keep an `hx-restore-*` target only if the record says the restore can resume (`verify_existing`, §28), and delete it otherwise;
+5. stop `hx-drive.service`;
+6. mark the job interrupted and clear the slot.
+
+This is what replaces the "stale repository locks" of the S4 design: `rustic_core` has no lock files, so the repository needs none, and what can be stale is the job record (and, across servers, the Drive lease, §29).
+
+## 36. Decisions and open items
+
+### Decisions
+
+Taken by the maintainer and the design review on 2026-11-26.
+
+1. **The recovery key is sealed to the owner key, not the device key** (M1). gatewayd can substitute device keys but cannot substitute the enrolled owner key (§34).
+2. **The backup key is generated on the server** (M2): by the installer's `credentials` stage, as `backup-key.cred`, and never transmitted. A Phase 1 host gets it by re-running the installer once. The client-supplied `BACKUP_KEY` kind is withdrawn and its number reserved (§5.2). The recovery key is a second key file for the same master key.
+3. **The lease: the new server wins** (M4, §29).
+4. **No index cache in v1** (M3): the worker runs `rustic` without a cache, and there is no `cache` device (§24). Run times are measured on the nightly Drive test, and a cache volume is added only if index reads prove slow.
+5. **Helper limits are accepted for now** (M5): 1 GiB memory and 2 CPUs for a helper, `MemoryMax=512M` for the Drive helper. See the open items.
+6. **The Drive helper is a role of `hx-backup-worker`** (M6), selected by `HX_BACKUP_ROLE=drive`, following the fetcher's `HX_FETCH_TEMPLATE` precedent (§6.12).
+7. **privd relays; the worker has no direct path to Drive** (§23), and verifies SHA-256 on every write (§30).
+8. **A helper container, not a host child of privd.** Rejected, with reasons: a host child of privd in a user namespace (privd's bounding set is `CAP_NET_ADMIN`, `CAP_NET_RAW` and `CAP_IPC_LOCK` with `RestrictNamespaces=yes`; unshifted storage would need an idmapped mount, which needs `CAP_SYS_ADMIN`; and it would walk a hostile tree from the host); systemd `PrivateUsers` or idmapped `BindPaths` (not available on systemd 252 to 255); the Incus file API or SFTP (slow, loses extended attributes, brings hostile data into privd); Incus backup tarballs (a full copy at each run); a long-lived helper with an image rootfs (S4).
+9. **The transport is an Incus proxy device and a unix socket**, not restic's REST protocol (an HTTP server in root privd, or TCP over the shared bridge; no typed errors, job control, secret channel or progress channel; a basic-auth password), not OpenDAL in privd, and not a tmpfs file hand-off.
+
+### Open items
+
+These are **not decided**; each needs the named measurement or review.
+
+| Item | Question |
+|---|---|
+| Q-H1 (likely blocking for "Drive token sealed with `systemd-creds`") | privd has no `CAP_DAC_OVERRIDE` and `/dev/tpmrm0` is normally `tss:tss` 0660, so privd probably cannot run `systemd-creds encrypt` or `decrypt` with the TPM when `SetBackupCredentials` arrives. Options: `SupplementaryGroups=tss` on privd, `--with-key=host`, or a root oneshot sealing unit. Needs the security review; there is no TPM on the development host. |
+| Q-H2 | Repeat the helper probes (§24) on Incus 6.0.5 (Zabbly), the distro Incus of Debian 13 and Ubuntu 26.04, and the Debian 12 kernel 6.1: unshifted storage plus an idmapped root mount, a disk-device source under `/var/lib/incus/storage-pools` accepted, the same directory layout, and an ephemeral helper that is deleted automatically when PID 1 exits. |
+| Q-H3 | Restore through the helper of POSIX ACLs, hard links, sparse files, `security.*` extended attributes other than capabilities, and Docker `overlay2` data. A user namespace cannot set `trusted.*` attributes. Covered by the Phase 2C restore test. |
+| Q-H4 | Does `limits.disk.priority` affect a VPS's block devices? (`io.weight` needs BFQ or `io.cost`.) Measure. |
+| Q-H5 | The relay's CPU and memory cost in privd at full upload speed under `mlockall`. |
+| M5 | Whether 1 GiB and 2 CPUs per helper and `MemoryMax=512M` for the Drive helper fit the 2 vCPU / 4 GB minimum host. Measure in the Gate 2 run and adjust. |
+| Q-C1 | Whether the worker's `Create`{} operation is needed at all next to `OpenRepo`{`create`}. Until that is settled §30 permits it for `INIT` only. |
+
+### Accepted risks
+
+- `rustic` keeps unzeroized copies of key material in memory. Mitigations: an ephemeral container, swap off, a non-dumpable process.
+- A compromised worker in a `FORGET_PRUNE` job can delete packs. A prune helper has no `/src`, so only repository content reaches it; this is accepted.
+- The worker is PID 1 and must handle `SIGTERM` and reap children (§24).
+- Two takeovers of one repository racing each other can both pass the lease check (§29).
+- The design depends on Incus internals: unshifted storage and the storage path layout (architecture §15). The mitigation is the guard before each job (§24) and the real-Incus test of the helper probes.
+
+### Where it lives in code (plan, not contract)
+
+`hx-ipc::repo` (new, beside `hx_ipc::privd` and `hx_ipc::link`) holds the frame policy for kinds 1 to 3 on the existing decoder, the `RepoFrame` schema, the data-frame codec, the limit constants, the error enums and a fuzz target. `hx-backup` keeps its pure modules (`rules`, `manifest`, `policy` for §30, `phases` for §33) in the default features, which privd uses without `rustic`; the `engine` feature (`rustic_core`, worker only) holds the engine and a backend that speaks the repository link; the `drive` feature (OpenDAL `gdrive`, Drive helper only) holds S4's `HxDrive`, the retrier, the lease and the server side of the Drive link. `apps/hx-agent/src/bin/hx-backup-worker.rs` dispatches on the role (§6.12); privd's `privd/backup/` holds the job state machine, the helper and snapshot calls, the relay, the Drive session, progress mapping, crash recovery, the credentials and the recovery-key handling. The engine takes its backend as a trait object and sets the pack-size limits of §28 at `init` (rustic's default is `u32::MAX`).
