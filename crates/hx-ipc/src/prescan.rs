@@ -114,6 +114,7 @@ fn count(buf: &[u8], field: u32, packed_varint: bool) -> Result<usize, FrameErro
 }
 
 /// Sum of `count(inner, field)` over every occurrence of the nested message `outer_field`.
+#[cfg(any(feature = "privd", feature = "link"))]
 fn count_in(buf: &[u8], outer_field: u32, field: u32, packed: bool) -> Result<usize, FrameError> {
     let mut total = 0usize;
     each_sub(buf, outer_field, |inner| {
@@ -171,6 +172,108 @@ pub(crate) fn check_gateway_message(body: &[u8], max_results: usize) -> Result<(
         return Err(too_many("frame_feedback.results: too many"));
     }
     Ok(())
+}
+
+/// repo `RepoFrame` (`docs/ipc.md` Part 3): every repeated field of the schema, counted over
+/// **all** occurrences of its enclosing messages (protobuf merges repeated occurrences of an
+/// embedded message, so a limit checked per occurrence could be evaded by splitting the elements
+/// over several of them).
+///
+/// * `job`(3): `secret_slots`(3), `backup`(11) with `excludes`(2), `tags`(4) and
+///   `manifest`(1).`container_config`(5), `forget_prune`(15).`forget`(1), `keys`(17).
+///   `remove_key_ids`(2);
+/// * `response`(5): `list_page`(2).`entries`(1), each at least an id (34 bytes);
+/// * `result`(7): `key_ids`(9), `snapshots`(11), each at least an id and a digest (68 bytes)
+///   and at most 4 `tags`(3).
+///
+/// The minimum entry sizes keep the element count of a body of near-empty elements well under the
+/// count limit, which bounds what `prost` can allocate for it.
+#[cfg(feature = "repo")]
+pub(crate) fn check_repo_frame(frame_body: &[u8]) -> Result<(), FrameError> {
+    use crate::repo::{
+        MAX_CONFIG_ENTRIES, MAX_EXCLUDES, MAX_FORGET, MAX_KEY_IDS, MAX_LIST_PAGE_ENTRIES,
+        MAX_REMOVE_KEY_IDS, MAX_SECRET_SLOTS, MAX_SNAPSHOTS, MAX_TAGS,
+    };
+    // An id is `tag, length, 32 bytes`.
+    const MIN_LIST_ENTRY: usize = 34;
+    const MIN_SNAPSHOT: usize = 68;
+
+    let (mut slots, mut excludes, mut tags, mut config) = (0usize, 0usize, 0usize, 0usize);
+    let (mut forget, mut remove_keys) = (0usize, 0usize);
+    each_sub(frame_body, 3, |job| {
+        slots = slots.saturating_add(count(job, 3, false)?);
+        if slots > MAX_SECRET_SLOTS {
+            return Err(too_many("job.secret_slots: too many"));
+        }
+        each_sub(job, 11, |backup| {
+            excludes = excludes.saturating_add(count(backup, 2, false)?);
+            if excludes > MAX_EXCLUDES {
+                return Err(too_many("backup.excludes: too many"));
+            }
+            tags = tags.saturating_add(count(backup, 4, false)?);
+            if tags > MAX_TAGS {
+                return Err(too_many("backup.tags: too many"));
+            }
+            each_sub(backup, 1, |manifest| {
+                config = config.saturating_add(count(manifest, 5, false)?);
+                if config > MAX_CONFIG_ENTRIES {
+                    return Err(too_many("manifest.container_config: too many"));
+                }
+                Ok(())
+            })
+        })?;
+        each_sub(job, 15, |fp| {
+            forget = forget.saturating_add(count(fp, 1, false)?);
+            if forget > MAX_FORGET {
+                return Err(too_many("forget_prune.forget: too many"));
+            }
+            Ok(())
+        })?;
+        each_sub(job, 17, |keys| {
+            remove_keys = remove_keys.saturating_add(count(keys, 2, false)?);
+            if remove_keys > MAX_REMOVE_KEY_IDS {
+                return Err(too_many("keys.remove_key_ids: too many"));
+            }
+            Ok(())
+        })
+    })?;
+
+    let mut entries = 0usize;
+    each_sub(frame_body, 5, |resp| {
+        each_sub(resp, 2, |page| {
+            entries = entries.saturating_add(count(page, 1, false)?);
+            if entries > MAX_LIST_PAGE_ENTRIES {
+                return Err(too_many("list_page.entries: too many"));
+            }
+            each_sub(page, 1, |entry| {
+                if entry.len() < MIN_LIST_ENTRY {
+                    return Err(too_many("list_page.entries: entry too short"));
+                }
+                Ok(())
+            })
+        })
+    })?;
+
+    let (mut key_ids, mut snapshots) = (0usize, 0usize);
+    each_sub(frame_body, 7, |result| {
+        key_ids = key_ids.saturating_add(count(result, 9, false)?);
+        if key_ids > MAX_KEY_IDS {
+            return Err(too_many("result.key_ids: too many"));
+        }
+        snapshots = snapshots.saturating_add(count(result, 11, false)?);
+        if snapshots > MAX_SNAPSHOTS {
+            return Err(too_many("result.snapshots: too many"));
+        }
+        each_sub(result, 11, |snap| {
+            if snap.len() < MIN_SNAPSHOT {
+                return Err(too_many("result.snapshots: entry too short"));
+            }
+            if count(snap, 3, false)? > MAX_TAGS {
+                return Err(too_many("snapshot.tags: too many"));
+            }
+            Ok(())
+        })
+    })
 }
 
 #[cfg(test)]

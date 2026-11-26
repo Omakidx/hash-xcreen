@@ -16,6 +16,10 @@ privd = ["dep:prost"]
 # The session link (docs/ipc.md Part 2): schemas, preamble, lanes, budgets. Needs the shared
 # hx.v1 types, hence hx-proto.
 link = ["dep:hx-proto", "dep:prost"]
+# The repository link (docs/ipc.md Part 3): schema, framing kinds 1 to 3, data frames, secret
+# frames, limits, link state and the operation policy. Not in `default`: the musl backup worker
+# builds with `default-features = false, features = ["repo"]`, and hx-privd enables it explicitly.
+repo = ["dep:prost"]
 
 [dependencies]
 bytes.workspace = true
@@ -31,6 +35,9 @@ prost-build = "0.14"
 protox = "0.9"
 
 [dev-dependencies]
+# Switches `repo` on for this crate's own tests: nothing else in the workspace depends on the
+# feature yet, and the repository link tests must run in a plain `cargo test --workspace`.
+hx-ipc = { path = ".", default-features = false, features = ["repo"] }
 criterion.workspace = true
 proptest = "1"
 

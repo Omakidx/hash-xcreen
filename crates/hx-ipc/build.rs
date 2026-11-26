@@ -26,8 +26,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=proto");
     println!("cargo:rerun-if-changed=../hx-proto/proto/hx.proto");
     let out = PathBuf::from(env::var("OUT_DIR")?);
-    // Leave both include files in place so `include!` finds them whatever the features.
-    for name in ["_privd_includes.rs", "_link_includes.rs"] {
+    // Leave every include file in place so `include!` finds them whatever the features.
+    for name in [
+        "_privd_includes.rs",
+        "_link_includes.rs",
+        "_repo_includes.rs",
+    ] {
         std::fs::write(out.join(name), "")?;
     }
     if env::var_os("CARGO_FEATURE_PRIVD").is_some() {
@@ -39,6 +43,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     if env::var_os("CARGO_FEATURE_LINK").is_some() {
         compile(&["link.proto"], "_link_includes.rs", true)?;
+    }
+    if env::var_os("CARGO_FEATURE_REPO").is_some() {
+        compile(&["repo.proto"], "_repo_includes.rs", false)?;
     }
     Ok(())
 }
