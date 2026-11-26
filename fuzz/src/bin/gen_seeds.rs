@@ -453,15 +453,48 @@ mod repo_seeds {
             last: true,
         });
         let done = || R::Done(rpb::Done {});
+        let page_last = || {
+            R::ListPage(rpb::ListPage {
+                entries: vec![],
+                last: true,
+            })
+        };
         let w = Endpoint::Worker;
         let pw = Endpoint::PrivdWorkerLink;
         let pd = Endpoint::PrivdDriveLink;
         let dh = Endpoint::DriveHelper;
         let kind_index =
             |k: rpb::JobKind| harness::KINDS.iter().position(|x| *x == k).unwrap() as u8;
-        let selector = |e: Endpoint, respond: bool, k: rpb::JobKind| {
+        let selector = |e: Endpoint, respond: bool, abort: bool, k: rpb::JobKind| {
             let ep = Endpoint::ALL.iter().position(|x| *x == e).unwrap() as u8;
-            ep | if respond { 4 } else { 0 } | (kind_index(k) << 3)
+            ep | if respond { 4 } else { 0 } | (kind_index(k) << 3) | if abort { 0x40 } else { 0 }
+        };
+        // `min_aborts`: how many aborted uploads a replay must have reached.
+        let seed_with = |o: &mut Out,
+                         name: &str,
+                         e: Endpoint,
+                         respond: bool,
+                         abort: bool,
+                         min_aborts: usize,
+                         k: rpb::JobKind,
+                         frames: &[Vec<u8>]| {
+            let mut v = vec![selector(e, respond, abort, k), 64];
+            v.extend(frames.concat());
+            o.put("ipc_repo", name, &v);
+            if name.starts_with("talk_") {
+                let got = harness::run(e, respond, abort, k, 64, &v[2..])
+                    .unwrap_or_else(|err| panic!("seed {name} is not accepted to its end: {err}"));
+                assert_eq!(
+                    got.frames,
+                    frames.len(),
+                    "seed {name}: every frame must be accepted"
+                );
+                assert!(
+                    got.aborts >= min_aborts,
+                    "seed {name}: reached {} aborted uploads, wanted {min_aborts}",
+                    got.aborts
+                );
+            }
         };
         let seed = |o: &mut Out,
                     name: &str,
@@ -469,18 +502,7 @@ mod repo_seeds {
                     respond: bool,
                     k: rpb::JobKind,
                     frames: &[Vec<u8>]| {
-            let mut v = vec![selector(e, respond, k), 64];
-            v.extend(frames.concat());
-            o.put("ipc_repo", name, &v);
-            if name.starts_with("talk_") {
-                let got = harness::run(e, respond, k, 64, &v[2..])
-                    .unwrap_or_else(|err| panic!("seed {name} is not accepted to its end: {err}"));
-                assert_eq!(
-                    got,
-                    frames.len(),
-                    "seed {name}: every frame must be accepted"
-                );
-            }
+            seed_with(o, name, e, respond, false, 0, k, frames)
         };
         let check = rpb::JobKind::Check;
 
@@ -765,6 +787,101 @@ mod repo_seeds {
                 req(dh, 4, Op::Quota(rpb::Quota {})),
                 msg(dh, F::CancelRequest(rpb::CancelRequest { req_id: 2 })),
                 msg(dh, F::Bye(rpb::Bye {})),
+            ],
+        );
+        // Aborted uploads (abort mode): the tracker's Aborted state at both ends.
+        let failed = rpb::JobResult {
+            ok: false,
+            error: rpb::WorkerError::Engine as i32,
+            ..Default::default()
+        };
+        seed_with(
+            o,
+            "talk_privd_worker_abort",
+            pw,
+            true,
+            true,
+            1,
+            backup,
+            &[
+                msg(pw, ack()),
+                // privd answers Error after the first data frame; the rest is discarded
+                req(pw, 1, write_op(T::Pack, 7, 20)),
+                data(1, false, 10),
+                data(1, false, 5),
+                data(1, true, 0),
+                msg(pw, F::Result(failed)),
+                msg(pw, F::Bye(rpb::Bye {})),
+            ],
+        );
+        let error = |to: Endpoint, id: u64| {
+            resp(
+                to,
+                id,
+                R::Error(rpb::RepoError {
+                    class: rpb::ErrorClass::QuotaExceeded as i32,
+                    retry_after_ms: 0,
+                }),
+            )
+        };
+        // The Error arrives before the rest of the upload: privd owes the closing empty END.
+        seed_with(
+            o,
+            "talk_privd_drive_abort",
+            pd,
+            true,
+            true,
+            1,
+            check,
+            &[
+                msg(pd, ack()),
+                resp(pd, 1, done()),
+                resp(pd, 2, page_last()),
+                // request 3 (Write, first 5 of 10 bytes sent)
+                error(pd, 3),
+                msg(pd, F::Bye(rpb::Bye {})),
+            ],
+        );
+        // The Error crosses privd's END: the request is finished and no END is owed.
+        seed_with(
+            o,
+            "talk_privd_drive_crossed",
+            pd,
+            true,
+            true,
+            0,
+            check,
+            &[
+                msg(pd, ack()),
+                resp(pd, 1, done()),
+                resp(pd, 2, page_last()),
+                msg(
+                    pd,
+                    F::Event(rpb::Event {
+                        kind: 2,
+                        until_ms: 0,
+                    }),
+                ),
+                error(pd, 3),
+                msg(pd, F::Bye(rpb::Bye {})),
+            ],
+        );
+        seed_with(
+            o,
+            "talk_worker_abort",
+            w,
+            true,
+            true,
+            1,
+            init,
+            &[
+                msg(w, hello()),
+                msg(w, F::Job(harness::job(init))),
+                repo::encode_secret(0, 0, &[1; 32]).expect("s0").to_vec(),
+                repo::encode_secret(0, 1, &[2; 32]).expect("s1").to_vec(),
+                resp(w, 1, page_last()),
+                error(w, 2),
+                msg(w, F::Bye(rpb::Bye {})),
             ],
         );
     }

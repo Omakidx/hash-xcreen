@@ -7,7 +7,7 @@
 //! plays the local end's own frames, so the tracker's later states are reachable from bytes.
 //! Input: `selector | chunk size | stream`; `selector & 3` picks the endpoint (worker, privd on
 //! the worker link, privd on the Drive link, Drive helper), bit 2 makes the harness respond or
-//! send requests, bits 3 to 5 pick the job kind.
+//! send requests, bits 3 to 5 pick the job kind, bit 6 enables abort mode.
 #![no_main]
 
 #[path = "../src/ipc_repo_harness.rs"]
@@ -26,6 +26,7 @@ fuzz_target!(|data: &[u8]| {
     let _ = harness::run(
         endpoint,
         sel & 4 != 0,
+        sel & 0x40 != 0,
         kind,
         usize::from(*chunk).max(1),
         stream,

@@ -15,14 +15,21 @@
 //!   fixed order `OpenRepo` (Drive link only), then `List`, `Write` (10 bytes, sent in full with
 //!   `END` at once), `ReadFull`, `Create`, repeating; request `n` has `req_id` `n`.
 //!
+//! With `abort` set, a responder answers a `Write` with `Error` after its first data frame, and a
+//! requester streams each upload in two parts and closes an aborted one with an empty `END` (or
+//! skips it when the `Error` crossed its `END`), so the tracker's `Aborted` state is reached.
+//! After every frame the harness checks the tracker's `done` claims (one slot freed, request no
+//! longer outstanding).
+//!
 //! Input layout of the target: `selector | chunk size | stream`; `selector & 3` is the endpoint,
-//! bit 2 `respond`, bits 3 to 5 the job kind (index into [`KINDS`]).
+//! bit 2 `respond`, bits 3 to 5 the job kind (index into [`KINDS`]), bit 6 `abort`.
 
 use bytes::Bytes;
 use hx_ipc::frame::{Decoder, RawFrame};
 use hx_ipc::repo::{
-    self, Endpoint, Incoming, LinkState, MAX_DATA_PAYLOAD, MAX_DRIVE_OUTSTANDING_REQUESTS,
-    MAX_OUTSTANDING_REQUESTS, MAX_OUTSTANDING_WRITES, RepoFramePolicy, check_op, pb,
+    self, Disposition, Endpoint, Incoming, LinkState, MAX_DATA_PAYLOAD,
+    MAX_DRIVE_OUTSTANDING_REQUESTS, MAX_OUTSTANDING_REQUESTS, MAX_OUTSTANDING_WRITES,
+    RepoFramePolicy, check_op, pb,
 };
 use repo::pb::repo_frame::Frame as F;
 use repo::pb::repo_request::Op;
@@ -168,25 +175,87 @@ fn answer(req_id: u64, op: &Op) -> pb::RepoFrame {
     )
 }
 
+/// What a replay reached, for `gen-seeds` to check.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Report {
+    /// Peer frames accepted.
+    pub frames: usize,
+    /// Uploads that were aborted by an `Error` before their `END` (the tracker's `Aborted`
+    /// state), counted at either end.
+    pub aborts: usize,
+    /// Data frames reported as discard.
+    pub discards: usize,
+}
+
 struct Harness {
     endpoint: Endpoint,
     link: LinkState,
     respond: bool,
+    /// Abort mode: a responder answers a `Write` with `Error` after its first data frame; a
+    /// requester streams each upload in two parts and closes an aborted one with an empty `END`.
+    abort: bool,
     kind: pb::JobKind,
     job_sent: bool,
     next_id: u64,
     /// Writes (ids) a responder is waiting to see the `END` of.
     pending_writes: Vec<u64>,
+    /// Uploads a requester has sent the first part of: `(req_id, owes_end)`, `owes_end` set when
+    /// an `Error` arrived before the rest was sent.
+    half_uploads: Vec<(u64, bool)>,
+    report: Report,
 }
 
 type Out = Result<(), String>;
 
 impl Harness {
+    /// Checks the tracker's claim about what a frame finished, and counts what was reached.
+    fn account(&mut self, before: usize, d: Disposition, aborted_error: bool) {
+        if let Some(id) = d.done {
+            assert_eq!(
+                self.link.outstanding() + 1,
+                before,
+                "a finished request must free exactly one slot"
+            );
+            assert!(
+                !self.link.is_outstanding(id),
+                "a finished request is no longer outstanding"
+            );
+        }
+        if aborted_error && d.done.is_none() {
+            self.report.aborts += 1;
+        }
+        if d.discard {
+            self.report.discards += 1;
+        }
+    }
+
     fn send(&mut self, f: &pb::RepoFrame) -> Out {
-        self.link
+        let before = self.link.outstanding();
+        let d = self
+            .link
             .sent_message(f)
-            .map(|_| ())
-            .map_err(|e| format!("own frame refused: {e}"))
+            .map_err(|e| format!("own frame refused: {e}"))?;
+        assert!(!d.discard, "an own frame is never discarded");
+        let is_error = matches!(
+            f.frame,
+            Some(F::Response(pb::RepoResponse {
+                result: Some(Res::Error(_)),
+                ..
+            }))
+        );
+        self.account(before, d, is_error);
+        Ok(())
+    }
+
+    fn send_data(&mut self, id: u64, end: bool, len: usize) -> Out {
+        let before = self.link.outstanding();
+        let d = self
+            .link
+            .sent_data(id, end, len)
+            .map_err(|e| format!("own data refused: {e}"))?;
+        assert!(!d.discard, "an own frame is never discarded");
+        self.account(before, d, false);
+        Ok(())
     }
 
     fn start(&mut self) -> Out {
@@ -205,8 +274,9 @@ impl Harness {
         matches!(self.endpoint, Endpoint::Worker | Endpoint::PrivdDriveLink)
     }
 
-    /// What the harness does after the peer's frame `incoming` was accepted.
-    fn react(&mut self, incoming: &Incoming) -> Out {
+    /// What the harness does after the peer's frame `incoming` was accepted (`d` is the
+    /// tracker's disposition of it).
+    fn react(&mut self, incoming: &Incoming, d: Disposition) -> Out {
         if let Incoming::Message(pb::RepoFrame { frame: Some(f) }) = incoming {
             match f {
                 F::Hello(_) if !self.endpoint.is_privd() => {
@@ -245,21 +315,61 @@ impl Harness {
                         }
                     }
                 }
+                // An Error for an upload of ours: if no END crossed it, one is owed.
+                F::Response(pb::RepoResponse {
+                    req_id,
+                    result: Some(Res::Error(_)),
+                }) => {
+                    if let Some(h) = self.half_uploads.iter_mut().find(|h| h.0 == *req_id) {
+                        h.1 = d.done.is_none();
+                    }
+                    if d.done.is_none() && self.requester() {
+                        self.report.aborts += 1;
+                    }
+                }
                 _ => {}
             }
         }
-        if let Incoming::Data(d) = incoming
+        if let Incoming::Data(data) = incoming
             && self.respond
             && !self.requester()
-            && d.end
-            && let Some(pos) = self.pending_writes.iter().position(|w| *w == d.stream_id)
+            && let Some(pos) = self
+                .pending_writes
+                .iter()
+                .position(|w| *w == data.stream_id)
         {
-            self.pending_writes.swap_remove(pos);
-            // The upload may have been aborted by an earlier answer; a refusal is then ours.
-            let _ = self.send(&answer(d.stream_id, &Op::Create(pb::Create {})));
+            if data.end {
+                self.pending_writes.swap_remove(pos);
+                self.send(&answer(data.stream_id, &Op::Create(pb::Create {})))?;
+            } else if self.abort {
+                // Answer before the END: the upload is aborted and the sender must close it.
+                self.pending_writes.swap_remove(pos);
+                let error = response(
+                    data.stream_id,
+                    Res::Error(pb::RepoError {
+                        class: pb::ErrorClass::QuotaExceeded as i32,
+                        retry_after_ms: 0,
+                    }),
+                );
+                self.send(&error)?;
+            }
         }
         if self.respond && self.requester() {
+            self.finish_uploads()?;
             self.next_request()?;
+        }
+        Ok(())
+    }
+
+    /// Second part of every upload we started: the rest and `END`, or only the closing empty
+    /// `END` when an `Error` already aborted it.
+    fn finish_uploads(&mut self) -> Out {
+        for (id, owes_end) in std::mem::take(&mut self.half_uploads) {
+            if owes_end {
+                self.send_data(id, true, 0)?;
+            } else {
+                self.send_data(id, true, 5)?;
+            }
         }
         Ok(())
     }
@@ -303,37 +413,43 @@ impl Harness {
         self.send(&request(n, op))?;
         self.next_id += 1;
         if is_write {
-            self.link
-                .sent_data(n, true, 10)
-                .map_err(|e| format!("own data refused: {e}"))?;
+            if self.abort {
+                self.send_data(n, false, 5)?;
+                self.half_uploads.push((n, false));
+            } else {
+                self.send_data(n, true, 10)?;
+            }
         }
         Ok(())
     }
 }
 
-/// Plays `endpoint` against `stream` (the peer's bytes, fed in chunks of `chunk`). Returns the
-/// number of peer frames that were accepted when the stream ended cleanly at a frame boundary,
-/// or the reason it was not accepted to its end (a peer violation or a refused frame of ours).
-/// Panics only on a broken invariant of the codec.
+/// Plays `endpoint` against `stream` (the peer's bytes, fed in chunks of `chunk`). Returns what
+/// was reached when the stream ended cleanly at a frame boundary, or the reason it was not
+/// accepted to its end (a peer violation or a refused frame of ours). Panics only on a broken
+/// invariant of the codec or of the tracker's dispositions.
 pub fn run(
     endpoint: Endpoint,
     respond: bool,
+    abort: bool,
     kind: pb::JobKind,
     chunk: usize,
     stream: &[u8],
-) -> Result<usize, String> {
+) -> Result<Report, String> {
     let mut h = Harness {
         endpoint,
         link: LinkState::new(endpoint),
         respond,
+        abort,
         kind,
         job_sent: false,
         next_id: 1,
         pending_writes: Vec::new(),
+        half_uploads: Vec::new(),
+        report: Report::default(),
     };
     h.start()?;
     let mut decoder = Decoder::new(RepoFramePolicy::new(endpoint));
-    let mut frames = 0usize;
     let mut rest = stream;
     while !rest.is_empty() {
         let take = rest.len().min(chunk.max(1));
@@ -344,10 +460,13 @@ pub fn run(
             let Some(raw) = raw else { continue };
             let incoming = repo::decode(raw, endpoint).map_err(|e| format!("decode: {e}"))?;
             check_stable(&incoming, endpoint);
-            h.link
+            let before = h.link.outstanding();
+            let d = h
+                .link
                 .received(&incoming)
                 .map_err(|e| format!("peer violation: {e}"))?;
-            frames += 1;
+            h.report.frames += 1;
+            h.account(before, d, false);
             let cap = if endpoint.on_worker_link() {
                 MAX_OUTSTANDING_REQUESTS
             } else {
@@ -355,12 +474,12 @@ pub fn run(
             };
             assert!(h.link.outstanding() <= cap);
             assert!(h.link.outstanding_writes() <= MAX_OUTSTANDING_WRITES);
-            h.react(&incoming)?;
+            h.react(&incoming, d)?;
         }
         rest = &rest[take..];
     }
     decoder.finish().map_err(|e| format!("truncated: {e}"))?;
-    Ok(frames)
+    Ok(h.report)
 }
 
 /// An accepted frame re-encodes for the same peer and decodes to the same value.
