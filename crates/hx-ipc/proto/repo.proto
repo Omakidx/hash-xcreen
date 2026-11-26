@@ -69,6 +69,9 @@ enum WorkerError {
   WORKER_ERROR_CANCELLED = 8;
   // A relayed repository error; privd uses its own record of it.
   WORKER_ERROR_REPO = 9;
+  // The repository failed its own integrity check before a prune (a pack in no index, a blob in
+  // two packs); nothing was deleted. Additive.
+  WORKER_ERROR_INTEGRITY = 10;
 }
 
 enum DockerMode {
