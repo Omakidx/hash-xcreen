@@ -657,3 +657,33 @@ fn a_corrupt_pack_makes_rustic_panic_in_restore_and_the_job_still_ends_with_a_re
     );
     assert!(out.bye, "an orderly end, not a crash");
 }
+
+#[test]
+fn a_damaged_index_ends_every_kind_of_job_with_a_result() {
+    let env = Env::new();
+    make_tree(&env.src());
+    env.init();
+    env.backup();
+    {
+        let mut st = env.store.lock().unwrap();
+        let keys: Vec<_> = st
+            .objects
+            .keys()
+            .filter(|(t, _)| *t == T::Index as i32)
+            .cloned()
+            .collect();
+        assert!(!keys.is_empty());
+        for k in keys {
+            let v = st.objects.get_mut(&k).unwrap();
+            for i in (0..v.len()).step_by(13) {
+                v[i] ^= 0x5a;
+            }
+        }
+    }
+    for j in [check_job(0), forget_job(&[])] {
+        let (code, out) = session(j, &env.store, Behavior::default(), &env.cfg());
+        assert_eq!(code, 0, "{:?}", out.worker_violations);
+        assert!(!out.result.expect("a JobResult").ok);
+        assert!(out.bye);
+    }
+}

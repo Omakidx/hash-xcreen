@@ -867,10 +867,10 @@ fn job_result_rules() {
         result_frame(r)
     };
     ok(&failed(&|r| r.files_new = 3), p);
-    for e in [0, 10, 99] {
+    for e in [0, 11, 99] {
         bad(&failed(&|r| r.error = e), p);
     }
-    for e in 1..=9 {
+    for e in 1..=10 {
         ok(&failed(&|r| r.error = e), p);
     }
     bad(&failed(&|r| r.snapshot_id = id(1)), p);
