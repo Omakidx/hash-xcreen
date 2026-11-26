@@ -168,25 +168,30 @@ The Incus side of the per-job helper container of ipc.md 24, for `hx-privd` to c
 takes a caller-chosen name, path, config key or device; privd is root, so every value is a constant
 or computed from a validated name (the way `SessionLink` is):
 
-- `JobId`, `PoolName`, `DesktopName`, `BackupSnapshotName` (`hx-backup-...`), `RestoreTargetName`
-  (`hx-restore-...`) and `HelperName` (`hx-bkw-<8 hex>`) are the validated names;
+- `JobId`, `PoolName`, `DesktopName` (`hx-<id>`), `BackupSnapshotName` (`hx-backup-...`),
+  `RestoreTargetName` (`hx-restore-...`) and `HelperName` (`hx-bkw-<8 hex>`) are the validated names;
+- `SnapshotMount::checked` (device `src`, read-only, `shift=true`, the snapshot's `rootfs`) and
+  `TargetMount::checked` (device `dst`, writable, `shift=true`) are the **only public way to get a
+  mount**: they run the checks before each job (idmapped mounts, btrfs, the desktop or target
+  identity and pool, `volatile.last_state.idmap` `[]`, that the snapshot belongs to the desktop,
+  and for a target that it is `Stopped` and never started) and derive every path from the objects
+  they were given. A failure is a `PreconditionFailed` that privd maps to `FAILED_PRECONDITION`;
+  `check_host_preconditions` is the host half, for failing early. `RepoLink` is the proxy device
+  (`repo`, host socket `/run/hx/backup/<job>.sock`, root, 0600; the `sun_path` limit is checked);
 - `BackupHelperSpec::{backup, restore, repository_only}` is the instance: the config table of
   ipc.md 24, `ephemeral: true`, `source.type=none`, no profiles, a 256 MiB root disk, no NIC;
-- `SnapshotMount` (device `src`, read-only, `shift=true`, the snapshot's `rootfs`), `TargetMount`
-  (device `dst`, writable, `shift=true`) and `RepoLink` (proxy device `repo`, host socket
-  `/run/hx/backup/<job>.sock`, root, 0600) are the devices. `RepoLink::in_dir` exists only for
-  tests that run as an ordinary user; privd uses `RepoLink::new`. The `sun_path` limit is checked;
 - `RestoreTargetSpec::from_desktop` builds the never-started `init --empty` restore target from
-  the desktop's `get_instance` result, without `volatile.*` and proxy devices, with
-  `boot.autostart=false`;
-- `check_backup_preconditions` and `check_restore_preconditions` are the checks before each job
-  (`idmapped_mounts`, btrfs, the desktop on the pool, `volatile.last_state.idmap` of desktop and
-  snapshot `[]`); a failure is a `PreconditionFailed` that privd maps to `FAILED_PRECONDITION`;
-- on `Client`: `create_backup_helper`, `populate_backup_helper` (directories and the worker as
-  `/sbin/init`), `start_backup_helper`, `finish_backup_helper` (waits for the ephemeral helper to
-  be deleted, force-deletes after a timeout), `force_delete_backup_helper`, `list_backup_helpers`
-  (crash recovery), `create_restore_target` and `delete_restore_target`. They act only on
-  instances that carry the helper marker (`user.hx.kind=backup-worker`) or the `user.hx.*` marker.
+  the desktop's `get_instance` result **by allowlist** (the keys privd sets on desktops, the hx
+  profiles, the `root` disk; anything else is refused), marked `user.hx.kind=restore-target`,
+  `user.hx.job`, `user.hx.state=restoring`, `boot.autostart=false`;
+- on `Client`: `create_backup_helper` (reads the helper back and deletes it if it is not exactly the
+  spec), `populate_backup_helper`, `start_backup_helper`, `finish_backup_helper` (waits for the
+  ephemeral helper to be deleted, force-deletes after a timeout), `force_delete_backup_helper`,
+  `list_backup_helpers`, `create_restore_target` (read back the same way), `delete_restore_target`
+  and `list_restore_targets`. The helper calls take the `JobId` and require both the kind marker
+  and `user.hx.job`; the target calls require `user.hx.kind=restore-target`.
+- `RepoLink::in_dir` and the unchecked mount constructors exist only under the `test-support`
+  feature, which this crate's own tests enable through a self dev-dependency.
 
 `STORAGE_POOLS_ROOT` (`/var/lib/incus/storage-pools`) is an Incus internal, in one constant.
 
@@ -194,7 +199,7 @@ or computed from a validated name (the way `SessionLink` is):
 leaves it behind), create `/run/hx/backup` (root 0700), connect to the socket with retries, and
 keep the job record. The helper's socket is a plain byte pipe; no half-close (ipc.md 24).
 
-`tests/backup_helper.rs` tests all of this against a scripted daemon. `tests/incus_real_backup.rs`
+The storage paths assume Incus's `default` project. `tests/backup_helper.rs` tests all of this against a scripted daemon. `tests/incus_real_backup.rs`
 (`#[ignore]`, objects `hx2w-test-*`, `hx-restore-hx2wtest` and the two helpers `hx-bkw-7e57ba5e`
 and `hx-bkw-7e57ba5f`) repeats the ipc.md 24 probes against a real Incus: a source container with
 ids 1234:4321 and 1000:1000, a v2 file capability, a user xattr, a fifo and a readable

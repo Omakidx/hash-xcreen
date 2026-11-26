@@ -29,11 +29,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use hx_provision::host::Naming;
 use hx_provision::incus::{
-    BackupHelperSpec, BackupSnapshotName, Client, DesktopName, ExecSpec, HelperEnd, ImageSource,
-    InstanceCreate, JobId, PoolName, RepoLink, Request, RestoreTargetName, RestoreTargetSpec,
-    SnapshotMount, StateAction, Transport, UnixTransport, check_backup_preconditions,
-    check_restore_preconditions,
+    BackupHelperSpec, Client, ExecSpec, HelperEnd, ImageSource, InstanceCreate, JobId,
+    PreconditionFailed, ProfileSpec, RepoLink, Request, RestoreTargetName, RestoreTargetSpec,
+    SnapshotMount, StateAction, TargetMount, Transport, UnixTransport, description_is_marked,
 };
 use hx_provision::orchestrate::{
     ReadyOptions, destroy_instance, exec_captured, wait_system_running,
@@ -43,7 +43,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 const POOL: &str = "hx2w-test-pool";
-const SRC: &str = "hx2w-test-src";
+/// A desktop's instance name is `hx-<id>`; the id carries the test prefix.
+const SRC: &str = "hx-hx2wtest";
+const PREFIX: &str = "hx2w-test-";
 const TARGET: &str = "hx-restore-hx2wtest";
 const JOB_BACKUP: &str = "7e57ba5e000000000000000000000001";
 const JOB_RESTORE: &str = "7e57ba5f000000000000000000000002";
@@ -76,37 +78,87 @@ fn job(hex: &str) -> JobId {
     JobId::from_hex(hex).unwrap()
 }
 
-fn link_dir() -> PathBuf {
-    // The directory's owner is the user running the test, which is also who owns the socket.
-    let uid = std::fs::metadata("/proc/self")
+fn my_uid() -> u32 {
+    std::fs::metadata("/proc/self")
         .map(|m| m.uid())
-        .unwrap_or(0);
-    std::env::temp_dir().join(format!("hx2w-test-{uid}"))
+        .expect("/proc/self")
 }
 
-/// Remove everything this suite may have created. Only objects with the names above are touched.
+fn link_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("hx2w-test-{}", my_uid()))
+}
+
+fn naming() -> Naming {
+    Naming::with_prefix(PREFIX).unwrap()
+}
+
+/// Whether `path` is a real directory (not a symlink) owned by the user running the test.
+fn is_my_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|m| m.file_type().is_dir() && !m.file_type().is_symlink() && m.uid() == my_uid())
+}
+
+/// Remove everything this suite may have created. Each object is checked before it is deleted:
+/// the pool and the profile by the hash-xcreen description and the test prefix, the desktop by its
+/// `user.hx.state` marker and a root disk on the test pool, the helpers and the target by their
+/// kind and job markers (the client calls refuse anything else), the scratch directory by being a
+/// real directory of ours.
 async fn cleanup(c: &Client<UnixTransport>) {
     for hex in [JOB_BACKUP, JOB_RESTORE] {
-        let name = job(hex).helper_name();
-        if let Err(e) = c.force_delete_backup_helper(&name).await {
-            eprintln!("cleanup: helper {name}: {e}");
+        if let Err(e) = c.force_delete_backup_helper(job(hex)).await {
+            eprintln!("cleanup: helper of {hex}: {e}");
         }
     }
     if let Err(e) = c
-        .delete_restore_target(&RestoreTargetName::new(TARGET).unwrap())
+        .delete_restore_target(
+            &RestoreTargetName::new(TARGET).unwrap(),
+            Some(job(JOB_RESTORE)),
+        )
         .await
     {
         eprintln!("cleanup: restore target: {e}");
     }
-    if let Err(e) = destroy_instance(c, SRC).await {
-        eprintln!("cleanup: {SRC}: {e}");
+    match c.get_instance(SRC).await {
+        Ok(Some(i))
+            if i.config.contains_key("user.hx.state")
+                && i.expanded_devices
+                    .get("root")
+                    .and_then(|r| r.get("pool"))
+                    .map(String::as_str)
+                    == Some(POOL) =>
+        {
+            if let Err(e) = destroy_instance(c, SRC).await {
+                eprintln!("cleanup: {SRC}: {e}");
+            }
+        }
+        Ok(Some(_)) => eprintln!("cleanup: {SRC} exists but is not ours: left alone"),
+        Ok(None) => {}
+        Err(e) => eprintln!("cleanup: {SRC}: {e}"),
     }
-    if let Ok(Some(_)) = c.get_storage_pool(POOL).await
+    let n = naming();
+    if let Ok(Some(p)) = c.get_profile(&n.desktop_profile).await
+        && description_is_marked(&p.description)
+        && n.desktop_profile.starts_with(PREFIX)
+        && let Err(e) = c.delete_profile(&n.desktop_profile).await
+    {
+        eprintln!("cleanup: profile: {e}");
+    }
+    if let Ok(Some(p)) = c.get_storage_pool(POOL).await
+        && description_is_marked(&p.description)
+        && POOL.starts_with(PREFIX)
         && let Err(e) = c.delete_storage_pool(POOL).await
     {
         eprintln!("cleanup: pool: {e}");
     }
-    let _ = std::fs::remove_dir_all(link_dir());
+    let dir = link_dir();
+    if is_my_real_dir(&dir) {
+        let _ = std::fs::remove_dir_all(&dir);
+    } else if dir.symlink_metadata().is_ok() {
+        eprintln!(
+            "cleanup: {} is not a real directory of ours: left alone",
+            dir.display()
+        );
+    }
 }
 
 /// Fingerprint of a cached Debian 13 container image (a download would make the test depend on
@@ -248,30 +300,42 @@ async fn real_backup_helper_probes() {
         .await
         .unwrap()
         .into_iter()
-        .filter(|h| {
-            h.job
-                .is_some_and(|j| j == job(JOB_BACKUP) || j == job(JOB_RESTORE))
-        })
+        .filter(|h| h.job == job(JOB_BACKUP) || h.job == job(JOB_RESTORE))
         .map(|h| h.name.to_string())
         .collect();
     assert!(left.is_empty(), "helpers left behind: {left:?}");
-    assert!(!link_dir().exists(), "link directory left behind");
+    assert!(
+        link_dir().symlink_metadata().is_err(),
+        "link directory left behind"
+    );
+    assert!(
+        c.get_profile(&naming().desktop_profile)
+            .await
+            .unwrap()
+            .is_none(),
+        "profile left behind"
+    );
     eprintln!("OBS cleanup verified: no pool, source, target, helper or link directory left");
     result.unwrap();
 }
 
 async fn probes(c: Client<UnixTransport>) {
     let started = Instant::now();
-    let pool = PoolName::new(POOL).unwrap();
-    let desktop_name = DesktopName::new(SRC).unwrap();
     let work = link_dir();
-    std::fs::create_dir_all(&work).unwrap();
+    // `create_dir`, not `create_dir_all`: an existing path (a symlink planted in /tmp, say) is an
+    // error, and what we got must be a real directory of ours.
+    std::fs::create_dir(&work).unwrap_or_else(|e| panic!("create {}: {e}", work.display()));
+    assert!(
+        is_my_real_dir(&work),
+        "{} is not a real directory of ours",
+        work.display()
+    );
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
     let owner = {
-        let m = std::fs::metadata(&work).unwrap();
+        let m = std::fs::symlink_metadata(&work).unwrap();
         (m.uid(), m.gid())
     };
     let fixture = build_fixture(&work);
@@ -287,13 +351,23 @@ async fn probes(c: Client<UnixTransport>) {
     )
     .await
     .unwrap();
+    c.create_profile(&ProfileSpec {
+        name: naming().desktop_profile,
+        description: "hash-xcreen: test desktop profile".into(),
+        config: Default::default(),
+        devices: Default::default(),
+    })
+    .await
+    .unwrap();
     c.create_instance(
         &InstanceCreate {
             name: SRC.into(),
             image: ImageSource::LocalFingerprint(image),
-            profiles: vec![],
+            profiles: vec![naming().desktop_profile],
             config: [
                 ("security.idmap.isolated", "true"),
+                ("security.privileged", "false"),
+                ("security.guestapi", "false"),
                 ("user.hx.state", "ready"),
             ]
             .into_iter()
@@ -384,17 +458,37 @@ async fn probes(c: Client<UnixTransport>) {
             .map(String::as_str),
         Some("[]")
     );
-    check_backup_preconditions(&info, &pool_info, &desktop, &snap).expect("the guard passes");
-    check_restore_preconditions(&info, &pool_info).expect("the restore guard passes");
+    eprintln!(
+        "OBS source container config keys: {:?}",
+        desktop.config.keys().collect::<Vec<_>>()
+    );
+    let mount = SnapshotMount::checked(&info, &pool_info, &desktop, &snap)
+        .expect("the checks before a backup pass");
+    eprintln!(
+        "OBS SnapshotMount::checked passed; source = {}",
+        mount.source()
+    );
+    // The checks are not a formality: the same objects with one input changed are refused.
+    let mut shifted = snap.clone();
+    shifted.config.insert(
+        "volatile.last_state.idmap".into(),
+        "[{\"Isuid\":true}]".into(),
+    );
+    assert!(matches!(
+        SnapshotMount::checked(&info, &pool_info, &desktop, &shifted),
+        Err(PreconditionFailed::SnapshotIdmap { .. })
+    ));
+    let mut other = snap.clone();
+    other.instance = "hx-other".into();
+    assert!(matches!(
+        SnapshotMount::checked(&info, &pool_info, &desktop, &other),
+        Err(PreconditionFailed::SnapshotOfOther { .. })
+    ));
 
     // --- backup: the helper reads the snapshot through `src` -----------------------------------
     let bjob = job(JOB_BACKUP);
     let spec = BackupHelperSpec::backup(
-        SnapshotMount::new(
-            pool.clone(),
-            desktop_name.clone(),
-            BackupSnapshotName::new(SNAPSHOT).unwrap(),
-        ),
+        mount,
         RepoLink::in_dir(bjob, work.to_str().unwrap(), owner).unwrap(),
     );
     let sock = PathBuf::from(spec.link().socket_path());
@@ -410,12 +504,12 @@ async fn probes(c: Client<UnixTransport>) {
     assert_eq!(def.config["user.hx.kind"], "backup-worker");
     assert_eq!(def.config["user.hx.job"], JOB_BACKUP);
     c.populate_backup_helper(&spec, &fixture).await.unwrap();
-    c.start_backup_helper(&spec.name()).await.unwrap();
+    c.start_backup_helper(bjob).await.unwrap();
     let listed = c.list_backup_helpers().await.unwrap();
     assert!(
         listed
             .iter()
-            .any(|h| h.name == spec.name() && h.job == Some(bjob)),
+            .any(|h| h.name == spec.name() && h.job == bjob),
         "crash recovery would find the helper: {listed:?}"
     );
     let (report, connected_after) = talk(&sock, false).await;
@@ -449,8 +543,14 @@ async fn probes(c: Client<UnixTransport>) {
         !uid_map.contains("4294967295"),
         "an unprivileged helper: {uid_map}"
     );
+    let helper_base = uid_map.split_whitespace().nth(2).map(str::to_string);
+    let desktop_base = desktop.config.get("volatile.idmap.base").cloned();
+    assert!(
+        helper_base.is_some() && helper_base != desktop_base,
+        "the helper has a host uid range of its own: helper {helper_base:?}, desktop {desktop_base:?}"
+    );
     let end = c
-        .finish_backup_helper(&spec.name(), Duration::from_secs(30))
+        .finish_backup_helper(bjob, Duration::from_secs(30))
         .await
         .unwrap();
     eprintln!("OBS ephemeral helper deleted by Incus after PID 1 exited: {end:?}");
@@ -462,15 +562,21 @@ async fn probes(c: Client<UnixTransport>) {
             .is_none(),
         "the helper is gone"
     );
-    eprintln!(
-        "OBS host socket left behind after the helper was deleted: {}",
-        sock.exists()
+    assert!(
+        sock.exists(),
+        "Incus leaves the host socket behind after the helper is deleted (ipc.md 24): privd removes it"
     );
+    eprintln!("OBS host socket left behind after the helper was deleted: true");
 
     // --- restore: the helper writes through `dst` into a never-started target -------------------
-    let tspec =
-        RestoreTargetSpec::from_desktop(&desktop, RestoreTargetName::new(TARGET).unwrap(), &pool)
-            .unwrap();
+    let rjob = job(JOB_RESTORE);
+    let tspec = RestoreTargetSpec::from_desktop(
+        &desktop,
+        RestoreTargetName::new(TARGET).unwrap(),
+        rjob,
+        &naming(),
+    )
+    .unwrap();
     c.create_restore_target(&tspec, Duration::from_secs(120))
         .await
         .unwrap();
@@ -478,6 +584,9 @@ async fn probes(c: Client<UnixTransport>) {
     assert_eq!(target.status, "Stopped");
     assert_eq!(target.config["boot.autostart"], "false");
     assert_eq!(target.config["security.idmap.isolated"], "true");
+    assert_eq!(target.config["user.hx.kind"], "restore-target");
+    assert_eq!(target.config["user.hx.job"], JOB_RESTORE);
+    assert_eq!(target.config["user.hx.state"], "restoring");
     let (db, tb) = (
         desktop.config.get("volatile.idmap.base"),
         target.config.get("volatile.idmap.base"),
@@ -496,16 +605,45 @@ async fn probes(c: Client<UnixTransport>) {
             .any(|d| d.get("type").map(String::as_str) == Some("proxy")),
         "no proxy device is copied"
     );
+    let listed = c.list_restore_targets().await.unwrap();
+    assert!(
+        listed
+            .iter()
+            .any(|t| t.name.as_str() == TARGET && t.job == Some(rjob))
+    );
+    eprintln!(
+        "OBS never-started target: status={:?} last_used_at={:?} volatile.last_state.*={:?} \
+         volatile.idmap.current={:?} volatile.last_state.idmap={:?}",
+        target.status,
+        target.last_used_at,
+        target
+            .config
+            .iter()
+            .filter(|(k, _)| k.starts_with("volatile.last_state."))
+            .collect::<Vec<_>>(),
+        target.config.get("volatile.idmap.current"),
+        target.config.get("volatile.last_state.idmap"),
+    );
+    let tmount = TargetMount::checked(&info, &pool_info, &target)
+        .expect("the checks before a restore pass on the never-started target");
+    eprintln!(
+        "OBS TargetMount::checked passed; source = {}",
+        tmount.source()
+    );
+    // The desktop is not a restore target, even though it is a perfectly good instance.
+    assert!(matches!(
+        TargetMount::checked(&info, &pool_info, &desktop),
+        Err(PreconditionFailed::NotARestoreTarget { .. })
+    ));
 
-    let rjob = job(JOB_RESTORE);
     let rspec = BackupHelperSpec::restore(
-        tspec.mount(),
+        tmount,
         RepoLink::in_dir(rjob, work.to_str().unwrap(), owner).unwrap(),
     );
     let rsock = PathBuf::from(rspec.link().socket_path());
     c.create_backup_helper(&rspec).await.unwrap();
     c.populate_backup_helper(&rspec, &fixture).await.unwrap();
-    c.start_backup_helper(&rspec.name()).await.unwrap();
+    c.start_backup_helper(rjob).await.unwrap();
     // The host half-closes after its request, which the contract says to never rely on (ipc.md
     // 24, "No half-close"): record what this Incus does. The restore itself is done before the
     // worker serves the link, so it does not depend on the answer.
@@ -520,7 +658,7 @@ async fn probes(c: Client<UnixTransport>) {
         }
     );
     let end = c
-        .finish_backup_helper(&rspec.name(), Duration::from_secs(60))
+        .finish_backup_helper(rjob, Duration::from_secs(60))
         .await
         .unwrap();
     eprintln!("OBS restore helper end: {end:?}");
@@ -571,6 +709,30 @@ async fn probes(c: Client<UnixTransport>) {
         target.config.get("volatile.last_state.idmap"),
         target.config.get("volatile.idmap.base")
     );
-    assert!(c.delete_restore_target(tspec.name()).await.unwrap());
+    // A target that has started is no longer accepted: stop it and ask again.
+    c.set_state(TARGET, StateAction::Stop, true, Duration::from_secs(30))
+        .await
+        .unwrap();
+    let stopped = c.get_instance(TARGET).await.unwrap().unwrap();
+    eprintln!(
+        "OBS started-then-stopped target: status={:?} last_used_at={:?} volatile.last_state.power={:?} volatile.idmap.current={:?}",
+        stopped.status,
+        stopped.last_used_at,
+        stopped.config.get("volatile.last_state.power"),
+        stopped
+            .config
+            .get("volatile.idmap.current")
+            .map(|_| "(present)"),
+    );
+    let refused = TargetMount::checked(&info, &pool_info, &stopped);
+    assert!(
+        matches!(refused, Err(PreconditionFailed::TargetStarted { .. })),
+        "{refused:?}"
+    );
+    assert!(
+        c.delete_restore_target(tspec.name(), Some(rjob))
+            .await
+            .unwrap()
+    );
     eprintln!("OBS all probes passed in {:?}", started.elapsed());
 }

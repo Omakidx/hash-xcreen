@@ -104,11 +104,16 @@ fn tmpfiles_creates_the_runtime_directories_of_section_3() {
         "hx-gatewayd",
         "-"
     ]));
+    // The repository link's sockets (docs/ipc.md 24): root only.
+    assert!(lines.contains(&vec!["d", "/run/hx/backup", "0700", "root", "root", "-"]));
     // No other path is created under /run/hx, and nothing is removed.
     for l in &lines {
         assert!(matches!(l[0], "d" | "f"), "unexpected tmpfiles type {l:?}");
         if l[1].starts_with("/run/hx") {
-            assert!(matches!(l[1], "/run/hx" | "/run/hx/link"), "{l:?}");
+            assert!(
+                matches!(l[1], "/run/hx" | "/run/hx/link" | "/run/hx/backup"),
+                "{l:?}"
+            );
         }
     }
 }
