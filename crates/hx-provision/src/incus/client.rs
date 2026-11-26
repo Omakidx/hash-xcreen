@@ -13,6 +13,10 @@ use hyper::Method;
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use super::backup::{
+    BackupHelperInfo, BackupHelperSpec, HELPER_JOB_KEY, HELPER_KIND, HELPER_KIND_KEY, HelperEnd,
+    HelperName, JobId, RestoreTargetName, RestoreTargetSpec, WORKER_INIT_PATH,
+};
 use super::error::IncusError;
 use super::limits::{LimitsApplied, LimitsUpdate};
 use super::link::{LinkOutcome, SESSION_LINK_DEVICE, SessionLink};
@@ -28,6 +32,8 @@ use super::types::{
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long reading one file out of an instance may take.
 const READ_FILE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often a helper's disappearance is polled.
+const HELPER_POLL: Duration = Duration::from_millis(200);
 /// Longest single `/wait` poll; the client loops until its own deadline.
 const WAIT_SLICE: Duration = Duration::from_secs(30);
 
@@ -1561,6 +1567,234 @@ impl<T: Transport> Client<T> {
                 decode("snapshot", s)
             })
             .collect()
+    }
+    // --- backup helpers and restore targets (ipc.md 24, 26, 35) -----------------------------
+
+    /// The helper `name`, when it exists. Refuses an instance of that name that does not carry
+    /// `user.hx.kind=backup-worker`: the helper calls act only on helpers (ipc.md 7, rule 8).
+    async fn marked_helper(&self, name: &HelperName) -> Result<Option<Instance>, IncusError> {
+        let Some(inst) = self.get_instance(name.as_str()).await? else {
+            return Ok(None);
+        };
+        if inst.config.get(HELPER_KIND_KEY).map(String::as_str) != Some(HELPER_KIND) {
+            return Err(IncusError::InvalidArgument(format!(
+                "instance `{name}` is not a backup helper ({HELPER_KIND_KEY} is not `{HELPER_KIND}`)"
+            )));
+        }
+        Ok(Some(inst))
+    }
+
+    /// Create (but do not start) a backup helper: one `POST` with the config, every device,
+    /// `source.type=none` and `ephemeral=true`. One request, not a create and a device patch,
+    /// because Incus accepts devices at creation (verified on 6.0.0) and the helper then never
+    /// exists in a state with some of its devices missing.
+    pub async fn create_backup_helper(&self, spec: &BackupHelperSpec) -> Result<(), IncusError> {
+        let name = spec.name();
+        self.run_verified(
+            Method::POST,
+            "/1.0/instances".into(),
+            Some(&spec.to_json()),
+            Duration::from_secs(120),
+            "backup helper creation",
+            async || Ok(self.get_instance(name.as_str()).await?.is_some()),
+        )
+        .await
+    }
+
+    /// Put the worker into a stopped helper: the directories of
+    /// [`BackupHelperSpec::directories`] and `worker` as `/sbin/init` (mode 0755, uid 0, gid 0).
+    pub async fn populate_backup_helper(
+        &self,
+        spec: &BackupHelperSpec,
+        worker: &[u8],
+    ) -> Result<(), IncusError> {
+        if worker.is_empty() {
+            return Err(IncusError::InvalidArgument(
+                "the worker binary is empty".into(),
+            ));
+        }
+        let name = spec.name();
+        let inst = self
+            .marked_helper(&name)
+            .await?
+            .ok_or_else(|| IncusError::Api {
+                code: 404,
+                message: format!("backup helper `{name}` not found"),
+            })?;
+        if !inst.status.eq_ignore_ascii_case("stopped") {
+            return Err(IncusError::InvalidArgument(format!(
+                "backup helper `{name}` is {}, files go into a stopped helper",
+                inst.status
+            )));
+        }
+        for (dir, mode) in spec.directories() {
+            self.push_dir(name.as_str(), dir, mode).await?;
+        }
+        self.push_file(name.as_str(), WORKER_INIT_PATH, worker, 0o755)
+            .await
+    }
+
+    /// Start a helper. The worker is PID 1; a helper whose worker has already exited and been
+    /// deleted by the time the start is confirmed counts as started.
+    pub async fn start_backup_helper(&self, name: &HelperName) -> Result<(), IncusError> {
+        self.marked_helper(name)
+            .await?
+            .ok_or_else(|| IncusError::Api {
+                code: 404,
+                message: format!("backup helper `{name}` not found"),
+            })?;
+        let body = json!({"action": "start", "timeout": 30, "force": false, "stateful": false});
+        self.run_verified(
+            Method::PUT,
+            format!("/1.0/instances/{name}/state"),
+            Some(&body),
+            Duration::from_secs(90),
+            "backup helper start",
+            async || {
+                Ok(match self.get_instance(name.as_str()).await? {
+                    None => true,
+                    Some(i) => i.status.eq_ignore_ascii_case("running"),
+                })
+            },
+        )
+        .await
+    }
+
+    /// Wait until the helper is gone (an ephemeral instance is deleted by Incus after PID 1
+    /// exits), at most `timeout`; if it is still there then, stop and delete it by force
+    /// ([`Client::force_delete_backup_helper`]). ipc.md 26, step 5.
+    pub async fn finish_backup_helper(
+        &self,
+        name: &HelperName,
+        timeout: Duration,
+    ) -> Result<HelperEnd, IncusError> {
+        let started = Instant::now();
+        loop {
+            if self.marked_helper(name).await?.is_none() {
+                return Ok(HelperEnd::Exited(started.elapsed()));
+            }
+            if started.elapsed() >= timeout {
+                break;
+            }
+            tokio::time::sleep(HELPER_POLL).await;
+        }
+        self.force_delete_backup_helper(name).await?;
+        Ok(HelperEnd::ForceDeleted)
+    }
+
+    /// Stop (killing it) and delete a backup helper. `Ok(false)` when there was none. Refused for
+    /// an instance that is not marked as a helper. Safe to repeat (crash recovery, ipc.md 35).
+    pub async fn force_delete_backup_helper(&self, name: &HelperName) -> Result<bool, IncusError> {
+        let Some(inst) = self.marked_helper(name).await? else {
+            return Ok(false);
+        };
+        if !inst.status.eq_ignore_ascii_case("stopped") {
+            match self
+                .set_state(
+                    name.as_str(),
+                    StateAction::Stop,
+                    true,
+                    Duration::from_secs(30),
+                )
+                .await
+            {
+                Ok(()) => {}
+                // An ephemeral instance is deleted as it stops.
+                Err(e) if e.is_not_found() => return Ok(true),
+                Err(e) => return Err(e),
+            }
+        }
+        for _ in 0..25 {
+            if self.get_instance(name.as_str()).await?.is_none() {
+                return Ok(true);
+            }
+            tokio::time::sleep(HELPER_POLL).await;
+        }
+        match self.delete_instance(name.as_str()).await {
+            Ok(()) => Ok(true),
+            Err(e) if e.is_not_found() => Ok(true),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The backup helpers Incus knows (`user.hx.kind=backup-worker` and an `hx-bkw-<8 hex>` name),
+    /// for crash recovery (ipc.md 35, step 1). Instances that carry only one of the two are
+    /// not listed.
+    pub async fn list_backup_helpers(&self) -> Result<Vec<BackupHelperInfo>, IncusError> {
+        let v = self
+            .sync(Method::GET, "/1.0/instances?recursion=1".into(), None)
+            .await?;
+        let Value::Array(items) = v else {
+            return Err(IncusError::Protocol("instance list is not an array".into()));
+        };
+        let mut out = Vec::new();
+        for item in items {
+            let inst: Instance = decode("instance", item)?;
+            if inst.config.get(HELPER_KIND_KEY).map(String::as_str) != Some(HELPER_KIND) {
+                continue;
+            }
+            let Ok(name) = HelperName::new(&inst.name) else {
+                continue;
+            };
+            out.push(BackupHelperInfo {
+                name,
+                job: inst
+                    .config
+                    .get(HELPER_JOB_KEY)
+                    .and_then(|j| JobId::from_hex(j).ok()),
+                status: inst.status,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Create (but never start) the restore target: an empty container with the desktop's
+    /// definition ([`RestoreTargetSpec`]). `deadline` bounds the creation.
+    pub async fn create_restore_target(
+        &self,
+        spec: &RestoreTargetSpec,
+        deadline: Duration,
+    ) -> Result<(), IncusError> {
+        let name = spec.name();
+        self.run_verified(
+            Method::POST,
+            "/1.0/instances".into(),
+            Some(&spec.to_json()),
+            deadline,
+            "restore target creation",
+            async || Ok(self.get_instance(name.as_str()).await?.is_some()),
+        )
+        .await
+    }
+
+    /// Delete a restore target (stopping it first if it runs). `Ok(false)` when there was none.
+    /// Refused for an instance without the hash-xcreen marker.
+    pub async fn delete_restore_target(
+        &self,
+        name: &RestoreTargetName,
+    ) -> Result<bool, IncusError> {
+        let Some(inst) = self.get_instance(name.as_str()).await? else {
+            return Ok(false);
+        };
+        if !super::marker::instance_is_marked(&inst.config) {
+            return Err(IncusError::InvalidArgument(format!(
+                "instance `{name}` does not carry the hash-xcreen marker"
+            )));
+        }
+        if !inst.status.eq_ignore_ascii_case("stopped") {
+            self.set_state(
+                name.as_str(),
+                StateAction::Stop,
+                true,
+                Duration::from_secs(30),
+            )
+            .await?;
+        }
+        match self.delete_instance(name.as_str()).await {
+            Ok(()) => Ok(true),
+            Err(e) if e.is_not_found() => Ok(true),
+            Err(e) => Err(e),
+        }
     }
 }
 
