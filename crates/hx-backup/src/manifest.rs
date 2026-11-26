@@ -138,10 +138,39 @@ impl Distro {
     }
 }
 
-/// Remove control characters and cut at [`MAX_TEXT_BYTES`] on a character boundary.
+/// True for the characters that must never reach a log line, a terminal or the repository link:
+/// the Unicode general categories `Cc`, `Cf`, `Zl` and `Zp`. **A copy of
+/// `hx_ipc::text::is_unsafe_char`** (this crate does not depend on `hx-ipc`), which is also the
+/// rule `hx_ipc::repo` applies to the manifest input of a `BACKUP` job (`docs/ipc.md` section 28):
+/// text cleaned here is always accepted there.
+fn is_unsafe_char(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{2028}' | '\u{2029}'
+            // Cf, per the Unicode character database
+            | '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}' | '\u{06DD}' | '\u{070F}'
+            | '\u{0890}'..='\u{0891}' | '\u{08E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}' | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}' | '\u{E0020}'..='\u{E007F}')
+}
+
+/// Remove control and format characters (`Cc`, `Cf`, `Zl`, `Zp`) and cut at [`MAX_TEXT_BYTES`] on
+/// a character boundary.
 fn clean_text(s: &str) -> String {
     let mut out = String::new();
-    for c in s.chars().filter(|c| !c.is_control()) {
+    for c in s.chars().filter(|c| !is_unsafe_char(*c)) {
         if out.len() + c.len_utf8() > MAX_TEXT_BYTES {
             break;
         }
@@ -695,6 +724,21 @@ mod tests {
         let m = Manifest::new(i, None, Timestamp::UNIX_EPOCH, SourceSizes::default()).unwrap();
         assert!(!m.container_config.contains_key("security.privileged"));
         assert!(!m.container_config.contains_key("limits.cpu"));
+    }
+
+    #[test]
+    fn format_and_separator_characters_are_stripped_from_os_release_values() {
+        // U+200B (zero-width space, Cf), U+2028 (line separator, Zl), U+202E (bidi override, Cf).
+        let d = Distro::from_os_release(
+            "ID=ub\u{200B}untu\nVERSION_ID=24\u{2028}.04\nPRETTY_NAME=\"Ubuntu\u{200B} 24.04\u{202E} LTS\"\n",
+        )
+        .unwrap();
+        assert_eq!(d.id, "ubuntu");
+        assert_eq!(d.version_id, "24.04");
+        assert_eq!(d.pretty_name.as_deref(), Some("Ubuntu 24.04 LTS"));
+        // A value that is only format characters is empty, so PRETTY_NAME is dropped.
+        let d = Distro::from_os_release("ID=x\nPRETTY_NAME=\u{200B}\u{2028}\n").unwrap();
+        assert_eq!(d.pretty_name, None);
     }
 
     #[test]
