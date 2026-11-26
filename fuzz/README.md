@@ -25,6 +25,7 @@ enables (`hx-crypto::fuzz`, `hx-transport::fuzz`, `hx-agent::link::fuzz`). Every
 | `crypto_pin_record` | `PinHash::from_storage_string` | The stored PIN verifier (cost bounds guard Argon2id memory) |
 | `ipc_frame` | `Decoder` under every policy (privd, admin, all link lanes, both roles), chunked | The framing under every internal socket |
 | `ipc_privd_admin` | privd and admin frame decode + validation, secret frame, command table | gatewayd-admin and privd requests |
+| `ipc_repo` | repository link (backup worker, privd, Drive helper): decoder under each of the four endpoints' policies, prescan, decode + validation, data-frame split, operation policy, link state tracker | Container-supplied: everything the backup worker sends privd, and what the Drive helper sends privd |
 | `ipc_link` | session-link frames and messages, media header, transfers, validators | Container-supplied: everything `hx-session` sends |
 | `ipc_text` | `sanitize_text` | The only filter between session text and the logs |
 | `agent_link_session` | the gateway's `ctl`, `media` and `bulk` lane readers (production loops over socket pairs) | Container-supplied: framing, budgets, decode, Annex B check and transfer rules together |
@@ -59,7 +60,7 @@ Useful flags: `-max_len=N` (the nightly uses 512 to 16384 per target), `-timeout
 
 Input layouts that are not "the bytes themselves": `transport_ws_session` (`role byte | raw WebSocket
 frames`), `agent_link_session` (`u16 ctl_len | u16 media_len | ctl | media | bulk`), `ipc_link` and
-`ipc_privd_admin` (`selector | kind | body`), `ipc_frame` (`policy | chunk size | stream`),
+`ipc_privd_admin` (`selector | kind | body`), `ipc_frame` (`policy | chunk size | stream`), `ipc_repo` (`selector | chunk size | stream of whole frames`; selector bits 0-1 the endpoint: worker, privd on the worker link, privd on the Drive link, Drive helper; bit 2 makes the harness respond or send requests; bits 3-5 the job kind that privd sends),
 `agent_update_extract` (`mode | bytes`: an odd mode wraps the bytes in gzip so the fuzzer edits tar headers
 directly), `agent_update_sig` (`u16 len | signed data | signature text`).
 
@@ -74,7 +75,7 @@ dictionaries for the text formats. The nightly passes both.
 `.github/workflows/fuzz-nightly.yml` runs every target (15 minutes for the pre-auth and session-link
 targets, 5 for the rest), restores the corpus from the Actions cache, uploads `crash-<target>` artifacts and
 fails the job on any crash, hang or out-of-memory. The run summary shows one row per target (executions,
-exec/s, coverage, corpus size, crashes) and a verdict: **a night counts for Gate 1 only if all 23 targets
+exec/s, coverage, corpus size, crashes) and a verdict: **a night counts for Gate 1 only if all 24 targets
 reported and none failed**. Run it by hand with "Run workflow" and a small `seconds` for a smoke test.
 The toolchain is a dated nightly (`NIGHTLY` in the workflow); move it forward deliberately.
 

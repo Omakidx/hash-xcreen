@@ -19,7 +19,7 @@ bytes = "1"
 flate2 = { version = "1.1.11", default-features = false, features = ["rust_backend"] }
 hx-agent = { path = "../apps/hx-agent", features = ["fuzzing", "test-support"] }
 hx-crypto = { path = "../crates/hx-crypto", features = ["fuzzing"] }
-hx-ipc = { path = "../crates/hx-ipc" }
+hx-ipc = { path = "../crates/hx-ipc", features = ["repo"] }
 hx-proto = { path = "../crates/hx-proto" }
 hx-pwcheck = { path = "../apps/hx-pwcheck" }
 hx-transport = { path = "../crates/hx-transport", features = ["fuzzing"] }
@@ -120,6 +120,13 @@ bench = false
 [[bin]]
 name = "ipc_privd_admin"
 path = "fuzz_targets/ipc_privd_admin.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipc_repo"
+path = "fuzz_targets/ipc_repo.rs"
 test = false
 doc = false
 bench = false

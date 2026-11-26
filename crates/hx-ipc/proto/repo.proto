@@ -1,0 +1,421 @@
+// The repository link (docs/ipc.md Part 3, sections 23 to 36): backup worker <-> hx-privd and
+// hx-privd <-> Drive helper.
+//
+// Conventions: unknown fields are ignored; **field numbers are never reused** (a removed field's
+// number stays reserved). Every enum has an UNSPECIFIED = 0 that validation rejects. No string
+// field carries free text from the worker or the Drive helper (section 27, section 31): the only
+// strings are the ones the contract names, and each has a length bound and a character rule
+// enforced by hx-ipc (HelloAck.software; the BACKUP spec's manifest input, excludes and tags,
+// which flow privd -> worker only; SnapshotInfo.tags, restricted to [A-Za-z0-9._-]; OpenRepo.folder,
+// which flows privd -> Drive helper only). Secrets never appear in this schema: they travel in
+// kind-2 frames and a Job only declares them.
+syntax = "proto3";
+
+package hx.repo.v1;
+
+// ----- enums -----
+
+enum JobKind {
+  JOB_KIND_UNSPECIFIED = 0;
+  JOB_KIND_INIT = 1;
+  JOB_KIND_BACKUP = 2;
+  JOB_KIND_SNAPSHOTS = 3;
+  JOB_KIND_RESTORE_PLAN = 4;
+  JOB_KIND_RESTORE = 5;
+  JOB_KIND_FORGET_PRUNE = 6;
+  JOB_KIND_CHECK = 7;
+  JOB_KIND_KEYS = 8;
+}
+
+// The repository file types of rustic (section 27).
+enum ObjectType {
+  OBJECT_TYPE_UNSPECIFIED = 0;
+  OBJECT_TYPE_CONFIG = 1;
+  OBJECT_TYPE_KEY = 2;
+  OBJECT_TYPE_SNAPSHOT = 3;
+  OBJECT_TYPE_INDEX = 4;
+  OBJECT_TYPE_PACK = 5;
+}
+
+// RepoError.class (section 31).
+enum ErrorClass {
+  ERROR_CLASS_UNSPECIFIED = 0;
+  ERROR_CLASS_NOT_FOUND = 1;
+  ERROR_CLASS_TRANSIENT = 2;
+  ERROR_CLASS_RATE_LIMITED = 3;
+  ERROR_CLASS_DAILY_LIMIT = 4;
+  ERROR_CLASS_QUOTA_EXCEEDED = 5;
+  ERROR_CLASS_AUTH_REVOKED = 6;
+  ERROR_CLASS_PERMISSION = 7;
+  ERROR_CLASS_LEASE_HELD = 8;
+  ERROR_CLASS_POLICY_DENIED = 9;
+  ERROR_CLASS_INTEGRITY = 10;
+  ERROR_CLASS_TOO_LARGE = 11;
+  ERROR_CLASS_UNAVAILABLE = 12;
+  ERROR_CLASS_CANCELLED = 13;
+  ERROR_CLASS_INTERNAL = 14;
+}
+
+// JobResult.error (section 31). No free text crosses the link.
+enum WorkerError {
+  WORKER_ERROR_UNSPECIFIED = 0;
+  WORKER_ERROR_ENGINE = 1;
+  WORKER_ERROR_SOURCE_UNREADABLE = 2;
+  WORKER_ERROR_WRONG_PASSWORD = 3;
+  WORKER_ERROR_NO_REPOSITORY = 4;
+  WORKER_ERROR_REPOSITORY_EXISTS = 5;
+  WORKER_ERROR_SNAPSHOT_NOT_FOUND = 6;
+  WORKER_ERROR_TARGET_UNWRITABLE = 7;
+  WORKER_ERROR_CANCELLED = 8;
+  // A relayed repository error; privd uses its own record of it.
+  WORKER_ERROR_REPO = 9;
+}
+
+enum DockerMode {
+  DOCKER_MODE_UNSPECIFIED = 0;
+  DOCKER_MODE_COMPLETE = 1;
+  DOCKER_MODE_LIGHT = 2;
+}
+
+// Section 33: what the worker is doing, as far as it knows. privd maps these to its own phase
+// table; the worker never sends text.
+enum ProgressPhase {
+  PROGRESS_PHASE_UNSPECIFIED = 0;
+  PROGRESS_PHASE_REPAIR_INDEX = 1;
+  PROGRESS_PHASE_SCAN_AND_UPLOAD = 2;
+  PROGRESS_PHASE_WRITE_SNAPSHOT = 3;
+  PROGRESS_PHASE_PLAN = 4;
+  PROGRESS_PHASE_DOWNLOAD_AND_WRITE = 5;
+  PROGRESS_PHASE_FIXUPS = 6;
+  PROGRESS_PHASE_CHECK = 7;
+  PROGRESS_PHASE_FORGET = 8;
+  PROGRESS_PHASE_PRUNE = 9;
+  PROGRESS_PHASE_INIT = 10;
+  PROGRESS_PHASE_KEYS = 11;
+}
+
+// Drive helper -> privd, unsolicited (section 29).
+enum EventKind {
+  EVENT_KIND_UNSPECIFIED = 0;
+  EVENT_KIND_PAUSED_DAILY_LIMIT = 1;
+  EVENT_KIND_RESUMED = 2;
+  EVENT_KIND_RETRYING = 3;
+}
+
+// Section 34.
+enum SecretKind {
+  SECRET_KIND_UNSPECIFIED = 0;
+  // Slot 0: the password that opens the repository.
+  SECRET_KIND_REPO_PASSWORD = 1;
+  // Slot 1: the password of a key that is being added.
+  SECRET_KIND_NEW_KEY_PASSWORD = 2;
+}
+
+// ----- the frame -----
+
+// Exactly one variant is set, else the frame is invalid. Which variants may travel towards which
+// endpoint is the table of section 27 and section 29, enforced by hx_ipc::repo.
+message RepoFrame {
+  oneof frame {
+    Hello hello = 1;
+    HelloAck hello_ack = 2;
+    Job job = 3;
+    RepoRequest request = 4;
+    RepoResponse response = 5;
+    Progress progress = 6;
+    JobResult result = 7;
+    // The job-level cancel, privd -> worker (section 32).
+    Cancel cancel = 8;
+    Ping ping = 9;
+    Pong pong = 10;
+    Bye bye = 11;
+    // The Drive link's cancel of one request, privd -> Drive helper (section 29).
+    CancelRequest cancel_request = 12;
+    Event event = 13;
+  }
+}
+
+// ----- session (section 26) -----
+
+message Hello {
+  uint32 major = 1;
+  uint32 minor = 2;
+  // 16 random bytes, the same on both links of one job.
+  bytes job_id = 3;
+}
+
+message HelloAck {
+  uint32 major = 1;
+  uint32 minor = 2;
+  // At most 64 bytes, no control characters.
+  string software = 3;
+}
+
+message Ping {
+  uint64 nonce = 1;
+}
+
+message Pong {
+  uint64 nonce = 1;
+}
+
+message Bye {}
+
+message Cancel {}
+
+message CancelRequest {
+  uint64 req_id = 1;
+}
+
+// ----- job (section 28) -----
+
+message Job {
+  bytes job_id = 1;
+  JobKind kind = 2;
+  // At most 2, in slot order; one kind-2 frame follows per entry.
+  repeated SecretSlot secret_slots = 3;
+  oneof spec {
+    InitSpec init = 10;
+    BackupSpec backup = 11;
+    SnapshotsSpec snapshots = 12;
+    RestorePlanSpec restore_plan = 13;
+    RestoreSpec restore = 14;
+    ForgetPruneSpec forget_prune = 15;
+    CheckSpec check = 16;
+    KeysSpec keys = 17;
+  }
+}
+
+message SecretSlot {
+  // 0 or 1.
+  uint32 slot = 1;
+  SecretKind kind = 2;
+  // 16 to 1024.
+  uint32 length = 3;
+}
+
+message InitSpec {
+  // Must be 3, 64 MiB and 16 MiB (section 28).
+  uint32 compression = 1;
+  uint32 datapack_size_limit = 2;
+  uint32 treepack_size_limit = 3;
+}
+
+message BackupSpec {
+  ManifestInput manifest = 1;
+  // At most 256, each 1 to 4096 bytes, in the hx_backup::rules syntax.
+  repeated string excludes = 2;
+  DockerMode docker_mode = 3;
+  // At most 4, each 1 to 64 bytes of [A-Za-z0-9._-]: the hx-backup-... snapshot name and the
+  // schedule kind.
+  repeated string tags = 4;
+}
+
+message ManifestInput {
+  string agent_version = 1;
+  Distro distro = 2;
+  string desktop = 3;
+  string preset = 4;
+  // Without volatile.* keys; at most 256.
+  repeated ConfigEntry container_config = 5;
+  uint32 format_version = 6;
+}
+
+message Distro {
+  string id = 1;
+  string version_id = 2;
+  string pretty_name = 3;
+}
+
+message ConfigEntry {
+  string key = 1;
+  string value = 2;
+}
+
+message SnapshotsSpec {}
+
+message RestorePlanSpec {
+  bytes snapshot_id = 1;
+}
+
+message RestoreSpec {
+  bytes snapshot_id = 1;
+  // Resume an interrupted restore.
+  bool verify_existing = 2;
+}
+
+message ForgetPruneSpec {
+  // Snapshot ids privd chose, 32 bytes each, at most 4096.
+  repeated bytes forget = 1;
+  // Must be true.
+  bool instant = 2;
+}
+
+message CheckSpec {
+  // 0 to 100; 0 = metadata only.
+  uint32 read_data_percent = 1;
+}
+
+message KeysSpec {
+  bool add = 1;
+  // At most 4, 32 bytes each, named by privd.
+  repeated bytes remove_key_ids = 2;
+}
+
+// ----- repository requests (section 27, section 29) -----
+
+message RepoRequest {
+  // Non-zero, unique per link.
+  uint64 req_id = 1;
+  oneof op {
+    List list = 2;
+    ReadFull read_full = 3;
+    ReadPartial read_partial = 4;
+    // Followed by data frames of stream req_id.
+    Write write = 5;
+    Remove remove = 6;
+    Create create = 7;
+    // The three below are privd -> Drive helper only.
+    OpenRepo open_repo = 8;
+    Quota quota = 9;
+    SetUploadRate set_upload_rate = 10;
+  }
+}
+
+message List {
+  ObjectType object_type = 1;
+}
+
+message ReadFull {
+  ObjectType object_type = 1;
+  // 32 bytes; all zero for CONFIG, non-zero otherwise.
+  bytes id = 2;
+}
+
+message ReadPartial {
+  ObjectType object_type = 1;
+  bytes id = 2;
+  uint32 offset = 3;
+  uint32 length = 4;
+}
+
+message Write {
+  ObjectType object_type = 1;
+  bytes id = 2;
+  // At most the per-type cap of section 25.
+  uint32 size = 3;
+}
+
+message Remove {
+  ObjectType object_type = 1;
+  bytes id = 2;
+}
+
+message Create {}
+
+message OpenRepo {
+  // 1 to 128 bytes of [A-Za-z0-9._-], starting with a letter or digit.
+  string folder = 1;
+  bool create = 2;
+  // 16 bytes.
+  bytes server_id = 3;
+  bool takeover = 4;
+}
+
+message Quota {}
+
+message SetUploadRate {
+  // 0 = unlimited.
+  uint64 bytes_per_s = 1;
+}
+
+message RepoResponse {
+  uint64 req_id = 1;
+  oneof result {
+    ListPage list_page = 2;
+    // Followed by data frames of stream req_id.
+    ReadBegin read_begin = 3;
+    Done done = 4;
+    RepoError error = 5;
+    // Drive helper -> privd only.
+    QuotaResult quota_result = 6;
+  }
+}
+
+message ListPage {
+  // At most 1024 per page, 1 000 000 per listing.
+  repeated ListEntry entries = 1;
+  bool last = 2;
+}
+
+message ListEntry {
+  // 32 bytes.
+  bytes id = 1;
+  uint32 size = 2;
+}
+
+message ReadBegin {
+  uint32 size = 1;
+}
+
+message Done {}
+
+message RepoError {
+  ErrorClass class = 1;
+  uint32 retry_after_ms = 2;
+}
+
+message QuotaResult {
+  uint64 limit = 1;
+  uint64 usage = 2;
+  uint64 usage_in_trash = 3;
+}
+
+// ----- progress and result (sections 27, 33) -----
+
+// Numbers only, never a path or text. At most 2 per second.
+message Progress {
+  ProgressPhase phase = 1;
+  uint64 files_done = 2;
+  uint64 files_total = 3;
+  uint64 bytes_done = 4;
+  // 0 = unknown.
+  uint64 bytes_total = 5;
+}
+
+message JobResult {
+  bool ok = 1;
+  WorkerError error = 2;
+  uint64 files_new = 3;
+  uint64 files_changed = 4;
+  uint64 files_unmodified = 5;
+  uint64 bytes_processed = 6;
+  uint64 bytes_added = 7;
+  // 32 bytes, BACKUP.
+  bytes snapshot_id = 8;
+  // INIT, KEYS; at most 4, 32 bytes each.
+  repeated bytes key_ids = 9;
+  // RESTORE_PLAN; at most 61 440 bytes. privd validates it as untrusted.
+  bytes manifest = 10;
+  // SNAPSHOTS; at most 4096 (and what fits the frame).
+  repeated SnapshotInfo snapshots = 11;
+}
+
+message SnapshotInfo {
+  // 32 bytes.
+  bytes id = 1;
+  // Unix seconds, not negative.
+  int64 time = 2;
+  repeated string tags = 3;
+  // 32 bytes; all zero when the snapshot has no manifest.
+  bytes manifest_digest = 4;
+  uint64 size = 5;
+}
+
+// ----- Drive helper status (section 29) -----
+
+message Event {
+  EventKind kind = 1;
+  // Unix time in milliseconds, 0 = unknown.
+  uint64 until_ms = 2;
+}

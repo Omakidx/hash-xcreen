@@ -31,6 +31,9 @@ zeroize = { workspace = true, optional = true }
 # Tests always build with the engine, also in `cargo nextest run --workspace` where nothing else enables it.
 hx-backup = { path = ".", features = ["engine"] }
 bytes.workspace = true
+# Only to check that `manifest::is_unsafe_char` stays a copy of `hx_ipc::text::is_unsafe_char`; with no
+# features hx-ipc is just framing and text (no prost), and it is not a normal dependency.
+hx-ipc.workspace = true
 # The local backend, for offline integration tests (no `opendal`, `rest` or `rclone`).
 rustic_backend = { version = "=0.8.0", default-features = false }
 proptest = "1"

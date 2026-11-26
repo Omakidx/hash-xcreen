@@ -11,7 +11,7 @@
 //!    sent with `SCM_RIGHTS`, for example) is refused, never installed. Always read sockets
 //!    through [`recv::NoCmsgReader`] or [`recv::recv_no_cmsg`].
 //! 3. Messages and rules per socket: [`privd`] and [`admin`] (feature `privd`), [`link`]
-//!    (feature `link`).
+//!    (feature `link`), `repo` (feature `repo`).
 //!
 //! # Features
 //!
@@ -19,10 +19,12 @@
 //! |---|---|---|
 //! | `privd` (default) | `hx.privd.v1` and `hx.gatewayd_admin.v1` schemas, [`privd`], [`admin`], [`secret`], [`peer`] | none |
 //! | `link` (default) | `hx.link.v1` schema and [`link`] | `hx-proto` (the shared `hx.v1` types) |
+//! | `repo` | `hx.repo.v1` schema, `repo` (the repository link of `docs/ipc.md` Part 3: kinds 1 to 3, limits, link state, operation policy) and `secret` | none |
 //!
 //! `hx-session` enables only `link` (`default-features = false, features = ["link"]`): it
 //! compiles neither the privd messages nor anything that pulls in `quinn` (this crate has no
-//! network dependency at all).
+//! network dependency at all). The musl backup worker enables only `repo`
+//! (`default-features = false, features = ["repo"]`); `hx-privd` enables `privd` and `repo`.
 //!
 //! # Reading a stream
 //!
@@ -84,7 +86,7 @@
 
 pub mod error;
 pub mod frame;
-#[cfg(any(feature = "privd", feature = "link"))]
+#[cfg(any(feature = "privd", feature = "link", feature = "repo"))]
 mod prescan;
 pub mod recv;
 pub mod text;
@@ -95,17 +97,26 @@ pub mod admin;
 pub mod peer;
 #[cfg(feature = "privd")]
 pub mod privd;
-#[cfg(feature = "privd")]
+#[cfg(any(feature = "privd", feature = "repo"))]
 pub mod secret;
 
 #[cfg(feature = "link")]
 pub mod link;
+#[cfg(feature = "repo")]
+pub mod repo;
 
 /// Generated code for `hx.privd.v1` and `hx.gatewayd_admin.v1`.
 #[cfg(feature = "privd")]
 #[allow(clippy::all, missing_docs)]
 mod generated_privd {
     include!(concat!(env!("OUT_DIR"), "/_privd_includes.rs"));
+}
+
+/// Generated code for `hx.repo.v1`.
+#[cfg(feature = "repo")]
+#[allow(clippy::all, missing_docs)]
+mod generated_repo {
+    include!(concat!(env!("OUT_DIR"), "/_repo_includes.rs"));
 }
 
 /// Generated code for `hx.link.v1`.

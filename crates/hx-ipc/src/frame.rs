@@ -12,7 +12,9 @@
 //! **Every limit is checked before anything is allocated.** The decoder checks `length` against
 //! the policy's absolute maximum as soon as the four prefix bytes are in, checks the kind byte
 //! and the per-kind maximum as soon as the fifth byte is in, and only then allocates the body
-//! (zero-initialised, so the allocation costs address space but no memory until bytes arrive).
+//! (zero-initialised, so the allocation costs address space but no memory until bytes arrive;
+//! under `mlockall(MCL_FUTURE)`, which privd and gatewayd use, the pages are locked and resident
+//! as soon as the allocation is made, so a large frame costs its full size at once).
 
 use std::io::{self, Read};
 
@@ -279,7 +281,8 @@ impl<P: FramePolicy> Decoder<P> {
                 body: BytesMut::new(),
             }));
         }
-        // Allocation happens only here, after both limit checks.
+        // Allocation happens only here, after both limit checks. (Under `mlockall(MCL_FUTURE)`
+        // the zeroed buffer is locked, resident memory immediately, not on first touch.)
         self.body = BytesMut::zeroed(body_len);
         self.filled = 0;
         self.stage = Stage::Body;
