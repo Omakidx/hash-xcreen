@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2bb40eec1a8f937aa27015d8192b063d814e296c48cb1aa6c5225b1d65fe5f9a # shrinks to files = [[".local"], [".config"]], home = "home/alice", user = [], use_defaults = false

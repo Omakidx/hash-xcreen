@@ -2903,6 +2903,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "globset",
+ "hx-backup",
  "jiff 0.2.46",
  "proptest",
  "rustic_backend",

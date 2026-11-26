@@ -14,9 +14,9 @@ nothing about Google Drive, Incus, HTTP or `hx-privd`; it is handed a rustic bac
 
 ## Features
 
-`default = ["engine"]`. `rules` and `manifest` have no rustic dependency; the `engine` feature
-(on by default) brings `rustic_core`. A consumer that must not link rustic (`hx-privd`) depends
-on the crate with `default-features = false`.
+`default = []`: the default build is `rules` and `manifest` only, with no rustic dependency, which
+is what `hx-privd` uses. The `engine` feature brings `rustic_core` and is enabled only by the backup
+worker (ipc.md §36). The crate's own tests always build with `engine` (a self dev-dependency).
 
 Dependencies are pinned in the workspace `Cargo.toml`; `rustic_core` is pinned **exactly**
 (`=0.14.0`, no default features, no `clap`) because its API changes between minors.

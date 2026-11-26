@@ -12,9 +12,9 @@ publish.workspace = true
 workspace = true
 
 [features]
-# `engine` links rustic_core. Consumers that only need the rules and the manifest (hx-privd) use
-# `default-features = false`.
-default = ["engine"]
+# The default build is pure (rules, manifest; no rustic), which is what hx-privd uses. `engine` links
+# rustic_core and is enabled only by the backup worker (ipc.md §36).
+default = []
 engine = ["dep:rustic_core", "dep:zeroize", "dep:tracing"]
 
 [dependencies]
@@ -28,6 +28,8 @@ tracing = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
+# Tests always build with the engine, also in `cargo nextest run --workspace` where nothing else enables it.
+hx-backup = { path = ".", features = ["engine"] }
 bytes.workspace = true
 # The local backend, for offline integration tests (no `opendal`, `rest` or `rclone`).
 rustic_backend = { version = "=0.8.0", default-features = false }

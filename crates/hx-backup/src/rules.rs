@@ -1251,7 +1251,9 @@ mod tests {
             use_defaults in any::<bool>(),
         ) {
             let t = tempfile::tempdir().unwrap();
-            let mut all: Vec<Vec<String>> = files;
+            // The fixed paths come first, so that a random entry (a plain file named `.local`, say)
+            // can never block them; random entries that collide with them are skipped below.
+            let mut all: Vec<Vec<String>> = Vec::new();
             for must in [
                 ".claude/projects/s.jsonl",
                 ".claude/.credentials.json",
@@ -1266,6 +1268,7 @@ mod tests {
             ] {
                 all.push(must.split('/').map(str::to_owned).collect());
             }
+            all.extend(files);
             for f in &all {
                 let full = t.path().join(home).join(f.join("/"));
                 // A path may collide with a file made by an earlier entry; ignore those.
