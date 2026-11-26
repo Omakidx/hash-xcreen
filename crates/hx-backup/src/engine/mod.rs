@@ -29,6 +29,7 @@
 mod progress;
 mod scan;
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -37,7 +38,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use jiff::{Timestamp, tz::TimeZone};
-use rustic_core::repofile::SnapshotFile;
+use rustic_core::repofile::{IndexFile, PackId, SnapshotFile};
 use rustic_core::{
     BackupOptions, CheckOptions, ConfigOptions, Credentials, IndexedFullStatus, KeepOptions,
     KeyOptions, LocalDestination, LsOptions, OpenStatus, PathList, PruneOptions, ReadSubsetOption,
@@ -130,6 +131,13 @@ pub enum EngineError {
     /// open the engine again.
     #[error("the engine is closed after a failed index load; open it again")]
     Closed,
+    /// A prune was refused because the repository does not read back as its index says (ipc.md
+    /// section 36, Q-S1): nothing was deleted.
+    #[error("prune refused, the repository failed verification: {finding}")]
+    Integrity {
+        /// What was found (never contains key material).
+        finding: String,
+    },
     /// `rustic_core` (or the backend behind it) failed.
     #[error("{operation} failed: {source}")]
     Repository {
@@ -1093,11 +1101,37 @@ impl Engine {
         })
     }
 
-    /// Remove data no snapshot uses, deleting immediately (`--instant`).
+    /// Remove data no snapshot uses, deleting immediately (`--instant`), **after making sure the
+    /// index can be trusted** (ipc.md section 36, Q-S1).
+    ///
+    /// A compromised `BACKUP` worker holds the repository password, so it can write validly
+    /// encrypted index files, remove index files and add pack files. `rustic_core`'s prune believes
+    /// the index: a forged one makes it delete the real packs that live snapshots need (a decoy pack
+    /// listing the same blobs, a marked-for-deletion entry, swapped blob locations). Pack files and
+    /// snapshots cannot be removed or overwritten by that worker, so the real data is always still
+    /// there; only the index and the decoys lie. Before planning, this method therefore:
+    ///
+    /// 1. rebuilds the index from the pack headers (`repair index --read-all-packs`), so the index
+    ///    says what the packs say, whatever index files were written or removed;
+    /// 2. refuses if a pack file is not in that index (an unreadable pack would be deleted as
+    ///    unreferenced);
+    /// 3. refuses if some blob is listed in two packs. A decoy has to list a real pack's blobs to
+    ///    win over it, so it always shows up as a duplicate; `check --read-data` cannot settle it,
+    ///    because it reads only the one copy per blob that the index lookup picks (observed in
+    ///    `tests/prune_safety.rs`: with a decoy index it fails on some runs and passes on others,
+    ///    by the order the index files were read), while prune keeps the copy in the pack with the
+    ///    highest id.
+    ///
+    /// The cost is one header read per pack and one listing. Nothing here changes the repository
+    /// format. A repository that legitimately holds duplicates (an interrupted prune leaves the
+    /// repacked blobs in two packs) is refused too, until the duplicates are resolved.
     ///
     /// # Errors
-    /// [`EngineError::Cancelled`] (before the plan), [`EngineError::Repository`].
+    /// [`EngineError::Cancelled`] (before the plan), [`EngineError::Integrity`] (nothing was
+    /// deleted), [`EngineError::Repository`].
     pub fn prune(&self, cancel: &CancelToken) -> Result<PruneOutcome, EngineError> {
+        cancel.check()?;
+        self.verify_index_before_prune(cancel)?;
         cancel.check()?;
         self.shared.set_phase(Phase::Prune);
         let opts = PruneOptions::default().instant_delete(true);
@@ -1114,6 +1148,66 @@ impl Engine {
         cancel.check()?;
         self.repo()?.prune(&opts, plan).map_err(rustic("pruning"))?;
         Ok(outcome)
+    }
+
+    /// Steps 1 to 3 of [`Engine::prune`].
+    fn verify_index_before_prune(&self, cancel: &CancelToken) -> Result<(), EngineError> {
+        let repo = self.repo()?;
+        self.shared.set_phase(Phase::RepairIndex);
+        repo.repair_index(&RepairIndexOptions::default().read_all(true), false)
+            .map_err(rustic("rebuilding the index from the pack headers"))?;
+        cancel.check()?;
+
+        let on_disk: HashSet<PackId> = repo
+            .list::<PackId>()
+            .map_err(rustic("listing packs"))?
+            .collect();
+        let mut indexed: HashSet<PackId> = HashSet::with_capacity(on_disk.len());
+        let mut first_pack: HashMap<rustic_core::BlobId, PackId> = HashMap::new();
+        let mut duplicated = 0_u64;
+        for file in repo
+            .stream_files::<IndexFile>()
+            .map_err(rustic("reading the index"))?
+        {
+            let (_, file) = file.map_err(rustic("reading the index"))?;
+            for pack in file
+                .packs
+                .iter()
+                .chain(&file.packs_to_delete)
+                .chain(&file.packs_to_recover)
+            {
+                indexed.insert(pack.id);
+                for blob in &pack.blobs {
+                    match first_pack.entry(blob.id) {
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            v.insert(pack.id);
+                        }
+                        std::collections::hash_map::Entry::Occupied(o) => {
+                            duplicated += u64::from(*o.get() != pack.id);
+                        }
+                    }
+                }
+            }
+        }
+        drop(first_pack);
+        if let Some(unindexed) = on_disk.difference(&indexed).next() {
+            return Err(EngineError::Integrity {
+                finding: format!(
+                    "pack {} has no readable header and is in no index ({} such packs)",
+                    unindexed.to_hex().as_str(),
+                    on_disk.difference(&indexed).count()
+                ),
+            });
+        }
+        if duplicated > 0 {
+            return Err(EngineError::Integrity {
+                finding: format!(
+                    "{duplicated} blobs are stored in more than one pack: the copy prune would keep \
+                     cannot be told from a decoy without reading every copy"
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Check the repository; optionally read and verify pack data.
