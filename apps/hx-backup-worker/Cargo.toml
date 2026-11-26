@@ -1,0 +1,46 @@
+[package]
+name = "hx-backup-worker"
+description = "The backup worker (PID 1 of the network-less helper container) and the Drive helper role: one binary, two roles."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "hx_backup_worker"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hx-backup-worker"
+path = "src/main.rs"
+
+[features]
+# Test hooks of the binary (docs/ipc.md §24): the run directory of the listener
+# (`HX_WORKER_RUN_DIR`), the source and target directories (`HX_WORKER_SRC`, `HX_WORKER_DST`) and
+# `HX_WORKER_NO_OWNERSHIP` (restore without chown, for a test that is not root). NEVER in a release
+# build: only this package's own dev-dependency on itself turns it on, as hx-agent does for its hooks.
+test-hooks = []
+
+[dependencies]
+hx-backup = { path = "../../crates/hx-backup", features = ["engine"] }
+hx-ipc = { workspace = true, features = ["repo"] }
+libc = "0.2" # capset, prctl and sigaction in sandbox.rs, and the seccomp syscall numbers
+rustix = { workspace = true, features = ["process", "thread"] }
+seccompiler = "0.5"
+sha2 = "0.10"
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
+zeroize.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+libc = "0.2"
+rustix = { workspace = true, features = ["process"] }
+hx-backup-worker = { path = ".", features = ["test-hooks"] }
+tempfile = "3.27.0"

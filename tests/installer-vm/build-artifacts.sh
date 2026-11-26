@@ -58,6 +58,9 @@ echo "==> agent binaries (test keys, test hooks)"
 HX_TEST_RELEASE_PUBKEY="$pubkey" HX_TEST_IMAGE_PUBKEY="$imgkey" cargo build -p hx-agent --bins --release --locked \
     --features test-release-key,test-image-key,install-test-hooks,privd-test-hooks
 
+echo "==> hx-backup-worker (its own package: rustic stays out of the agent binaries)"
+cargo build -p hx-backup-worker --release --locked
+
 echo "==> hx-session and hx-pwcheck"
 cargo build --release --locked -p hx-session --bin hx-session -p hx-pwcheck --bin hx-pwcheck
 

@@ -122,6 +122,10 @@ jobs:
           else
             cargo build -p hx-agent --bins --release --locked --target x86_64-unknown-linux-musl --features release-build
           fi
+          # The backup worker is its own package so that rustic never reaches an hx-agent binary
+          # (docs/ipc.md section 36): a separate invocation, never one `cargo build` for both, which
+          # would unify their features.
+          cargo build -p hx-backup-worker --release --locked --target x86_64-unknown-linux-musl
       - name: Collect and check the binaries
         run: |
           set -eu
@@ -139,7 +143,7 @@ jobs:
             [ -f "$out/$b" ] || { echo "::error::$b was not built"; exit 1; }
           done
           ls -l "$out"
-          # all bins are bins of one crate, so one CARGO_PKG_VERSION by construction
+          # both packages take their version from [workspace.package], so one version by construction
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: agent-bins
