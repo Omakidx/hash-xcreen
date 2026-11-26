@@ -82,7 +82,7 @@ mod validate;
 
 pub use data::{DataFrame, encode_data, encode_data_header};
 pub use limits::*;
-pub use link::{LinkError, LinkState};
+pub use link::{D, Disposition, LinkError, LinkState};
 pub use policy::{Verdict, check_job_op, check_op};
 pub use validate::{check_result_shape, validate_frame, validate_request, validate_secret};
 
@@ -210,7 +210,11 @@ pub fn decode(raw: RawFrame, endpoint: Endpoint) -> Result<Incoming, FrameError>
                     max: MAX_MESSAGE_LENGTH,
                 });
             }
-            // Bound repeated-field counts before prost allocates an element per occurrence.
+            // Refuse a variant that may not travel here before decoding any of it, then bound
+            // repeated-field counts before prost allocates an element per occurrence.
+            crate::prescan::check_repo_direction(&raw.body, |n| {
+                validate::variant_number_travels_to(n, endpoint)
+            })?;
             crate::prescan::check_repo_frame(&raw.body)?;
             let frame = pb::RepoFrame::decode(raw.body.as_ref())
                 .map_err(|e| FrameError::Decode(e.to_string()))?;
@@ -238,6 +242,10 @@ pub fn encode_message(frame: &pb::RepoFrame, to: Endpoint) -> Result<Vec<u8>, Fr
 /// Encodes a kind-2 secret frame (privd to the worker). `request_id` is 0 (the job: v1 has no
 /// per-request secrets), `slot` 0 or 1, the secret 16 to 1 024 bytes. The result is zeroized on
 /// drop.
+///
+/// **Write the result to the worker link only after [`LinkState::sent_secret`] returned `Ok` for
+/// the same slot**: the tracker is what makes sure the secret is the next one the `Job` declared,
+/// that the link is the worker link and that the job exists.
 pub fn encode_secret(
     request_id: u64,
     slot: u8,

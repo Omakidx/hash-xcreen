@@ -174,6 +174,23 @@ pub(crate) fn check_gateway_message(body: &[u8], max_results: usize) -> Result<(
     Ok(())
 }
 
+/// repo `RepoFrame`: refuse, before anything is decoded, a variant that may not travel towards
+/// the receiving endpoint (`allowed` says which top-level field numbers may), so that a hostile
+/// peer cannot make the receiver decode a large body just to refuse it. Field numbers outside
+/// 1..=13 are unknown and ignored, as `prost` ignores them.
+#[cfg(feature = "repo")]
+pub(crate) fn check_repo_direction(
+    frame_body: &[u8],
+    allowed: impl Fn(u32) -> bool,
+) -> Result<(), FrameError> {
+    walk(frame_body, |f| {
+        if (1..=13).contains(&f.number) && !allowed(f.number) {
+            return Err(too_many("frame: variant not valid in this direction"));
+        }
+        Ok(())
+    })
+}
+
 /// repo `RepoFrame` (`docs/ipc.md` Part 3): every repeated field of the schema, counted over
 /// **all** occurrences of its enclosing messages (protobuf merges repeated occurrences of an
 /// embedded message, so a limit checked per occurrence could be evaded by splitting the elements

@@ -15,9 +15,9 @@ use super::limits::{
     ID_LEN, INIT_COMPRESSION, INIT_DATAPACK_SIZE_LIMIT, INIT_TREEPACK_SIZE_LIMIT, JOB_ID_LEN,
     MAX_CONFIG_ENTRIES, MAX_CONFIG_KEY_LEN, MAX_CONFIG_VALUE_LEN, MAX_EXCLUDE_LEN, MAX_EXCLUDES,
     MAX_FOLDER_LEN, MAX_FORGET, MAX_KEY_IDS, MAX_LIST_PAGE_ENTRIES, MAX_MANIFEST_BYTES,
-    MAX_OBJECT_SIZE, MAX_REMOVE_KEY_IDS, MAX_SECRET_BYTES, MAX_SECRET_SLOTS, MAX_SNAPSHOTS,
-    MAX_SOFTWARE_LEN, MAX_TAG_LEN, MAX_TAGS, MAX_TEXT_LEN, MIN_SECRET_BYTES, SERVER_ID_LEN,
-    max_object_size,
+    MAX_OBJECT_SIZE, MAX_REMOVE_KEY_IDS, MAX_RETRY_AFTER_MS, MAX_SECRET_BYTES, MAX_SECRET_SLOTS,
+    MAX_SNAPSHOTS, MAX_SOFTWARE_LEN, MAX_TAG_LEN, MAX_TAGS, MAX_TEXT_LEN, MIN_SECRET_BYTES,
+    SERVER_ID_LEN, max_object_size,
 };
 use super::{Endpoint, pb};
 use crate::error::FrameError;
@@ -62,6 +62,12 @@ fn plain_id(id: &[u8], what: &'static str) -> Check {
     require(id.len() == ID_LEN && !all_zero(id), what)
 }
 
+fn has_duplicates(ids: &[bytes::Bytes]) -> bool {
+    let mut seen: Vec<&[u8]> = ids.iter().map(|b| b.as_ref()).collect();
+    seen.sort_unstable();
+    seen.windows(2).any(|w| w[0] == w[1])
+}
+
 /// A string of `min..=max` bytes without control or format characters.
 fn text(s: &str, min: usize, max: usize, what: &'static str) -> Check {
     require(
@@ -102,6 +108,24 @@ fn travels_to(variant: &pb::repo_frame::Frame, to: Endpoint) -> bool {
     }
 }
 
+/// The top-level `RepoFrame` field numbers (the oneof tags of `repo.proto`) that may travel
+/// towards `to`; [`travels_to`] by number, for the pre-scan.
+pub(crate) fn variant_number_travels_to(number: u32, to: Endpoint) -> bool {
+    use Endpoint as E;
+    match number {
+        1 => matches!(to, E::Worker | E::DriveHelper), // hello
+        2 => matches!(to, E::PrivdWorkerLink | E::PrivdDriveLink), // hello_ack
+        3 | 8 => to == E::Worker,                      // job, cancel
+        4 => matches!(to, E::PrivdWorkerLink | E::DriveHelper), // request
+        5 => matches!(to, E::Worker | E::PrivdDriveLink), // response
+        6 | 7 => to == E::PrivdWorkerLink,             // progress, result
+        9..=11 => true,                                // ping, pong, bye
+        12 => to == E::DriveHelper,                    // cancel_request
+        13 => to == E::PrivdDriveLink,                 // event
+        _ => true,
+    }
+}
+
 /// Checks one decoded kind-1 frame that is about to be accepted by, or sent to, the endpoint
 /// `to`.
 pub fn validate_frame(frame: &pb::RepoFrame, to: Endpoint) -> Check {
@@ -118,7 +142,13 @@ pub fn validate_frame(frame: &pb::RepoFrame, to: Endpoint) -> Check {
             h.job_id.len() == JOB_ID_LEN && !all_zero(&h.job_id),
             "hello.job_id",
         ),
-        F::HelloAck(a) => text(&a.software, 0, MAX_SOFTWARE_LEN, "hello_ack.software"),
+        F::HelloAck(a) => require(
+            (1..=MAX_SOFTWARE_LEN).contains(&a.software.len())
+                && a.software
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'+' | b'-')),
+            "hello_ack.software",
+        ),
         F::Job(j) => validate_job(j),
         F::Request(r) => validate_request(r, to),
         F::Response(r) => validate_response(r, to),
@@ -215,6 +245,10 @@ fn validate_response(r: &pb::RepoResponse, to: Endpoint) -> Check {
         Some(R::Error(e)) => {
             use pb::ErrorClass as C;
             known::<C>(e.class, "error.class")?;
+            require(
+                e.retry_after_ms <= MAX_RETRY_AFTER_MS,
+                "error.retry_after_ms",
+            )?;
             // From the Drive helper: the classes that are privd's own verdicts (section 31) are
             // not the helper's to give.
             let privd_own = matches!(
@@ -267,12 +301,7 @@ fn validate_job(j: &pb::Job) -> Check {
             s.forget
                 .iter()
                 .try_for_each(|id| plain_id(id, "forget_prune.forget"))?;
-            let mut seen: Vec<&[u8]> = s.forget.iter().map(|b| b.as_ref()).collect();
-            seen.sort_unstable();
-            require(
-                seen.windows(2).all(|w| w[0] != w[1]),
-                "forget_prune.forget: duplicate",
-            )?;
+            require(!has_duplicates(&s.forget), "forget_prune.forget: duplicate")?;
         }
         (K::Check, Spec::Check(s)) => {
             require(s.read_data_percent <= 100, "check.read_data_percent")?
@@ -286,6 +315,10 @@ fn validate_job(j: &pb::Job) -> Check {
             s.remove_key_ids
                 .iter()
                 .try_for_each(|id| plain_id(id, "keys.remove_key_ids"))?;
+            require(
+                !has_duplicates(&s.remove_key_ids),
+                "keys.remove_key_ids: duplicate",
+            )?;
         }
         _ => return invalid("job: spec does not match kind"),
     }

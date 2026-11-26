@@ -8,7 +8,7 @@ mod repo_common;
 
 use bytes::{Bytes, BytesMut};
 use hx_ipc::repo::pb::{self, JobKind, ObjectType as T, repo_frame::Frame as F, repo_request::Op};
-use hx_ipc::repo::{DataFrame, Endpoint, Incoming, LinkState};
+use hx_ipc::repo::{DataFrame, Disposition, Endpoint, Incoming, LinkState};
 use hx_ipc::secret::SecretFrame;
 use proptest::prelude::*;
 use repo_common::*;
@@ -44,14 +44,14 @@ impl Pair {
     }
 
     /// `who` sends; the other end receives. Both must give the same verdict.
-    fn msg(&mut self, who: Who, f: pb::RepoFrame) -> Result<(), String> {
+    fn msg(&mut self, who: Who, f: pb::RepoFrame) -> Result<Disposition, String> {
         let (tx, rx) = self.ends(who);
         let a = tx.sent_message(&f);
         let b = rx.received_message(&f);
         agree(a, b)
     }
 
-    fn secret(&mut self, who: Who, slot: u8, len: usize) -> Result<(), String> {
+    fn secret(&mut self, who: Who, slot: u8, len: usize) -> Result<Disposition, String> {
         let (tx, rx) = self.ends(who);
         let a = tx.sent_secret(0, slot, len);
         let mut body = 0u64.to_le_bytes().to_vec();
@@ -62,7 +62,13 @@ impl Pair {
         agree(a, b)
     }
 
-    fn data(&mut self, who: Who, stream: u64, end: bool, len: usize) -> Result<(), String> {
+    fn data(
+        &mut self,
+        who: Who,
+        stream: u64,
+        end: bool,
+        len: usize,
+    ) -> Result<Disposition, String> {
         let (tx, rx) = self.ends(who);
         let a = tx.sent_data(stream, end, len);
         let frame = DataFrame {
@@ -116,21 +122,21 @@ impl Pair {
     }
 }
 
-fn agree(
-    a: Result<(), hx_ipc::repo::LinkError>,
-    b: Result<(), hx_ipc::repo::LinkError>,
-) -> Result<(), String> {
+fn agree(a: hx_ipc::repo::D, b: hx_ipc::repo::D) -> Result<Disposition, String> {
     match (a, b) {
-        (Ok(()), Ok(())) => Ok(()),
+        (Ok(x), Ok(y)) => {
+            assert_eq!(x, y, "the two ends disagree on the disposition");
+            Ok(x)
+        }
         (Err(x), Err(_)) => Err(x.to_string()),
         (a, b) => panic!("the two ends disagree: sender {a:?}, receiver {b:?}"),
     }
 }
 
-fn err_has(r: Result<(), String>, needle: &str) {
+fn err_has<T>(r: Result<T, String>, needle: &str) {
     match r {
         Err(e) => assert!(e.contains(needle), "wanted {needle:?} in {e:?}"),
-        Ok(()) => panic!("expected a violation mentioning {needle:?}"),
+        Ok(_) => panic!("expected a violation mentioning {needle:?}"),
     }
 }
 
@@ -178,11 +184,8 @@ fn handshake_order_and_version() {
     }
     for mut p in [Pair::worker(), Pair::drive()] {
         p.msg(Who::Privd, hello()).unwrap();
-        // Between Hello and HelloAck only the ack passes.
-        err_has(
-            p.msg(Who::Privd, frame(F::Ping(pb::Ping { nonce: 1 }))),
-            "handshake",
-        );
+        // Between Hello and HelloAck only the ack and pings pass.
+        err_has(p.msg(Who::Privd, req(1, list(T::Pack))), "handshake");
     }
     for mut p in [Pair::worker(), Pair::drive()] {
         p.msg(Who::Privd, hello()).unwrap();
@@ -793,10 +796,23 @@ fn a_response_must_match_its_request() {
 
 // ----- progress, result, bye -----
 
+/// A worker-link pair with the job open and, for a backup, a committed SNAPSHOT write of id 0x11
+/// (what `result_for(Backup)` names).
+fn opened(kind: JobKind) -> Pair {
+    let mut p = Pair::worker().open(kind);
+    if kind == JobKind::Backup {
+        p.msg(Who::Other, req(900, write(T::Snapshot, 0x11, 4)))
+            .unwrap();
+        p.data(Who::Other, 900, true, 4).unwrap();
+        p.msg(Who::Privd, done(900)).unwrap();
+    }
+    p
+}
+
 #[test]
 fn one_job_result_matching_the_kind_then_bye() {
     for kind in KINDS {
-        let mut p = Pair::worker().open(kind);
+        let mut p = opened(kind);
         p.msg(
             Who::Other,
             frame(F::Progress(pb::Progress {
@@ -811,7 +827,7 @@ fn one_job_result_matching_the_kind_then_bye() {
             p.msg(Who::Other, result_frame(result_for(kind))),
             "second JobResult",
         );
-        let mut p = Pair::worker().open(kind);
+        let mut p = opened(kind);
         p.msg(Who::Other, result_frame(result_for(kind))).unwrap();
         err_has(
             p.msg(
@@ -823,10 +839,10 @@ fn one_job_result_matching_the_kind_then_bye() {
             ),
             "after JobResult",
         );
-        let mut p = Pair::worker().open(kind);
+        let mut p = opened(kind);
         p.msg(Who::Other, result_frame(result_for(kind))).unwrap();
         err_has(p.msg(Who::Other, req(1, list(T::Pack))), "after JobResult");
-        let mut p = Pair::worker().open(kind);
+        let mut p = opened(kind);
         p.msg(Who::Other, result_frame(result_for(kind))).unwrap();
         p.msg(Who::Other, frame(F::Bye(pb::Bye {}))).unwrap();
         assert!(p.privd.is_closed());
@@ -871,11 +887,13 @@ fn one_job_result_matching_the_kind_then_bye() {
         p.msg(Who::Other, result_frame(result_for(JobKind::Check))),
         "before the job is ready",
     );
-    // Pending requests may outlive the result (privd just stops answering them).
+    // A pending request is a violation (a cancelled worker waits for the answers).
     let mut p = Pair::worker().open(JobKind::Check);
     p.msg(Who::Other, req(1, list(T::Pack))).unwrap();
-    p.msg(Who::Other, result_frame(result_for(JobKind::Check)))
-        .unwrap();
+    err_has(
+        p.msg(Who::Other, result_frame(result_for(JobKind::Check))),
+        "outstanding",
+    );
 }
 
 // ----- properties -----
@@ -992,5 +1010,233 @@ proptest! {
             if failed { prop_assert!(r.is_err()); }
             failed |= r.is_err();
         }
+    }
+}
+
+// ----- review additions -----
+
+#[test]
+fn an_aborted_upload_stays_outstanding_until_the_senders_end() {
+    // Error mid-upload; the sender closes with an empty END; only then is the slot free.
+    let mut p = Pair::worker().open(JobKind::Backup);
+    upload(&mut p, 1, 100);
+    p.data(Who::Other, 1, false, 40).unwrap();
+    let d = p
+        .msg(Who::Privd, error(1, pb::ErrorClass::Transient))
+        .unwrap();
+    assert_eq!(d.done, None, "the request is not finished by the Error");
+    assert_eq!(p.privd.outstanding_writes(), 1);
+    let d = p.data(Who::Other, 1, false, 20).unwrap();
+    assert!(d.discard && d.done.is_none());
+    let d = p.data(Who::Other, 1, true, 0).unwrap();
+    assert!(d.discard);
+    assert_eq!(d.done, Some(1), "the END finishes the request");
+    assert_eq!(p.privd.outstanding_writes(), 0);
+    // Data after that END is a violation.
+    err_has(p.data(Who::Other, 1, true, 0), "unknown stream");
+
+    // Error after all `size` bytes but before END: the END is still required.
+    let mut p = Pair::worker().open(JobKind::Backup);
+    upload(&mut p, 1, 10);
+    p.data(Who::Other, 1, false, 10).unwrap();
+    p.msg(Who::Privd, error(1, pb::ErrorClass::Integrity))
+        .unwrap();
+    assert_eq!(p.privd.outstanding(), 1);
+    p.data(Who::Other, 1, true, 0).unwrap();
+    assert_eq!(p.privd.outstanding(), 0);
+
+    // The same on the Drive link: privd sends the empty END after the helper's Error.
+    let mut p = Pair::drive().open(JobKind::Backup);
+    p.msg(Who::Privd, req(2, write(T::Pack, 1, 50))).unwrap();
+    p.data(Who::Privd, 2, false, 20).unwrap();
+    p.msg(Who::Other, error(2, pb::ErrorClass::QuotaExceeded))
+        .unwrap();
+    p.data(Who::Privd, 2, true, 0).unwrap();
+    assert_eq!(p.privd.outstanding(), 0);
+
+    // Done without the END is still refused for an aborted upload.
+    let mut p = Pair::worker().open(JobKind::Backup);
+    upload(&mut p, 1, 10);
+    p.msg(Who::Privd, error(1, pb::ErrorClass::Transient))
+        .unwrap();
+    err_has(p.msg(Who::Privd, done(1)), "already answered");
+}
+
+#[test]
+fn the_drive_link_allows_ten_outstanding_requests_and_four_writes() {
+    let mut p = Pair::drive().open(JobKind::Backup);
+    for i in 2..=11 {
+        p.msg(Who::Privd, req(i, list(T::Pack))).unwrap();
+    }
+    assert_eq!(p.privd.outstanding(), 10);
+    assert!(!p.privd.can_request(false));
+    err_has(
+        p.msg(Who::Privd, req(12, list(T::Pack))),
+        "too many outstanding",
+    );
+    // Four writes, never five, even with free slots.
+    let mut p = Pair::drive().open(JobKind::Backup);
+    for i in 2..=5 {
+        assert!(p.privd.can_request(true));
+        p.msg(Who::Privd, req(i, write(T::Pack, 1, 10))).unwrap();
+    }
+    assert!(!p.privd.can_request(true) && p.privd.can_request(false));
+    err_has(
+        p.msg(Who::Privd, req(6, write(T::Pack, 1, 10))),
+        "too many outstanding writes",
+    );
+    // The worker link stays at eight.
+    let mut p = Pair::worker().open(JobKind::Backup);
+    for i in 1..=8 {
+        p.msg(Who::Other, req(i, list(T::Pack))).unwrap();
+    }
+    assert!(!p.privd.can_request(false));
+}
+
+#[test]
+fn ping_is_valid_once_hello_has_been_sent() {
+    for mut p in [Pair::worker(), Pair::drive()] {
+        err_has(
+            p.msg(Who::Privd, frame(F::Ping(pb::Ping { nonce: 1 }))),
+            "handshake",
+        );
+    }
+    for mut p in [Pair::worker(), Pair::drive()] {
+        p.msg(Who::Privd, hello()).unwrap();
+        p.msg(Who::Privd, frame(F::Ping(pb::Ping { nonce: 1 })))
+            .unwrap();
+        p.msg(Who::Other, frame(F::Pong(pb::Pong { nonce: 1 })))
+            .unwrap();
+        p.msg(Who::Other, ack()).unwrap();
+    }
+}
+
+#[test]
+fn job_result_and_bye_wait_for_outstanding_requests() {
+    let mut p = Pair::worker().open(JobKind::Check);
+    p.msg(Who::Other, req(1, list(T::Pack))).unwrap();
+    err_has(
+        p.msg(Who::Other, result_frame(result_for(JobKind::Check))),
+        "outstanding",
+    );
+    // A cancelled worker closes its aborted upload with END before JobResult.
+    let failed = pb::JobResult {
+        ok: false,
+        error: pb::WorkerError::Cancelled as i32,
+        ..Default::default()
+    };
+    let mut p = Pair::worker().open(JobKind::Backup);
+    upload(&mut p, 1, 10);
+    p.msg(Who::Privd, error(1, pb::ErrorClass::Cancelled))
+        .unwrap();
+    err_has(
+        p.msg(Who::Other, result_frame(failed.clone())),
+        "outstanding",
+    );
+    let mut p = Pair::worker().open(JobKind::Backup);
+    upload(&mut p, 1, 10);
+    p.msg(Who::Privd, error(1, pb::ErrorClass::Cancelled))
+        .unwrap();
+    p.data(Who::Other, 1, true, 0).unwrap();
+    p.msg(Who::Other, result_frame(failed)).unwrap();
+    p.msg(Who::Other, frame(F::Bye(pb::Bye {}))).unwrap();
+}
+
+#[test]
+fn a_backup_result_must_name_a_committed_snapshot_write() {
+    let commit = |p: &mut Pair, req_id: u64, b: u8| {
+        p.msg(Who::Other, req(req_id, write(T::Snapshot, b, 10)))
+            .unwrap();
+        p.data(Who::Other, req_id, true, 10).unwrap();
+        p.msg(Who::Privd, done(req_id)).unwrap();
+    };
+    let result = |b: u8| {
+        let mut r = result_for(JobKind::Backup);
+        r.snapshot_id = id(b);
+        result_frame(r)
+    };
+    let mut p = Pair::worker().open(JobKind::Backup);
+    commit(&mut p, 1, 0x11);
+    p.msg(Who::Other, result(0x11)).unwrap();
+    // Not written at all, a different id, aborted, or written as a PACK.
+    let mut p = Pair::worker().open(JobKind::Backup);
+    err_has(p.msg(Who::Other, result(0x11)), "committed SNAPSHOT");
+    let mut p = Pair::worker().open(JobKind::Backup);
+    commit(&mut p, 1, 0x22);
+    err_has(p.msg(Who::Other, result(0x11)), "committed SNAPSHOT");
+    let mut p = Pair::worker().open(JobKind::Backup);
+    p.msg(Who::Other, req(1, write(T::Snapshot, 0x11, 10)))
+        .unwrap();
+    p.msg(Who::Privd, error(1, pb::ErrorClass::Integrity))
+        .unwrap();
+    p.data(Who::Other, 1, true, 0).unwrap();
+    err_has(p.msg(Who::Other, result(0x11)), "committed SNAPSHOT");
+    let mut p = Pair::worker().open(JobKind::Backup);
+    p.msg(Who::Other, req(1, write(T::Pack, 0x11, 10))).unwrap();
+    p.data(Who::Other, 1, true, 10).unwrap();
+    p.msg(Who::Privd, done(1)).unwrap();
+    err_has(p.msg(Who::Other, result(0x11)), "committed SNAPSHOT");
+    // A failed backup needs no snapshot.
+    let mut p = Pair::worker().open(JobKind::Backup);
+    let failed = pb::JobResult {
+        ok: false,
+        error: pb::WorkerError::Engine as i32,
+        ..Default::default()
+    };
+    p.msg(Who::Other, result_frame(failed)).unwrap();
+}
+
+#[test]
+fn a_config_listing_has_at_most_one_entry() {
+    let mut p = Pair::worker().open(JobKind::Check);
+    p.msg(Who::Other, req(1, list(T::Config))).unwrap();
+    p.msg(Who::Privd, resp(1, page(T::Config, 1, true)))
+        .unwrap();
+    let mut p = Pair::worker().open(JobKind::Check);
+    p.msg(Who::Other, req(1, list(T::Config))).unwrap();
+    err_has(
+        p.msg(Who::Privd, resp(1, page(T::Config, 2, true))),
+        "at most one",
+    );
+    let mut p = Pair::worker().open(JobKind::Check);
+    p.msg(Who::Other, req(1, list(T::Config))).unwrap();
+    p.msg(Who::Privd, resp(1, page(T::Config, 1, false)))
+        .unwrap();
+    err_has(
+        p.msg(Who::Privd, resp(1, page(T::Config, 1, true))),
+        "at most one",
+    );
+}
+
+#[test]
+fn dispositions_tell_a_relay_what_finished() {
+    let mut p = Pair::worker().open(JobKind::Backup);
+    let d = p.msg(Who::Other, req(1, list(T::Pack))).unwrap();
+    assert_eq!(d, Disposition::default());
+    let d = p.msg(Who::Privd, resp(1, page(T::Pack, 1, false))).unwrap();
+    assert_eq!(d.done, None);
+    let d = p.msg(Who::Privd, resp(1, page(T::Pack, 1, true))).unwrap();
+    assert_eq!(d.done, Some(1));
+    upload(&mut p, 2, 4);
+    assert_eq!(p.data(Who::Other, 2, true, 4).unwrap().done, None);
+    assert_eq!(p.msg(Who::Privd, done(2)).unwrap().done, Some(2));
+    p.msg(Who::Other, req(3, read_full(T::Pack, 1))).unwrap();
+    p.msg(Who::Privd, resp(3, read_begin(2))).unwrap();
+    assert_eq!(
+        p.data(Who::Privd, 3, false, 1).unwrap(),
+        Disposition::default()
+    );
+    assert_eq!(p.data(Who::Privd, 3, true, 1).unwrap().done, Some(3));
+}
+
+#[test]
+fn only_privd_on_the_worker_link_may_send_secrets() {
+    for e in [
+        Endpoint::Worker,
+        Endpoint::PrivdDriveLink,
+        Endpoint::DriveHelper,
+    ] {
+        let mut s = LinkState::new(e);
+        assert!(s.sent_secret(0, 0, 32).is_err(), "{e:?}");
     }
 }

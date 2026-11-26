@@ -35,7 +35,7 @@ pub fn ack() -> pb::RepoFrame {
     frame(F::HelloAck(pb::HelloAck {
         major: 1,
         minor: 0,
-        software: "hx-backup-worker 0.1.0".into(),
+        software: "hx-backup-worker-0.1.0".into(),
     }))
 }
 

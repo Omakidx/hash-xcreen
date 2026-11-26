@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 0927bdaf63e76b51caaedb86f98811492c1f5e29a5fe3f84bcfccaca2c3f397d # shrinks to (f, to) = (RepoFrame { frame: Some(HelloAck(HelloAck { major: 1, minor: 0, software: "hx-backup-worker 0.1.0" })) }, [PrivdWorkerLink, PrivdDriveLink]), chunk = 1

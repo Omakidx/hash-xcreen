@@ -185,6 +185,29 @@ fn worst_case_bodies_are_refused_without_amplification_and_secrets_are_not_copie
         "list_page.entries over many occurrences",
     );
 
+    // A Job with a legal count of ids (1 900 of 4 096) that a worker sends to privd: refused by
+    // direction before prost allocates an element for each.
+    let ids = field(1, &[1u8; 32]).repeat(1_900);
+    let job_body = field(3, &field(15, &ids));
+    refused(&job_body, p, "a Job towards privd (worker link)");
+    refused(&job_body, d, "a Job towards privd (Drive link)");
+    refused(
+        &job_body,
+        Endpoint::DriveHelper,
+        "a Job towards the Drive helper",
+    );
+    // Sensitivity: towards the worker it is a legal frame and does allocate.
+    let raw = RawFrame {
+        kind: repo::KIND_MESSAGE,
+        body: BytesMut::from(&job_body[..]),
+    };
+    let (r, peak) = peak_during(|| repo::decode(raw, w));
+    assert!(
+        r.is_err(),
+        "no job_id: refused by validation, after decoding"
+    );
+    assert!(peak > SLACK, "the decode itself allocates {peak}");
+
     // Sensitivity: the same snapshot body decoded by prost alone is a large multiple of its size.
     use prost::Message;
     let body = nested(&[7, 11], 65_000);

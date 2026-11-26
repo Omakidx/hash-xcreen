@@ -21,7 +21,11 @@
 use super::pb::{self, ObjectType as T, repo_request::Op};
 
 /// What the policy says about one request.
+///
+/// **`AllowIfAbsent` is not `Allow`.** Code that treats every non-`Deny` as "forward" lets an
+/// `INIT` job overwrite an existing repository config; match all three variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a verdict must be acted on; AllowIfAbsent is not Allow"]
 pub enum Verdict {
     /// Forward the request.
     Allow,

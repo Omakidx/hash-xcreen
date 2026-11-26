@@ -264,8 +264,8 @@ fn backup_spec_limits() {
         w,
     );
     edge(
-        backup_job_with(|b| b.excludes = vec![s(4096)]),
-        backup_job_with(|b| b.excludes = vec![s(4097)]),
+        backup_job_with(|b| b.excludes = vec![s(1024)]),
+        backup_job_with(|b| b.excludes = vec![s(1025)]),
         w,
     );
     bad(&backup_job_with(|b| b.excludes = vec![String::new()]), w);
@@ -817,9 +817,18 @@ fn hello_ack_progress_and_event() {
     };
     for e in [Endpoint::PrivdWorkerLink, Endpoint::PrivdDriveLink] {
         edge(ack_with(&s(64)), ack_with(&s(65)), e);
-        ok(&ack_with(""), e);
-        bad(&ack_with("evil\u{1b}[2J"), e);
-        bad(&ack_with("a\nb"), e);
+        ok(&ack_with("hx-backup-worker_0.1.0+build.5"), e);
+        bad(&ack_with(""), e);
+        for text in [
+            "evil\u{1b}[2J",
+            "a\nb",
+            "has space",
+            "caf\u{e9}",
+            "a\u{200b}b",
+            "x/y",
+        ] {
+            bad(&ack_with(text), e);
+        }
     }
     let prog = |phase| {
         frame(F::Progress(pb::Progress {
@@ -1235,5 +1244,107 @@ proptest! {
     fn arbitrary_message_bodies_never_panic(body in proptest::collection::vec(any::<u8>(), 0..2000), kind in 0u8..5, which in 0usize..4) {
         let raw = RawFrame { kind, body: BytesMut::from(&body[..]) };
         let _ = repo::decode(raw, ALL[which]);
+    }
+}
+
+// ----- review additions -----
+
+#[test]
+fn retry_after_is_at_most_a_day_and_text_rules_refuse_format_characters() {
+    let err = |ms: u32| {
+        resp(
+            1,
+            pb::repo_response::Result::Error(pb::RepoError {
+                class: pb::ErrorClass::RateLimited as i32,
+                retry_after_ms: ms,
+            }),
+        )
+    };
+    for e in [Endpoint::Worker, Endpoint::PrivdDriveLink] {
+        edge(err(86_400_000), err(86_400_001), e);
+    }
+    // Event.until_ms stays unbounded in the codec (privd clamps it).
+    ok(
+        &frame(F::Event(pb::Event {
+            kind: 1,
+            until_ms: u64::MAX,
+        })),
+        Endpoint::PrivdDriveLink,
+    );
+    // Cf and Zl characters are refused in the manifest text and in excludes.
+    let w = Endpoint::Worker;
+    for bad_text in ["a\u{200b}b", "a\u{2028}b", "a\u{202e}b", "a\u{feff}"] {
+        bad(
+            &backup_job_with(|b| {
+                manifest_of(b).distro.as_mut().unwrap().pretty_name = bad_text.into()
+            }),
+            w,
+        );
+        bad(&backup_job_with(|b| b.excludes = vec![bad_text.into()]), w);
+    }
+    // KEYS: removals must not repeat an id.
+    let keys = |ids: Vec<Bytes>| {
+        let mut j = job(JobKind::Keys);
+        let Some(pb::job::Spec::Keys(k)) = &mut j.spec else {
+            unreachable!()
+        };
+        k.remove_key_ids = ids;
+        frame(F::Job(j))
+    };
+    ok(&keys(vec![id(1), id(2)]), w);
+    bad(&keys(vec![id(1), id(1)]), w);
+}
+
+#[test]
+fn a_variant_that_may_not_travel_here_is_refused_before_decoding() {
+    // The pre-scan reads only the top-level field number: a Job towards privd is refused even
+    // when its body is garbage that would not decode.
+    for (field_number, refused_at) in [
+        (
+            3u8,
+            vec![
+                Endpoint::PrivdWorkerLink,
+                Endpoint::PrivdDriveLink,
+                Endpoint::DriveHelper,
+            ],
+        ),
+        (4, vec![Endpoint::Worker, Endpoint::PrivdDriveLink]),
+        (
+            6,
+            vec![
+                Endpoint::Worker,
+                Endpoint::PrivdDriveLink,
+                Endpoint::DriveHelper,
+            ],
+        ),
+        (
+            12,
+            vec![
+                Endpoint::Worker,
+                Endpoint::PrivdWorkerLink,
+                Endpoint::PrivdDriveLink,
+            ],
+        ),
+        (
+            13,
+            vec![
+                Endpoint::Worker,
+                Endpoint::PrivdWorkerLink,
+                Endpoint::DriveHelper,
+            ],
+        ),
+    ] {
+        let body = [(field_number << 3) | 2, 3, 0xFF, 0xFF, 0xFF];
+        for e in refused_at {
+            let raw = RawFrame {
+                kind: 1,
+                body: BytesMut::from(&body[..]),
+            };
+            let err = repo::decode(raw, e).unwrap_err();
+            assert!(
+                matches!(&err, FrameError::Invalid(m) if m.contains("direction")),
+                "field {field_number} at {e:?}: {err:?}"
+            );
+        }
     }
 }

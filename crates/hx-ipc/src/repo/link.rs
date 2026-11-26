@@ -22,21 +22,25 @@
 //!   declared secret frames in order and of the declared lengths; the worker sends nothing but
 //!   `Ping` and `Pong` until the last secret has been delivered.
 //! * **Requests.** `req_id` non-zero and unique among the live requests (a request is live from
-//!   its `RepoRequest` to its last answer); at most 8 live, at most 4 of them writes; on the
-//!   Drive link the first request is `OpenRepo` and no other is.
+//!   its `RepoRequest` to its last answer); at most 8 live on the worker link and 10 on the Drive
+//!   link, at most 4 of them writes ([`LinkState::can_request`] asks without changing anything);
+//!   on the Drive link the first request is `OpenRepo` and no other is.
 //! * **Streams.** A `Write` opens an upload stream of exactly `size` bytes that ends with an
 //!   `END` frame, and its `Done` may come only after `END`; a `ReadBegin{size}` opens a download
 //!   stream with the same rules. A frame without `END` has at least one byte. A frame for an
 //!   unknown, finished, wrong-direction or overrun stream, and an `END` before `size`, are
-//!   violations. An `Error` answering a `Write` aborts the upload: the sender's frames that are
-//!   already in flight are accepted and discarded up to `size` (or its `END`).
+//!   violations. An `Error` answering a `Write` aborts the upload but the request stays
+//!   outstanding until the sender closes the stream with `END` (it may be empty): data frames up
+//!   to and including that `END` are accepted and must be discarded ([`Disposition::discard`]).
 //! * **Listing.** Pages answer a `List` until `last`; a page before the last has an entry; ids
 //!   are all zero for `CONFIG` and non-zero otherwise; sizes respect the per-type cap; at most
 //!   1 000 000 entries in all.
 //! * **Reads.** `ReadBegin` is at most the per-type cap, and for a `ReadPartial` at most the
 //!   requested length.
-//! * **End.** Exactly one `JobResult` (its shape must match the job kind), no `Progress` or
-//!   request after it, and the worker's `Bye` only after it.
+//! * **End.** Exactly one `JobResult` (its shape must match the job kind), only while no request
+//!   is outstanding; for a successful `BACKUP`, its `snapshot_id` is the id of a `SNAPSHOT` write
+//!   of this job whose `Done` has passed. No `Progress` or request after it; the worker's `Bye`
+//!   only after it and with nothing outstanding. `Ping` and `Pong` are valid from `Hello` on.
 //!
 //! `req_id` is unique among live requests, which is all the state machine depends on; a sender
 //! numbers its requests upwards and never reuses a number.
@@ -45,8 +49,8 @@ use bytes::Bytes;
 use thiserror::Error;
 
 use super::limits::{
-    MAX_LIST_ENTRIES, MAX_OUTSTANDING_REQUESTS, MAX_OUTSTANDING_WRITES, VERSION_MAJOR,
-    max_object_size,
+    MAX_COMMITTED_SNAPSHOTS, MAX_DRIVE_OUTSTANDING_REQUESTS, MAX_LIST_ENTRIES,
+    MAX_OUTSTANDING_REQUESTS, MAX_OUTSTANDING_WRITES, VERSION_MAJOR, max_object_size,
 };
 use super::validate::check_result_shape;
 use super::{DataFrame, Endpoint, Incoming, pb};
@@ -68,6 +72,8 @@ impl From<FrameError> for LinkError {
 }
 
 type R = Result<(), LinkError>;
+/// The verdict of one frame: accepted with a [`Disposition`], or a violation.
+pub type D = Result<Disposition, LinkError>;
 
 fn violation(what: &'static str) -> R {
     Err(LinkError(what))
@@ -75,6 +81,18 @@ fn violation(what: &'static str) -> R {
 
 fn need(cond: bool, what: &'static str) -> R {
     if cond { Ok(()) } else { violation(what) }
+}
+
+/// What a relay needs to know about the frame that [`LinkState`] just accepted, so that it need
+/// not shadow the state machine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Disposition {
+    /// The frame is a data frame of an aborted upload (an `Error` already answered its `Write`):
+    /// drop it, do not forward it.
+    pub discard: bool,
+    /// The frame finished this request: its slot is free (the last `ListPage`, `Done`, `Error`,
+    /// `QuotaResult`, the `END` of a download, or the `END` that closes an aborted upload).
+    pub done: Option<u64>,
 }
 
 /// The two ends of a link, by role in the conversation.
@@ -93,12 +111,23 @@ enum Phase {
 }
 
 /// What a live request is waiting for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Op {
-    List { ty: pb::ObjectType, total: u32 },
-    ReadFull { ty: pb::ObjectType },
-    ReadPartial { ty: pb::ObjectType, length: u32 },
-    Write,
+    List {
+        ty: pb::ObjectType,
+        total: u32,
+    },
+    ReadFull {
+        ty: pb::ObjectType,
+    },
+    ReadPartial {
+        ty: pb::ObjectType,
+        length: u32,
+    },
+    /// `snapshot` is the id of a `SNAPSHOT` write.
+    Write {
+        snapshot: Option<Bytes>,
+    },
     Plain,
     Quota,
 }
@@ -117,7 +146,7 @@ enum Stream {
     Aborted(u32),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Live {
     req_id: u64,
     op: Op,
@@ -141,6 +170,9 @@ pub struct LinkState {
     job: Option<JobState>,
     result_seen: bool,
     live: Vec<Live>,
+    /// Ids of the `SNAPSHOT` objects this job wrote and had answered `Done`.
+    committed: Vec<Bytes>,
+    disp: Disposition,
     requests_started: bool,
     poisoned: bool,
 }
@@ -154,7 +186,9 @@ impl LinkState {
             job_id: None,
             job: None,
             result_seen: false,
-            live: Vec::with_capacity(MAX_OUTSTANDING_REQUESTS),
+            live: Vec::with_capacity(MAX_DRIVE_OUTSTANDING_REQUESTS),
+            committed: Vec::new(),
+            disp: Disposition::default(),
             requests_started: false,
             poisoned: false,
         }
@@ -182,7 +216,10 @@ impl LinkState {
 
     /// Of those, the writes.
     pub fn outstanding_writes(&self) -> usize {
-        self.live.iter().filter(|l| l.op == Op::Write).count()
+        self.live
+            .iter()
+            .filter(|l| matches!(l.op, Op::Write { .. }))
+            .count()
     }
 
     /// The kind of the job, once `Job` has passed (worker link).
@@ -203,10 +240,29 @@ impl LinkState {
         self.result_seen
     }
 
+    /// Could the requester of this link send one more request (a write if `is_write`) right now?
+    /// Does not change the state.
+    pub fn can_request(&self, is_write: bool) -> bool {
+        self.phase == Phase::Open
+            && !self.poisoned
+            && !self.result_seen
+            && self.ready_for_requests()
+            && self.live.len() < self.max_outstanding()
+            && (!is_write || self.outstanding_writes() < MAX_OUTSTANDING_WRITES)
+    }
+
+    fn max_outstanding(&self) -> usize {
+        if self.on_worker_link() {
+            MAX_OUTSTANDING_REQUESTS
+        } else {
+            MAX_DRIVE_OUTSTANDING_REQUESTS
+        }
+    }
+
     // ----- frames of the peer -----
 
     /// A decoded frame of the peer.
-    pub fn received(&mut self, incoming: &Incoming) -> R {
+    pub fn received(&mut self, incoming: &Incoming) -> D {
         match incoming {
             Incoming::Message(f) => self.received_message(f),
             Incoming::Secret(s) => self.received_secret(s),
@@ -215,19 +271,19 @@ impl LinkState {
     }
 
     /// A kind-1 frame of the peer.
-    pub fn received_message(&mut self, frame: &pb::RepoFrame) -> R {
+    pub fn received_message(&mut self, frame: &pb::RepoFrame) -> D {
         let from = self.peer();
         self.guarded(|s| s.message(from, frame))
     }
 
     /// A kind-2 frame of the peer (only privd sends them, so only the worker end receives).
-    pub fn received_secret(&mut self, frame: &SecretFrame) -> R {
+    pub fn received_secret(&mut self, frame: &SecretFrame) -> D {
         let from = self.peer();
         self.guarded(|s| s.secret(from, frame.request_id, frame.slot, frame.secret.len()))
     }
 
     /// A kind-3 frame of the peer.
-    pub fn received_data(&mut self, frame: &DataFrame) -> R {
+    pub fn received_data(&mut self, frame: &DataFrame) -> D {
         let from = self.peer();
         self.guarded(|s| s.data(from, frame.stream_id, frame.end, frame.payload.len()))
     }
@@ -235,19 +291,19 @@ impl LinkState {
     // ----- frames of our own -----
 
     /// A kind-1 frame this end is about to send.
-    pub fn sent_message(&mut self, frame: &pb::RepoFrame) -> R {
+    pub fn sent_message(&mut self, frame: &pb::RepoFrame) -> D {
         let from = self.own();
         self.guarded(|s| s.message(from, frame))
     }
 
     /// A kind-2 frame this end is about to send (privd, on the worker link).
-    pub fn sent_secret(&mut self, request_id: u64, slot: u8, len: usize) -> R {
+    pub fn sent_secret(&mut self, request_id: u64, slot: u8, len: usize) -> D {
         let from = self.own();
         self.guarded(|s| s.secret(from, request_id, slot, len))
     }
 
     /// A kind-3 frame this end is about to send, with its payload length.
-    pub fn sent_data(&mut self, stream_id: u64, end: bool, payload_len: usize) -> R {
+    pub fn sent_data(&mut self, stream_id: u64, end: bool, payload_len: usize) -> D {
         let from = self.own();
         self.guarded(|s| s.data(from, stream_id, end, payload_len))
     }
@@ -288,19 +344,27 @@ impl LinkState {
         }
     }
 
-    fn guarded(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+    fn guarded(&mut self, f: impl FnOnce(&mut Self) -> R) -> D {
         if self.poisoned {
-            return violation("link already failed");
+            return Err(LinkError("link already failed"));
         }
-        let r = f(self);
-        if r.is_err() {
-            self.poisoned = true;
+        self.disp = Disposition::default();
+        match f(self) {
+            Ok(()) => Ok(std::mem::take(&mut self.disp)),
+            Err(e) => {
+                self.poisoned = true;
+                Err(e)
+            }
         }
-        r
+    }
+
+    fn finish(&mut self, idx: usize) {
+        let live = self.live.swap_remove(idx);
+        self.disp.done = Some(live.req_id);
     }
 
     /// May the requester send requests yet?
-    fn can_request(&self) -> bool {
+    fn ready_for_requests(&self) -> bool {
         if self.on_worker_link() {
             self.job_ready()
         } else {
@@ -333,6 +397,10 @@ impl LinkState {
                 self.phase = Phase::Open;
                 return Ok(());
             }
+            F::Ping(_) | F::Pong(_) => need(
+                matches!(self.phase, Phase::Open | Phase::AwaitAck),
+                "frame before the handshake",
+            )?,
             _ => need(self.phase == Phase::Open, "frame before the handshake")?,
         }
         match variant {
@@ -351,8 +419,18 @@ impl LinkState {
                 need(from == Party::Other, "JobResult from privd")?;
                 need(self.job_ready(), "JobResult before the job is ready")?;
                 need(!self.result_seen, "second JobResult")?;
+                need(
+                    self.live.is_empty(),
+                    "JobResult while requests are outstanding",
+                )?;
                 let kind = self.job_kind().unwrap_or(pb::JobKind::Unspecified);
                 check_result_shape(kind, r)?;
+                if r.ok && kind == pb::JobKind::Backup {
+                    need(
+                        self.committed.contains(&r.snapshot_id),
+                        "JobResult: snapshot_id is not a committed SNAPSHOT write",
+                    )?;
+                }
                 self.result_seen = true;
                 Ok(())
             }
@@ -373,6 +451,7 @@ impl LinkState {
             F::Bye(_) => {
                 if self.on_worker_link() && from == Party::Other {
                     need(self.result_seen, "Bye before JobResult")?;
+                    need(self.live.is_empty(), "Bye while requests are outstanding")?;
                 }
                 self.phase = Phase::Closed;
                 Ok(())
@@ -420,7 +499,7 @@ impl LinkState {
     fn request(&mut self, from: Party, r: &pb::RepoRequest) -> R {
         use pb::repo_request::Op as O;
         need(from == self.requester(), "request from the responder")?;
-        need(self.can_request(), "request before the job is ready")?;
+        need(self.ready_for_requests(), "request before the job is ready")?;
         need(!self.result_seen, "request after JobResult")?;
         need(r.req_id != 0, "request: req_id is zero")?;
         need(
@@ -428,7 +507,7 @@ impl LinkState {
             "request: req_id already in use",
         )?;
         need(
-            self.live.len() < MAX_OUTSTANDING_REQUESTS,
+            self.live.len() < self.max_outstanding(),
             "too many outstanding requests",
         )?;
         let Some(op) = &r.op else {
@@ -475,7 +554,13 @@ impl LinkState {
                     self.outstanding_writes() < MAX_OUTSTANDING_WRITES,
                     "too many outstanding writes",
                 )?;
-                (Op::Write, Stream::Upload(w.size))
+                (
+                    Op::Write {
+                        snapshot: (w.object_type == pb::ObjectType::Snapshot as i32)
+                            .then(|| w.id.clone()),
+                    },
+                    Stream::Upload(w.size),
+                )
             }
             O::Quota(_) => (Op::Quota, Stream::Idle),
             O::Remove(_) | O::Create(_) | O::OpenRepo(_) | O::SetUploadRate(_) => {
@@ -520,6 +605,10 @@ impl LinkState {
                 let n = u32::try_from(p.entries.len()).unwrap_or(u32::MAX);
                 *total = total.saturating_add(n);
                 need(*total <= MAX_LIST_ENTRIES, "listing over 1 000 000 entries")?;
+                need(
+                    !config || *total <= 1,
+                    "a CONFIG listing has at most one entry",
+                )?;
                 p.last
             }
             (Op::ReadFull { ty }, Res::ReadBegin(b)) => {
@@ -539,11 +628,18 @@ impl LinkState {
                 live.stream = Stream::Download(b.size);
                 false
             }
-            (Op::Write, Res::Done(_)) => {
+            (Op::Write { snapshot }, Res::Done(_)) => {
                 need(
                     live.stream == Stream::UploadDone,
                     "Done before the END of the upload",
                 )?;
+                if let Some(id) = snapshot.take() {
+                    need(
+                        self.committed.len() < MAX_COMMITTED_SNAPSHOTS,
+                        "too many SNAPSHOT writes in one job",
+                    )?;
+                    self.committed.push(id);
+                }
                 true
             }
             (Op::Plain, Res::Done(_)) | (Op::Quota, Res::QuotaResult(_)) => true,
@@ -557,7 +653,7 @@ impl LinkState {
             _ => return violation("response does not match the request"),
         };
         if done {
-            self.live.swap_remove(idx);
+            self.finish(idx);
         }
         Ok(())
     }
@@ -589,7 +685,7 @@ impl LinkState {
                 need(len <= left, "stream exceeds its announced size")?;
                 if end {
                     need(len == left, "END before the announced size")?;
-                    self.live.swap_remove(idx);
+                    self.finish(idx);
                 } else {
                     live.stream = Stream::Download(left - len);
                 }
@@ -598,10 +694,11 @@ impl LinkState {
             Stream::Aborted(left) => {
                 need(from == requester, "upload data from the responder")?;
                 need(len <= left, "stream exceeds its announced size")?;
+                self.disp.discard = true;
                 if end {
-                    self.live.swap_remove(idx);
+                    self.finish(idx);
                 } else {
-                    live.stream = Stream::Aborted(left - len);
+                    self.live[idx].stream = Stream::Aborted(left - len);
                 }
                 Ok(())
             }

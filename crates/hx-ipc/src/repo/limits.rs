@@ -40,10 +40,18 @@ pub const DATA_FRAME_HEADER_LEN: usize = crate::frame::PREFIX_LEN + DATA_HEADER_
 /// The `END` bit of a data frame's `flags`; every other bit must be zero.
 pub const FLAG_END: u8 = 0b0000_0001;
 
-/// Outstanding repository requests per link.
+/// Outstanding repository requests on the worker link.
 pub const MAX_OUTSTANDING_REQUESTS: usize = 8;
-/// Of those, at most this many writes.
+/// Outstanding requests on the Drive link: the 8 relayed from the worker plus 2 of privd's own
+/// control requests (`Quota`, `SetUploadRate`).
+pub const MAX_DRIVE_OUTSTANDING_REQUESTS: usize = 10;
+/// Of those, at most this many writes (either link).
 pub const MAX_OUTSTANDING_WRITES: usize = 4;
+/// `Write` of `SNAPSHOT` objects a job may commit (a backup writes one); the tracker remembers
+/// their ids to check the `JobResult`.
+pub const MAX_COMMITTED_SNAPSHOTS: usize = 16;
+/// Largest `RepoError.retry_after_ms`: 24 hours.
+pub const MAX_RETRY_AFTER_MS: u32 = 86_400_000;
 
 // ----- objects (section 25) -----
 
@@ -91,8 +99,8 @@ pub const MAX_SNAPSHOTS: usize = 4_096;
 pub const MAX_FORGET: usize = 4_096;
 /// Entries in `BackupSpec.excludes`.
 pub const MAX_EXCLUDES: usize = 256;
-/// Longest exclude, in bytes.
-pub const MAX_EXCLUDE_LEN: usize = 4_096;
+/// Longest exclude, in bytes (`hx_backup::rules::MAX_PATTERN_BYTES`).
+pub const MAX_EXCLUDE_LEN: usize = 1_024;
 /// Entries in `KeysSpec.remove_key_ids`.
 pub const MAX_REMOVE_KEY_IDS: usize = 4;
 /// Entries in `JobResult.key_ids`.
