@@ -2,7 +2,7 @@
 //!
 //! [`change_user_password`] is the standalone entry point for `SetUserPassword`: it is not part of
 //! the post stage, but it uses the same secret path as the post stage's `chpasswd` step. A secret
-//! exists in the container only in a file with mode 0600 in the 0700 [`WORK_DIR`], redirected into
+//! exists in the container only in a file with mode 0600 in the 0700 [`WORK_DIR`](crate::orchestrate::WORK_DIR), redirected into
 //! the command's standard input and deleted by the same wrapper; it is never in argv or in the
 //! environment. The work directory is swept before and after.
 //!

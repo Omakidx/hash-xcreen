@@ -63,6 +63,8 @@ struct Daemon {
     inject_nic: bool,
     inject_profile: bool,
     drop_config_key: Option<String>,
+    /// A DELETE fails with 500 while the instance vanishes (Incus deleting it at the same time).
+    delete_races: bool,
 }
 
 #[derive(Clone, Default)]
@@ -201,6 +203,10 @@ impl Transport for Mock {
                     }
                 }
                 op(&mut d)
+            }
+            ("DELETE", ["1.0", "instances", n]) if d.delete_races => {
+                d.instances.remove(*n);
+                err(500, "Instance is busy")
             }
             ("DELETE", ["1.0", "instances", n]) => {
                 if d.instances.remove(*n).is_none() {
@@ -1865,4 +1871,69 @@ async fn an_incus_error_on_creation_is_returned_and_nothing_else_is_sent() {
         .unwrap_err();
     assert!(matches!(e, IncusError::Api { code: 400, .. }), "{e}");
     assert_eq!(calls.load(Ordering::SeqCst), 1, "only the POST was sent");
+}
+
+#[tokio::test]
+async fn a_delete_that_races_incus_own_deletion_is_not_an_error() {
+    let (c, m) = client();
+    let spec = BackupHelperSpec::repository_only(pool(), RepoLink::new(job()));
+    c.create_backup_helper(&spec).await.unwrap();
+    m.with(|d| d.delete_races = true);
+    // Stopped: deleted directly; the DELETE fails but the helper is gone.
+    assert!(c.force_delete_backup_helper(job()).await.unwrap());
+    assert!(!m.with(|d| d.instances.contains_key("hx-bkw-0a1b2c3d")));
+    // A DELETE that fails while the instance stays is still an error.
+    m.with(|d| d.delete_races = false);
+    c.create_backup_helper(&spec).await.unwrap();
+    struct Stuck(Mock);
+    impl Transport for Stuck {
+        async fn send(&self, r: Request) -> Result<Response, IncusError> {
+            if r.method == hyper::Method::DELETE && r.path.starts_with("/1.0/instances/") {
+                return Ok(err(500, "Instance is busy"));
+            }
+            self.0.send(r).await
+        }
+    }
+    let e = Client::new(Stuck(m.clone()))
+        .force_delete_backup_helper(job())
+        .await
+        .unwrap_err();
+    assert!(matches!(e, IncusError::Api { code: 500, .. }), "{e}");
+}
+
+#[test]
+fn the_allowlist_bounds_come_from_the_crates_limits() {
+    use hx_provision::incus::{MAX_CPU, MAX_DISK_GIB, MAX_MEMORY_MIB};
+    let try_cfg = |k: &str, v: String| {
+        let mut d = full_desktop();
+        d.config.insert(k.into(), v);
+        spec_of(&d)
+    };
+    let try_root = |size: String| {
+        let mut d = full_desktop();
+        d.devices
+            .get_mut("root")
+            .unwrap()
+            .insert("size".into(), size);
+        spec_of(&d)
+    };
+    assert!(try_cfg("limits.memory", format!("{MAX_MEMORY_MIB}MiB")).is_ok());
+    assert!(try_cfg("limits.memory", format!("{}MiB", MAX_MEMORY_MIB + 1)).is_err());
+    assert!(try_cfg("limits.cpu", MAX_CPU.to_string()).is_ok());
+    assert!(try_cfg("limits.cpu", (MAX_CPU + 1).to_string()).is_err());
+    assert!(try_cfg("limits.processes", u32::MAX.to_string()).is_ok());
+    assert!(try_cfg("limits.processes", (u64::from(u32::MAX) + 1).to_string()).is_err());
+    assert!(try_root(format!("{MAX_DISK_GIB}GiB")).is_ok());
+    assert!(try_root(format!("{}GiB", MAX_DISK_GIB + 1)).is_err());
+    for bad in ["0", "01", "+5", "-1", "5 ", "", "99999999999999999999999"] {
+        assert!(try_cfg("limits.cpu", bad.into()).is_err(), "{bad:?}");
+        assert!(
+            try_cfg("limits.memory", format!("{bad}MiB")).is_err(),
+            "{bad:?}"
+        );
+        assert!(try_root(format!("{bad}GiB")).is_err(), "{bad:?}");
+    }
+    // The guest API stays off.
+    assert!(try_cfg("security.guestapi", "true".into()).is_err());
+    assert!(try_cfg("security.guestapi", "false".into()).is_ok());
 }

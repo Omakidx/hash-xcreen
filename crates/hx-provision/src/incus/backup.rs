@@ -27,6 +27,7 @@ use std::fmt;
 use serde_json::{Value, json};
 
 use super::error::IncusError;
+use super::limits::{MAX_CPU, MAX_DISK_GIB, MAX_MEMORY_MIB};
 use super::link::SESSION_LINK_DEVICE;
 use super::marker::{INSTANCE_KEY_PREFIX, INSTANCE_STATE_KEY};
 use super::types::{Instance, ServerInfo, Snapshot, StoragePool};
@@ -38,7 +39,7 @@ use crate::orchestrate::DESKTOP_CONFIG_KEYS;
 /// (`containers/<name>/rootfs`, `containers-snapshots/<name>/<snapshot>/rootfs`) is not a
 /// documented interface. It is verified on Incus 6.0.0 by the real-Incus test
 /// (`tests/incus_real_backup.rs`) and guarded before each job
-/// ([`check_backup_preconditions`]). This is the only place the path is written.
+/// ([`SnapshotMount::checked`]). This is the only place the path is written.
 pub const STORAGE_POOLS_ROOT: &str = "/var/lib/incus/storage-pools";
 /// Prefix of a helper's name (`hx-bkw-` and 8 hex digits of the job id).
 pub const HELPER_PREFIX: &str = "hx-bkw-";
@@ -1001,8 +1002,13 @@ fn refuse(msg: impl fmt::Display) -> IncusError {
     IncusError::InvalidArgument(format!("restore target: {msg}"))
 }
 
-fn all_digits(v: &str, max_len: usize) -> bool {
-    !v.is_empty() && v.len() <= max_len && v.bytes().all(|b| b.is_ascii_digit()) && v != "0"
+/// A canonical decimal number (no sign, no leading zero) from 1 to `max`.
+fn bounded(v: &str, max: u64) -> bool {
+    !v.is_empty()
+        && v.len() <= 20
+        && !v.starts_with('0')
+        && v.bytes().all(|b| b.is_ascii_digit())
+        && v.parse::<u64>().is_ok_and(|n| (1..=max).contains(&n))
 }
 
 /// Whether `v` is an acceptable value of an allowlisted desktop config key.
@@ -1010,8 +1016,14 @@ fn desktop_value_ok(key: &str, v: &str) -> bool {
     match key {
         "security.privileged" => v == "false",
         "security.idmap.isolated" => v == "true",
-        "limits.processes" | "limits.cpu" => all_digits(v, 6),
-        "limits.memory" => v.strip_suffix("MiB").is_some_and(|n| all_digits(n, 9)),
+        // Bounds are the ones the rest of the crate enforces: `to_create` takes any non-zero u32
+        // for `limits.processes`; `set_limits` caps cpu, memory and disk (limits.rs).
+        "limits.processes" => bounded(v, u64::from(u32::MAX)),
+        "limits.cpu" => bounded(v, u64::from(MAX_CPU)),
+        "limits.memory" => v
+            .strip_suffix("MiB")
+            .is_some_and(|n| bounded(n, MAX_MEMORY_MIB)),
+        "security.guestapi" => v == "false",
         _ => v == "true" || v == "false",
     }
 }
@@ -1146,7 +1158,10 @@ impl RestoreTargetSpec {
             if n == SESSION_LINK_DEVICE && ty == Some("proxy") {
                 continue;
             }
-            let size_ok = |s: &str| s.strip_suffix("GiB").is_some_and(|n| all_digits(n, 6));
+            let size_ok = |s: &str| {
+                s.strip_suffix("GiB")
+                    .is_some_and(|n| bounded(n, MAX_DISK_GIB))
+            };
             let ok = n == "root"
                 && ty == Some("disk")
                 && d.get("path").map(String::as_str) == Some("/")

@@ -1745,7 +1745,15 @@ impl<T: Transport> Client<T> {
         match self.delete_instance(name.as_str()).await {
             Ok(()) => Ok(true),
             Err(e) if e.is_not_found() => Ok(true),
-            Err(e) => Err(e),
+            // Incus may delete an ephemeral helper itself at the same moment (a helper that was
+            // already on its way out): if it is gone now, that is the result we wanted.
+            Err(e) => {
+                if self.get_instance(name.as_str()).await?.is_none() {
+                    Ok(true)
+                } else {
+                    Err(e)
+                }
+            }
         }
     }
 

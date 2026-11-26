@@ -536,17 +536,24 @@ async fn probes(c: Client<UnixTransport>) {
     assert!(report.contains("got=go"), "host to worker bytes arrive");
     let uid_map = report.lines().find(|l| l.starts_with("uid_map=")).unwrap();
     eprintln!(
-        "OBS helper user namespace: {uid_map} (desktop: {:?})",
+        "OBS helper user namespace: {uid_map} (desktop host base: {:?})",
         desktop.config.get("volatile.idmap.base")
     );
     assert!(
         !uid_map.contains("4294967295"),
         "an unprivileged helper: {uid_map}"
     );
-    let helper_base = uid_map.split_whitespace().nth(2).map(str::to_string);
+    // `uid_map=<ns start> <host base> <size>`: field 1 is the host base.
+    let helper_base = uid_map
+        .strip_prefix("uid_map=")
+        .and_then(|m| m.split_whitespace().nth(1))
+        .map(str::to_string);
     let desktop_base = desktop.config.get("volatile.idmap.base").cloned();
     assert!(
-        helper_base.is_some() && helper_base != desktop_base,
+        helper_base
+            .as_deref()
+            .is_some_and(|b| b.parse::<u64>().is_ok_and(|n| n > 0))
+            && helper_base != desktop_base,
         "the helper has a host uid range of its own: helper {helper_base:?}, desktop {desktop_base:?}"
     );
     let end = c
