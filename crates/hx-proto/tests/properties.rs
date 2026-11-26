@@ -947,12 +947,13 @@ proptest! {
         prop_assert_eq!(pushed, released.len() as u64 + w.held() as u64 + w.dropped_stale());
     }
 
+    /// A stream starts with a key frame; from there, frames in order pass straight through.
     #[test]
     fn reorder_window_in_order_is_passthrough(start in any::<u32>(), n in 1usize..64) {
         let mut w = ReorderWindow::<u32>::new(4);
         for i in 0..n as u32 {
             let f = start.wrapping_add(i);
-            prop_assert_eq!(w.push(f, false, f), vec![f]);
+            prop_assert_eq!(w.push(f, i == 0, f), vec![f]);
         }
         prop_assert_eq!(w.dropped_stale(), 0);
     }
@@ -997,16 +998,45 @@ fn reorder_window_examples() {
     assert!(w.push(13, false, "f13").is_empty());
     // A key frame discards older held frames.
     let mut w = ReorderWindow::new(4);
-    assert_eq!(w.push(1, false, 1), vec![1]);
+    assert_eq!(w.push(1, true, 1), vec![1]);
     assert!(w.push(5, false, 5).is_empty());
     assert!(w.push(7, false, 7).is_empty());
     assert_eq!(w.push(9, true, 9), vec![9]);
     assert_eq!(w.held(), 0);
     // Wraparound.
     let mut w = ReorderWindow::new(4);
-    assert_eq!(w.push(u32::MAX, false, 0), vec![0]);
+    assert_eq!(w.push(u32::MAX, true, 0), vec![0]);
     assert_eq!(w.push(0, false, 1), vec![1]);
     assert!(w.push(u32::MAX, false, 2).is_empty());
+}
+
+/// Protocol §6.1 rule 6: P frames that overtake the key frame which starts the stream wait for
+/// it instead of making it stale, then follow it in order.
+#[test]
+fn reorder_window_waits_for_the_first_key_frame() {
+    let mut w = ReorderWindow::new(8);
+    assert!(w.push(11, false, "p11").is_empty());
+    assert!(w.push(13, false, "p13").is_empty());
+    assert!(w.push(12, false, "p12").is_empty());
+    assert_eq!(w.push(10, true, "k10"), vec!["k10", "p11", "p12", "p13"]);
+    assert_eq!((w.held(), w.dropped_stale()), (0, 0));
+    // Across the wraparound too.
+    let mut w = ReorderWindow::new(8);
+    assert!(w.push(0, false, "p0").is_empty());
+    assert!(w.push(u32::MAX, false, "pmax").is_empty());
+    assert_eq!(w.push(u32::MAX - 1, true, "k"), vec!["k", "pmax", "p0"]);
+    // A key frame that never comes: the hold expiry releases the lowest held frame, as for any
+    // gap, and the late key frame is then stale.
+    let mut w = ReorderWindow::new(8);
+    assert!(w.push(21, false, "p21").is_empty());
+    assert!(w.push(22, false, "p22").is_empty());
+    assert_eq!(w.release_lowest(), vec!["p21", "p22"]);
+    assert!(w.push(20, true, "k20").is_empty());
+    // A window that overflows before the key frame releases the lowest too.
+    let mut w = ReorderWindow::new(2);
+    assert!(w.push(31, false, 31).is_empty());
+    assert!(w.push(32, false, 32).is_empty());
+    assert_eq!(w.push(33, false, 33), vec![31, 32, 33]);
 }
 
 #[test]
