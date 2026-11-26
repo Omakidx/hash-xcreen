@@ -52,12 +52,15 @@ impl Store {
 
 /// When the fake sends `Cancel`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(clippy::enum_variant_names)]
 pub enum CancelOn {
     /// When the first `Write` of a `PACK` is requested.
-    FirstPackWrite,
+    PackWrite,
     /// After it has started the first download of a `PACK` (sent `ReadBegin` and one data frame,
     /// no `END`), and then it holds the rest back until the worker's `JobResult` arrives.
-    FirstPackDownload,
+    PackDownload,
+    /// When the first read of a `PACK` is requested (the object is still answered).
+    PackRead,
 }
 
 /// A rule of the link that the fake breaks on purpose.
@@ -92,6 +95,8 @@ pub struct Behavior {
     /// Hold read-like requests until six are waiting (or the link goes idle), so that many are
     /// outstanding at once.
     pub defer_reads: bool,
+    /// Answer every read of this type with this error.
+    pub fail_reads: Option<(T, pb::ErrorClass)>,
 }
 
 /// What the fake saw.
@@ -505,7 +510,7 @@ impl Fake {
             Op::Write(w) => {
                 if w.object_type == T::Pack as i32 {
                     self.out.packs_written += 1;
-                    if self.b.cancel_on == Some(CancelOn::FirstPackWrite) {
+                    if self.b.cancel_on == Some(CancelOn::PackWrite) {
                         self.send_cancel();
                     }
                 }
@@ -558,6 +563,15 @@ impl Fake {
     }
 
     fn download(&mut self, rid: u64, ty: i32, id: &[u8], offset: usize, len: Option<usize>) {
+        if let Some((t, class)) = self.b.fail_reads
+            && t as i32 == ty
+        {
+            self.error(rid, class);
+            return;
+        }
+        if ty == T::Pack as i32 && self.b.cancel_on == Some(CancelOn::PackRead) {
+            self.send_cancel();
+        }
         let obj = self
             .store
             .lock()
@@ -585,7 +599,7 @@ impl Fake {
             None => frames.push((true, Vec::new())),
         }
         let hold = ty == T::Pack as i32
-            && self.b.cancel_on == Some(CancelOn::FirstPackDownload)
+            && self.b.cancel_on == Some(CancelOn::PackDownload)
             && !self.cancel_sent
             && frames.len() > 1;
         if hold {

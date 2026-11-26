@@ -182,6 +182,19 @@ impl Outbox {
         true
     }
 
+    /// A closing data frame: queued at once, never waiting for room (one frame per finishing
+    /// upload beyond the bound).
+    fn push_data_now(&self, header: [u8; repo::DATA_FRAME_HEADER_LEN], payload: Bytes) -> bool {
+        let mut q = lock(&self.q);
+        if q.closed {
+            return false;
+        }
+        q.data_bytes += payload.len();
+        q.items.push_back(Out::Data { header, payload });
+        self.cv.notify_all();
+        true
+    }
+
     /// A data frame: waits while two frames are already queued.
     fn push_data(&self, header: [u8; repo::DATA_FRAME_HEADER_LEN], payload: Bytes) -> bool {
         let mut q = lock(&self.q);
@@ -364,13 +377,31 @@ impl Inner {
     fn send_data(&self, req_id: u64, end: bool, payload: Bytes) -> Result<(), BackendFault> {
         let header = repo::encode_data_header(req_id, end, payload.len())
             .map_err(|e| BackendFault::Refused(refusal(&e)))?;
-        let disp = lock(&self.state)
-            .sent_data(req_id, end, payload.len())
-            .map_err(|e| BackendFault::Link(self.violation(e.0)))?;
-        if disp.done == Some(req_id) {
-            // The `END` that closes an aborted upload finishes the request: free its slot.
-            self.finished(req_id);
+        if end {
+            // The `END` closes the stream and may free the request's slot, and a thread woken by
+            // that sends its request without waiting: the `END` must already be in the queue.
+            // It is queued under the `state` lock and without waiting (a queue of two other
+            // uploads must not hold it back), so nothing queued later can overtake it.
+            let mut st = lock(&self.state);
+            let disp = st
+                .sent_data(req_id, true, payload.len())
+                .map_err(|e| BackendFault::Link(self.violation(e.0)))?;
+            let queued = self.outbox.push_data_now(header, payload);
+            drop(st);
+            if disp.done == Some(req_id) {
+                self.finished(req_id);
+            }
+            return if queued {
+                Ok(())
+            } else {
+                Err(BackendFault::Link(
+                    self.failed().unwrap_or(LinkFailure::Lost),
+                ))
+            };
         }
+        lock(&self.state)
+            .sent_data(req_id, false, payload.len())
+            .map_err(|e| BackendFault::Link(self.violation(e.0)))?;
         if self.outbox.push_data(header, payload) {
             Ok(())
         } else {

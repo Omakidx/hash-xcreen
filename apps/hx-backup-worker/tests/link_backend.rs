@@ -96,3 +96,66 @@ fn many_threads_never_exceed_eight_requests_or_four_writes() {
 fn rustic_id(b: [u8; 32]) -> hx_backup::engine::Id {
     hx_backup::engine::Id::new(b)
 }
+
+/// Four-plus parallel uploads, one of them aborted by privd while the writer's queue is busy with
+/// the others: the closing `END` must be queued before the slot is freed, or a woken request overtakes
+/// it and privd sees a ninth request or a fifth write.
+#[test]
+fn an_aborted_upload_frees_its_slot_only_after_its_end_is_queued() {
+    for round in 0..3u8 {
+        let store = new_store();
+        let (worker_end, privd_end) = UnixStream::pair().unwrap();
+        let j = backup_job(&[], &[]);
+        let fake = Fake::new(
+            privd_end,
+            j.job,
+            j.secrets,
+            Arc::clone(&store),
+            Behavior {
+                abort_pack_upload: Some(pb::ErrorClass::Transient),
+                ..Behavior::default()
+            },
+        );
+        let fake = std::thread::spawn(move || fake.run());
+        let (link, _start) = Link::accept(worker_end, "test-1.0", LinkOptions::default()).unwrap();
+        link.start().unwrap();
+        let backend = Arc::new(link.backend());
+        let mut threads = Vec::new();
+        for t in 0..16u32 {
+            let be = Arc::clone(&backend);
+            threads.push(std::thread::spawn(move || {
+                let mut errors = 0;
+                for n in 0..4u32 {
+                    let body =
+                        vec![(t * 5 + n) as u8 + round; 3 * 1024 * 1024 + (t as usize) * 1000];
+                    let id = Sha256::digest(&body);
+                    let id = rustic_id(<[u8; 32]>::try_from(id.as_slice()).unwrap());
+                    if be
+                        .write_bytes(FileType::Pack, &id, false, body.into())
+                        .is_err()
+                    {
+                        errors += 1;
+                    }
+                    // requests right behind the uploads, to overtake a late END
+                    let _ = be.list_with_size(FileType::Index);
+                }
+                errors
+            }));
+        }
+        let errors: u32 = threads.into_iter().map(|t| t.join().unwrap()).sum();
+        assert_eq!(errors, 1, "exactly the one aborted upload fails");
+        link.finish(pb::JobResult {
+            ok: false,
+            error: pb::WorkerError::Engine as i32,
+            ..Default::default()
+        })
+        .unwrap();
+        let out = fake.join().unwrap();
+        assert!(
+            out.worker_violations.is_empty(),
+            "round {round}: {:?}",
+            out.worker_violations
+        );
+        assert!(out.max_outstanding <= 8 && out.max_writes <= 4);
+    }
+}

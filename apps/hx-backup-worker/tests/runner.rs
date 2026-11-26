@@ -498,7 +498,7 @@ fn cancel_during_a_backup_ends_with_cancelled_inside_the_window_and_leaves_no_sn
         backup_job(&[], &[]),
         &env.store,
         Behavior {
-            cancel_on: Some(CancelOn::FirstPackWrite),
+            cancel_on: Some(CancelOn::PackWrite),
             ..Behavior::default()
         },
         &env.cfg(),
@@ -538,7 +538,7 @@ fn cancel_during_a_restore_sends_the_failed_result_while_a_download_is_still_run
         restore_job(&b.snapshot_id),
         &env.store,
         Behavior {
-            cancel_on: Some(CancelOn::FirstPackDownload),
+            cancel_on: Some(CancelOn::PackDownload),
             read_chunk: Some(64 * 1024),
             ..Behavior::default()
         },
@@ -836,7 +836,7 @@ fn a_cancelled_check_is_cancelled_not_a_damaged_repository() {
         check_job(100),
         &env.store,
         Behavior {
-            cancel_on: Some(CancelOn::FirstPackDownload),
+            cancel_on: Some(CancelOn::PackDownload),
             read_chunk: Some(64 * 1024),
             ..Behavior::default()
         },
@@ -862,7 +862,7 @@ fn the_wait_for_a_discarded_download_is_bounded_and_the_worker_exits_without_bye
         restore_job(&b.snapshot_id),
         &env.store,
         Behavior {
-            cancel_on: Some(CancelOn::FirstPackDownload),
+            cancel_on: Some(CancelOn::PackDownload),
             read_chunk: Some(64 * 1024),
             never_release_held: true,
             ..Behavior::default()
@@ -882,7 +882,8 @@ fn a_damaged_index_ends_every_job_that_loads_it_with_a_result() {
     make_tree(&env.src());
     env.init();
     let b = env.backup();
-    {
+    // precondition: there are index files, and every one of them is damaged
+    let damaged = {
         let mut st = env.store.lock().unwrap();
         let keys: Vec<_> = st
             .objects
@@ -890,25 +891,108 @@ fn a_damaged_index_ends_every_job_that_loads_it_with_a_result() {
             .filter(|(t, _)| *t == T::Index as i32)
             .cloned()
             .collect();
-        for k in keys {
-            let v = st.objects.get_mut(&k).unwrap();
+        for k in &keys {
+            let v = st.objects.get_mut(k).unwrap();
             for i in (0..v.len()).step_by(13) {
                 v[i] ^= 0x5a;
             }
         }
-    }
+        keys.len()
+    };
+    assert!(damaged > 0, "the backup wrote no index to damage");
+    // (job, must succeed): jobs that read no index, and the prune that rebuilds it, still work;
+    // restore and check fail, each with a result
     let jobs = [
-        restore_job(&b.snapshot_id),
-        restore_plan_job(&b.snapshot_id),
-        snapshots_job(),
-        check_job(100),
-        forget_job(&[]),
-        backup_job(&[], &[]),
+        ("snapshots", snapshots_job(), true),
+        ("restore_plan", restore_plan_job(&b.snapshot_id), true),
+        ("restore", restore_job(&b.snapshot_id), false),
+        ("check", check_job(100), false),
+        // the prune rebuilds the index from the pack headers (Q-S1), so it copes
+        ("forget_prune", forget_job(&[]), true),
     ];
-    for (i, j) in jobs.into_iter().enumerate() {
+    for (name, j, must_succeed) in jobs {
         let (code, out) = session(j, &env.store, Behavior::default(), &env.cfg());
-        assert_eq!(code, 0, "job {i}: {:?}", out.worker_violations);
-        assert!(out.result.is_some(), "job {i} ended without a JobResult");
-        assert!(out.bye, "job {i}");
+        assert_eq!(code, 0, "{name}: {:?}", out.worker_violations);
+        let r = out.result.unwrap_or_else(|| panic!("{name}: no JobResult"));
+        assert_eq!(r.ok, must_succeed, "{name}: {r:?}");
+        assert!(out.bye, "{name}");
     }
+    // a backup repairs the index from the pack headers and succeeds, or fails; either way it ends
+    // with a result
+    let (code, out) = session(
+        backup_job(&[], &[]),
+        &env.store,
+        Behavior::default(),
+        &env.cfg(),
+    );
+    assert_eq!(code, 0);
+    assert!(out.result.is_some() && out.bye);
+}
+
+#[test]
+fn a_cancel_during_the_prune_verification_is_cancelled_not_integrity() {
+    let env = Env::new();
+    make_tree(&env.src());
+    env.init();
+    let first = env.backup();
+    write(&env.src().join("home/user/n"), &noise(21, 200_000), 0o644);
+    env.backup();
+    let (code, out) = session(
+        forget_job(&[first.snapshot_id.to_vec()]),
+        &env.store,
+        Behavior {
+            cancel_on: Some(CancelOn::PackRead),
+            ..Behavior::default()
+        },
+        &env.cfg(),
+    );
+    assert!(
+        out.worker_violations.is_empty(),
+        "{:?}",
+        out.worker_violations
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out.result.unwrap().error, W::Cancelled as i32);
+}
+
+#[test]
+fn a_transient_error_during_the_prune_verification_is_repo_not_integrity() {
+    let env = Env::new();
+    make_tree(&env.src());
+    env.init();
+    let first = env.backup();
+    write(&env.src().join("home/user/n"), &noise(22, 200_000), 0o644);
+    env.backup();
+    let (code, out) = session(
+        forget_job(&[first.snapshot_id.to_vec()]),
+        &env.store,
+        Behavior {
+            fail_reads: Some((T::Pack, pb::ErrorClass::Transient)),
+            ..Behavior::default()
+        },
+        &env.cfg(),
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out.result.unwrap().error, W::Repo as i32);
+}
+
+#[test]
+fn a_restore_whose_pack_is_not_found_is_not_target_unwritable() {
+    let env = Env::new();
+    make_tree(&env.src());
+    env.init();
+    let b = env.backup();
+    let (code, out) = session(
+        restore_job(&b.snapshot_id),
+        &env.store,
+        Behavior {
+            fail_reads: Some((T::Pack, pb::ErrorClass::NotFound)),
+            ..Behavior::default()
+        },
+        &env.cfg(),
+    );
+    assert_eq!(code, 0);
+    let r = out.result.unwrap();
+    assert!(!r.ok);
+    assert_ne!(r.error, W::TargetUnwritable as i32);
 }

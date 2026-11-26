@@ -17,7 +17,7 @@ use hx_backup::engine::{
     RepoKey, RestoreRequest, SnapshotId, SnapshotSelector, WriteBackend,
 };
 use hx_backup::manifest::{CURRENT_FORMAT_VERSION, Distro, ManifestInput};
-use hx_backup::rules::{DockerMode, RuleSet};
+use hx_backup::rules::{DockerMode, RuleSet, RulesError};
 use hx_ipc::repo::{self, pb};
 use hx_ipc::secret::Secret;
 use sha2::{Digest, Sha256};
@@ -105,8 +105,14 @@ fn has_backend_fault(e: &EngineError) -> bool {
 pub fn classify(f: &Facts, e: &EngineError) -> pb::WorkerError {
     use pb::JobKind as K;
     use pb::WorkerError as W;
-    if matches!(e, EngineError::Cancelled) || (f.cancelled && backend_caused(e)) {
+    if matches!(e, EngineError::Cancelled)
+        || (f.cancelled && (backend_caused(e) || matches!(e, EngineError::Integrity { .. })))
+    {
         return W::Cancelled;
+    }
+    // The prune's verification reads the repository: a failed read there is not an integrity finding.
+    if matches!(e, EngineError::Integrity { .. }) && f.repo_error.is_some() {
+        return W::Repo;
     }
     if backend_caused(e) && f.repo_error.is_some() {
         return W::Repo;
@@ -129,13 +135,19 @@ pub fn classify(f: &Facts, e: &EngineError) -> pb::WorkerError {
             (K::Restore, "restore target") => W::TargetUnwritable,
             _ => W::Engine,
         },
+        EngineError::Rules(RulesError::RootNotDirectory { .. }) if f.kind == K::Backup => {
+            W::SourceUnreadable
+        }
         EngineError::MissingCapability(_) | EngineError::RestoreVerification { .. } => {
             W::TargetUnwritable
         }
         // A restore that fails inside rustic with the link healthy failed on the local side.
-        EngineError::Repository { operation, .. }
+        EngineError::Repository { operation, source }
             if f.kind == K::Restore
                 && !has_backend_fault(e)
+                && source
+                    .display_log()
+                    .contains("related to input/output operations")
                 && matches!(
                     *operation,
                     "preparing the restore target" | "preparing the restore" | "restoring"
@@ -418,7 +430,10 @@ fn backup(ctx: &Ctx<'_>, spec: &pb::BackupSpec) -> Result<pb::JobResult, Fail> {
     let unreadable = out
         .summary
         .error_count
-        .saturating_add(out.manifest.source_sizes.unreadable_entries);
+        .saturating_add(out.manifest.source_sizes.unreadable_entries)
+        // rule discovery steps that failed (budget, unreadable directory) leave their paths in the
+        // backup; protected paths stay protected (hx_backup::rules)
+        .saturating_add(u64::from(out.resolved.discovery_skipped()));
     if unreadable > 0 {
         tracing::warn!(unreadable, "some entries of the source could not be read");
     }

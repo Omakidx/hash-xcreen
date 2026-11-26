@@ -851,7 +851,7 @@ pub fn resolve(root: &Path, rules: &RuleSet) -> Result<ResolvedRules, RulesError
 /// The `tracing` dependency belongs to the `engine` feature; the rules stay free of it.
 fn tracing_warn(_e: &RulesError) {
     #[cfg(feature = "engine")]
-    tracing::warn!(error = %_e, "rule discovery step skipped; its paths stay in the backup");
+    tracing::debug!(error = %_e, "rule discovery step skipped; its paths stay in the backup");
 }
 
 /// The protected path a candidate conflicts with, if any. `named_cache` candidates may lie
