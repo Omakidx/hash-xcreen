@@ -38,7 +38,8 @@
 //! * **Reads.** `ReadBegin` is at most the per-type cap, and for a `ReadPartial` at most the
 //!   requested length.
 //! * **End.** Exactly one `JobResult` (its shape must match the job kind), only while no request
-//!   is outstanding; for a successful `BACKUP`, its `snapshot_id` is the id of a `SNAPSHOT` write
+//!   is outstanding, except that a failed one may go while the only outstanding requests are
+//!   downloads already begun (their remaining data is reported as discard); for a successful `BACKUP`, its `snapshot_id` is the id of a `SNAPSHOT` write
 //!   of this job whose `Done` has passed. No `Progress` or request after it; the worker's `Bye`
 //!   only after it and with nothing outstanding. `Ping` and `Pong` are valid from `Hello` on.
 //!
@@ -87,11 +88,18 @@ fn need(cond: bool, what: &'static str) -> R {
 /// not shadow the state machine.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Disposition {
-    /// The frame is a data frame of an aborted upload (an `Error` already answered its `Write`):
-    /// drop it, do not forward it.
+    /// The frame is a data frame **received from the peer** that must be dropped, not forwarded:
+    /// it belongs to an aborted upload (an `Error` already answered its `Write`), or to a
+    /// download that is still running after a failed `JobResult`. Always false for the frames
+    /// this end sends itself (`sent_*`): the sender of the closing `END` knows what it is doing.
     pub discard: bool,
     /// The frame finished this request: its slot is free (the last `ListPage`, `Done`, `Error`,
     /// `QuotaResult`, the `END` of a download, or the `END` that closes an aborted upload).
+    ///
+    /// For an `Error` answering a `Write` it also tells the sender whether an `END` is still
+    /// owed: `Some` means the request is finished (its `END` had already been sent and crossed
+    /// the `Error`), `None` means the upload is aborted and the sender must close the stream with
+    /// an `END` (it may be empty).
     pub done: Option<u64>,
 }
 
@@ -302,7 +310,8 @@ impl LinkState {
         self.guarded(|s| s.secret(from, request_id, slot, len))
     }
 
-    /// A kind-3 frame this end is about to send, with its payload length.
+    /// A kind-3 frame this end is about to send, with its payload length. The disposition's
+    /// `discard` is always false here.
     pub fn sent_data(&mut self, stream_id: u64, end: bool, payload_len: usize) -> D {
         let from = self.own();
         self.guarded(|s| s.data(from, stream_id, end, payload_len))
@@ -419,8 +428,12 @@ impl LinkState {
                 need(from == Party::Other, "JobResult from privd")?;
                 need(self.job_ready(), "JobResult before the job is ready")?;
                 need(!self.result_seen, "second JobResult")?;
+                // A failed result may go while only started downloads are outstanding (their data
+                // is then discarded); uploads and unanswered requests block every result.
                 need(
-                    self.live.is_empty(),
+                    self.live
+                        .iter()
+                        .all(|l| !r.ok && matches!(l.stream, Stream::Download(_))),
                     "JobResult while requests are outstanding",
                 )?;
                 let kind = self.job_kind().unwrap_or(pb::JobKind::Unspecified);
@@ -665,6 +678,7 @@ impl LinkState {
             return violation("data for an unknown stream");
         };
         let requester = self.requester();
+        let peer = self.peer();
         let live = &mut self.live[idx];
         let len = u32::try_from(len).map_err(|_| LinkError("data: payload length"))?;
         need(len > 0 || end, "an empty data frame without END")?;
@@ -683,6 +697,7 @@ impl LinkState {
             Stream::Download(left) => {
                 need(from != requester, "download data from the requester")?;
                 need(len <= left, "stream exceeds its announced size")?;
+                self.disp.discard = self.result_seen && from == peer;
                 if end {
                     need(len == left, "END before the announced size")?;
                     self.finish(idx);
@@ -694,7 +709,7 @@ impl LinkState {
             Stream::Aborted(left) => {
                 need(from == requester, "upload data from the responder")?;
                 need(len <= left, "stream exceeds its announced size")?;
-                self.disp.discard = true;
+                self.disp.discard = from == peer;
                 if end {
                     self.finish(idx);
                 } else {

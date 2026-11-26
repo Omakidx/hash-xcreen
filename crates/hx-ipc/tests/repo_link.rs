@@ -122,11 +122,12 @@ impl Pair {
     }
 }
 
-fn agree(a: hx_ipc::repo::D, b: hx_ipc::repo::D) -> Result<Disposition, String> {
-    match (a, b) {
+fn agree(sender: hx_ipc::repo::D, receiver: hx_ipc::repo::D) -> Result<Disposition, String> {
+    match (sender, receiver) {
         (Ok(x), Ok(y)) => {
-            assert_eq!(x, y, "the two ends disagree on the disposition");
-            Ok(x)
+            assert!(!x.discard, "a frame an end sends itself is never discarded");
+            assert_eq!(x.done, y.done, "the two ends disagree on what finished");
+            Ok(y)
         }
         (Err(x), Err(_)) => Err(x.to_string()),
         (a, b) => panic!("the two ends disagree: sender {a:?}, receiver {b:?}"),
@@ -1239,4 +1240,145 @@ fn only_privd_on_the_worker_link_may_send_secrets() {
         let mut s = LinkState::new(e);
         assert!(s.sent_secret(0, 0, 32).is_err(), "{e:?}");
     }
+}
+
+// ----- second review additions -----
+
+#[test]
+fn an_error_that_crosses_the_senders_end_finishes_the_request() {
+    for mut p in [
+        Pair::worker().open(JobKind::Backup),
+        Pair::drive().open(JobKind::Backup),
+    ] {
+        let (requester, responder, id) = if p.worker_link {
+            (Who::Other, Who::Privd, 1)
+        } else {
+            (Who::Privd, Who::Other, 2)
+        };
+        p.msg(requester, req(id, write(T::Pack, 1, 10))).unwrap();
+        p.data(requester, id, true, 10).unwrap();
+        // The Error arrives after the END: no END is owed, the request is done on both ends.
+        let d = p
+            .msg(responder, error(id, pb::ErrorClass::Transient))
+            .unwrap();
+        assert_eq!(d.done, Some(id));
+        assert_eq!(p.privd.outstanding_writes(), 0);
+        assert_eq!(p.other.outstanding_writes(), 0);
+        // A further END is refused.
+        err_has(p.data(requester, id, true, 0), "unknown stream");
+    }
+    // Contrast: an Error before the END leaves `done` None, so the sender knows an END is owed.
+    let mut p = Pair::worker().open(JobKind::Backup);
+    upload(&mut p, 1, 10);
+    let d = p
+        .msg(Who::Privd, error(1, pb::ErrorClass::Transient))
+        .unwrap();
+    assert_eq!(d.done, None);
+}
+
+#[test]
+fn only_received_frames_are_reported_as_discard() {
+    let mut p = Pair::drive().open(JobKind::Backup);
+    p.msg(Who::Privd, req(2, write(T::Pack, 1, 50))).unwrap();
+    p.data(Who::Privd, 2, false, 20).unwrap();
+    p.msg(Who::Other, error(2, pb::ErrorClass::QuotaExceeded))
+        .unwrap();
+    // privd's own closing END: not a discard, and it finishes the request.
+    let sent = p.privd.sent_data(2, true, 0).unwrap();
+    assert!(!sent.discard);
+    assert_eq!(sent.done, Some(2));
+    // The Drive helper receiving it discards it.
+    let frame = DataFrame {
+        stream_id: 2,
+        end: true,
+        payload: Bytes::new(),
+    };
+    let got = p.other.received_data(&frame).unwrap();
+    assert!(got.discard);
+    assert_eq!(got.done, Some(2));
+}
+
+#[test]
+fn a_failed_job_result_may_go_while_started_downloads_run() {
+    let cancelled = || {
+        result_frame(pb::JobResult {
+            ok: false,
+            error: pb::WorkerError::Cancelled as i32,
+            ..Default::default()
+        })
+    };
+    let mut p = Pair::worker().open(JobKind::Restore);
+    p.msg(Who::Other, req(1, read_full(T::Pack, 1))).unwrap();
+    p.msg(Who::Privd, resp(1, read_begin(50_000_000))).unwrap();
+    p.msg(Who::Privd, frame(F::Cancel(pb::Cancel {}))).unwrap();
+    p.msg(Who::Other, cancelled()).unwrap();
+    // Data for that stream is still accepted, reported as discard (by its receiver).
+    let d = p.data(Who::Privd, 1, false, 1000).unwrap();
+    assert!(d.discard && d.done.is_none());
+    // Bye needs nothing outstanding.
+    err_has(p.msg(Who::Other, frame(F::Bye(pb::Bye {}))), "outstanding");
+}
+
+#[test]
+fn bye_waits_for_the_end_of_a_download_after_a_failed_result() {
+    let mut p = Pair::worker().open(JobKind::Restore);
+    p.msg(Who::Other, req(1, read_full(T::Pack, 1))).unwrap();
+    p.msg(Who::Privd, resp(1, read_begin(4))).unwrap();
+    p.msg(
+        Who::Other,
+        result_frame(pb::JobResult {
+            ok: false,
+            error: pb::WorkerError::Cancelled as i32,
+            ..Default::default()
+        }),
+    )
+    .unwrap();
+    let mut q = Pair::worker().open(JobKind::Restore);
+    q.msg(Who::Other, req(1, read_full(T::Pack, 1))).unwrap();
+    q.msg(Who::Privd, resp(1, read_begin(4))).unwrap();
+    q.msg(
+        Who::Other,
+        result_frame(pb::JobResult {
+            ok: false,
+            error: pb::WorkerError::Cancelled as i32,
+            ..Default::default()
+        }),
+    )
+    .unwrap();
+    let d = q.data(Who::Privd, 1, true, 4).unwrap();
+    assert!(d.discard);
+    assert_eq!(d.done, Some(1));
+    q.msg(Who::Other, frame(F::Bye(pb::Bye {}))).unwrap();
+    // Without the END, Bye is refused.
+    err_has(p.msg(Who::Other, frame(F::Bye(pb::Bye {}))), "outstanding");
+}
+
+#[test]
+fn uploads_unanswered_requests_and_successes_still_block_a_job_result() {
+    let failed = || {
+        result_frame(pb::JobResult {
+            ok: false,
+            error: pb::WorkerError::Cancelled as i32,
+            ..Default::default()
+        })
+    };
+    // ok = true with a download outstanding.
+    let mut p = Pair::worker().open(JobKind::Restore);
+    p.msg(Who::Other, req(1, read_full(T::Pack, 1))).unwrap();
+    p.msg(Who::Privd, resp(1, read_begin(4))).unwrap();
+    err_has(p.msg(Who::Other, result_frame(ok_result())), "outstanding");
+    // A read still waiting for its ReadBegin.
+    let mut p = Pair::worker().open(JobKind::Restore);
+    p.msg(Who::Other, req(1, read_full(T::Pack, 1))).unwrap();
+    err_has(p.msg(Who::Other, failed()), "outstanding");
+    // An upload, running or aborted.
+    let mut p = Pair::worker().open(JobKind::Backup);
+    upload(&mut p, 1, 10);
+    err_has(p.msg(Who::Other, failed()), "outstanding");
+    // A download plus one unanswered request.
+    let mut p = Pair::worker().open(JobKind::Restore);
+    p.msg(Who::Other, req(1, read_full(T::Pack, 1))).unwrap();
+    p.msg(Who::Privd, resp(1, read_begin(4))).unwrap();
+    p.msg(Who::Other, req(2, list(T::Pack))).unwrap();
+    err_has(p.msg(Who::Other, failed()), "outstanding");
 }
