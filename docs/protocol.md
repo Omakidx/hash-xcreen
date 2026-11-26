@@ -684,7 +684,7 @@ Streams are independent, so frames can complete in a different order than they w
 3. A frame equal to `last_released + 1` is released at once, followed by any held frames that are now contiguous.
 4. Another newer frame is held until its predecessors arrive, until more than the window capacity is held, or until the hold time expires (the timer restarts whenever a frame is released); then the lowest held frame is released (the missing numbers become stale and are dropped if they arrive later).
 5. A frame flagged `KEY` or `RESYNC` is released at once and discards held frames older than it.
-6. The very first frame is released immediately.
+6. Before anything has been released, only a key frame is released at once; any other frame is held as in rule 4. A stream starts with a `KEY | RESYNC` frame, which is large and travels on its own stream, so a P frame sent after it can complete first. Releasing that P frame would make the key frame stale (rule 2), and the decoder, which cannot use a P frame without it, would wait for a `request_keyframe` round trip and a second key frame. If the hold time expires or the window overflows first, the lowest held frame is released as in rule 4, and the gap is handled as below.
 
 `hx_proto::ReorderWindow` implements these rules as a pure state machine; `hx_transport::Connection::recv_video_frame` applies them.
 

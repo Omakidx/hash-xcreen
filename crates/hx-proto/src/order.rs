@@ -55,8 +55,10 @@ impl<T> ReorderWindow<T> {
             return Vec::new();
         }
         let mut out = Vec::new();
+        // Before anything is released only a key frame goes straight through: the stream starts
+        // with one, and a P frame that overtook it would make it stale (protocol §6.1 rule 6).
         let contiguous = match self.last_released {
-            None => true,
+            None => false,
             Some(l) => frame_number == l.wrapping_add(1),
         };
         if key || contiguous {
@@ -72,8 +74,21 @@ impl<T> ReorderWindow<T> {
             return out;
         }
         self.held.push((frame_number, item));
-        let last = self.last_released.unwrap_or(0);
-        self.held.sort_by_key(|(n, _)| n.wrapping_sub(last));
+        // Sort in serial order from the last released frame, or, before the first release, from
+        // just below the oldest held frame (frame numbers may start anywhere, wraparound included).
+        let base = match self.last_released {
+            Some(l) => l,
+            None => {
+                let oldest = self
+                    .held
+                    .iter()
+                    .map(|(n, _)| *n)
+                    .reduce(|a, b| if serial_gt(a, b) { b } else { a })
+                    .unwrap_or(frame_number);
+                oldest.wrapping_sub(1)
+            }
+        };
+        self.held.sort_by_key(|(n, _)| n.wrapping_sub(base));
         if self.held.len() > self.capacity {
             out.extend(self.release_lowest());
         }
