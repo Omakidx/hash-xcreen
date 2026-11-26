@@ -1228,6 +1228,8 @@ privd's framing of §4 applies (`length` u32 LE, `kind` u8, body; `length` is ch
 
 A data stream's `stream_id` is the `req_id` of the request it belongs to. Streams may interleave; the bytes within one stream are ordered. A data frame for an unknown or finished stream, a stream that exceeds its announced size, and an `END` before `size` bytes have arrived are protocol violations.
 
+**Stream rules** (settled with the codec). A stream carries exactly the announced `size` bytes and ends with a frame whose `END` flag is set. A frame without `END` carries at least one byte; the `END` frame may be empty, so a zero-size object is one empty `END` frame. An upload (`Write`) flows requester to responder, and the responder answers `Done` only after `END`; a download (`ReadBegin`) flows responder to requester. An `Error` answering a `Write` closes its stream: data frames that the sender already had in flight are discarded, up to the announced size or its `END`, and never beyond. `ReadBegin` is the complete answer to a read, so a failure of the source in mid-stream is signalled by ending the session, never by a second response. A request is outstanding until its last response (`Done`, `Error`, `QuotaResult`, the `ListPage` with `last`) or, for a download, the `END` of its stream. `req_id` must be unique among the outstanding requests of a link (a sender numbers its requests upwards from 1 and never reuses a number). The count limits of this section are upper bounds: every message must also fit its 65 536-byte frame (about 600 snapshots fit a `JobResult`; the excludes of a `Job` share the frame with the rest of the spec), and a sender whose message does not fit fails the job instead of sending it.
+
 | Limit | Value |
 |---|---|
 | Outstanding repository requests per worker link | 8, of which at most 4 writes |
@@ -1267,9 +1269,13 @@ On the Drive link privd opens a session of its own for the job, starting with `H
 
 `type` ∈ `CONFIG`, `KEY`, `SNAPSHOT`, `INDEX`, `PACK`; `id` is 32 bytes (all zero for `CONFIG`). **No message carries a path, a Drive name or id, a URL, a credential or free text from the worker.**
 
+**Shapes fixed by the codec.** The job-level `Cancel`{} keeps its name; the Drive link's cancel of one request is the separate variant `CancelRequest`{`req_id`} (§29). `secret_slots` entries are {`slot` 0 or 1, `kind` ∈ `REPO_PASSWORD` (slot 0), `NEW_KEY_PASSWORD` (slot 1), `length` 16 to 1 024}, declared in slot order, and the kind-2 frames follow in that order with `request_id` 0; `INIT` declares slots 0 and 1, `KEYS` declares slot 1 only when `add`, every other kind declares slot 0 only. A `SNAPSHOTS` job carries the empty `SnapshotsSpec`. `ListPage` may be repeated for one `req_id` until the page with `last`; a page before the last one has at least one entry. A `RepoRequest` for `OpenRepo`, `Quota` and `SetUploadRate` is answered like any other (`Done`, or `QuotaResult` for `Quota`, or `Error`); `OpenRepo` must be the first request of the Drive session. Errors from the Drive helper never use `POLICY_DENIED`, `INTEGRITY`, `TOO_LARGE` or `UNAVAILABLE`, which are privd's own (§31). `Progress.phase` takes the values of `repo.proto` (repair index, scan and upload, write snapshot, plan, download and write, fix-ups, check, forget, prune, init, keys). `JobResult`: `ok` and `error` agree (`ok` means no `error`; a failure carries no snapshot, key, manifest or snapshot list); `snapshot_id` is set exactly for a successful `BACKUP`, `manifest` exactly for a successful `RESTORE_PLAN` (at most 61 440 bytes, so that it fits the frame; `hx-backup` writes manifests of up to 64 KiB, and a larger one is reported as `ENGINE`), `snapshots` only for `SNAPSHOTS`, `key_ids` (at most 4) only for `INIT` and `KEYS`. A snapshot entry's `tags` (here and in the `BACKUP` spec) are at most 4 strings of 1 to 64 bytes from `[A-Za-z0-9._-]`; `manifest_digest` is the SHA-256 of the manifest (all zero when the snapshot has none). `Event.until_ms` is a Unix time in milliseconds (0 = unknown).
+
 ## 28. Job specs
 
 privd validates the spec before sending it; the worker validates it again.
+
+Bounds beyond the table: the text fields of the manifest input (`distro` id, version and pretty name, `desktop`, `preset`, `agent version`) are at most 128 bytes without control characters; the container configuration has at most 256 entries, keys of at most 128 bytes and values of at most 1 024 bytes (the `hx_backup::manifest` limits) and no key starting with `volatile.`; every exclude is non-empty and free of control characters. The `INIT` and `FORGET_PRUNE` constants (`compression`, pack size limits, `instant`) must have exactly the values of the table.
 
 | Kind | Spec | Secret slots | Devices |
 |---|---|---|---|
@@ -1284,14 +1290,14 @@ privd validates the spec before sending it; the worker validates it again.
 
 ## 29. Drive link: privd-only operations
 
-The Drive link uses the same framing, `Hello`, `RepoRequest` and `RepoResponse` as §25 to §27, plus the operations below, which only privd may send. The worker's link has none of them.
+The Drive link uses the same framing, `Hello`, `RepoRequest` and `RepoResponse` as §25 to §27, plus the operations below, which only privd may send. The worker's link has none of them. `OpenRepo`, `Quota` and `SetUploadRate` are operations of `RepoRequest` (each with privd's own `req_id`, answered as in §27); `QuotaResult` is a `RepoResponse` result; `CancelRequest` and `Event` are top-level `RepoFrame` variants. The variants valid on the Drive link are exactly `Hello` (carrying the job id), `HelloAck`, `RepoRequest`, `RepoResponse`, `CancelRequest`, `Event`, `Ping`, `Pong` and `Bye`; `Job`, `Progress`, `JobResult`, `Cancel` and secrets never appear on it.
 
 | Message | Direction | Meaning |
 |---|---|---|
-| `OpenRepo`{`folder`, `create`, `server_id`, `takeover`} | privd → Drive helper | Names the repository folder (a privd constant per server and desktop; the worker never learns it). It must be the first request of a session. Lease handling is described below. |
+| `OpenRepo`{`folder`, `create`, `server_id`, `takeover`} | privd → Drive helper | Names the repository folder (a privd constant per server and desktop; the worker never learns it; 1 to 128 bytes of `[A-Za-z0-9._-]` starting with a letter or digit). `server_id` is the 16 raw bytes. It must be the first request of a session. Lease handling is described below. |
 | `Quota`{} → `QuotaResult`{`limit`, `usage`, `usage_in_trash`} | privd → Drive helper and back | From Drive's `about.storageQuota`, which counts the trash (architecture §9.7). |
 | `SetUploadRate`{`bytes_per_s`} | privd → Drive helper | 0 = unlimited. privd sets the 50% cap while a client is connected (architecture §9.5). |
-| `Cancel`{`req_id`} | privd → Drive helper | Abandon one request. |
+| `CancelRequest`{`req_id`} | privd → Drive helper | Abandon one request (the request is still answered, normally with `CANCELLED`). |
 | `Event`{`kind` ∈ `PAUSED_DAILY_LIMIT`, `RESUMED`, `RETRYING`; `until_ms`} | Drive helper → privd, unsolicited | Status only. |
 
 **The Drive helper owns** per-request retries (1 s doubling to 64 s, equal jitter, `Retry-After` honoured, at most 8 retries); the daily-limit gate shared by all requests of the session (a pause of one hour, then a probe, at most 26 pauses); per-attempt timeouts (60 s plus 4 s per MiB); the lazy creation of the `data/xx` folders; permanent deletion (`DELETE files/{id}`; it never calls `files.emptyTrash`; folders are deleted leaves first; architecture §9.7); and the lease. This is S4's `HxDrive` and retrier, unchanged. **privd owns** job deadlines, the operation policy (§30), the hash check of every write, cancellation, the upload-rate setting, the persisted "daily limit hit at T" time, progress and the audit log.
