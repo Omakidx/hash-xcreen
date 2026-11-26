@@ -166,6 +166,9 @@ pub struct Instance {
     /// Devices after profiles are applied.
     #[serde(default)]
     pub expanded_devices: BTreeMap<String, BTreeMap<String, String>>,
+    /// RFC 3339 time of the last start (Incus sets it at every start; epoch zero when never).
+    #[serde(default)]
+    pub last_used_at: String,
 }
 
 /// Run state of an instance (`GET /1.0/instances/<name>/state`).
@@ -177,6 +180,13 @@ pub struct InstanceState {
     pub pid: i64,
     /// Global IPv4 addresses per interface name.
     pub ipv4: BTreeMap<String, Vec<String>>,
+    /// Cumulative CPU time of the instance in nanoseconds (`cpu.usage`); `None` when not reported.
+    pub cpu_usage_ns: Option<u64>,
+    /// Memory in use in bytes (`memory.usage`); `None` when not reported.
+    pub memory_usage_bytes: Option<u64>,
+    /// Usage of the `root` disk device in bytes (`disk.root.usage`); `None` when the storage
+    /// driver reports none (a negative or missing value).
+    pub disk_root_usage_bytes: Option<u64>,
 }
 
 impl InstanceState {
@@ -209,6 +219,9 @@ impl InstanceState {
                 .to_string(),
             pid: m.get("pid").and_then(Value::as_i64).unwrap_or(0),
             ipv4,
+            cpu_usage_ns: m.pointer("/cpu/usage").and_then(Value::as_u64),
+            memory_usage_bytes: m.pointer("/memory/usage").and_then(Value::as_u64),
+            disk_root_usage_bytes: m.pointer("/disk/root/usage").and_then(Value::as_u64),
         }
     }
 
@@ -544,5 +557,36 @@ impl StateAction {
             Self::Stop => "stop",
             Self::Restart => "restart",
         }
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn usage_counters_are_read_when_present_and_none_otherwise() {
+        let st = InstanceState::from_metadata(&json!({
+            "status": "Running",
+            "cpu": {"usage": 12_000_000_000u64},
+            "memory": {"usage": 1_073_741_824u64, "usage_peak": 9},
+            "disk": {"root": {"usage": 5_368_709_120u64, "total": 0}},
+        }));
+        assert_eq!(st.cpu_usage_ns, Some(12_000_000_000));
+        assert_eq!(st.memory_usage_bytes, Some(1_073_741_824));
+        assert_eq!(st.disk_root_usage_bytes, Some(5_368_709_120));
+        // A driver without accounting (`dir`) leaves the disk out; a negative value is no number.
+        let st = InstanceState::from_metadata(&json!({
+            "status": "Stopped", "disk": {"root": {"usage": -1}},
+        }));
+        assert_eq!(
+            (
+                st.cpu_usage_ns,
+                st.memory_usage_bytes,
+                st.disk_root_usage_bytes
+            ),
+            (None, None, None)
+        );
     }
 }

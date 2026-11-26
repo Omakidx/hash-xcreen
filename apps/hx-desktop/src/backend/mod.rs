@@ -585,15 +585,31 @@ pub enum DesktopStatus {
     Unknown,
 }
 
-/// What Server details, Overview shows. Only what the server reports: there are no live CPU,
-/// memory or disk usage numbers, no desktop uptime and no name of the connected device, so none
-/// are shown.
+/// Live numbers of the running desktop; each is `None` when the server did not report it (a
+/// stopped desktop, a storage driver without disk usage, the first CPU sample, an older agent), and
+/// the screen then leaves the row out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    /// Percent (0 to 100) of the desktop's CPU allowance.
+    pub cpu_percent: Option<u32>,
+    /// MiB of memory in use.
+    pub memory_used_mib: Option<u64>,
+    /// MiB used on the desktop's disk.
+    pub disk_used_mib: Option<u64>,
+    /// Seconds since the desktop last started.
+    pub uptime_secs: Option<u64>,
+}
+
+/// What Server details, Overview shows. Only what the server reports: there is no name of the
+/// connected device, so none is shown.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Overview {
     /// The desktop.
     pub desktop: DesktopStatus,
     /// How long the agent has run.
     pub agent_uptime_secs: u64,
+    /// Live usage of the desktop.
+    pub usage: Usage,
     /// Some client holds the desktop now.
     pub session_active: bool,
     /// "Ubuntu 24.04 · XFCE · Developer · Docker on".

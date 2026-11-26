@@ -12,7 +12,7 @@ use super::known_hosts::Known;
 use super::{App, model, spawn_ui, ss};
 use crate::backend::{
     AdminContext, AdminError, DesktopStatus, EngineError, HostKey, Limits, Overview, Secret,
-    SshAuth, SshTarget, UninstallRequest,
+    SshAuth, SshTarget, UninstallRequest, Usage,
 };
 use crate::details::{self, DangerFlow, DeviceRow, RevokePlan};
 use crate::servers::{Lifecycle, parse_version};
@@ -148,6 +148,43 @@ fn uptime_text(s: u64) -> String {
     }
 }
 
+/// A size in MiB as "1.5 GB" (binary units, like the limits).
+fn gb_text(mib: u64) -> String {
+    format!("{:.1} GB", mib as f64 / 1024.0)
+}
+
+/// The live usage rows of the desktop card, in order: CPU, Memory, Disk, Uptime. A number the
+/// server did not report gets no row. Memory and disk read "used of limit" when the limit is
+/// known; an unlimited disk is measured against the storage pool.
+fn usage_rows(o: &Overview) -> Vec<(&'static str, String)> {
+    let u: &Usage = &o.usage;
+    let of = |used: u64, limit_gb: u32| {
+        if limit_gb > 0 {
+            format!("{} of {limit_gb} GB", gb_text(used))
+        } else {
+            gb_text(used)
+        }
+    };
+    let mut rows = Vec::new();
+    if let Some(p) = u.cpu_percent {
+        rows.push(("CPU", format!("{p}%")));
+    }
+    if let Some(m) = u.memory_used_mib {
+        rows.push(("Memory", of(m, o.limits.map_or(0, |l| l.memory_gb))));
+    }
+    if let Some(d) = u.disk_used_mib {
+        let limit = o.limits.map_or(0, |l| l.disk_gb);
+        rows.push((
+            "Disk",
+            of(d, if limit > 0 { limit } else { o.host_disk_gb }),
+        ));
+    }
+    if let Some(s) = u.uptime_secs {
+        rows.push(("Uptime", uptime_text(s)));
+    }
+    rows
+}
+
 fn fetch_overview(app: &Rc<App>) {
     let Some(ctx) = admin_ctx(app) else { return };
     let (epoch, id) = {
@@ -218,7 +255,7 @@ fn fill_overview(app: &Rc<App>, s: &crate::servers::Server, o: &Overview) {
         DesktopStatus::NotCreated => "Not created yet",
         DesktopStatus::Unknown => "Unknown",
     };
-    vm.set_ov_desktop(model(vec![
+    let mut desktop_rows = vec![
         kv("Status", status),
         kv(
             "Session",
@@ -229,7 +266,9 @@ fn fill_overview(app: &Rc<App>, s: &crate::servers::Server, o: &Overview) {
             },
         ),
         kv("Setup", o.setup.clone()),
-    ]));
+    ];
+    desktop_rows.extend(usage_rows(o).into_iter().map(|(k, v)| kv(k, v)));
+    vm.set_ov_desktop(model(desktop_rows));
     vm.set_ov_agent(model(vec![
         kv(
             "Version",
@@ -1152,6 +1191,64 @@ mod tests {
     use crate::backend::{BoxFuture, InstallRequest, InstallRun, Preflight};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn overview_with(usage: Usage, limits: Option<Limits>) -> Overview {
+        Overview {
+            desktop: DesktopStatus::Running,
+            agent_uptime_secs: 0,
+            usage,
+            session_active: false,
+            setup: String::new(),
+            agent_version: String::new(),
+            privd_version: String::new(),
+            channel: "stable".into(),
+            update_available: None,
+            rolled_back: None,
+            protocol: String::new(),
+            limits,
+            host_os: String::new(),
+            host_cpus: 4,
+            host_mem_gb: 5,
+            host_disk_gb: 152,
+            docker: false,
+            attention: vec![],
+        }
+    }
+
+    #[test]
+    fn usage_rows_show_what_is_known_and_hide_the_rest() {
+        let lim = Some(Limits {
+            cpu: 3,
+            memory_gb: 5,
+            disk_gb: 60,
+        });
+        let all = Usage {
+            cpu_percent: Some(18),
+            memory_used_mib: Some(1536),
+            disk_used_mib: Some(14_336),
+            uptime_secs: Some(3 * 86_400 + 7 * 3600),
+        };
+        assert_eq!(
+            usage_rows(&overview_with(all, lim)),
+            vec![
+                ("CPU", "18%".to_owned()),
+                ("Memory", "1.5 GB of 5 GB".to_owned()),
+                ("Disk", "14.0 GB of 60 GB".to_owned()),
+                ("Uptime", "3 days 7 hours".to_owned()),
+            ]
+        );
+        // No limits: memory alone, the disk against the pool.
+        let rows = usage_rows(&overview_with(all, None));
+        assert_eq!(rows[1].1, "1.5 GB");
+        assert_eq!(rows[2].1, "14.0 GB of 152 GB");
+        // Nothing reported: no rows at all, never zeros.
+        assert!(usage_rows(&overview_with(Usage::default(), lim)).is_empty());
+        let part = Usage {
+            memory_used_mib: Some(512),
+            ..Usage::default()
+        };
+        assert_eq!(usage_rows(&overview_with(part, lim)).len(), 1);
+    }
 
     fn key(fp: &str) -> HostKey {
         HostKey {

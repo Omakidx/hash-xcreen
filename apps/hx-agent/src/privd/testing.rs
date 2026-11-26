@@ -156,6 +156,10 @@ pub struct FakeInstance {
     pub snapshots: Vec<String>,
     /// The `source` object of the create request (which image it was made from).
     pub source: Value,
+    /// Extra members of the `/state` metadata (`cpu`, `memory`, `disk`), merged over the defaults.
+    pub state_extra: Value,
+    /// `last_used_at` of the instance record (empty: epoch zero, as for an instance never run).
+    pub last_used_at: String,
 }
 
 /// An image of the fake image store.
@@ -344,6 +348,8 @@ impl FakeIncus {
                     devices: [("root".to_string(), root)].into_iter().collect(),
                     snapshots: Vec::new(),
                     source: Value::Null,
+                    state_extra: Value::Null,
+                    last_used_at: String::new(),
                 },
             );
         });
@@ -561,6 +567,8 @@ impl FakeIncus {
                         devices,
                         snapshots: Vec::new(),
                         source: body["source"].clone(),
+                        state_extra: Value::Null,
+                        last_used_at: String::new(),
                     },
                 );
                 ok_sync(Value::Null)
@@ -580,6 +588,11 @@ impl FakeIncus {
                         "profiles": ["hx-desktop"], "config": i.config, "description": "",
                         "architecture": "x86_64", "devices": i.devices,
                         "expanded_devices": devices,
+                        "last_used_at": if i.last_used_at.is_empty() {
+                            "1970-01-01T00:00:00Z"
+                        } else {
+                            i.last_used_at.as_str()
+                        },
                     }));
                     r.headers.insert("etag".into(), "etag-1".into());
                     r
@@ -641,9 +654,17 @@ impl FakeIncus {
             }
             ("GET", ["1.0", "instances", name, "state"]) => match s.instances.get(*name) {
                 None => err_response(404, "Instance not found"),
-                Some(i) => ok_sync(json!({"status": i.status, "pid": 1,
+                Some(i) => {
+                    let mut m = json!({"status": i.status, "pid": 1,
                     "network": {"eth0": {"addresses": [
-                        {"family": "inet", "scope": "global", "address": "10.77.0.5"}]}}})),
+                        {"family": "inet", "scope": "global", "address": "10.77.0.5"}]}}});
+                    if let (Some(base), Some(extra)) =
+                        (m.as_object_mut(), i.state_extra.as_object())
+                    {
+                        base.extend(extra.clone());
+                    }
+                    ok_sync(m)
+                }
             },
             ("GET", ["1.0", "instances", name, "snapshots"]) => match s.instances.get(*name) {
                 None => err_response(404, "Instance not found"),

@@ -472,6 +472,16 @@ impl ServerControl for DemoServerControl {
                     DesktopStatus::Running
                 },
                 agent_uptime_secs: 12 * 86_400 + 4 * 3600,
+                usage: if sick {
+                    Usage::default()
+                } else {
+                    Usage {
+                        cpu_percent: Some(18),
+                        memory_used_mib: Some(2150),
+                        disk_used_mib: Some(14_336),
+                        uptime_secs: Some(3 * 86_400 + 7 * 3600),
+                    }
+                },
                 session_active: false,
                 setup: "Ubuntu 24.04 · XFCE · Developer · Docker on".into(),
                 agent_version: "0.1.0".into(),

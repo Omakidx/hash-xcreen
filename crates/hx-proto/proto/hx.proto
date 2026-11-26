@@ -635,6 +635,19 @@ message ServerDesktop {
   // At most 8.
   repeated ServerAttention needs_attention = 7;
   uint64 created_unix = 8;
+  // Live numbers of the running desktop; unset when it is not running or privd gave none.
+  ServerDesktopUsage usage = 9;
+}
+
+// Every field is absent when unknown (never 0 as a stand-in); desktop only, not the host.
+message ServerDesktopUsage {
+  // 0 to 100: share of the desktop's CPU allowance.
+  optional uint32 cpu_percent = 1;
+  optional uint64 memory_used_mib = 2;
+  // Root device.
+  optional uint64 disk_used_mib = 3;
+  // Seconds since the desktop's last start.
+  optional uint64 uptime_s = 4;
 }
 
 message ServerOverview {

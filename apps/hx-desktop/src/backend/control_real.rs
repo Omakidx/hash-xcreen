@@ -194,9 +194,21 @@ pub fn overview_view(o: &pb::ServerOverview, protocol: Option<(u32, u32)>) -> Ov
         None => (String::new(), 1, 1, 8),
     };
     let u = o.update.clone().unwrap_or_default();
+    let usage = o
+        .desktop
+        .as_ref()
+        .and_then(|d| d.usage.as_ref())
+        .map(|u| Usage {
+            cpu_percent: u.cpu_percent.map(|p| p.min(100)),
+            memory_used_mib: u.memory_used_mib,
+            disk_used_mib: u.disk_used_mib,
+            uptime_secs: u.uptime_s,
+        })
+        .unwrap_or_default();
     Overview {
         desktop,
         agent_uptime_secs: o.agent_uptime_s,
+        usage,
         session_active: o.session_active,
         setup,
         agent_version: crate::session::connect::sanitize(&o.agent_version),
@@ -461,6 +473,23 @@ mod tests {
         assert_eq!(v.host_disk_gb, 152);
         assert_eq!(v.update_available.as_deref(), Some("0.1.1"));
         assert!(v.docker && v.attention.is_empty());
+        assert_eq!(v.usage, Usage::default(), "an older agent sends none");
+        let mut with = o.clone();
+        with.desktop.as_mut().unwrap().usage = Some(pb::ServerDesktopUsage {
+            cpu_percent: Some(250),
+            memory_used_mib: Some(1536),
+            disk_used_mib: None,
+            uptime_s: Some(90),
+        });
+        assert_eq!(
+            overview_view(&with, None).usage,
+            Usage {
+                cpu_percent: Some(100),
+                memory_used_mib: Some(1536),
+                disk_used_mib: None,
+                uptime_secs: Some(90),
+            }
+        );
         let none = overview_view(&pb::ServerOverview::default(), None);
         assert_eq!(none.desktop, DesktopStatus::Unknown);
     }

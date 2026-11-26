@@ -404,6 +404,12 @@ impl ServerMgmtService {
                 } as i32,
                 needs_attention: attention(&d.needs_attention),
                 created_unix: d.created_unix_s,
+                usage: d.usage.map(|u| pb::ServerDesktopUsage {
+                    cpu_percent: u.cpu_percent.map(|p| p.min(100)),
+                    memory_used_mib: u.memory_used_mib,
+                    disk_used_mib: u.disk_used_mib,
+                    uptime_s: u.uptime_s,
+                }),
             }),
             Ok(Ok(None)) => Some(pb::ServerDesktop {
                 state: pb::ServerDesktopState::None as i32,

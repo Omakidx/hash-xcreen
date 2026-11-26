@@ -233,6 +233,21 @@ fn build_desktop<T: Transport + Clone + 'static>(
             .and_then(|v| parse_gib(v))
             .unwrap_or(0),
     };
+    let usage = {
+        let mut cpu = d.cpu_samples.lock().unwrap_or_else(|e| e.into_inner());
+        let percent = if st.is_running() {
+            let cores = if limits.cpu > 0 {
+                limits.cpu
+            } else {
+                d.probe.cpu_count()
+            };
+            cpu.observe(id, d.clock.unix_ms(), st.cpu_usage_ns, cores)
+        } else {
+            cpu.forget(id);
+            None
+        };
+        crate::privd::usage::desktop_usage(st, &l.instance, d.clock.unix_secs(), percent)
+    };
     pb::Desktop {
         desktop_id: id.to_string(),
         state: state as i32,
@@ -258,6 +273,7 @@ fn build_desktop<T: Transport + Clone + 'static>(
         }),
         snapshot_count: u32::try_from(snapshots).unwrap_or(u32::MAX),
         created_unix_s: l.meta.created,
+        usage,
     }
 }
 

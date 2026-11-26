@@ -32,6 +32,7 @@ fn desktop() -> pb::Desktop {
         }),
         snapshot_count: 1,
         created_unix_s: 1_700_000_000,
+        usage: None,
     }
 }
 

@@ -694,6 +694,19 @@ message Desktop {
   SessionInfo session = 10;
   uint32 snapshot_count = 11;
   uint64 created_unix_s = 12;
+  // Live numbers of a running desktop; unset when it is not running.
+  DesktopUsage usage = 13;
+}
+
+// Every field is absent when unknown (never 0 as a stand-in). See ipc.md 6.6.
+message DesktopUsage {
+  // 0 to 100: share of the desktop's CPU allowance used since the previous sample.
+  optional uint32 cpu_percent = 1;
+  optional uint64 memory_used_mib = 2;
+  // Root device usage.
+  optional uint64 disk_used_mib = 3;
+  // Seconds since the instance's last start.
+  optional uint64 uptime_s = 4;
 }
 
 message GetDesktopResult {
