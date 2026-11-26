@@ -146,7 +146,13 @@ fn canned_privd() -> PrivdHandler {
 }
 
 fn canned_admin() -> AdminHandler {
-    Arc::new(|req, _s| {
+    canned_admin_with(setup_fields(false, false, apb::SetupJobState::Idle, 0))
+}
+
+/// The canned admin whose `Status` also reports the given setup fields (10 to 14).
+fn canned_admin_with(setup: apb::StatusResult) -> AdminHandler {
+    Arc::new(move |req, _s| {
+        let setup = setup.clone();
         Box::pin(async move {
             use apb::request::Command as C;
             use apb::response::Result as A;
@@ -163,6 +169,11 @@ fn canned_admin() -> AdminHandler {
                     }),
                     session_link: apb::LinkState::Up as i32,
                     registry_version: 5,
+                    setup_device_bound: setup.setup_device_bound,
+                    setup_device_id: setup.setup_device_id,
+                    setup_token_pending: setup.setup_token_pending,
+                    setup_job: setup.setup_job,
+                    setup_job_id: setup.setup_job_id,
                     ..Default::default()
                 }),
                 C::ListDevices(_) => A::ListDevices(apb::ListDevicesResult {
@@ -209,6 +220,10 @@ fn canned_admin() -> AdminHandler {
 }
 
 async fn stack() -> (tempfile::TempDir, hx_agent::cli::Config) {
+    stack_with(setup_fields(false, false, apb::SetupJobState::Idle, 0)).await
+}
+
+async fn stack_with(setup: apb::StatusResult) -> (tempfile::TempDir, hx_agent::cli::Config) {
     let dir = private_tempdir();
     let p = ScriptedPrivd::start(
         dir.path(),
@@ -217,7 +232,7 @@ async fn stack() -> (tempfile::TempDir, hx_agent::cli::Config) {
         canned_privd(),
     )
     .await;
-    let a = ScriptedAdmin::start(dir.path(), "a.sock", "0.1.0", canned_admin()).await;
+    let a = ScriptedAdmin::start(dir.path(), "a.sock", "0.1.0", canned_admin_with(setup)).await;
     let mut cfg = unreachable_config(dir.path());
     cfg.privd_socket = p.path.clone();
     cfg.admin_socket = a.path.clone();
@@ -303,7 +318,8 @@ async fn status_json_is_stable() {
                     "connected_clients": 1, "certificate": "VALID",
                     "certificate_not_after_unix_s": 1_900_000_000u64,
                     "setup_window": {"open": true, "expires_at_unix_s": 1_900_007_200u64},
-                    "session_link": "UP", "link_faults_10min": 0, "registry_version": 5
+                    "session_link": "UP", "link_faults_10min": 0, "registry_version": 5,
+                    "setup": idle_setup()
                 },
                 "devices": {"total": 2, "active": 1, "revoked": 0, "locked": 1},
                 "needs_attention": ["PIN_LOCKED"],
@@ -410,7 +426,7 @@ async fn pairing_pin_and_setup_json_is_stable() {
         &[],
         &[],
         0,
-        json!({"ok": true, "command": "setup begin", "data": {"open": true, "expires_at_unix_s": 1_900_007_200u64}}),
+        json!({"ok": true, "command": "setup begin", "data": {"open": true, "expires_at_unix_s": 1_900_007_200u64, "setup": idle_setup()}}),
     )
     .await;
     golden(
@@ -419,7 +435,7 @@ async fn pairing_pin_and_setup_json_is_stable() {
         &[],
         &[],
         0,
-        json!({"ok": true, "command": "setup extend", "data": {"open": true, "expires_at_unix_s": 1_900_009_000u64}}),
+        json!({"ok": true, "command": "setup extend", "data": {"open": true, "expires_at_unix_s": 1_900_009_000u64, "setup": idle_setup()}}),
     )
     .await;
     golden(
@@ -428,7 +444,7 @@ async fn pairing_pin_and_setup_json_is_stable() {
         &[],
         &[],
         0,
-        json!({"ok": true, "command": "setup finish", "data": {"open": false}}),
+        json!({"ok": true, "command": "setup finish", "data": {"open": false, "setup": idle_setup()}}),
     )
     .await;
 }
@@ -584,4 +600,118 @@ async fn update_and_uninstall_json_is_stable() {
         human.stdout
     );
     assert!(human.stdout.contains("incus delete --force hx-main"));
+}
+
+// ------------------------------------------------------------------ setup binding and job
+
+fn idle_setup() -> Value {
+    json!({"device_bound": false, "device_id": null, "token_pending": false, "job": "IDLE", "job_id": 0})
+}
+
+fn setup_fields(
+    bound: bool,
+    token: bool,
+    job: apb::SetupJobState,
+    job_id: u32,
+) -> apb::StatusResult {
+    apb::StatusResult {
+        setup_device_bound: bound,
+        setup_device_id: if bound {
+            vec![0xaa; 16].into()
+        } else {
+            Default::default()
+        },
+        setup_token_pending: token,
+        setup_job: job as i32,
+        setup_job_id: job_id,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn status_and_setup_show_the_bound_device_and_a_running_job() {
+    use apb::SetupJobState as J;
+    let (_d, cfg) = stack_with(setup_fields(true, false, J::Running, 3)).await;
+    let r = cli(&cfg, &["status"], &[], &[]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(
+        r.stdout
+            .contains(&format!("  setup        device bound {AA}\n")),
+        "{}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("               job running (id 3)\n"),
+        "{}",
+        r.stdout
+    );
+    assert!(!r.stdout.contains("installer token"), "{}", r.stdout);
+    let want = json!({"device_bound": true, "device_id": AA, "token_pending": false, "job": "RUNNING", "job_id": 3});
+    let v = cli(&cfg, &["status", "--json"], &[], &[]).await.json();
+    assert_eq!(v["data"]["gatewayd"]["setup"], want);
+    // `setup` shows the same, in text and in JSON, next to its unchanged members.
+    let r = cli(&cfg, &["setup", "begin", "--yes"], &[], &[]).await;
+    assert!(
+        r.stdout.contains(&format!("device bound {AA}")),
+        "{}",
+        r.stdout
+    );
+    assert!(r.stdout.contains("job running (id 3)"), "{}", r.stdout);
+    let v = cli(&cfg, &["setup", "extend", "30m", "--json"], &[], &[])
+        .await
+        .json();
+    assert_eq!(v["data"]["setup"], want);
+    assert_eq!(v["data"]["open"], true);
+    assert_eq!(v["data"]["expires_at_unix_s"], 1_900_009_000u64);
+}
+
+#[tokio::test]
+async fn status_shows_each_job_state_and_the_token_flag() {
+    use apb::SetupJobState as J;
+    for (job, id, name, line) in [
+        (J::Unspecified, 0, "UNSPECIFIED", Some("job unspecified")),
+        (J::Idle, 0, "IDLE", None),
+        (J::Idle, 4, "IDLE", None),
+        (J::Running, 1, "RUNNING", Some("job running (id 1)")),
+        (J::Succeeded, 2, "SUCCEEDED", Some("job succeeded (id 2)")),
+        (J::Failed, 5, "FAILED", Some("job failed (id 5)")),
+        (J::Cancelled, 6, "CANCELLED", Some("job cancelled (id 6)")),
+    ] {
+        let (_d, cfg) = stack_with(setup_fields(false, true, job, id)).await;
+        let r = cli(&cfg, &["status"], &[], &[]).await;
+        assert!(
+            r.stdout.contains("  setup        no setup device\n"),
+            "{}",
+            r.stdout
+        );
+        assert!(
+            r.stdout
+                .contains("               installer token waiting to be used\n"),
+            "{}",
+            r.stdout
+        );
+        match line {
+            Some(l) => assert!(r.stdout.contains(l), "{l}: {}", r.stdout),
+            None => assert!(!r.stdout.contains("job "), "{}", r.stdout),
+        }
+        let v = cli(&cfg, &["status", "--json"], &[], &[]).await.json();
+        assert_eq!(
+            v["data"]["gatewayd"]["setup"],
+            json!({"device_bound": false, "device_id": null, "token_pending": true, "job": name, "job_id": id}),
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn status_idle_unbound_says_so_without_token_or_job_lines() {
+    let (_d, cfg) = stack().await;
+    let r = cli(&cfg, &["status"], &[], &[]).await;
+    assert!(
+        r.stdout.contains("  setup        no setup device\n"),
+        "{}",
+        r.stdout
+    );
+    assert!(!r.stdout.contains("installer token"), "{}", r.stdout);
+    assert!(!r.stdout.contains("job "), "{}", r.stdout);
 }
