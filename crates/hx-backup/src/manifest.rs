@@ -727,6 +727,20 @@ mod tests {
     }
 
     #[test]
+    fn is_unsafe_char_equals_the_one_of_hx_ipc_for_every_char() {
+        for cp in 0..=0x10FFFFu32 {
+            let Some(c) = char::from_u32(cp) else {
+                continue;
+            }; // surrogates
+            assert_eq!(
+                is_unsafe_char(c),
+                hx_ipc::text::is_unsafe_char(c),
+                "U+{cp:04X}"
+            );
+        }
+    }
+
+    #[test]
     fn format_and_separator_characters_are_stripped_from_os_release_values() {
         // U+200B (zero-width space, Cf), U+2028 (line separator, Zl), U+202E (bidi override, Cf).
         let d = Distro::from_os_release(
