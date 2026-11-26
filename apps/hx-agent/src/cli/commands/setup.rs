@@ -9,8 +9,9 @@
 
 use hx_ipc::admin::pb as apb;
 use hx_ipc::privd::pb::{self, request::Command, response::Result as R};
-use serde_json::json;
+use serde_json::{Value, json};
 
+use super::status::setup_state;
 use super::{admin, confirm, privd};
 use crate::cli::error::CliError;
 use crate::cli::gatewayd::unexpected as admin_unexpected;
@@ -34,6 +35,28 @@ fn mirror(
         apb::response::Result::SetupWindow(r) => Ok(r.state.unwrap_or_default()),
         _ => Err(admin_unexpected("SetupWindow")),
     }
+}
+
+/// Best effort: the setup binding and job from gatewayd `Status`, as the extra JSON member and the
+/// extra text. The window already changed, so a failed read only leaves them out.
+fn setup_detail(env: &Env<'_>) -> Option<(Value, String)> {
+    let mut a = admin(env).ok()?;
+    match a
+        .call(apb::request::Command::Status(apb::StatusRequest {}), None)
+        .ok()?
+    {
+        apb::response::Result::Status(s) => Some(setup_state(&s)),
+        _ => None,
+    }
+}
+
+/// Adds the setup detail to an outcome's text and JSON.
+fn with_detail(env: &Env<'_>, mut text: String, mut data: Value) -> Outcome {
+    if let Some((j, t)) = setup_detail(env) {
+        text.push_str(&t);
+        data["setup"] = j;
+    }
+    Outcome::ok(text, data)
 }
 
 fn mirror_failed(what: &str, e: CliError) -> CliError {
@@ -69,7 +92,8 @@ pub(super) fn begin(env: &mut Env<'_>, secs: u32, yes: bool) -> Result<Outcome, 
     };
     let state = mirror(env, apb::SetupWindowAction::Open, secs)
         .map_err(|e| mirror_failed("opened the setup window", e))?;
-    Ok(Outcome::ok(
+    Ok(with_detail(
+        env,
         format!(
             "setup window open until {} (privd and gatewayd)\n",
             time(expires)
@@ -95,7 +119,8 @@ pub(super) fn extend(env: &mut Env<'_>, secs: u32) -> Result<Outcome, CliError> 
         Err(e) => Err(e),
     }
     .map_err(|e| mirror_failed("extended the setup window", e))?;
-    Ok(Outcome::ok(
+    Ok(with_detail(
+        env,
         format!(
             "setup window now open until {} (24 hours in total at most)\n",
             time(expires)
@@ -114,8 +139,9 @@ pub(super) fn finish(env: &mut Env<'_>, force: bool) -> Result<Outcome, CliError
     }
     mirror(env, apb::SetupWindowAction::Close, 0)
         .map_err(|e| mirror_failed("closed the setup window", e))?;
-    Ok(Outcome::ok(
-        "setup window closed (privd and gatewayd)\n",
+    Ok(with_detail(
+        env,
+        "setup window closed (privd and gatewayd)\n".into(),
         json!({"open": false}),
     ))
 }

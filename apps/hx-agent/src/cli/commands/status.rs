@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use super::{admin, enum_name, privd};
 use crate::cli::error::{CliError, exit};
-use crate::cli::text::{peer, time};
+use crate::cli::text::{hex, peer, time};
 use crate::cli::{Env, Outcome};
 
 fn needs_json(list: &[i32]) -> Vec<&'static str> {
@@ -205,6 +205,44 @@ fn privd_part(env: &Env<'_>) -> PrivdPart {
     }
 }
 
+/// The setup binding and job of a gatewayd `Status` (docs/ipc.md 9, "1G additive fields"):
+/// the JSON member `setup` and the human lines that follow the `setup window` line.
+pub(super) fn setup_state(s: &apb::StatusResult) -> (Value, String) {
+    let job = enum_name!(apb::SetupJobState, s.setup_job, "SETUP_JOB_STATE_");
+    let id = s.setup_device_id.get(..16).unwrap_or(&s.setup_device_id);
+    let device_id = (s.setup_device_bound && !id.is_empty()).then(|| hex(id));
+    let json = json!({
+        "device_bound": s.setup_device_bound,
+        "device_id": device_id,
+        "token_pending": s.setup_token_pending,
+        "job": job,
+        "job_id": s.setup_job_id,
+    });
+    let mut lines = vec![if !s.setup_device_bound {
+        "no setup device".to_string()
+    } else {
+        format!(
+            "device bound {}",
+            device_id.as_deref().unwrap_or("(id unknown)")
+        )
+    }];
+    if s.setup_token_pending {
+        lines.push("installer token waiting to be used".into());
+    }
+    if job != "IDLE" {
+        lines.push(if s.setup_job_id == 0 {
+            format!("job {}", job.to_lowercase())
+        } else {
+            format!("job {} (id {})", job.to_lowercase(), s.setup_job_id)
+        });
+    }
+    let mut t = format!("  setup        {}\n", lines[0]);
+    for l in &lines[1..] {
+        t.push_str(&format!("               {l}\n"));
+    }
+    (json, t)
+}
+
 struct GatewayPart {
     json: Value,
     text: String,
@@ -274,6 +312,8 @@ fn gateway_part(env: &Env<'_>) -> GatewayPart {
             "closed".into()
         }
     ));
+    let (setup_json, setup_text) = setup_state(&s);
+    t.push_str(&setup_text);
     t.push_str(&format!(
         "  session link {} ({} faults in 10 min), certificate {}, registry v{}\n",
         link.to_lowercase(),
@@ -294,6 +334,7 @@ fn gateway_part(env: &Env<'_>) -> GatewayPart {
             "certificate": cert,
             "certificate_not_after_unix_s": s.certificate_not_after_unix_s,
             "setup_window": {"open": setup.open, "expires_at_unix_s": setup.expires_at_unix_s},
+            "setup": setup_json,
             "session_link": link,
             "link_faults_10min": s.link_faults_10min,
             "registry_version": s.registry_version,
