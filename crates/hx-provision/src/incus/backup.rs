@@ -12,12 +12,14 @@
 //!   that hand the desktop's data to the worker, [`RepoLink`] (device `repo`) is the proxy device
 //!   of the repository link;
 //! - [`RestoreTargetSpec`] is the never-started `init --empty` instance a restore writes into;
-//! - [`check_backup_preconditions`] and [`check_restore_preconditions`] are the checks `hx-privd`
-//!   makes before each job, because the design depends on Incus internals (architecture 15).
+//! - [`SnapshotMount::checked`] and [`TargetMount::checked`] are the checks `hx-privd` makes before
+//!   each job, because the design depends on Incus internals (architecture 15); they are the only
+//!   public way to get a mount.
 //!
 //! The calls are on [`Client`](super::Client): `create_backup_helper`, `populate_backup_helper`,
 //! `start_backup_helper`, `finish_backup_helper`, `force_delete_backup_helper`,
-//! `list_backup_helpers`, `create_restore_target` and `delete_restore_target`.
+//! `list_backup_helpers`, `create_restore_target`, `delete_restore_target` and
+//! `list_restore_targets`.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -26,8 +28,10 @@ use serde_json::{Value, json};
 
 use super::error::IncusError;
 use super::link::SESSION_LINK_DEVICE;
-use super::marker::INSTANCE_KEY_PREFIX;
+use super::marker::{INSTANCE_KEY_PREFIX, INSTANCE_STATE_KEY};
 use super::types::{Instance, ServerInfo, Snapshot, StoragePool};
+use crate::host::Naming;
+use crate::orchestrate::DESKTOP_CONFIG_KEYS;
 
 /// Where Incus keeps its storage pools. **This is an Incus internal** (architecture 15): the
 /// backup helper mounts paths below it as disk-device sources, and the layout
@@ -139,15 +143,24 @@ impl PoolName {
 }
 
 name_type! {
-    /// The Incus name of a desktop instance, `^[a-z0-9][a-z0-9-]{0,62}$` without a trailing `-`.
-    /// It becomes one path segment (`containers-snapshots/<desktop>`).
+    /// The Incus name of a desktop instance: `hx-` and a desktop id, `^hx-[a-z][a-z0-9]{0,11}$`
+    /// (the id of ipc.md 6). It becomes one path segment (`containers-snapshots/<desktop>`).
     DesktopName
 }
 
 impl DesktopName {
     /// Validate a desktop instance name.
     pub fn new(name: &str) -> Result<Self, IncusError> {
-        if is_lower_name(name, 63) {
+        let ok = name.strip_prefix("hx-").is_some_and(|id| {
+            let b = id.as_bytes();
+            !b.is_empty()
+                && b.len() <= 12
+                && b[0].is_ascii_lowercase()
+                && b[1..]
+                    .iter()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        });
+        if ok {
             Ok(Self(name.to_string()))
         } else {
             Err(invalid("desktop", name))
@@ -282,6 +295,12 @@ impl JobId {
     }
 }
 
+impl fmt::Display for JobId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.hex())
+    }
+}
+
 /// What a job does with the desktop's files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobKind {
@@ -315,14 +334,183 @@ fn device(pairs: &[(&str, String)]) -> Device {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Devices
+// The checks before each job, and the mounts they guard
 // ---------------------------------------------------------------------------------------------
+
+/// Which check before a job failed (ipc.md 24, "Why this mechanism is correct"). `hx-privd` maps
+/// every variant to `FAILED_PRECONDITION` and never runs the job, because a backup would record
+/// wrong ids and a restore would write them.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PreconditionFailed {
+    /// `kernel_features.idmapped_mounts` is not `"true"`.
+    #[error("the kernel does not offer idmapped mounts (kernel_features.idmapped_mounts = {0:?})")]
+    IdmappedMounts(Option<String>),
+    /// The pool is not btrfs.
+    #[error("storage pool `{pool}` uses driver `{driver}`, not btrfs")]
+    PoolDriver {
+        /// Pool name.
+        pool: String,
+        /// Its driver.
+        driver: String,
+    },
+    /// A name that would not be one safe path segment of the expected kind.
+    #[error("{what} name `{name}` is not acceptable")]
+    InvalidName {
+        /// What kind of object.
+        what: String,
+        /// The rejected name (truncated).
+        name: String,
+    },
+    /// The instance is not a hash-xcreen desktop.
+    #[error("instance `{name}` is not a desktop: {reason}")]
+    NotADesktop {
+        /// Instance name.
+        name: String,
+        /// Why.
+        reason: String,
+    },
+    /// The desktop's root disk is not on the pool the paths were computed for.
+    #[error("desktop `{desktop}` is on pool {actual:?}, not `{pool}`")]
+    DesktopPool {
+        /// Desktop name.
+        desktop: String,
+        /// Pool the job would use.
+        pool: String,
+        /// The pool of the desktop's `root` device.
+        actual: Option<String>,
+    },
+    /// `volatile.last_state.idmap` of the desktop is not `[]`: its rootfs is stored shifted.
+    #[error("desktop `{desktop}`: volatile.last_state.idmap is {value:?}, not \"[]\"")]
+    DesktopIdmap {
+        /// Desktop name.
+        desktop: String,
+        /// The value, `None` when the key is missing (the desktop never ran).
+        value: Option<String>,
+    },
+    /// The snapshot is not an `hx-backup-...` snapshot.
+    #[error("snapshot `{snapshot}` is not a backup snapshot")]
+    SnapshotNotBackup {
+        /// Snapshot name.
+        snapshot: String,
+    },
+    /// The snapshot belongs to another instance (or to none that is known).
+    #[error("snapshot `{snapshot}` belongs to {instance:?}, not to desktop `{desktop}`")]
+    SnapshotOfOther {
+        /// Snapshot name.
+        snapshot: String,
+        /// The instance it belongs to (empty when unknown).
+        instance: String,
+        /// The desktop the job is for.
+        desktop: String,
+    },
+    /// `volatile.last_state.idmap` of the snapshot is not `[]`.
+    #[error("snapshot `{snapshot}`: volatile.last_state.idmap is {value:?}, not \"[]\"")]
+    SnapshotIdmap {
+        /// Snapshot name.
+        snapshot: String,
+        /// The value, `None` when the key is missing.
+        value: Option<String>,
+    },
+    /// The instance is not a restore target made by privd (`user.hx.kind=restore-target`).
+    #[error("instance `{target}` is not a restore target ({reason})")]
+    NotARestoreTarget {
+        /// Instance name.
+        target: String,
+        /// Why.
+        reason: String,
+    },
+    /// The target is not stopped.
+    #[error("restore target `{target}` is {status}, not Stopped")]
+    TargetNotStopped {
+        /// Instance name.
+        target: String,
+        /// Its status.
+        status: String,
+    },
+    /// The target has started before: its rootfs may no longer be in the state of a fresh empty
+    /// instance.
+    #[error("restore target `{target}` has been started before ({evidence})")]
+    TargetStarted {
+        /// Instance name.
+        target: String,
+        /// What showed it.
+        evidence: String,
+    },
+    /// `volatile.last_state.idmap` of the target is not `[]`.
+    #[error("restore target `{target}`: volatile.last_state.idmap is {value:?}, not \"[]\"")]
+    TargetIdmap {
+        /// Instance name.
+        target: String,
+        /// The value, `None` when the key is missing.
+        value: Option<String>,
+    },
+    /// The target's root disk is not on the pool.
+    #[error("restore target `{target}` is on pool {actual:?}, not `{pool}`")]
+    TargetPool {
+        /// Instance name.
+        target: String,
+        /// Pool the job would use.
+        pool: String,
+        /// The pool of its `root` device.
+        actual: Option<String>,
+    },
+}
+
+fn bad_name(e: IncusError) -> PreconditionFailed {
+    match e {
+        IncusError::InvalidName { what, name } => PreconditionFailed::InvalidName {
+            what: what.to_string(),
+            name,
+        },
+        other => PreconditionFailed::InvalidName {
+            what: "name".into(),
+            name: other.to_string(),
+        },
+    }
+}
+
+/// The value `volatile.last_state.idmap` has on an instance whose rootfs is stored unshifted
+/// (and on a never-started empty instance), observed on Incus 6.0.0.
+const IDMAP_EMPTY: &str = "[]";
+
+fn root_pool(i: &Instance) -> Option<String> {
+    i.expanded_devices
+        .get("root")
+        .and_then(|r| r.get("pool"))
+        .cloned()
+}
+
+/// What every job needs from the host: idmapped mounts and a btrfs pool. [`SnapshotMount::checked`]
+/// and [`TargetMount::checked`] run it; it is public so that privd can fail early, before it
+/// takes a snapshot or creates a target.
+pub fn check_host_preconditions(
+    server: &ServerInfo,
+    pool: &StoragePool,
+) -> Result<(), PreconditionFailed> {
+    let feature = server.kernel_features.get("idmapped_mounts");
+    if feature.map(String::as_str) != Some("true") {
+        return Err(PreconditionFailed::IdmappedMounts(feature.cloned()));
+    }
+    if pool.driver != "btrfs" {
+        return Err(PreconditionFailed::PoolDriver {
+            pool: pool.name.clone(),
+            driver: pool.driver.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// Whether an `last_used_at` value means "never" (Incus reports the zero time).
+fn never_used(t: &str) -> bool {
+    t.is_empty() || t.starts_with("0001-01-01") || t.starts_with("1970-01-01")
+}
 
 /// The `src` device: the desktop's snapshot, read-only, with `shift=true` (ipc.md 24).
 ///
 /// The source is the snapshot's **`rootfs` subdirectory** (the snapshot's top directory is
 /// `d--x------` owned by the desktop's host root id, which a helper with a different isolated map
-/// cannot enter).
+/// cannot enter). The only public way to get one is [`SnapshotMount::checked`], which runs every
+/// check of ipc.md 24 on the objects the paths are derived from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotMount {
     pool: PoolName,
@@ -331,8 +519,80 @@ pub struct SnapshotMount {
 }
 
 impl SnapshotMount {
-    /// From a validated pool, desktop and snapshot name.
-    pub fn new(pool: PoolName, desktop: DesktopName, snapshot: BackupSnapshotName) -> Self {
+    /// The mount for `snapshot` of `desktop` on `pool`, after the checks before a `BACKUP` job:
+    /// the host checks ([`check_host_preconditions`]); the desktop is a container named
+    /// `hx-<desktop id>` that carries the hash-xcreen marker and no `user.hx.kind`, has its root
+    /// disk on `pool` and `volatile.last_state.idmap` `[]`; the snapshot belongs to that desktop, is
+    /// an `hx-backup-...` snapshot and has `volatile.last_state.idmap` `[]`. Every name in the
+    /// path comes from these objects.
+    pub fn checked(
+        server: &ServerInfo,
+        pool: &StoragePool,
+        desktop: &Instance,
+        snapshot: &Snapshot,
+    ) -> Result<Self, PreconditionFailed> {
+        check_host_preconditions(server, pool)?;
+        let pool_name = PoolName::new(&pool.name).map_err(bad_name)?;
+        let desktop_name = DesktopName::new(&desktop.name).map_err(bad_name)?;
+        let not = |reason: &str| PreconditionFailed::NotADesktop {
+            name: desktop.name.clone(),
+            reason: reason.into(),
+        };
+        if desktop.kind != "container" {
+            return Err(not("not a container"));
+        }
+        if !super::marker::instance_is_marked(&desktop.config) {
+            return Err(not("no hash-xcreen marker"));
+        }
+        if desktop.config.contains_key(HELPER_KIND_KEY) {
+            return Err(not(
+                "carries user.hx.kind (a helper or restore target, not a desktop)",
+            ));
+        }
+        let actual = root_pool(desktop);
+        if actual.as_deref() != Some(pool.name.as_str()) {
+            return Err(PreconditionFailed::DesktopPool {
+                desktop: desktop.name.clone(),
+                pool: pool.name.clone(),
+                actual,
+            });
+        }
+        let d = desktop.config.get("volatile.last_state.idmap").cloned();
+        if d.as_deref() != Some(IDMAP_EMPTY) {
+            return Err(PreconditionFailed::DesktopIdmap {
+                desktop: desktop.name.clone(),
+                value: d,
+            });
+        }
+        let snapshot_name = BackupSnapshotName::new(&snapshot.name).map_err(|_| {
+            PreconditionFailed::SnapshotNotBackup {
+                snapshot: snapshot.name.chars().take(80).collect(),
+            }
+        })?;
+        if snapshot.instance != desktop.name {
+            return Err(PreconditionFailed::SnapshotOfOther {
+                snapshot: snapshot.name.clone(),
+                instance: snapshot.instance.clone(),
+                desktop: desktop.name.clone(),
+            });
+        }
+        let s = snapshot.config.get("volatile.last_state.idmap").cloned();
+        if s.as_deref() != Some(IDMAP_EMPTY) {
+            return Err(PreconditionFailed::SnapshotIdmap {
+                snapshot: snapshot.name.clone(),
+                value: s,
+            });
+        }
+        Ok(Self {
+            pool: pool_name,
+            desktop: desktop_name,
+            snapshot: snapshot_name,
+        })
+    }
+
+    /// A mount without any check, for tests of the request shapes.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn unchecked(pool: PoolName, desktop: DesktopName, snapshot: BackupSnapshotName) -> Self {
         Self {
             pool,
             desktop,
@@ -366,7 +626,8 @@ impl SnapshotMount {
     }
 }
 
-/// The `dst` device: a restore target's rootfs, writable, with `shift=true` (ipc.md 24).
+/// The `dst` device: a restore target's rootfs, writable, with `shift=true` (ipc.md 24). The only
+/// public way to get one is [`TargetMount::checked`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetMount {
     pool: PoolName,
@@ -374,8 +635,74 @@ pub struct TargetMount {
 }
 
 impl TargetMount {
-    /// From a validated pool and restore target name.
-    pub fn new(pool: PoolName, target: RestoreTargetName) -> Self {
+    /// The mount for the restore target `target` on `pool`, after the checks before a `RESTORE`
+    /// job: the host checks; the target is a container named `hx-restore-...` with
+    /// `user.hx.kind=restore-target`; it is `Stopped` and has **never started** (`last_used_at`
+    /// is the zero time, there is no `volatile.last_state.power` and no `volatile.idmap.current`);
+    /// its `volatile.last_state.idmap` is exactly `[]`, the value a never-started empty instance
+    /// has on Incus 6.0.0; and its root disk is on `pool`. Fails closed on anything else.
+    pub fn checked(
+        server: &ServerInfo,
+        pool: &StoragePool,
+        target: &Instance,
+    ) -> Result<Self, PreconditionFailed> {
+        check_host_preconditions(server, pool)?;
+        let pool_name = PoolName::new(&pool.name).map_err(bad_name)?;
+        let not = |reason: String| PreconditionFailed::NotARestoreTarget {
+            target: target.name.chars().take(80).collect(),
+            reason,
+        };
+        let name = RestoreTargetName::new(&target.name)
+            .map_err(|_| not("the name is not hx-restore-...".into()))?;
+        if target.kind != "container" {
+            return Err(not("not a container".into()));
+        }
+        let kind = target.config.get(HELPER_KIND_KEY);
+        if kind.map(String::as_str) != Some(RESTORE_TARGET_KIND) {
+            return Err(not(format!("{HELPER_KIND_KEY} is {kind:?}")));
+        }
+        if !target.status.eq_ignore_ascii_case("stopped") {
+            return Err(PreconditionFailed::TargetNotStopped {
+                target: target.name.clone(),
+                status: target.status.clone(),
+            });
+        }
+        let started = |evidence: String| PreconditionFailed::TargetStarted {
+            target: target.name.clone(),
+            evidence,
+        };
+        if !never_used(&target.last_used_at) {
+            return Err(started(format!("last_used_at = {}", target.last_used_at)));
+        }
+        for key in ["volatile.last_state.power", "volatile.idmap.current"] {
+            if let Some(v) = target.config.get(key) {
+                return Err(started(format!("{key} = {v}")));
+            }
+        }
+        let idmap = target.config.get("volatile.last_state.idmap").cloned();
+        if idmap.as_deref() != Some(IDMAP_EMPTY) {
+            return Err(PreconditionFailed::TargetIdmap {
+                target: target.name.clone(),
+                value: idmap,
+            });
+        }
+        let actual = root_pool(target);
+        if actual.as_deref() != Some(pool.name.as_str()) {
+            return Err(PreconditionFailed::TargetPool {
+                target: target.name.clone(),
+                pool: pool.name.clone(),
+                actual,
+            });
+        }
+        Ok(Self {
+            pool: pool_name,
+            target: name,
+        })
+    }
+
+    /// A mount without any check, for tests of the request shapes.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn unchecked(pool: PoolName, target: RestoreTargetName) -> Self {
         Self { pool, target }
     }
 
@@ -431,6 +758,7 @@ impl RepoLink {
     /// (rule 2 of ipc.md 7: no caller-chosen paths). `host_dir` must be an absolute path of
     /// normal components (`[A-Za-z0-9._-]`, no `.` or `..` component, no trailing slash), and
     /// the whole `listen` path must fit `sun_path` ([`SUN_PATH_MAX`]).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn in_dir(job: JobId, host_dir: &str, owner: (u32, u32)) -> Result<Self, IncusError> {
         let ok = host_dir.starts_with('/')
             && host_dir.len() > 1
@@ -464,6 +792,7 @@ impl RepoLink {
         Ok(link)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn check_len(&self) -> Result<(), IncusError> {
         let n = self.socket_path().len();
         if n > SUN_PATH_MAX {
@@ -662,86 +991,191 @@ impl BackupHelperSpec {
 // The restore target
 // ---------------------------------------------------------------------------------------------
 
+/// `user.hx.kind` of a restore target (ipc.md 24, 35). A target is never a desktop until privd
+/// promotes it (architecture 9.8).
+pub const RESTORE_TARGET_KIND: &str = "restore-target";
+/// `user.hx.state` of a restore target.
+pub const RESTORE_TARGET_STATE: &str = "restoring";
+
+fn refuse(msg: impl fmt::Display) -> IncusError {
+    IncusError::InvalidArgument(format!("restore target: {msg}"))
+}
+
+fn all_digits(v: &str, max_len: usize) -> bool {
+    !v.is_empty() && v.len() <= max_len && v.bytes().all(|b| b.is_ascii_digit()) && v != "0"
+}
+
+/// Whether `v` is an acceptable value of an allowlisted desktop config key.
+fn desktop_value_ok(key: &str, v: &str) -> bool {
+    match key {
+        "security.privileged" => v == "false",
+        "security.idmap.isolated" => v == "true",
+        "limits.processes" | "limits.cpu" => all_digits(v, 6),
+        "limits.memory" => v.strip_suffix("MiB").is_some_and(|n| all_digits(n, 9)),
+        _ => v == "true" || v == "false",
+    }
+}
+
+/// `user.hx.<name>` keys privd keeps on a desktop are copied when key and value are plain.
+fn hx_key_ok(key: &str, v: &str) -> bool {
+    key.strip_prefix(INSTANCE_KEY_PREFIX).is_some_and(|k| {
+        !k.is_empty()
+            && k.len() <= 48
+            && k.bytes().all(|b| {
+                b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+            })
+    }) && v.len() <= 256
+        && v.bytes().all(|b| (0x20..0x7f).contains(&b))
+}
+
 /// The never-started `init --empty` instance a restore writes into (ipc.md 24, `dst`).
 ///
-/// It is built from the desktop's own definition as read from Incus, so the restored desktop has
-/// the same profiles, limits and devices. What is **not** copied, and why:
+/// It is built from the desktop's definition as read from Incus, but by **allowlist**: its config
+/// is exactly the keys privd sets on desktops ([`DESKTOP_CONFIG_KEYS`]), the Docker add-on's
+/// ([`ALLOWED_INSTANCE_CONFIG`](crate::plan::ALLOWED_INSTANCE_CONFIG)) and plain `user.hx.*` keys;
+/// its profiles are the hx desktop profile (and the compat profile if the desktop has it) of the
+/// given [`Naming`]; its devices are the desktop's own `root` disk, on the pool, and nothing else
+/// (the desktop's `hx-link` proxy device is not copied: started beside the desktop it would take
+/// over the desktop's host socket). Anything else on the desktop (`raw.*`, `security.idmap.base`,
+/// `linux.*`, another device, `security.privileged` true, `security.idmap.isolated` not true, a
+/// `user.hx.kind` of its own) makes [`RestoreTargetSpec::from_desktop`] refuse. Not copied, without
+/// error: `volatile.*` (runtime state, and `volatile.idmap.*` would give two instances one host
+/// range) and `image.*` (descriptive keys Incus adds when it unpacks an image).
 ///
-/// - every `volatile.*` key: they are runtime state (MAC addresses, uuids, `last_state`) and, above
-///   all, `volatile.idmap.*` would give two instances the same host uid range. The target gets
-///   its own isolated range at its first start; ids on disk are the container's own ids (the
-///   rootfs is stored unshifted), so the range does not matter for what the worker writes;
-/// - the session-link proxy device (`hx-link`): started next to the desktop it would take over
-///   the desktop's host socket; privd adds the link again when the restored desktop is installed;
-/// - `boot.autostart` is forced to `false`: a target that is not complete must not start by
-///   itself when Incus restarts.
+/// The target is marked `user.hx.kind=restore-target`, `user.hx.job=<job>` and
+/// `user.hx.state=restoring`, and has `boot.autostart=false`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoreTargetSpec {
     name: RestoreTargetName,
+    job: JobId,
     pool: PoolName,
     architecture: String,
-    description: String,
     profiles: Vec<String>,
     config: BTreeMap<String, String>,
     devices: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl RestoreTargetSpec {
-    /// Build the target for `desktop` (as returned by `get_instance`) on `pool`.
-    ///
-    /// Refused when the desktop is not marked as ours, is not a container, or does not live on
-    /// `pool` (its effective `root` device must name that pool).
+    /// Build the target for `desktop` (as returned by `get_instance`), for `job`, on the pool of
+    /// `naming`. Refused with `InvalidArgument` as described on the type.
     pub fn from_desktop(
         desktop: &Instance,
         name: RestoreTargetName,
-        pool: &PoolName,
+        job: JobId,
+        naming: &Naming,
     ) -> Result<Self, IncusError> {
-        if !super::marker::instance_is_marked(&desktop.config) {
-            return Err(IncusError::InvalidArgument(
-                "the desktop does not carry the hash-xcreen marker".into(),
-            ));
-        }
+        let pool = PoolName::new(&naming.pool)?;
+        DesktopName::new(&desktop.name).map_err(|_| {
+            refuse(format_args!(
+                "`{}` is not named like a desktop (hx-<id>)",
+                desktop.name
+            ))
+        })?;
         if desktop.kind != "container" {
-            return Err(IncusError::InvalidArgument(format!(
+            return Err(refuse(format_args!(
                 "the desktop is a `{}`, not a container",
                 desktop.kind
             )));
         }
-        let root_pool = desktop
-            .expanded_devices
-            .get("root")
-            .and_then(|r| r.get("pool"));
-        if root_pool.map(String::as_str) != Some(pool.as_str()) {
-            return Err(IncusError::InvalidArgument(format!(
-                "the desktop's root disk is on pool {root_pool:?}, not `{pool}`"
+        if !super::marker::instance_is_marked(&desktop.config) {
+            return Err(refuse("the desktop does not carry the hash-xcreen marker"));
+        }
+        if desktop.config.contains_key(HELPER_KIND_KEY) {
+            return Err(refuse(format_args!(
+                "the source carries {HELPER_KIND_KEY}: it is a helper or a target, not a desktop"
             )));
         }
-        let mut config: BTreeMap<String, String> = desktop
+        if desktop
             .config
-            .iter()
-            .filter(|(k, _)| !k.starts_with("volatile."))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        config.insert("boot.autostart".into(), "false".into());
-        if !config.keys().any(|k| k.starts_with(INSTANCE_KEY_PREFIX)) {
-            return Err(IncusError::InvalidArgument(
-                "the desktop has no user.hx.* key".into(),
-            ));
+            .get("security.idmap.isolated")
+            .map(String::as_str)
+            != Some("true")
+        {
+            return Err(refuse("the desktop is not on an isolated idmap"));
         }
-        let devices = desktop
-            .devices
-            .iter()
-            .filter(|(n, d)| {
-                n.as_str() != SESSION_LINK_DEVICE
-                    && d.get("type").map(String::as_str) != Some("proxy")
-            })
-            .map(|(n, d)| (n.clone(), d.clone()))
-            .collect();
+        if root_pool(desktop).as_deref() != Some(pool.as_str()) {
+            return Err(refuse(format_args!(
+                "the desktop's root disk is not on pool `{pool}`"
+            )));
+        }
+
+        // Profiles: only ours, starting with the desktop profile.
+        let known = [&naming.desktop_profile, &naming.compat_profile];
+        if desktop.profiles.first() != Some(&naming.desktop_profile)
+            || desktop.profiles.iter().any(|p| !known.contains(&p))
+            || desktop.profiles.len() > 2
+            || (desktop.profiles.len() == 2 && desktop.profiles[0] == desktop.profiles[1])
+        {
+            return Err(refuse(format_args!(
+                "profiles {:?} are not the hx desktop profile (and the compat profile)",
+                desktop.profiles
+            )));
+        }
+
+        // Config: allowlist.
+        let mut config = BTreeMap::new();
+        for (k, v) in &desktop.config {
+            if k.starts_with("volatile.") || k.starts_with("image.") {
+                continue;
+            }
+            if matches!(k.as_str(), HELPER_JOB_KEY | INSTANCE_STATE_KEY) {
+                continue; // replaced below
+            }
+            let allowed = DESKTOP_CONFIG_KEYS.contains(&k.as_str())
+                || crate::plan::ALLOWED_INSTANCE_CONFIG.contains(&k.as_str());
+            if allowed {
+                if !desktop_value_ok(k, v) {
+                    return Err(refuse(format_args!("config `{k}` has the value {v:?}")));
+                }
+            } else if !hx_key_ok(k, v) {
+                return Err(refuse(format_args!(
+                    "config key `{k}` is not one privd sets on a desktop"
+                )));
+            }
+            config.insert(k.clone(), v.clone());
+        }
+        config.insert("boot.autostart".into(), "false".into());
+        config.insert(HELPER_KIND_KEY.into(), RESTORE_TARGET_KIND.into());
+        config.insert(HELPER_JOB_KEY.into(), job.hex());
+        config.insert(INSTANCE_STATE_KEY.into(), RESTORE_TARGET_STATE.into());
+
+        // Devices: the root disk on the pool; `hx-link` is skipped; nothing else.
+        let mut devices = BTreeMap::new();
+        for (n, d) in &desktop.devices {
+            let ty = d.get("type").map(String::as_str);
+            if n == SESSION_LINK_DEVICE && ty == Some("proxy") {
+                continue;
+            }
+            let size_ok = |s: &str| s.strip_suffix("GiB").is_some_and(|n| all_digits(n, 6));
+            let ok = n == "root"
+                && ty == Some("disk")
+                && d.get("path").map(String::as_str) == Some("/")
+                && d.get("pool").map(String::as_str) == Some(pool.as_str())
+                && d.keys()
+                    .all(|k| matches!(k.as_str(), "type" | "path" | "pool" | "size"))
+                && d.get("size").is_none_or(|s| size_ok(s));
+            if !ok {
+                return Err(refuse(format_args!(
+                    "device `{n}` is not the root disk on the pool"
+                )));
+            }
+            devices.insert(n.clone(), d.clone());
+        }
+        let architecture = if desktop.architecture.len() <= 16
+            && desktop
+                .architecture
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        {
+            desktop.architecture.clone()
+        } else {
+            return Err(refuse("the architecture is not plain"));
+        };
         Ok(Self {
             name,
-            pool: pool.clone(),
-            architecture: desktop.architecture.clone(),
-            description: desktop.description.clone(),
+            job,
+            pool,
+            architecture,
             profiles: desktop.profiles.clone(),
             config,
             devices,
@@ -753,17 +1187,27 @@ impl RestoreTargetSpec {
         &self.name
     }
 
-    /// The mount a restore helper needs for this target.
-    pub fn mount(&self) -> TargetMount {
-        TargetMount::new(self.pool.clone(), self.name.clone())
+    /// The job.
+    pub fn job(&self) -> JobId {
+        self.job
     }
 
-    /// The configuration (no `volatile.*`, `boot.autostart=false`).
+    /// The pool.
+    pub fn pool(&self) -> &PoolName {
+        &self.pool
+    }
+
+    /// The profiles.
+    pub fn profiles(&self) -> &[String] {
+        &self.profiles
+    }
+
+    /// The configuration (allowlisted keys, the restore-target marker, `boot.autostart=false`).
     pub fn config(&self) -> &BTreeMap<String, String> {
         &self.config
     }
 
-    /// The instance-level devices (no proxy devices).
+    /// The instance-level devices (the `root` disk, or none).
     pub fn devices(&self) -> &BTreeMap<String, BTreeMap<String, String>> {
         &self.devices
     }
@@ -777,7 +1221,6 @@ impl RestoreTargetSpec {
             "profiles": self.profiles,
             "config": self.config,
             "devices": self.devices,
-            "description": self.description,
             "ephemeral": false,
         });
         if !self.architecture.is_empty()
@@ -790,114 +1233,27 @@ impl RestoreTargetSpec {
         }
         v
     }
+
+    /// What is wrong with `inst` compared to this spec (read back after creation), if anything.
+    pub(crate) fn mismatch(&self, inst: &Instance) -> Option<String> {
+        if inst.profiles != self.profiles {
+            return Some(format!("profiles are {:?}", inst.profiles));
+        }
+        if inst.devices != self.devices {
+            return Some(format!("devices are {:?}", inst.devices));
+        }
+        config_mismatch(&self.config, &inst.expanded_config)
+    }
 }
 
-// ---------------------------------------------------------------------------------------------
-// The checks before each job
-// ---------------------------------------------------------------------------------------------
-
-/// Which check before a job failed (ipc.md 24, "Why this mechanism is correct"). `hx-privd` maps
-/// every variant to `FAILED_PRECONDITION` and never runs the job, because a backup would record
-/// wrong ids.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum PreconditionFailed {
-    /// `kernel_features.idmapped_mounts` is not `"true"`.
-    #[error("the kernel does not offer idmapped mounts (kernel_features.idmapped_mounts = {0:?})")]
-    IdmappedMounts(Option<String>),
-    /// The pool is not btrfs.
-    #[error("storage pool `{pool}` uses driver `{driver}`, not btrfs")]
-    PoolDriver {
-        /// Pool name.
-        pool: String,
-        /// Its driver.
-        driver: String,
-    },
-    /// The desktop's root disk is not on the pool the paths were computed for.
-    #[error("desktop `{desktop}` is on pool {actual:?}, not `{pool}`")]
-    DesktopPool {
-        /// Desktop name.
-        desktop: String,
-        /// Pool the job would use.
-        pool: String,
-        /// The pool of the desktop's `root` device.
-        actual: Option<String>,
-    },
-    /// `volatile.last_state.idmap` of the desktop is not `[]`: its rootfs is stored shifted.
-    #[error("desktop `{desktop}`: volatile.last_state.idmap is {value:?}, not \"[]\"")]
-    DesktopIdmap {
-        /// Desktop name.
-        desktop: String,
-        /// The value, `None` when the key is missing (the desktop never ran).
-        value: Option<String>,
-    },
-    /// `volatile.last_state.idmap` of the snapshot is not `[]`.
-    #[error("snapshot `{snapshot}`: volatile.last_state.idmap is {value:?}, not \"[]\"")]
-    SnapshotIdmap {
-        /// Snapshot name.
-        snapshot: String,
-        /// The value, `None` when the key is missing.
-        value: Option<String>,
-    },
-}
-
-const IDMAP_EMPTY: &str = "[]";
-
-/// What both job kinds need from the host: idmapped mounts and a btrfs pool.
-pub fn check_restore_preconditions(
-    server: &ServerInfo,
-    pool: &StoragePool,
-) -> Result<(), PreconditionFailed> {
-    let feature = server.kernel_features.get("idmapped_mounts");
-    if feature.map(String::as_str) != Some("true") {
-        return Err(PreconditionFailed::IdmappedMounts(feature.cloned()));
-    }
-    if pool.driver != "btrfs" {
-        return Err(PreconditionFailed::PoolDriver {
-            pool: pool.name.clone(),
-            driver: pool.driver.clone(),
-        });
-    }
-    Ok(())
-}
-
-/// The checks before a `BACKUP` job: the host checks of [`check_restore_preconditions`], that the
-/// desktop lives on `pool`, and that the desktop's and the snapshot's `volatile.last_state.idmap`
-/// are `"[]"` (this Incus stores the rootfs unshifted and mounts it idmapped).
-pub fn check_backup_preconditions(
-    server: &ServerInfo,
-    pool: &StoragePool,
-    desktop: &Instance,
-    snapshot: &Snapshot,
-) -> Result<(), PreconditionFailed> {
-    check_restore_preconditions(server, pool)?;
-    let actual = desktop
-        .expanded_devices
-        .get("root")
-        .and_then(|r| r.get("pool"))
-        .cloned();
-    if actual.as_deref() != Some(pool.name.as_str()) {
-        return Err(PreconditionFailed::DesktopPool {
-            desktop: desktop.name.clone(),
-            pool: pool.name.clone(),
-            actual,
-        });
-    }
-    let idmap = |c: &BTreeMap<String, String>| c.get("volatile.last_state.idmap").cloned();
-    let d = idmap(&desktop.config);
-    if d.as_deref() != Some(IDMAP_EMPTY) {
-        return Err(PreconditionFailed::DesktopIdmap {
-            desktop: desktop.name.clone(),
-            value: d,
-        });
-    }
-    let s = idmap(&snapshot.config);
-    if s.as_deref() != Some(IDMAP_EMPTY) {
-        return Err(PreconditionFailed::SnapshotIdmap {
-            snapshot: snapshot.name.clone(),
-            value: s,
-        });
-    }
-    Ok(())
+/// The first key of `want` that `have` lacks or has with another value.
+fn config_mismatch(
+    want: &BTreeMap<String, String>,
+    have: &BTreeMap<String, String>,
+) -> Option<String> {
+    want.iter()
+        .find(|(k, v)| have.get(*k) != Some(*v))
+        .map(|(k, v)| format!("config `{k}` is {:?}, expected {v:?}", have.get(k)))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -913,13 +1269,40 @@ pub enum HelperEnd {
     ForceDeleted,
 }
 
-/// A backup helper found in Incus (crash recovery, ipc.md 35 step 1).
+/// A backup helper found in Incus (crash recovery, ipc.md 35 step 1): marked
+/// `user.hx.kind=backup-worker`, named `hx-bkw-<8 hex>` and carrying a `user.hx.job` whose first
+/// 8 digits are the name's. An instance that has the marker or the name but not the rest is not
+/// listed, and no helper call will touch it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupHelperInfo {
     /// Its name.
     pub name: HelperName,
+    /// The job id from `user.hx.job`.
+    pub job: JobId,
+    /// Run state text.
+    pub status: String,
+}
+
+/// A restore target found in Incus (ipc.md 35 step 4): `user.hx.kind=restore-target` and an
+/// `hx-restore-...` name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreTargetInfo {
+    /// Its name.
+    pub name: RestoreTargetName,
     /// The job id from `user.hx.job`, when present and well-formed.
     pub job: Option<JobId>,
     /// Run state text.
     pub status: String,
+}
+
+/// What is wrong with a created helper compared to its spec, if anything (ipc.md 24: no profile,
+/// the exact devices, in particular no NIC, and every config key).
+pub(crate) fn helper_mismatch(spec: &BackupHelperSpec, inst: &Instance) -> Option<String> {
+    if !inst.profiles.is_empty() {
+        return Some(format!("profiles are {:?}", inst.profiles));
+    }
+    if inst.expanded_devices != spec.devices() {
+        return Some(format!("devices are {:?}", inst.expanded_devices));
+    }
+    config_mismatch(&spec.config(), &inst.expanded_config)
 }

@@ -20,10 +20,10 @@ pub use backup::{
     BACKUP_SNAPSHOT_PREFIX, BackupHelperInfo, BackupHelperSpec, BackupSnapshotName, DesktopName,
     HELPER_JOB_KEY, HELPER_KIND, HELPER_KIND_KEY, HELPER_PREFIX, HELPER_ROOT_SIZE, HelperEnd,
     HelperName, JobId, JobKind, PoolName, PreconditionFailed, REPO_DEVICE, REPO_LINK_CONNECT,
-    REPO_LINK_HOST_DIR, REPO_LINK_MODE, RESTORE_TARGET_PREFIX, RepoLink, RestoreTargetName,
-    RestoreTargetSpec, SNAPSHOT_DEVICE, SNAPSHOT_MOUNT_PATH, STORAGE_POOLS_ROOT, SUN_PATH_MAX,
-    SnapshotMount, TARGET_DEVICE, TARGET_MOUNT_PATH, TargetMount, WORKER_INIT_PATH,
-    check_backup_preconditions, check_restore_preconditions,
+    REPO_LINK_HOST_DIR, REPO_LINK_MODE, RESTORE_TARGET_KIND, RESTORE_TARGET_PREFIX,
+    RESTORE_TARGET_STATE, RepoLink, RestoreTargetInfo, RestoreTargetName, RestoreTargetSpec,
+    SNAPSHOT_DEVICE, SNAPSHOT_MOUNT_PATH, STORAGE_POOLS_ROOT, SUN_PATH_MAX, SnapshotMount,
+    TARGET_DEVICE, TARGET_MOUNT_PATH, TargetMount, WORKER_INIT_PATH, check_host_preconditions,
 };
 pub use client::{Client, IMAGE_ALIAS_PREFIX, PathStat};
 pub use error::IncusError;
