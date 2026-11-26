@@ -88,7 +88,8 @@ snapshot; readable from a listing without fetching data; not a file in the resto
   `boot.autostart`, `security.nesting`, `security.syscalls.intercept.mknod` and
   `security.syscalls.intercept.setxattr` (`true`/`false`), each with a strict value grammar.
   `restorable_container_config` drops everything else and counts it (never fatal);
-  `Manifest::new` applies it, and parsing rejects a manifest carrying anything else.
+  `Manifest::new` applies it, and parsing drops anything else and counts it
+  (`Manifest::from_slice_counting`), so an older backup stays restorable if the list narrows.
   **A restore must still re-validate the manifest's configuration against its own policy and
   never trust it:** the manifest is writable by anyone holding a repository key.
 * `docker_mode` comes from the backup rules (`rules.docker_mode()`, one source of truth);

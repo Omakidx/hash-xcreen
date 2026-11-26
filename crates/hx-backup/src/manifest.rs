@@ -250,6 +250,17 @@ impl Manifest {
     /// [`ManifestError::Parse`], [`ManifestError::InvalidVersion`],
     /// [`ManifestError::NewerFormat`] or [`ManifestError::Field`].
     pub fn from_slice(bytes: &[u8]) -> Result<Self, ManifestError> {
+        Self::from_slice_counting(bytes).map(|(m, _)| m)
+    }
+
+    /// [`Manifest::from_slice`], also returning how many `container_config` entries were dropped
+    /// because they are not on the allow-list. Such entries are dropped, not fatal: the
+    /// allow-list may narrow in a later agent, and an older backup must stay restorable (its data
+    /// matters more than its recorded configuration, which a restore re-validates anyway).
+    ///
+    /// # Errors
+    /// As [`Manifest::from_slice`].
+    pub fn from_slice_counting(bytes: &[u8]) -> Result<(Self, usize), ManifestError> {
         if bytes.len() > MAX_MANIFEST_BYTES {
             return Err(ManifestError::TooLarge {
                 size: bytes.len(),
@@ -270,8 +281,20 @@ impl Manifest {
                 });
             }
         };
+        let mut manifest = manifest;
+        if manifest.container_config.len() > MAX_CONFIG_ENTRIES {
+            return Err(ManifestError::Field {
+                field: "container_config",
+                reason: "too many entries",
+            });
+        }
+        let before = manifest.container_config.len();
+        manifest
+            .container_config
+            .retain(|k, v| config_entry_allowed(k, v));
+        let dropped = before - manifest.container_config.len();
         manifest.validate()?;
-        Ok(manifest)
+        Ok((manifest, dropped))
     }
 
     /// Compact JSON for storing in the snapshot description.
@@ -659,13 +682,10 @@ mod tests {
         // dangerous configuration, even in an otherwise valid document.
         let mut v: serde_json::Value = serde_json::from_str(&sample().to_json().unwrap()).unwrap();
         v["container_config"]["security.privileged"] = "true".into();
-        assert!(matches!(
-            Manifest::from_slice(v.to_string().as_bytes()),
-            Err(ManifestError::Field {
-                field: "container_config",
-                ..
-            })
-        ));
+        let (m, dropped) = Manifest::from_slice_counting(v.to_string().as_bytes()).unwrap();
+        assert_eq!(dropped, 1);
+        assert!(!m.container_config.contains_key("security.privileged"));
+        assert_eq!(m.container_config, sample().container_config);
         // Building from hostile input drops entries instead of failing.
         let mut i = input();
         i.container_config
