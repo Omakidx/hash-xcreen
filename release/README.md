@@ -116,7 +116,7 @@ package layout and the AppImage decisions are in [`packaging/hx-desktop/README.m
 
 | File | What |
 |---|---|
-| `hx-desktop_<version>_<distro>_amd64.deb` | `<distro>` is `ubuntu-24.04`, `debian-12` or `debian-13` (`ubuntu-26.04` is a known gap, below: its cell is NOT built by `release.yml` until it builds, so no artifact name for it is reserved for an attacker to fill). `Depends` are the distro's own library packages. |
+| `hx-desktop_<version>_<distro>_amd64.deb` | `<distro>` is `ubuntu-24.04`, `ubuntu-26.04`, `debian-12` or `debian-13`. `Depends` are the distro's own library packages. |
 | `hx-desktop-<version>-x86_64.AppImage` | One file for every x86_64 Linux desktop with glibc 2.39 or newer; FFmpeg is bundled. |
 | `<file>.minisig` | A minisign signature of each file above, made in the `sign` job with the same `release-signing` key as `install.sh` (`-t "hx-desktop v<version> <file name>"`). |
 
@@ -132,12 +132,8 @@ How the release workflow handles them:
   `.deb` and the AppImage (audit only, like the other subjects); `publish` attaches the files and their
   signatures to `v<version>`, in the same `gh release create` as the agent tarball. The moving
   `channel-*` release does not carry them: nothing on a server reads the desktop app from a channel.
-- The release fails if the `ubuntu-24.04`, `debian-12` or `debian-13` `.deb` or the AppImage is missing.
-  **Known gap:** Ubuntu 26.04 ships FFmpeg 8 and the workspace pins `ffmpeg-next` 7.1, so `release.yml` and
-  `desktop-packages.yml` have NO 26.04 desktop cell (a cell that is expected to fail leaves its artifact
-  name free for another job to fill, and `assemble` would then collect and `sign` would sign it; the
-  `assemble` job downloads every artifact by exact name and prints a notice). Once the pin moves, add the
-  cell back in both workflows and its exact `desktop-deb-ubuntu-26.04` download and required-file check in `assemble`.
+- The release fails if the `ubuntu-24.04`, `ubuntu-26.04`, `debian-12` or `debian-13` `.deb` or the AppImage is missing.
+  `assemble` downloads every artifact by exact name, one per matrix cell, so a failing cell fails the release instead of leaving a name free for another job to fill.
 
 Verify a download (the public key is the one of `apps/hx-agent/release-keys/current.pub`):
 

@@ -251,15 +251,13 @@ jobs:
     needs: gate
     runs-on: ubuntu-24.04
     container: ${{ matrix.image }}
-    # No ubuntu-26.04 cell: it ships FFmpeg 8 and the workspace pins ffmpeg-next 7.1 (a KNOWN GAP,
-    # packaging/hx-desktop/README.md). A cell that is expected to fail would leave its artifact name
-    # free for any other job to fill, and that artifact would then be signed; so there is none until
-    # it builds. Every artifact the assemble job collects is downloaded by exact name.
+    # Every artifact the assemble job collects is downloaded by exact name, one per matrix cell.
     strategy:
       fail-fast: false
       matrix:
         include:
           - { distro: ubuntu-24.04, image: "ubuntu:24.04@sha256:562111b88caa79c71391c0c4d3c2114a7d5c35915c20561fd893cb1e07929e6b" }
+          - { distro: ubuntu-26.04, image: "ubuntu:26.04@sha256:d66b366dac61b575bee2aef07e9c26e8070096fbe84a3d4d3eb0da069b5d76db" }
           - { distro: debian-12, image: "debian:12@sha256:1d04200c2ece1d4d75a2a6f8e11ebce7d86a2ae28b34bb2c9cbb3ee9f4953e75" }
           - { distro: debian-13, image: "debian:13@sha256:3cda3ca472ce45507a5109c6a3907093e24d9ae67d55954c9a07a45665dafba2" }
     steps:
@@ -314,6 +312,7 @@ jobs:
       matrix:
         include:
           - { distro: ubuntu-24.04, image: "ubuntu:24.04@sha256:562111b88caa79c71391c0c4d3c2114a7d5c35915c20561fd893cb1e07929e6b" }
+          - { distro: ubuntu-26.04, image: "ubuntu:26.04@sha256:d66b366dac61b575bee2aef07e9c26e8070096fbe84a3d4d3eb0da069b5d76db" }
           - { distro: debian-12, image: "debian:12@sha256:1d04200c2ece1d4d75a2a6f8e11ebce7d86a2ae28b34bb2c9cbb3ee9f4953e75" }
           - { distro: debian-13, image: "debian:13@sha256:3cda3ca472ce45507a5109c6a3907093e24d9ae67d55954c9a07a45665dafba2" }
     steps:
@@ -454,6 +453,10 @@ jobs:
           path: in/desktop/desktop-deb-ubuntu-24.04
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
+          name: desktop-deb-ubuntu-26.04
+          path: in/desktop/desktop-deb-ubuntu-26.04
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
           name: desktop-deb-debian-12
           path: in/desktop/desktop-deb-debian-12
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -470,12 +473,11 @@ jobs:
         run: |
           set -eu
           mkdir desktop
-          for n in ubuntu-24.04 debian-12 debian-13; do
+          for n in ubuntu-24.04 ubuntu-26.04 debian-12 debian-13; do
             cp "in/desktop/desktop-deb-$n/hx-desktop.deb" "desktop/hx-desktop_${VERSION}_${n}_amd64.deb"
           done
           cp in/desktop/desktop-appimage/*.AppImage desktop/
-          echo "::notice::no Ubuntu 26.04 hx-desktop .deb in this release (known gap: FFmpeg 8 vs ffmpeg-next 7.1)"
-          for n in ubuntu-24.04 debian-12 debian-13; do
+          for n in ubuntu-24.04 ubuntu-26.04 debian-12 debian-13; do
             [ -f "desktop/hx-desktop_${VERSION}_${n}_amd64.deb" ] || { echo "::error::the $n hx-desktop .deb is missing"; exit 1; }
           done
           [ -f "desktop/hx-desktop-${VERSION}-x86_64.AppImage" ] || { echo "::error::the AppImage is missing"; exit 1; }

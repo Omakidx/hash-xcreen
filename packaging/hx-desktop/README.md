@@ -54,11 +54,11 @@ Package `hx-desktop`, architecture `amd64`, built with `dpkg-deb --root-owner-gr
 | Ubuntu 24.04 | 6.1 | `libavcodec60 (>= 7:6.0), libavutil58 (>= 7:6.0)` (computed, this host) |
 | Debian 12 | 5.1 | `libavcodec59, libavutil57` (expected; computed in CI) |
 | Debian 13 | 7.1 | `libavcodec61, libavutil59` (expected; computed in CI) |
-| Ubuntu 26.04 | 8.0 | `libavcodec62, libavutil60`: **known gap, below** |
+| Ubuntu 26.04 | 8.0 | `libavcodec62, libavutil60` (expected; computed in CI) |
 
 On Ubuntu 24.04 the whole Depends line is: `libavcodec60 (>= 7:6.0), libavutil58 (>= 7:6.0), libc6 (>= 2.39), libfontconfig1 (>= 2.12.6), libgcc-s1 (>= 4.2)` followed by the `dlopen` list. The other distros differ in the version constraints that `dpkg-shlibdeps` writes.
 
-**Known gap: Ubuntu 26.04.** That release ships FFmpeg 8 and the workspace pins `ffmpeg-next` 7.1, which supports FFmpeg up to 7.1: the `cargo build` fails there (ffmpeg-sys-next's bindings want `libavcodec/avfft.h`, which FFmpeg 8 removed; seen in CI on PR #56). The pull-request workflow therefore has no 26.04 `.deb` cell, and the release keeps its 26.04 cell with `continue-on-error` and goes out without a 26.04 desktop package (a warning in the `assemble` job says so). The fix is a newer `ffmpeg-next`, or a distro-specific FFmpeg build; until then use the AppImage on 26.04, which bundles FFmpeg 6.1 and is smoke-tested on a clean 26.04. Add the cell back to `desktop-packages.yml` and remove `known_gap` from `release.yml` when it is closed.
+Ubuntu 26.04 needs `ffmpeg-next` 8 (`ffmpeg-sys-next` 8.1 supports `libavcodec` 56 to 62, so the same workspace pin builds on all four distros; 7.1 failed there because FFmpeg 8 removed `libavcodec/avfft.h`).
 
 ## The AppImage
 
@@ -66,7 +66,7 @@ One file, `hx-desktop-<version>-x86_64.AppImage`, built on Ubuntu 24.04. It runs
 
 **Choice: FFmpeg is bundled.** The reasons:
 
-- The `.deb` is per distro because FFmpeg's sonames differ on each (`libavcodec59` to `62`). An AppImage is one file for all of them, so it cannot link whichever FFmpeg the user has; relying on the system's would break on any distro that is not the build host's (Ubuntu 26.04's FFmpeg 8 is exactly the case the `.deb` cannot cover).
+- The `.deb` is per distro because FFmpeg's sonames differ on each (`libavcodec59` to `62`). An AppImage is one file for all of them, so it cannot link whichever FFmpeg the user has; relying on the system's would break on any distro that is not the build host's (the `.deb`s cover four different FFmpegs, 5.1 to 8.0, only because each is built on its own distro).
 - The app needs FFmpeg only for software H.264 decoding, which any FFmpeg 6.1 does; there is no reason to chase the system's.
 - Cost: the file is about 60 MB (81 libraries, FFmpeg's codec dependencies among them) and security fixes to FFmpeg arrive with a new hash-xcreen release, not with the distro's updates. The `.deb` is the choice for people who want the distro to patch FFmpeg.
 

@@ -25,13 +25,6 @@
 # below (libraries the binary opens at run time, which no tool can see). Recommends: a Secret
 # Service, which the app needs to keep the device key (without one it shows an error screen).
 #
-# KNOWN GAP, ubuntu-26.04: that release ships FFmpeg 8 (libavcodec62) and the workspace pins
-# ffmpeg-next 7.1, which supports FFmpeg up to 7.1. The cargo build fails there (ffmpeg-sys-next's
-# bindings want libavcodec/avfft.h, which FFmpeg 8 removed), not this script: the pull-request
-# workflow has no 26.04 cell, and the release workflow does not publish a 26.04 desktop package
-# until the workspace moves to ffmpeg-next 8.
-# See packaging/hx-desktop/README.md.
-#
 # FFmpeg sonames expected per distro (checked 2026-11-22, the same table as packaging/hx-session):
 #   ubuntu-24.04  libavcodec60 libavutil58   FFmpeg 6.1    (the build host of CI and releases)
 #   ubuntu-26.04  libavcodec62 libavutil60   FFmpeg 8.0.1

@@ -197,7 +197,7 @@ Design: architecture §4.1, §4.2, §5 and §13, and ipc.md §5.4, §6.12 and §
 - [x] SSH setup via `russh` with host-key confirmation (`hx-sshsetup`, PR #43; the danger-zone uninstall also pins the trusted key since PR #58)
 - [x] Desktop view with the rendering path from S1; toolbar, stats overlay, reconnect overlay (PR #54, on the CPU-upload path; the S1 box above stays open for the maintainer's GPU bench)
 - [x] Device key in the system keyring; Server details (Overview, Security, Desktop, Danger zone) (PR #54; server management over the session, protocol 1.3)
-- [x] `.deb` and AppImage packaging (PR #56: `.deb` for Ubuntu 24.04, Debian 12 and 13, a reproducible AppImage smoke-tested on clean Ubuntu 24.04, 26.04 and Debian 13; Ubuntu 26.04's `.deb` waits for `ffmpeg-next` 8, a known gap in packaging/hx-desktop/README.md)
+- [x] `.deb` and AppImage packaging (PR #56: `.deb` for Ubuntu 24.04, Debian 12 and 13, a reproducible AppImage smoke-tested on clean Ubuntu 24.04, 26.04 and Debian 13; Ubuntu 26.04's `.deb` followed once the workspace moved to `ffmpeg-next` 8)
 
 Notes (design approved 2026-11-22, written before the code):
 
