@@ -17,8 +17,9 @@
 //!
 //! Each scenario is run twice on the real `rustic_core` 0.14.0: with `rustic_core`'s own prune
 //! (`instant_delete`), which is what the engine did before the fix, and with `Engine::prune`,
-//! which now rebuilds the index from pack headers and reads all data when a blob is listed in two
-//! packs. Findings are in `docs/ipc.md` section 36.
+//! which now removes unreadable index files, rebuilds the index from the pack headers, refuses when
+//! a pack file is in no index, and reads every copy of a blob that is stored in two packs and checks
+//! that it decrypts to its id. Findings are in `docs/ipc.md` section 36.
 
 use std::fs;
 use std::path::Path;
@@ -30,9 +31,9 @@ use aes256ctr_poly1305aes::{
 };
 use bytes::Bytes;
 use hx_backup::engine::{
-    BackupRequest, CancelToken, Engine, EngineOptions, ForgetRequest, KeepRules, NullSink,
-    OpenMode, Ownership, ReadData, RepoKey, RepositoryBackends, RestoreRequest, SnapshotId,
-    SnapshotSelector,
+    BackupRequest, CancelToken, Engine, EngineError, EngineOptions, ForgetRequest, KeepRules,
+    NullSink, OpenMode, Ownership, ReadData, RepoKey, RepositoryBackends, RestoreRequest,
+    SnapshotId, SnapshotSelector,
 };
 use hx_backup::manifest::{Distro, ManifestInput};
 use hx_backup::rules::{DockerMode, RuleSet};
@@ -610,6 +611,8 @@ impl Attacker {
 struct Outcome {
     /// `None` when the prune ran to the end.
     prune_error: Option<String>,
+    /// The prune was refused with `EngineError::Integrity`.
+    prune_integrity: bool,
     /// Snapshots that were not forgotten.
     remaining: Vec<SnapshotId>,
     /// Snapshots whose restore failed or produced different bytes.
@@ -681,8 +684,12 @@ fn forget_prune(fx: &Fx, how: How, extra: &[SnapshotId]) -> Outcome {
         .collect();
     raw.delete_snapshots(&rids).unwrap();
 
+    let mut prune_integrity = false;
     let prune_error = match how {
-        How::Engine => engine.prune(&cancel).err().map(|e| e.to_string()),
+        How::Engine => engine.prune(&cancel).err().map(|e| {
+            prune_integrity = matches!(e, EngineError::Integrity { .. });
+            e.to_string()
+        }),
         How::RusticPrune => {
             let opts = PruneOptions::default().instant_delete(true);
             raw.prune_plan(&opts)
@@ -717,6 +724,7 @@ fn forget_prune(fx: &Fx, how: How, extra: &[SnapshotId]) -> Outcome {
     }
     Outcome {
         prune_error,
+        prune_integrity,
         remaining,
         restore_bad,
         check_ok,
@@ -982,8 +990,9 @@ fn c1_only_a_decoy_index_makes_rustic_prune_delete_every_real_pack() {
 fn c1_engine_prune_refuses_and_keeps_every_real_pack() {
     let (o, fx) = scenario("c1", How::Engine, attack_c1);
     assert!(
-        o.prune_error.is_some(),
-        "a decoy is detected by the data read"
+        o.prune_integrity,
+        "a decoy copy fails verification: {:?}",
+        o.prune_error
     );
     assert_eq!(o.removed_packs, 0);
     // The real packs are all still there: dropping the decoys and repairing restores everything.
@@ -1000,7 +1009,7 @@ fn c2_a_decoy_index_added_beside_the_real_ones_makes_rustic_prune_delete_real_pa
 #[test]
 fn c2_engine_prune_refuses_and_keeps_every_real_pack() {
     let (o, fx) = scenario("c2", How::Engine, attack_c2);
-    assert!(o.prune_error.is_some());
+    assert!(o.prune_integrity, "{:?}", o.prune_error);
     assert_eq!(o.removed_packs, 0);
     assert_recoverable(&fx, &o);
 }
@@ -1015,7 +1024,7 @@ fn c3_marking_real_packs_deleted_makes_rustic_prune_delete_them_whatever_the_ids
 #[test]
 fn c3_engine_prune_refuses_and_keeps_every_real_pack() {
     let (o, fx) = scenario("c3", How::Engine, attack_c3);
-    assert!(o.prune_error.is_some());
+    assert!(o.prune_integrity, "{:?}", o.prune_error);
     assert_eq!(o.removed_packs, 0);
     assert_recoverable(&fx, &o);
 }
@@ -1030,7 +1039,7 @@ fn c4_decoy_packs_alone_are_indexed_by_the_next_backup_and_rustic_prune_deletes_
 #[test]
 fn c4_engine_prune_refuses_and_keeps_every_real_pack() {
     let (o, fx) = scenario("c4", How::Engine, attack_c4);
-    assert!(o.prune_error.is_some());
+    assert!(o.prune_integrity, "{:?}", o.prune_error);
     assert_eq!(o.removed_packs, 0);
     assert_recoverable(&fx, &o);
 }
@@ -1404,4 +1413,375 @@ fn engine_prune_reads_pack_headers_only_on_a_healthy_repository() {
         "header scan read {extra} bytes of {total}: it must not read pack data"
     );
     assert!(engine.pack_reads <= rustic.pack_reads + 2 * packs.len() as u64);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Availability: interrupted prunes, junk index files, killed or failed rebuilds (review of Q-S1)
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Default)]
+struct Faults {
+    /// Panic at this pack read (1-based): a process killed in the middle of the header scan.
+    panic_at_pack_read: Option<u64>,
+    /// Fail this one pack read: a transient Drive error.
+    error_at_pack_read: Option<u64>,
+    /// Fail every pack read from this one on.
+    error_from_pack_read: Option<u64>,
+    /// Fail every pack removal: a Drive error while a prune deletes packs.
+    fail_pack_remove: bool,
+    pack_reads: u64,
+}
+
+/// A backend that injects faults into pack reads and removals.
+struct Faulty {
+    inner: Arc<dyn WriteBackend>,
+    f: Mutex<Faults>,
+}
+
+impl Faulty {
+    fn on_pack_read(&self) -> RusticResult<()> {
+        let mut f = self.f.lock().unwrap();
+        f.pack_reads += 1;
+        let n = f.pack_reads;
+        if f.panic_at_pack_read == Some(n) {
+            drop(f);
+            panic!("simulated kill at pack read {n}");
+        }
+        if f.error_at_pack_read == Some(n) || f.error_from_pack_read.is_some_and(|from| n >= from) {
+            return Err(RusticError::new(
+                ErrorKind::Backend,
+                "simulated transient read error",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ReadBackend for Faulty {
+    fn location(&self) -> String {
+        self.inner.location()
+    }
+    fn warmup_path(&self, tpe: FileType, id: &Id) -> String {
+        self.inner.warmup_path(tpe, id)
+    }
+    fn list_with_size(&self, tpe: FileType) -> RusticResult<Vec<(Id, u32)>> {
+        self.inner.list_with_size(tpe)
+    }
+    fn read_full(&self, tpe: FileType, id: &Id) -> RusticResult<Bytes> {
+        if tpe == FileType::Pack {
+            self.on_pack_read()?;
+        }
+        self.inner.read_full(tpe, id)
+    }
+    fn read_partial(
+        &self,
+        tpe: FileType,
+        id: &Id,
+        cacheable: bool,
+        offset: u32,
+        length: u32,
+    ) -> RusticResult<Bytes> {
+        if tpe == FileType::Pack {
+            self.on_pack_read()?;
+        }
+        self.inner.read_partial(tpe, id, cacheable, offset, length)
+    }
+}
+
+impl WriteBackend for Faulty {
+    fn create(&self) -> RusticResult<()> {
+        self.inner.create()
+    }
+    fn write_bytes(
+        &self,
+        tpe: FileType,
+        id: &Id,
+        cacheable: bool,
+        content: BytesList,
+    ) -> RusticResult<()> {
+        self.inner.write_bytes(tpe, id, cacheable, content)
+    }
+    fn remove(&self, tpe: FileType, id: &Id, cacheable: bool) -> RusticResult<()> {
+        if tpe == FileType::Pack && self.f.lock().unwrap().fail_pack_remove {
+            return Err(RusticError::new(
+                ErrorKind::Backend,
+                "simulated Drive error on delete",
+            ));
+        }
+        self.inner.remove(tpe, id, cacheable)
+    }
+}
+
+fn faulty_backend(fx: &Fx, f: Faults) -> Arc<Faulty> {
+    Arc::new(Faulty {
+        inner: raw_backends(fx.repo.path()).repository(),
+        f: Mutex::new(f),
+    })
+}
+
+fn engine_on(be: Arc<dyn WriteBackend>) -> Engine {
+    let o = EngineOptions {
+        open_mode: OpenMode::OpenExisting,
+        ..EngineOptions::default()
+    };
+    Engine::open_with_backend(be, &key(), &o, Arc::new(NullSink)).unwrap()
+}
+
+fn rustic_repo(be: Arc<dyn WriteBackend>) -> Repository<rustic_core::OpenStatus> {
+    Repository::new(
+        &RepositoryOptions::default().no_cache(true),
+        &RepositoryBackends::new(be, None),
+    )
+    .unwrap()
+    .open(&Credentials::Password(KEY.to_owned()))
+    .unwrap()
+}
+
+fn forget_oldest_two(fx: &Fx) {
+    let raw = rustic_repo(raw_backends(fx.repo.path()).repository());
+    let rids: Vec<_> = fx.snaps[..2]
+        .iter()
+        .map(|i| {
+            i.as_str()
+                .parse::<rustic_core::repofile::SnapshotId>()
+                .unwrap()
+        })
+        .collect();
+    raw.delete_snapshots(&rids).unwrap();
+}
+
+fn n_files(fx: &Fx, t: FileType) -> usize {
+    raw_backends(fx.repo.path())
+        .repository()
+        .list(t)
+        .unwrap()
+        .len()
+}
+
+fn all_restore(fx: &Fx, snaps: &[SnapshotId]) -> bool {
+    snaps.iter().all(|s| restores_correctly(fx, s))
+}
+
+/// H2: a prune interrupted after it repacked (a Drive error while it deletes the old packs) leaves
+/// every repacked blob in two packs. The next prune must verify the copies, find them good and go
+/// ahead, instead of refusing for good.
+#[test]
+fn h2_a_prune_interrupted_after_repacking_does_not_block_the_next_prune() {
+    let fx = fixture();
+    forget_oldest_two(&fx);
+    let packs_before = n_files(&fx, FileType::Pack);
+    let raw = rustic_repo(faulty_backend(
+        &fx,
+        Faults {
+            fail_pack_remove: true,
+            ..Faults::default()
+        },
+    ));
+    // Force the repack of the partly used packs (what a prune of a real repository does).
+    let opts = PruneOptions::default()
+        .instant_delete(true)
+        .max_repack(rustic_core::LimitOption::Unlimited)
+        .max_unused(rustic_core::LimitOption::Percentage(0));
+    let plan = raw.prune_plan(&opts).unwrap();
+    assert!(plan.stats.size_sum().repack > 0, "the plan repacks");
+    assert!(
+        raw.prune(&opts, plan).is_err(),
+        "interrupted by the Drive error"
+    );
+    drop(raw);
+    assert!(
+        n_files(&fx, FileType::Pack) > packs_before,
+        "the repacked packs exist next to the old ones"
+    );
+    let remaining = fx.snaps[2..].to_vec();
+    assert!(
+        all_restore(&fx, &remaining),
+        "restores work after the interruption"
+    );
+
+    let o = open_raw(fx.repo.path())
+        .prune(&CancelToken::new())
+        .map_err(|e| e.to_string());
+    assert!(o.is_ok(), "the next prune goes ahead: {o:?}");
+    let report = open_raw(fx.repo.path())
+        .check(ReadData::All, &CancelToken::new())
+        .unwrap();
+    assert!(report.ok, "{:?}", report.findings);
+    assert!(all_restore(&fx, &remaining));
+    assert!(
+        n_files(&fx, FileType::Pack) <= packs_before,
+        "the extra copies are gone"
+    );
+}
+
+/// H2: the same repository with a decoy among the copies is still refused (c1 to c4 above assert
+/// the same for the decoy scenarios); here the decoy is the second copy of a repacked blob.
+#[test]
+fn h2_a_corrupt_copy_among_honest_duplicates_is_refused_naming_the_pack() {
+    let mut fx = fixture();
+    let a = Attacker::new(fx.repo.path());
+    attack_c2(&a, &fx);
+    fx.decoys = a.written.lock().unwrap().clone();
+    drop(a);
+    let err = open_raw(fx.repo.path())
+        .prune(&CancelToken::new())
+        .unwrap_err();
+    let EngineError::Integrity { finding } = err else {
+        panic!("not an integrity error: {err}");
+    };
+    assert!(
+        fx.decoys.iter().any(|d| finding.contains(&d[..64])),
+        "the finding names a decoy pack: {finding}"
+    );
+}
+
+/// H1: junk INDEX files (hash-valid names, undecryptable or malformed content), written within the
+/// BACKUP policy, must not block restore, check, backup or prune.
+#[test]
+fn h1_junk_index_files_block_neither_restore_nor_check_nor_backup_nor_prune() {
+    let fx = fixture();
+    let real_indexes = n_files(&fx, FileType::Index);
+    let a = Attacker::new(fx.repo.path());
+    let _ = a.put(FileType::Index, noise(3, 500));
+    let _ = a.put(FileType::Index, noise(4, 5));
+    let _ = a.put(FileType::Index, a.encrypt(b"{ not an index"));
+    a.assert_in_policy();
+    drop(a);
+    assert_eq!(
+        n_files(&fx, FileType::Index),
+        real_indexes + 3,
+        "three junk files and the real index files"
+    );
+
+    // Read-only jobs leave the junk alone and work.
+    assert!(all_restore(&fx, &fx.snaps), "restore with junk index files");
+    let report = open_raw(fx.repo.path())
+        .check(ReadData::All, &CancelToken::new())
+        .unwrap();
+    assert!(report.ok, "{:?}", report.findings);
+    assert_eq!(
+        n_files(&fx, FileType::Index),
+        real_indexes + 3,
+        "a read-only job removes nothing"
+    );
+
+    // A backup (BACKUP policy) removes it.
+    let src = tempfile::tempdir().unwrap();
+    fs::create_dir_all(src.path().join("data")).unwrap();
+    for (name, bytes) in expected(3) {
+        fs::write(src.path().join(name), bytes).unwrap();
+    }
+    let (be, log) = Policed::new(raw_backends(fx.repo.path()).repository(), Job::Backup);
+    let mut engine = engine_on(be);
+    engine
+        .backup(
+            &request(src.path(), "2026-01-05T00:00:00Z"),
+            &CancelToken::new(),
+        )
+        .unwrap();
+    assert!(log.lock().unwrap().denied.is_empty());
+    assert!(
+        n_files(&fx, FileType::Index) <= real_indexes + 1,
+        "the junk is gone (the backup wrote one index file)"
+    );
+
+    // And so does a prune (FORGET_PRUNE policy), when junk is written again.
+    let a = Attacker::new(fx.repo.path());
+    let _ = a.put(FileType::Index, noise(5, 700));
+    drop(a);
+    let (be, log) = Policed::new(
+        raw_backends(fx.repo.path()).repository(),
+        Job::ForgetPrune(Vec::new()),
+    );
+    engine_on(be).prune(&CancelToken::new()).unwrap();
+    assert!(log.lock().unwrap().denied.is_empty());
+    let report = open_raw(fx.repo.path())
+        .check(ReadData::All, &CancelToken::new())
+        .unwrap();
+    assert!(report.ok, "{:?}", report.findings);
+    assert!(all_restore(&fx, &fx.snaps));
+}
+
+/// M1: a process killed in the middle of the header scan of the rebuild must leave the old index
+/// in place, so restores still work.
+#[test]
+fn m1_a_kill_during_the_header_scan_leaves_the_repository_restorable() {
+    let fx = fixture();
+    let before = n_files(&fx, FileType::Index);
+    let e = engine_on(faulty_backend(
+        &fx,
+        Faults {
+            panic_at_pack_read: Some(2),
+            ..Faults::default()
+        },
+    ));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        e.prune(&CancelToken::new()).is_ok()
+    }));
+    assert!(r.is_err(), "the simulated kill happened");
+    assert_eq!(
+        n_files(&fx, FileType::Index),
+        before,
+        "no index file was removed"
+    );
+    assert!(all_restore(&fx, &fx.snaps));
+    let report = open_raw(fx.repo.path())
+        .check(ReadData::None, &CancelToken::new())
+        .unwrap();
+    assert!(report.ok, "{:?}", report.findings);
+    // And the next prune simply works.
+    open_raw(fx.repo.path()).prune(&CancelToken::new()).unwrap();
+    assert!(all_restore(&fx, &fx.snaps));
+}
+
+/// M1: one transient error on a header read must neither drop the pack from the index nor leave
+/// the repository unrestorable: the rebuild reads the missing header again.
+#[test]
+fn m1_one_transient_header_read_error_is_retried_and_loses_nothing() {
+    let fx = fixture();
+    let e = engine_on(faulty_backend(
+        &fx,
+        Faults {
+            error_at_pack_read: Some(1),
+            ..Faults::default()
+        },
+    ));
+    e.prune(&CancelToken::new()).unwrap();
+    drop(e);
+    assert!(all_restore(&fx, &fx.snaps));
+    let report = open_raw(fx.repo.path())
+        .check(ReadData::All, &CancelToken::new())
+        .unwrap();
+    assert!(report.ok, "{:?}", report.findings);
+}
+
+/// M1: headers that stay unreadable: the prune is refused, nothing is deleted, the old index files
+/// are all still there and every restore works.
+#[test]
+fn m1_headers_that_stay_unreadable_refuse_the_prune_and_keep_the_old_index() {
+    let fx = fixture();
+    let index_before = raw_backends(fx.repo.path())
+        .repository()
+        .list(FileType::Index)
+        .unwrap();
+    let packs_before = n_files(&fx, FileType::Pack);
+    let e = engine_on(faulty_backend(
+        &fx,
+        Faults {
+            error_from_pack_read: Some(1),
+            ..Faults::default()
+        },
+    ));
+    let err = e.prune(&CancelToken::new()).unwrap_err();
+    assert!(matches!(err, EngineError::Integrity { .. }), "{err}");
+    drop(e);
+    let index_after = raw_backends(fx.repo.path())
+        .repository()
+        .list(FileType::Index)
+        .unwrap();
+    for id in &index_before {
+        assert!(index_after.contains(id), "old index file {id:?} removed");
+    }
+    assert_eq!(n_files(&fx, FileType::Pack), packs_before);
+    assert!(all_restore(&fx, &fx.snaps));
 }

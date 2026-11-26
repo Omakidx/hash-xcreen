@@ -26,10 +26,10 @@
 //! password as a `String`, so a copy of it lives inside rustic for as long as the repository is
 //! open and is not wiped by this crate.
 
+mod integrity;
 mod progress;
 mod scan;
 
-use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -38,12 +38,11 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use jiff::{Timestamp, tz::TimeZone};
-use rustic_core::repofile::{IndexFile, PackId, SnapshotFile};
+use rustic_core::repofile::SnapshotFile;
 use rustic_core::{
     BackupOptions, CheckOptions, ConfigOptions, Credentials, IndexedFullStatus, KeepOptions,
     KeyOptions, LocalDestination, LsOptions, OpenStatus, PathList, PruneOptions, ReadSubsetOption,
-    RepairIndexOptions, Repository, RepositoryOptions, RestoreOptions, RusticError,
-    SnapshotOptions,
+    Repository, RepositoryOptions, RestoreOptions, RusticError, SnapshotOptions,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -53,6 +52,8 @@ use crate::rules::{self, ResolvedRules, RuleSet, RulesError};
 pub use progress::{CancelToken, NullSink, Phase, ProgressEvent, ProgressSink, ProgressUnit};
 pub use rustic_core::{ReadBackend, RepositoryBackends, WriteBackend};
 
+use integrity::IndexGuard;
+pub use integrity::MAX_DUPLICATE_VERIFY_BYTES;
 use progress::{Bars, Shared};
 
 /// zstd level used for new repositories (architecture 9.4: level 9 cost about 70% more CPU for
@@ -551,6 +552,8 @@ pub struct Engine {
     /// `None` only after loading the index failed (the repository handle is consumed by that call).
     repo: Option<Repository<OpenStatus>>,
     shared: Arc<Shared>,
+    /// The repository backend as rustic sees it: hides unreadable index files, defers removals.
+    guard: Arc<IndexGuard>,
 }
 
 impl fmt::Debug for Engine {
@@ -614,7 +617,9 @@ impl Engine {
         shared.set_phase(Phase::OpenRepository);
         // No local cache, ever: the worker is sandboxed and must not create directories.
         let ropts = RepositoryOptions::default().no_cache(true);
-        let repo = Repository::new_with_progress(&ropts, backends, Bars(Arc::clone(&shared)))
+        let guard = Arc::new(IndexGuard::new(backends.repository()));
+        let guarded = RepositoryBackends::new(guard.clone(), backends.repo_hot());
+        let repo = Repository::new_with_progress(&ropts, &guarded, Bars(Arc::clone(&shared)))
             .map_err(rustic("opening the repository"))?;
         let mut creds = key.credentials()?;
         let opened = Self::open_or_init(repo, &creds, options);
@@ -626,6 +631,7 @@ impl Engine {
         Ok(Self {
             repo: Some(repo),
             shared,
+            guard,
         })
     }
 
@@ -785,9 +791,7 @@ impl Engine {
 
         // Step 0: orphan packs from an interrupted run become part of the index.
         self.shared.set_phase(Phase::RepairIndex);
-        self.repo()?
-            .repair_index(&RepairIndexOptions::default(), false)
-            .map_err(rustic("repairing the index"))?;
+        self.repair_index_for_backup()?;
         cancel.check()?;
 
         self.shared.set_phase(Phase::ResolveRules);
@@ -980,6 +984,7 @@ impl Engine {
         let snap = self.find_snapshot(&req.snapshot)?;
         let id: SnapshotId = hex_id(snap.id)?;
 
+        self.prepare_index(false)?;
         let open = self.repo.take().ok_or(EngineError::Closed)?;
         let indexed = open.to_indexed().map_err(rustic("loading the index"))?;
         let result = restore_indexed(&indexed, &self.shared, req, &id, target_str, cancel);
@@ -1009,6 +1014,12 @@ impl Engine {
     /// Apply retention rules to all snapshots of the repository (one group: a repository holds
     /// one desktop), removing what the rules do not keep, except the newest
     /// `req.protect_latest`. Space is only freed by [`Engine::prune`].
+    ///
+    /// **Never use this for the `FORGET_PRUNE` job** (ipc.md section 36, decision 10). It takes
+    /// the snapshots from the repository listing, and a compromised `BACKUP` worker can write
+    /// snapshots dated in the future that fill the keep slots and the protected newest ones, so that
+    /// every real snapshot is removed. That job deletes exactly the ids privd chose from its own
+    /// record of successful backups. This method is for tools that own the whole repository.
     ///
     /// # Errors
     /// [`EngineError::InvalidInput`] if no keep period is set, [`EngineError::Cancelled`],
@@ -1111,20 +1122,23 @@ impl Engine {
     /// snapshots cannot be removed or overwritten by that worker, so the real data is always still
     /// there; only the index and the decoys lie. Before planning, this method therefore:
     ///
-    /// 1. rebuilds the index from the pack headers (`repair index --read-all-packs`), so the index
-    ///    says what the packs say, whatever index files were written or removed;
-    /// 2. refuses if a pack file is not in that index (an unreadable pack would be deleted as
+    /// 1. removes index files that cannot be read (junk: they hold no data);
+    /// 2. rebuilds the index from the pack headers (`repair index --read-all-packs`), writing the new
+    ///    index before removing the old files, so the index says what the packs say whatever index
+    ///    files were written or removed, and a kill in between loses nothing;
+    /// 3. refuses if a pack file is in no index (an unreadable pack would be deleted as
     ///    unreferenced);
-    /// 3. refuses if some blob is listed in two packs. A decoy has to list a real pack's blobs to
-    ///    win over it, so it always shows up as a duplicate; `check --read-data` cannot settle it,
-    ///    because it reads only the one copy per blob that the index lookup picks (observed in
-    ///    `tests/prune_safety.rs`: with a decoy index it fails on some runs and passes on others,
-    ///    by the order the index files were read), while prune keeps the copy in the pack with the
-    ///    highest id.
+    /// 4. reads every copy of every blob that is stored in more than one pack (ranged reads of
+    ///    those blobs only) and refuses unless each decrypts, decompresses and hashes to its blob id.
+    ///    A decoy has to list real blobs to win over a real pack, so it always shows up here, and
+    ///    only a copy that verifies passes. `check --read-data` cannot settle it: it reads only the
+    ///    one copy per blob that the index lookup picks, while prune keeps the copy in the pack with
+    ///    the highest id. Honest duplicates (an interrupted prune leaves the repacked blobs in two
+    ///    packs) verify and are harmless; the prune then removes the extra copies.
     ///
-    /// The cost is one header read per pack and one listing. Nothing here changes the repository
-    /// format. A repository that legitimately holds duplicates (an interrupted prune leaves the
-    /// repacked blobs in two packs) is refused too, until the duplicates are resolved.
+    /// The cost is one header read per pack and one listing, plus a read of the duplicated blobs
+    /// (at most [`MAX_DUPLICATE_VERIFY_BYTES`], else the prune is refused) and about 100 bytes of
+    /// memory per blob while the index is scanned. The repository format does not change.
     ///
     /// # Errors
     /// [`EngineError::Cancelled`] (before the plan), [`EngineError::Integrity`] (nothing was
@@ -1139,6 +1153,16 @@ impl Engine {
             .repo()?
             .prune_plan(&opts)
             .map_err(rustic("planning the prune"))?;
+        // The plan deletes every pack file that is in no index (instant delete). The check above
+        // makes that impossible; this ties it to the exact listing the plan acted on.
+        if plan.stats.packs_unref != 0 {
+            return Err(EngineError::Integrity {
+                finding: format!(
+                    "{} pack files are in no index; the prune would delete them",
+                    plan.stats.packs_unref
+                ),
+            });
+        }
         let st = plan.stats.size_sum();
         let outcome = PruneOutcome {
             unused_bytes: st.unused,
@@ -1150,66 +1174,6 @@ impl Engine {
         Ok(outcome)
     }
 
-    /// Steps 1 to 3 of [`Engine::prune`].
-    fn verify_index_before_prune(&self, cancel: &CancelToken) -> Result<(), EngineError> {
-        let repo = self.repo()?;
-        self.shared.set_phase(Phase::RepairIndex);
-        repo.repair_index(&RepairIndexOptions::default().read_all(true), false)
-            .map_err(rustic("rebuilding the index from the pack headers"))?;
-        cancel.check()?;
-
-        let on_disk: HashSet<PackId> = repo
-            .list::<PackId>()
-            .map_err(rustic("listing packs"))?
-            .collect();
-        let mut indexed: HashSet<PackId> = HashSet::with_capacity(on_disk.len());
-        let mut first_pack: HashMap<rustic_core::BlobId, PackId> = HashMap::new();
-        let mut duplicated = 0_u64;
-        for file in repo
-            .stream_files::<IndexFile>()
-            .map_err(rustic("reading the index"))?
-        {
-            let (_, file) = file.map_err(rustic("reading the index"))?;
-            for pack in file
-                .packs
-                .iter()
-                .chain(&file.packs_to_delete)
-                .chain(&file.packs_to_recover)
-            {
-                indexed.insert(pack.id);
-                for blob in &pack.blobs {
-                    match first_pack.entry(blob.id) {
-                        std::collections::hash_map::Entry::Vacant(v) => {
-                            v.insert(pack.id);
-                        }
-                        std::collections::hash_map::Entry::Occupied(o) => {
-                            duplicated += u64::from(*o.get() != pack.id);
-                        }
-                    }
-                }
-            }
-        }
-        drop(first_pack);
-        if let Some(unindexed) = on_disk.difference(&indexed).next() {
-            return Err(EngineError::Integrity {
-                finding: format!(
-                    "pack {} has no readable header and is in no index ({} such packs)",
-                    unindexed.to_hex().as_str(),
-                    on_disk.difference(&indexed).count()
-                ),
-            });
-        }
-        if duplicated > 0 {
-            return Err(EngineError::Integrity {
-                finding: format!(
-                    "{duplicated} blobs are stored in more than one pack: the copy prune would keep \
-                     cannot be told from a decoy without reading every copy"
-                ),
-            });
-        }
-        Ok(())
-    }
-
     /// Check the repository; optionally read and verify pack data.
     ///
     /// A repository with errors is a normal result, not an `Err`: see [`CheckReport::ok`].
@@ -1219,6 +1183,7 @@ impl Engine {
     /// [`EngineError::Repository`] when the check itself could not run.
     pub fn check(&self, read: ReadData, cancel: &CancelToken) -> Result<CheckReport, EngineError> {
         cancel.check()?;
+        self.prepare_index(false)?;
         let mut opts = CheckOptions::default();
         self.shared.reset_read_bytes();
         match read {
