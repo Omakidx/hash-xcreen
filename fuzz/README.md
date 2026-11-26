@@ -60,7 +60,7 @@ Useful flags: `-max_len=N` (the nightly uses 512 to 16384 per target), `-timeout
 
 Input layouts that are not "the bytes themselves": `transport_ws_session` (`role byte | raw WebSocket
 frames`), `agent_link_session` (`u16 ctl_len | u16 media_len | ctl | media | bulk`), `ipc_link` and
-`ipc_privd_admin` (`selector | kind | body`), `ipc_frame` (`policy | chunk size | stream`), `ipc_repo` (`endpoint and responder bits | chunk size | stream of whole frames`),
+`ipc_privd_admin` (`selector | kind | body`), `ipc_frame` (`policy | chunk size | stream`), `ipc_repo` (`selector | chunk size | stream of whole frames`; selector bits 0-1 the endpoint: worker, privd on the worker link, privd on the Drive link, Drive helper; bit 2 makes the harness respond or send requests; bits 3-5 the job kind that privd sends),
 `agent_update_extract` (`mode | bytes`: an odd mode wraps the bytes in gzip so the fuzzer edits tar headers
 directly), `agent_update_sig` (`u16 len | signed data | signature text`).
 
