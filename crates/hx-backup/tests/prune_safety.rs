@@ -1833,6 +1833,18 @@ enum Layout {
     GoodThenJunk,
     /// The same blob twice in one pack, the junk first.
     JunkThenGood,
+    /// Byte-exact copies, but every entry typed tree (so the pack is a tree pack).
+    TreeTyped,
+    /// A junk tree blob first, then byte-exact copies typed data: the pack is typed by its first
+    /// blob, so it is a tree pack that mixes types.
+    JunkTreeFirst,
+}
+
+/// `header_entry` with the blob type forced.
+fn typed_header_entry(b: &Value, len: u32, tree: bool) -> Vec<u8> {
+    let mut v = b.clone();
+    v["type"] = json!(if tree { "tree" } else { "data" });
+    header_entry(&v, len)
 }
 
 /// A pack with `layout` for every blob of `target`, a filler blob so that its id can be varied, and
@@ -1843,6 +1855,13 @@ fn forged_pack(a: &Attacker, target: &Value, layout: Layout, after_real: bool) -
     for seed in 1_u64.. {
         let mut body = Vec::new();
         let mut header = Vec::new();
+        if matches!(layout, Layout::JunkTreeFirst) {
+            body.extend_from_slice(&noise(seed, 64));
+            header.extend(header_entry(
+                &json!({"type": "tree", "id": hex_of(&Sha256::digest(format!("junktree{seed}")))}),
+                64,
+            ));
+        }
         for b in target["blobs"].as_array().unwrap() {
             let off = b["offset"].as_u64().unwrap() as usize;
             let len = b["length"].as_u64().unwrap() as usize;
@@ -1865,11 +1884,25 @@ fn forged_pack(a: &Attacker, target: &Value, layout: Layout, after_real: bool) -
                     junk(&mut body, &mut header);
                     good(&mut body, &mut header);
                 }
+                Layout::TreeTyped => {
+                    body.extend_from_slice(&raw[off..off + len]);
+                    header.extend(typed_header_entry(b, u32::try_from(len).unwrap(), true));
+                }
+                Layout::JunkTreeFirst => {
+                    body.extend_from_slice(&raw[off..off + len]);
+                    header.extend(typed_header_entry(b, u32::try_from(len).unwrap(), false));
+                }
             }
         }
-        // A filler blob (a fake id) gives every seed another pack id.
+        // A filler blob (a fake id) gives every seed another pack id; it has the pack's type.
         body.extend_from_slice(&noise(seed, 64));
-        header.push(0);
+        header.push(
+            if matches!(layout, Layout::TreeTyped | Layout::JunkTreeFirst) {
+                1
+            } else {
+                0
+            },
+        );
         header.extend_from_slice(&64_u32.to_le_bytes());
         header.extend_from_slice(&Sha256::digest(format!("filler{seed}")));
         let enc = a.encrypt(&header);
@@ -1944,6 +1977,11 @@ fn xs_adversarial_duplicate_layouts_never_remove_a_real_pack() {
         (
             "good copy in one pack, junk in another",
             vec![Layout::Good, Layout::Junk],
+        ),
+        ("genuine copies typed tree", vec![Layout::TreeTyped]),
+        (
+            "junk tree blob first, copies typed data",
+            vec![Layout::JunkTreeFirst],
         ),
     ] {
         for after_real in [true, false] {
@@ -2031,4 +2069,88 @@ fn m3_a_zstd_bomb_copy_is_refused_by_its_declared_length() {
         .map(|_| ());
     assert!(matches!(r, Err(EngineError::Integrity { .. })), "{r:?}");
     assert!(started.elapsed().as_secs() < 60);
+}
+
+/// XT0 and XT1 of the third review: verbatim copies of a real data pack's blobs, but typed tree
+/// (every entry, or a mixed pack typed by its first blob), with an id after the real pack's. Every
+/// entry decrypts and hashes, yet rustic counts uses by id alone and files the entries as trees.
+fn type_confusion(layout: Layout, what: &str) {
+    let mut fx = fixture();
+    let src = tempfile::tempdir().unwrap();
+    fs::create_dir_all(src.path().join("big")).unwrap();
+    fs::write(src.path().join("big/f"), noise(999, 24 << 20)).unwrap();
+    open_raw(fx.repo.path())
+        .backup(
+            &request(src.path(), "2026-01-05T00:00:00Z"),
+            &CancelToken::new(),
+        )
+        .unwrap();
+    forget_oldest_two(&fx);
+    let a = Attacker::new(fx.repo.path());
+    let target = smallest_data_pack(&a);
+    let real: Vec<Id> = a.list(FileType::Pack);
+    let _ = forged_pack(&a, &target, layout, true);
+    a.assert_in_policy();
+    fx.decoys = a.written.lock().unwrap().clone();
+    drop(a);
+    let r = open_raw(fx.repo.path())
+        .prune(&CancelToken::new())
+        .map(|_| ());
+    assert_refused_and_recoverable(&fx, &real, r, what);
+}
+
+#[test]
+fn xt0_genuine_copies_typed_tree_displace_a_real_data_pack() {
+    type_confusion(Layout::TreeTyped, "xt0");
+}
+
+#[test]
+fn xt1_mixed_pack_typed_by_its_first_blob_displaces_a_real_data_pack() {
+    type_confusion(Layout::JunkTreeFirst, "xt1");
+}
+
+/// L7: a pack holding one honest blob of the given declared (uncompressed) length, typed tree: its
+/// plaintext is zeros, compressed, encrypted, with a filler blob to vary the pack id.
+fn big_tree_pack(a: &Attacker, plain_len: usize, seed: u64) -> Id {
+    let plain = vec![0_u8; plain_len];
+    let id = hex_of(&Sha256::digest(&plain));
+    let ct = a.encrypt(&zstd::bulk::compress(&plain, 3).unwrap());
+    let blob = json!({"type": "tree", "id": id, "uncompressed_length": plain_len});
+    let mut body = ct.clone();
+    let mut header = header_entry(&blob, u32::try_from(ct.len()).unwrap());
+    body.extend_from_slice(&noise(seed, 64));
+    header.push(1);
+    header.extend_from_slice(&64_u32.to_le_bytes());
+    header.extend_from_slice(&Sha256::digest(format!("bigfiller{seed}")));
+    let enc = a.encrypt(&header);
+    body.extend_from_slice(&enc);
+    body.extend_from_slice(&u32::try_from(enc.len()).unwrap().to_le_bytes());
+    a.put(FileType::Pack, body)
+}
+
+/// L7: an honest tree blob larger than 64 MiB (rustic does not chunk trees) that is stored twice
+/// must not block the prune; one byte over the 96 MiB cap is refused.
+#[test]
+fn l7_a_huge_honest_duplicated_tree_blob_verifies_up_to_the_object_cap() {
+    let cap = 96 << 20;
+    for (len, ok) in [(cap, true), (cap + 1, false)] {
+        let fx = fixture();
+        let a = Attacker::new(fx.repo.path());
+        let _ = big_tree_pack(&a, len, 1);
+        let _ = big_tree_pack(&a, len, 2);
+        a.assert_in_policy();
+        drop(a);
+        let r = open_raw(fx.repo.path())
+            .prune(&CancelToken::new())
+            .map(|_| ());
+        if ok {
+            assert!(r.is_ok(), "{len} bytes: {r:?}");
+            assert!(all_restore(&fx, &fx.snaps));
+        } else {
+            assert!(
+                matches!(r, Err(EngineError::Integrity { .. })),
+                "{len} bytes: {r:?}"
+            );
+        }
+    }
 }

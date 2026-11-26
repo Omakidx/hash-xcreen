@@ -10,11 +10,13 @@
 //! * [`Engine::verify_index_before_prune`] adds the checks that make prune safe.
 //!
 //! **Invariant** established before a prune plans: after the rebuild, every pack file is in an
-//! index; no pack lists a blob id twice (rustic's packer never writes that); and every index entry
-//! of every blob that has more than one entry decrypts, decompresses to its declared length and
-//! hashes to the blob id. rustic's prune keeps the copy in the pack processed last and its index
-//! lookup picks any entry, so a decoy can only win if it shares a blob id with a real pack; the
-//! invariant leaves a decoy no entry that is not a faithful copy.
+//! index; no pack mixes blob types or lists a blob id twice (rustic's packer never writes either);
+//! every blob that has more than one entry has one effective type across all its entries (rustic
+//! files an entry under its pack's type); and every one of those entries decrypts, decompresses to
+//! its declared length and hashes to the blob id. rustic's prune counts uses by id alone, keeps the
+//! copy in the pack processed last and its lookup picks any entry of the right type, so a decoy can
+//! only win if it shares a blob id with a real pack; the invariant leaves a decoy no entry that is
+//! not a faithful copy, of the same type.
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
@@ -25,7 +27,7 @@ use aes256ctr_poly1305aes::{
     aead::{Aead, generic_array::GenericArray},
 };
 use bytes::Bytes;
-use rustic_core::repofile::{IndexFile, IndexId, PackId};
+use rustic_core::repofile::{BlobType, IndexFile, IndexId, PackId};
 use rustic_core::{
     BlobId, BytesList, FileType, Id, ReadBackend, RepairIndexOptions, RusticResult, WriteBackend,
 };
@@ -39,9 +41,11 @@ use super::{CancelToken, Engine, EngineError, Phase, rustic};
 /// the prune is refused, because a repository with that much duplication needs an operator.
 pub const DUPLICATE_VERIFY_FLOOR_BYTES: u64 = 2 << 30;
 
-/// Largest blob (stored or decompressed) and largest index file the engine will decompress while
-/// verifying. rustic's chunker produces blobs of a few MiB at most.
-const MAX_BLOB_BYTES: u64 = 64 << 20;
+/// Largest blob (stored or decompressed) the engine will decompress while verifying: the 96 MiB
+/// object cap of the repository link (ipc.md section 25). Data blobs are a few MiB at most, but
+/// rustic does not chunk trees, so a huge directory is one large tree blob.
+const MAX_BLOB_BYTES: u64 = 96 << 20;
+/// Largest index file the engine will decompress while classifying.
 const MAX_INDEX_FILE_BYTES: u64 = 256 << 20;
 
 /// Longest single ranged read when verifying duplicates.
@@ -175,6 +179,8 @@ struct Stored {
     offset: u32,
     length: u32,
     uncompressed: Option<NonZeroU32>,
+    /// The type rustic files the entry under: its pack's.
+    tpe: BlobType,
 }
 
 /// Does `bytes` (a blob as stored in a pack) decrypt, decompress and hash to `id`?
@@ -452,8 +458,18 @@ impl Engine {
                 .chain(&file.packs_to_recover)
             {
                 indexed.insert(pack.id);
+                let pack_type = pack.blob_type();
                 for b in &pack.blobs {
+                    if b.tpe != pack_type {
+                        return Err(EngineError::Integrity {
+                            finding: format!(
+                                "pack {} mixes data and tree blobs",
+                                pack.id.to_hex().as_str()
+                            ),
+                        });
+                    }
                     let c = Stored {
+                        tpe: pack_type,
                         pack: pack.id,
                         offset: b.location.offset,
                         length: b.location.length,
@@ -465,6 +481,14 @@ impl Engine {
                         }
                         std::collections::hash_map::Entry::Occupied(o) => {
                             let f = *o.get();
+                            if f.tpe != c.tpe {
+                                return Err(EngineError::Integrity {
+                                    finding: format!(
+                                        "a blob is listed as data in one pack and as a tree in another (pack {})",
+                                        c.pack.to_hex().as_str()
+                                    ),
+                                });
+                            }
                             // Every entry of the blob is compared with every other: two entries
                             // in one pack, wherever they come in the order, hide junk behind a
                             // good copy (rustic's packer never writes a blob twice into a pack).
