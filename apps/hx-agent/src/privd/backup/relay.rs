@@ -44,6 +44,9 @@ use super::{BackupEnv, Failure, JobState, JobStatus, LinkName, Timing};
 use crate::privd::cancel::CancelToken;
 use crate::privd::progress::ProgressSender;
 
+/// Called with the accepted result of a successful `BACKUP`.
+pub type BackupHook = Box<dyn Fn(&pb::JobResult) + Send + Sync>;
+
 /// The id of the `OpenRepo` request, the first of the Drive session.
 pub const OPEN_REPO_ID: u64 = 1;
 
@@ -161,8 +164,9 @@ pub struct Session<E: BackupEnv> {
     pause_end_mono: Option<u64>,
     cancel_seen: bool,
     last_tick_ms: u64,
+    open_life: Option<u64>,
     pub(super) open_repo_answer: Option<pb::repo_response::Result>,
-    on_backup_ok: Option<Box<dyn Fn(&pb::JobResult) + Send + Sync>>,
+    on_backup_ok: Option<BackupHook>,
 }
 
 async fn next_event(l: &mut Option<Link>) -> Option<LinkEvent> {
@@ -224,6 +228,7 @@ impl<E: BackupEnv> Session<E> {
             pause_end_mono: None,
             cancel_seen: false,
             last_tick_ms: now,
+            open_life: None,
             open_repo_answer: None,
             on_backup_ok: None,
         }
@@ -231,7 +236,7 @@ impl<E: BackupEnv> Session<E> {
 
     /// Called with the accepted result of a successful `BACKUP`, as soon as it is seen and
     /// before cleanup (the completed-backups record, ipc.md section 35).
-    pub fn set_backup_hook(&mut self, f: Box<dyn Fn(&pb::JobResult) + Send + Sync>) {
+    pub fn set_backup_hook(&mut self, f: BackupHook) {
         self.on_backup_ok = Some(f);
     }
 
@@ -264,6 +269,11 @@ impl<E: BackupEnv> Session<E> {
         self.forced
             .clone()
             .or_else(|| self.drain.as_ref().map(|d| d.reason.clone()))
+    }
+
+    /// `OpenRepo` has been sent: it is guarded like any Drive request.
+    pub fn begin_open_repo(&mut self) {
+        self.open_life = Some(self.now());
     }
 
     /// Records a repository error class that privd saw (the answer to `OpenRepo`).
@@ -566,7 +576,10 @@ impl<E: BackupEnv> Session<E> {
                     .is_some_and(|l| l.state.is_outstanding(r.d_id));
             guarded && now >= r.life.max(pause_end).saturating_add(guard)
         });
-        if stale {
+        let open_stale = self
+            .open_life
+            .is_some_and(|l| now >= l.max(pause_end).saturating_add(guard));
+        if stale || open_stale {
             self.drive_lost(ErrorClass::Unavailable, Failure::Guard);
         }
     }
@@ -856,6 +869,7 @@ impl<E: BackupEnv> Session<E> {
         let d_id = r.req_id;
         let Some(result) = r.result else { return };
         if d_id == OPEN_REPO_ID {
+            self.open_life = None;
             self.open_repo_answer = Some(result);
             return;
         }
@@ -971,6 +985,9 @@ impl<E: BackupEnv> Session<E> {
         let now = self.now();
         for r in self.reqs.values_mut() {
             r.life = now;
+        }
+        if self.open_life.is_some() {
+            self.open_life = Some(now);
         }
         let unix_ms = self.env.now_unix().saturating_mul(1000);
         let day = 26 * 60 * 60 * 1000;

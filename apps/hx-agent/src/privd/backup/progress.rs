@@ -368,7 +368,6 @@ mod tests {
             bytes_total: 40,
             files_done: 3,
             files_total: 4,
-            ..Default::default()
         });
         assert_eq!(m.current().percent, 25);
         m.worker(&wp(ProgressPhase::ScanAndUpload, 5, 0));

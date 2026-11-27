@@ -1,6 +1,6 @@
 //! Crash recovery and the cleanup before `DestroyDesktop` and `Uninstall` (ipc.md section 35).
 //!
-//! **At privd start, before any backup command is admitted**, [`recover_all`]:
+//! **At privd start, before any backup command is admitted**, `Recovery::recover_all`:
 //!
 //! 1. force-deletes every instance marked as a backup helper (`user.hx.kind=backup-worker`, an
 //!    `hx-bkw-<8 hex>` name and a `user.hx.job` whose first 8 digits match the name);
@@ -17,9 +17,9 @@
 //! run, and the report says whether every listing succeeded (`complete`), because a recovery that
 //! could not look must be repeated before jobs are admitted.
 //!
-//! [`recover_desktop`] is the same cleanup for the objects one `job.json` names (a job whose
+//! `Recovery::recover_desktop` is the same cleanup for the objects one `job.json` names (a job whose
 //! cleanup failed leaves its record behind; the next admission for that desktop runs it first),
-//! and [`teardown_cleanup`] is steps 1 and 4 plus the sockets and the records, for
+//! and `Recovery::teardown` is steps 1 and 4 plus the sockets and the records, for
 //! `DestroyDesktop` and `Uninstall`: there every restore target goes, resumable or not.
 
 use std::collections::BTreeSet;
@@ -253,7 +253,7 @@ impl<H: BackupHost, E: BackupEnv> Recovery<'_, H, E> {
             Err(e) => self.fail(rep, format!("{id}: {e}")),
         }
         if let Ok(Some(r)) = ResumeRecord::load(&rp)
-            && !kept.iter().any(|k| *k == r.target)
+            && !kept.contains(&r.target)
         {
             let _ = remove_record(&rp);
         }

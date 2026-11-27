@@ -201,7 +201,8 @@ pub fn forget_list(record: &CompletedRecord, retention: &Retention) -> Vec<[u8; 
     for i in order.iter().take(FLOOR.max(retention.last)) {
         keep[*i] = true;
     }
-    let buckets: [(usize, fn(u64) -> u64); 3] = [
+    type KeyOf = fn(u64) -> u64;
+    let buckets: [(usize, KeyOf); 3] = [
         (retention.daily, |t| t / 86_400),
         (retention.weekly, |t| (t / 86_400 + 3) / 7),
         (retention.monthly, |t| {

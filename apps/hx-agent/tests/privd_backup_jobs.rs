@@ -22,7 +22,8 @@ fn mt() -> bool {
 async fn a_full_backup_round_trip() {
     let rig = Rig::ready().await;
     rig.drive.put(T::Config, &[0u8; 32], b"repository-config");
-    let sent: Arc<Mutex<Option<(pb::Job, Vec<(u8, Vec<u8>)>)>>> = Arc::default();
+    type Sent = Option<(pb::Job, Vec<(u8, Vec<u8>)>)>;
+    let sent: Arc<Mutex<Sent>> = Arc::default();
     let sent2 = sent.clone();
     let mono = rig.mono.clone();
     rig.worker(move |w| {
@@ -119,6 +120,10 @@ async fn a_full_backup_round_trip() {
         rig.runner.start(rig.backup_request()).await.is_ok(),
         "the slot is free again"
     );
+    rig.until("the relay slots to come back", || {
+        rig.runner.relay_slots_free() >= 14
+    })
+    .await;
     // Progress: privd's own text, privd's phase table, the byte counters.
     let mut frames = Vec::new();
     while let Some(f) = queue.pop() {

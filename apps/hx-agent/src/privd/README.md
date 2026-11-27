@@ -162,8 +162,38 @@ waiters and a 10 s wait). `Ping` is answered at once, at most 10 times a second.
 | DestroyDesktop | implemented |
 | Uninstall | implemented, narrowed to what privd created (see "Uninstall"); the CLI removes units, credentials, binaries and gatewayd's state |
 | ResetLockout, EnrolOwnerKey | implemented |
-| UpgradeIncus, BeginSecretUpload, every Phase 2 command | `UNIMPLEMENTED` (reserved) |
+| UpgradeIncus, BeginSecretUpload, every Phase 2 command (`BackupRun`, `BackupStatus`, ... of ipc.md 6.14) | `UNIMPLEMENTED` (reserved); the runner underneath them exists (see "The backup job runner") |
 | PepperVerify, PepperEnrol, RecordEvent | implemented |
+
+## The backup job runner
+
+`privd::backup` (ipc.md Part 3, sections 24 to 36) is privd's side of the repository link: given a
+job kind and its spec it takes the job slot, writes the job record, opens the job's Drive session,
+creates the snapshot and the ephemeral helper container, runs the sandboxed worker over the link,
+relays its requests to the Drive helper (the section 30 policy on every request, SHA-256 of every
+write), maps its progress, enforces liveness, deadlines and cancel, and cleans up. The client
+commands of ipc.md 6.14 are not wired yet (W5b): the runner's internal API is what they will use.
+
+| Item | Use |
+|---|---|
+| `Daemon::backups()` | the `JobRunner` (`start`, `status`, `cancel`, `completed`, `resume_point`) |
+| `JobRunner::start(JobRequest)` | admission, then the job runs in the background; returns a `JobHandle` (`status`, `watch`, `progress`, `cancel`, `finished`) |
+| `Daemon::recover_backups()` | crash recovery; `serve` starts it, and `start` refuses jobs until it has finished |
+| `Daemon::backup_teardown(desktops)` | what `DestroyDesktop` and `Uninstall` run first: cancels the active job, removes helpers, restore targets (all of them), sockets and records |
+| `BackupHost`, `BackupEnv` | the seams (Incus and systemd; audit, flags, alerts, the desktop lock), faked in `privd::backup::testing` |
+
+Files, all under `/var/lib/hx/backup/` (root, 0700; every write atomic): `server-id` (32 hex digits),
+and per desktop `job.json` (the slot's record, present only while a job runs or its cleanup
+failed), `completed.json` (the backups privd completed: the **only** input of retention),
+`resume.json` (a kept restore target) and `backoff.json` (writing jobs are refused until then).
+The exact fields are in ipc.md section 35. A record that does not parse is never reset: that
+desktop refuses jobs and an administrator looks at the file.
+
+The runner uses the unit's credentials directory for `backup-key` (ipc.md 34), `/etc/hx/creds/
+drive-token.cred` only for its existence (a missing file sets `needs_attention=DRIVE_RECONNECT`
+and starts nothing), `/run/hx/backup/` (root 0700, tmpfiles) for the job sockets and
+`/run/hx/drive.sock`. The two `LoadCredentialEncrypted` lines and `hx-drive.socket` are enabled by
+the installer's Phase 2 work (W5c); until then no job can start on a real host.
 
 ## Self-update
 

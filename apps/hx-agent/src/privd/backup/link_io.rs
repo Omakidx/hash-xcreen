@@ -48,6 +48,7 @@ const WRITE_STALL: Duration = Duration::from_secs(120);
 
 /// What a reader thread reports.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // one per frame; boxing would only add an allocation
 pub enum LinkEvent {
     /// A decoded, validated frame, and the relay slot it holds.
     Frame(Incoming, OwnedSemaphorePermit),

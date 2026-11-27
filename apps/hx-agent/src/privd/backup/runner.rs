@@ -309,6 +309,11 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
         }
     }
 
+    /// Relay frame slots not in use (16 when no job holds one; ipc.md section 25).
+    pub fn relay_slots_free(&self) -> usize {
+        self.inner.budget.available_permits()
+    }
+
     /// Whether crash recovery has completed.
     pub fn is_recovered(&self) -> bool {
         self.inner.recovered.load(Ordering::SeqCst)

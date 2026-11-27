@@ -283,12 +283,9 @@ fn list_worker(w: &mut WorkerPeer) {
     let req = w.request(pb::repo_request::Op::List(pb::List {
         object_type: T::Pack as i32,
     }));
-    match w.try_wait(req) {
-        Some(Reply::Error(ErrorClass::Unavailable)) => {
-            w.wait_cancel();
-            w.finish_err(WorkerError::Cancelled);
-        }
-        _ => {}
+    if let Some(Reply::Error(ErrorClass::Unavailable)) = w.try_wait(req) {
+        w.wait_cancel();
+        w.finish_err(WorkerError::Cancelled);
     }
 }
 
@@ -697,15 +694,12 @@ async fn an_init_config_write_is_allowed_only_after_privd_saw_no_config() {
                 let _ = w.list(T::Config);
             }
             let req = w.start_write(T::Config, &[0u8; 32], b"new config");
-            match w.try_wait(req) {
-                Some(Reply::Done) => {
-                    w.put(T::Key, b"a key file");
-                    w.finish_ok(pb::JobResult {
-                        key_ids: vec![Bytes::from(vec![1u8; 32]), Bytes::from(vec![2u8; 32])],
-                        ..Default::default()
-                    });
-                }
-                _ => {}
+            if let Some(Reply::Done) = w.try_wait(req) {
+                w.put(T::Key, b"a key file");
+                w.finish_ok(pb::JobResult {
+                    key_ids: vec![Bytes::from(vec![1u8; 32]), Bytes::from(vec![2u8; 32])],
+                    ..Default::default()
+                });
             }
         });
         let h = rig.runner.start(init_request(&rig)).await.unwrap();
@@ -935,4 +929,19 @@ async fn a_snapshot_privd_did_not_record_cannot_be_removed_by_a_prune() {
     assert_eq!(rig.drive.objects(T::Snapshot), vec![vec![0xee; 32]]);
     // The record is untouched by a failed job.
     assert_eq!(rig.runner.completed("main").unwrap().backups.len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_open_repo_that_is_never_answered_is_stale_after_the_guard() {
+    let rig = Rig::ready().await;
+    rig.drive.knobs.lock().unwrap().hold_open = true;
+    let h = rig.runner.start(rig.backup_request()).await.unwrap();
+    rig.until("OpenRepo", || {
+        rig.drive.seen().iter().any(|s| matches!(s, Seen::Open(_)))
+    })
+    .await;
+    rig.advance(32 * 60_000, 32 * 60_000).await;
+    let out = rig.outcome(&h).await;
+    assert_eq!(out.result.as_ref().unwrap_err(), &Failure::Guard);
+    assert_eq!(rig.host.count("create_snapshot"), 0);
 }

@@ -80,6 +80,7 @@ pub async fn open<E: BackupEnv>(
             takeover: p.takeover,
         })),
     }));
+    s.begin_open_repo();
     if !s.send_drive(&open) {
         return Err(Failure::Unavailable);
     }

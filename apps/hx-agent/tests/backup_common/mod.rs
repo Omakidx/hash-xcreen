@@ -47,6 +47,7 @@ pub fn hex(b: &[u8]) -> String {
 // ----- one end of a link -------------------------------------------------------------------
 
 /// What `Peer::next` returns.
+#[allow(clippy::large_enum_variant)]
 pub enum Got {
     Msg(pb::RepoFrame),
     Data {
@@ -137,12 +138,7 @@ impl Peer {
 
     /// The next frame; a timeout is an error here.
     pub fn next(&mut self) -> Result<Got, String> {
-        loop {
-            match self.poll()? {
-                Some(g) => return Ok(g),
-                None => return Err("timeout".into()),
-            }
-        }
+        self.poll()?.ok_or_else(|| "timeout".to_string())
     }
 
     pub fn send(&mut self, f: F) -> Result<(), String> {
@@ -488,6 +484,8 @@ pub struct DriveKnobs {
     pub fail_reads: Option<(usize, ErrorClass)>,
     /// Never answer a `Write` (the upload is held, as for a capped upload).
     pub hold_writes: bool,
+    /// `OpenRepo` is never answered.
+    pub hold_open: bool,
 }
 
 pub struct DriveCtl {
@@ -698,6 +696,9 @@ fn serve_drive(
                         Op::OpenRepo(o) => {
                             note(Seen::Open(o.folder.clone()));
                             opens.lock().unwrap().push(o);
+                            if knobs.lock().unwrap().hold_open {
+                                continue;
+                            }
                             match knobs.lock().unwrap().open_error {
                                 Some(c) => err(&mut p, c),
                                 None => done(&mut p),
