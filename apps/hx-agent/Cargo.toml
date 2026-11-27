@@ -57,7 +57,8 @@ getrandom = "0.4"
 hkdf = "0.12"
 hmac = "0.12"
 hx-crypto.workspace = true
-hx-ipc = { workspace = true, features = ["privd", "link"] }
+hx-ipc = { workspace = true, features = ["privd", "link", "repo"] }
+hx-backup = { path = "../../crates/hx-backup", version = "0.1.0" } # the pure modules only (manifest validation); never `engine` (ipc.md 36, tests/layout.rs of the worker)
 hx-proto.workspace = true
 hx-provision.workspace = true
 hx-transport.workspace = true

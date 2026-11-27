@@ -66,6 +66,10 @@ pub enum Flag {
     UpdateRolledBack,
     /// The `DOCKER-USER` rules could not be applied.
     HostDockerForwarding,
+    /// The Drive token is revoked or missing (ipc.md 31, host-wide).
+    DriveReconnect,
+    /// Another server owns the backup repository (ipc.md 29, per desktop).
+    BackupTakenOver,
 }
 
 impl Flag {
@@ -79,6 +83,8 @@ impl Flag {
             Self::PasswordLocked => pb::NeedsAttention::PasswordLocked,
             Self::UpdateRolledBack => pb::NeedsAttention::UpdateRolledBack,
             Self::HostDockerForwarding => pb::NeedsAttention::HostDockerForwarding,
+            Self::DriveReconnect => pb::NeedsAttention::DriveReconnect,
+            Self::BackupTakenOver => pb::NeedsAttention::BackupTakenOver,
         }
     }
 }

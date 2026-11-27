@@ -56,6 +56,9 @@ pub async fn destroy_desktop<T: Transport + Clone + 'static>(
         return Err(CmdError::invalid("destroy_desktop.confirm_destroy"));
     }
     let _g = d.lock_desktop(ctx, &r.desktop_id, true).await?;
+    // A running backup job, its helper, restore target and sockets would keep the pool "in use"
+    // (ipc.md 35): cancel the job and clean up before the instance goes.
+    d.backup_teardown(std::slice::from_ref(&r.desktop_id)).await;
     let name = d.instance_name(&r.desktop_id);
     let client = d.incus.scoped();
     let report = d

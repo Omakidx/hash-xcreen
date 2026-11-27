@@ -1,0 +1,539 @@
+//! The I/O of one repository link: a reader thread and a writer thread over a blocking unix
+//! socket, and the async [`Link`] the job loop drives (ipc.md sections 24, 25 and 32).
+//!
+//! * **Reading.** One thread per link reads with `recvmsg` through [`NoCmsgReader`] (a control
+//!   message or `MSG_CTRUNC` is a violation, section 24, "No descriptors"), decodes and validates
+//!   every frame with [`repo::decode`] and hands it to the loop through a one-slot channel. Before
+//!   it reads a frame it takes one of the **16 frame slots** of the relay budget (section 25) and
+//!   waits until the queue of the *other* link holds less than two data frames: privd reads the
+//!   next chunk only after it has written the previous one. The slot travels with the frame and is
+//!   released when the frame has been written to the other link or dropped.
+//! * **Writing.** One thread per link drains an [`OutQueue`]: control frames first, then data. A
+//!   write that makes no progress for 120 s fails the link.
+//! * **Silence.** The reader stamps `last_rx` on every read that returns bytes, so a frame that
+//!   arrives slowly keeps the link alive (section 32). While the reader is held back on purpose
+//!   (the other link is slow) it stamps too: a peer that privd is not reading is not silent.
+//!
+//! The end of the stream at a frame boundary is [`LinkEvent::Eof`] and a frame cut short is
+//! [`LinkEvent::Cut`]: the Drive link treats the first as the loss of the session and the second
+//! as a violation (section 32).
+
+use std::collections::VecDeque;
+use std::io::{self, Read, Write};
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
+
+use bytes::Bytes;
+use hx_ipc::error::{FrameError, ReadError};
+use hx_ipc::frame::Decoder;
+use hx_ipc::recv::NoCmsgReader;
+use hx_ipc::repo::{
+    self, DATA_FRAME_HEADER_LEN, Endpoint, Incoming, LinkState, RepoFramePolicy,
+    encode_data_header, encode_message, encode_secret, pb,
+};
+use tokio::runtime::Handle;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use zeroize::Zeroizing;
+
+use super::clock::Monotonic;
+
+/// The reader waits while the other link has this many data bytes queued: two full frames.
+pub const SINK_LIMIT: usize = 2 * 1024 * 1024;
+
+/// A write that makes no progress for this long fails the link.
+const WRITE_STALL: Duration = Duration::from_secs(120);
+
+/// What a reader thread reports.
+#[derive(Debug)]
+pub enum LinkEvent {
+    /// A decoded, validated frame, and the relay slot it holds.
+    Frame(Incoming, OwnedSemaphorePermit),
+    /// The stream ended at a frame boundary.
+    Eof,
+    /// The stream ended inside a frame.
+    Cut,
+    /// The peer broke a rule of the codec (the text names the rule, never peer data).
+    Violation(String),
+    /// The socket failed (a reset counts as the loss of the link).
+    Io,
+    /// The writer could not write.
+    WriteFailed,
+}
+
+/// One thing for the writer thread.
+pub enum Out {
+    /// An encoded kind-1 frame.
+    Msg(Vec<u8>),
+    /// An encoded kind-2 frame; wiped when dropped.
+    Secret(Zeroizing<Vec<u8>>),
+    /// A kind-3 frame: header, the payload exactly as it was read, and the relay slot it holds.
+    Data {
+        /// The 14 bytes before the payload.
+        header: [u8; DATA_FRAME_HEADER_LEN],
+        /// The payload.
+        payload: Bytes,
+        /// Released when the frame has been written.
+        _permit: Option<OwnedSemaphorePermit>,
+    },
+    /// Close the link after everything before it has been written.
+    Close,
+}
+
+#[derive(Default)]
+struct QueueInner {
+    ctl: VecDeque<Out>,
+    data: VecDeque<Out>,
+    data_bytes: usize,
+    closed: bool,
+}
+
+/// The outgoing queue of a link: control frames go first, data frames wait behind them.
+#[derive(Default)]
+pub struct OutQueue {
+    inner: Mutex<QueueInner>,
+    cv: Condvar,
+}
+
+impl OutQueue {
+    /// An empty, open queue.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, QueueInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Queues a control item; `false` when the queue is closed.
+    pub fn push_ctl(&self, out: Out) -> bool {
+        let mut g = self.lock();
+        if g.closed {
+            return false;
+        }
+        g.ctl.push_back(out);
+        self.cv.notify_all();
+        true
+    }
+
+    /// Queues a data frame of `len` payload bytes; `false` when the queue is closed.
+    pub fn push_data(&self, out: Out, len: usize) -> bool {
+        let mut g = self.lock();
+        if g.closed {
+            return false;
+        }
+        g.data.push_back(out);
+        g.data_bytes += len;
+        self.cv.notify_all();
+        true
+    }
+
+    /// The next item, blocking; `None` once the queue is closed (what is still queued is dropped).
+    pub fn pop(&self) -> Option<(Out, usize)> {
+        let mut g = self.lock();
+        loop {
+            if g.closed {
+                return None;
+            }
+            if let Some(o) = g.ctl.pop_front() {
+                return Some((o, 0));
+            }
+            if let Some(o) = g.data.pop_front() {
+                let len = match &o {
+                    Out::Data { payload, .. } => payload.len(),
+                    _ => 0,
+                };
+                return Some((o, len));
+            }
+            g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Called by the writer after it wrote a data frame of `len` bytes.
+    fn written(&self, len: usize) {
+        let mut g = self.lock();
+        g.data_bytes = g.data_bytes.saturating_sub(len);
+        self.cv.notify_all();
+    }
+
+    /// Data bytes queued and not yet written.
+    pub fn data_bytes(&self) -> usize {
+        self.lock().data_bytes
+    }
+
+    /// Waits up to `timeout` for fewer than `limit` queued data bytes. `true` when below the
+    /// limit or closed.
+    pub fn wait_below(&self, limit: usize, timeout: Duration) -> bool {
+        let g = self.lock();
+        let (g, _) = self
+            .cv
+            .wait_timeout_while(g, timeout, |q| !q.closed && q.data_bytes >= limit)
+            .unwrap_or_else(|e| e.into_inner());
+        g.closed || g.data_bytes < limit
+    }
+
+    /// Closes the queue: the writer stops and what is queued is dropped.
+    pub fn close(&self) {
+        let mut g = self.lock();
+        g.closed = true;
+        g.ctl.clear();
+        g.data.clear();
+        g.data_bytes = 0;
+        self.cv.notify_all();
+    }
+
+    /// Whether the queue is closed.
+    pub fn is_closed(&self) -> bool {
+        self.lock().closed
+    }
+}
+
+struct Stamping<'a> {
+    inner: NoCmsgReader<&'a UnixStream>,
+    last_rx: &'a AtomicU64,
+    mono: &'a dyn Monotonic,
+}
+
+impl Read for Stamping<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.last_rx.store(self.mono.now_ms(), Ordering::SeqCst);
+        }
+        Ok(n)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_reader(
+    stream: UnixStream,
+    endpoint: Endpoint,
+    budget: Arc<Semaphore>,
+    handle: Handle,
+    sink: Arc<OutQueue>,
+    tx: mpsc::Sender<LinkEvent>,
+    last_rx: Arc<AtomicU64>,
+    mono: Arc<dyn Monotonic>,
+) {
+    let mut dec = Decoder::new(RepoFramePolicy::new(endpoint));
+    loop {
+        // privd reads the next chunk only after it has written the previous one.
+        while !sink.wait_below(SINK_LIMIT, Duration::from_millis(100)) {
+            last_rx.store(mono.now_ms(), Ordering::SeqCst);
+        }
+        let Ok(permit) = handle.block_on(budget.clone().acquire_owned()) else {
+            return;
+        };
+        let mut r = Stamping {
+            inner: NoCmsgReader(&stream),
+            last_rx: &last_rx,
+            mono: mono.as_ref(),
+        };
+        let event = match dec.read_from(&mut r) {
+            Ok(Some(raw)) => match repo::decode(raw, endpoint) {
+                Ok(incoming) => LinkEvent::Frame(incoming, permit),
+                Err(e) => LinkEvent::Violation(e.to_string().chars().take(100).collect()),
+            },
+            Ok(None) => LinkEvent::Eof,
+            Err(ReadError::Frame(FrameError::Truncated)) => LinkEvent::Cut,
+            Err(ReadError::Io(_)) => LinkEvent::Io,
+            Err(e) => LinkEvent::Violation(e.to_string().chars().take(100).collect()),
+        };
+        let last = !matches!(event, LinkEvent::Frame(..));
+        if tx.blocking_send(event).is_err() || last {
+            return;
+        }
+    }
+}
+
+fn run_writer(mut stream: UnixStream, q: Arc<OutQueue>, tx: mpsc::Sender<LinkEvent>) {
+    let _ = stream.set_write_timeout(Some(WRITE_STALL));
+    while let Some((item, data_len)) = q.pop() {
+        let r = match &item {
+            Out::Msg(b) => stream.write_all(b),
+            Out::Secret(b) => stream.write_all(b),
+            Out::Data {
+                header, payload, ..
+            } => stream
+                .write_all(header)
+                .and_then(|()| stream.write_all(payload)),
+            Out::Close => {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                q.close();
+                return;
+            }
+        };
+        if matches!(item, Out::Data { .. }) {
+            q.written(data_len);
+        }
+        if r.is_err() {
+            let _ = tx.blocking_send(LinkEvent::WriteFailed);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            q.close();
+            return;
+        }
+    }
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+}
+
+/// What a send on a link can fail with: the rule (the state machine's or the codec's) or a link
+/// that is closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendError {
+    /// The link's state machine or the codec refused the frame: a bug of privd's own.
+    Rule(&'static str),
+    /// The queue is closed.
+    Closed,
+}
+
+/// One link as the job loop sees it.
+pub struct Link {
+    /// `"worker"` or `"drive"`, for audit lines.
+    pub name: &'static str,
+    /// The stateful rules of this end.
+    pub state: LinkState,
+    peer: Endpoint,
+    /// The outgoing queue.
+    pub q: Arc<OutQueue>,
+    /// What the reader reports.
+    pub rx: mpsc::Receiver<LinkEvent>,
+    /// Monotonic time of the last byte read.
+    pub last_rx: Arc<AtomicU64>,
+    shutdown: UnixStream,
+    /// Monotonic time at which the next `Ping` is due.
+    pub next_ping_ms: u64,
+    nonce: u64,
+    /// False once the link has ended or been closed.
+    pub open: bool,
+}
+
+/// What a link needs from the runner to start.
+pub struct LinkParts {
+    /// The relay budget (frame slots) shared by every job.
+    pub budget: Arc<Semaphore>,
+    /// The runtime the reader thread blocks on for the budget.
+    pub handle: Handle,
+    /// The clock.
+    pub mono: Arc<dyn Monotonic>,
+    /// How often privd pings (15 s; ipc.md section 32).
+    pub ping_interval: Duration,
+}
+
+impl Link {
+    /// Starts the reader and writer threads on `stream`. `me` is the endpoint of privd on this
+    /// link (it decodes for it); `own_q` is this link's outgoing queue and `other_q` the queue of
+    /// the other link, which this link's reader waits on.
+    pub fn spawn(
+        name: &'static str,
+        stream: UnixStream,
+        me: Endpoint,
+        own_q: Arc<OutQueue>,
+        other_q: Arc<OutQueue>,
+        parts: &LinkParts,
+    ) -> io::Result<Self> {
+        let (tx, rx) = mpsc::channel(1);
+        let last_rx = Arc::new(AtomicU64::new(parts.mono.now_ms()));
+        let rstream = stream.try_clone()?;
+        let wstream = stream.try_clone()?;
+        {
+            let (budget, handle, mono, last_rx, tx) = (
+                parts.budget.clone(),
+                parts.handle.clone(),
+                parts.mono.clone(),
+                last_rx.clone(),
+                tx.clone(),
+            );
+            std::thread::Builder::new()
+                .name(format!("hx-bkp-{name}-rd"))
+                .spawn(move || {
+                    run_reader(rstream, me, budget, handle, other_q, tx, last_rx, mono)
+                })?;
+        }
+        {
+            let q = own_q.clone();
+            std::thread::Builder::new()
+                .name(format!("hx-bkp-{name}-wr"))
+                .spawn(move || run_writer(wstream, q, tx))?;
+        }
+        Ok(Self {
+            name,
+            state: LinkState::new(me),
+            peer: me.peer(),
+            q: own_q,
+            rx,
+            last_rx,
+            shutdown: stream,
+            next_ping_ms: parts.mono.now_ms()
+                + u64::try_from(parts.ping_interval.as_millis()).unwrap_or(u64::MAX),
+            nonce: 0,
+            open: true,
+        })
+    }
+
+    /// Sends a kind-1 frame: the state machine first (a frame it refuses is a bug of privd's
+    /// own), then the codec (which validates it for the peer), then the control queue.
+    pub fn send(&mut self, frame: &pb::RepoFrame) -> Result<(), SendError> {
+        self.state
+            .sent_message(frame)
+            .map_err(|e| SendError::Rule(e.0))?;
+        let bytes = encode_message(frame, self.peer).map_err(|_| SendError::Rule("encode"))?;
+        if self.q.push_ctl(Out::Msg(bytes)) {
+            Ok(())
+        } else {
+            Err(SendError::Closed)
+        }
+    }
+
+    /// Sends one data frame.
+    pub fn send_data(
+        &mut self,
+        stream_id: u64,
+        end: bool,
+        payload: Bytes,
+        permit: Option<OwnedSemaphorePermit>,
+    ) -> Result<(), SendError> {
+        self.state
+            .sent_data(stream_id, end, payload.len())
+            .map_err(|e| SendError::Rule(e.0))?;
+        let header = encode_data_header(stream_id, end, payload.len())
+            .map_err(|_| SendError::Rule("encode"))?;
+        let len = payload.len();
+        let ok = self.q.push_data(
+            Out::Data {
+                header,
+                payload,
+                _permit: permit,
+            },
+            len,
+        );
+        if ok { Ok(()) } else { Err(SendError::Closed) }
+    }
+
+    /// Sends one secret frame (the worker link).
+    pub fn send_secret(&mut self, slot: u8, secret: &[u8]) -> Result<(), SendError> {
+        self.state
+            .sent_secret(0, slot, secret.len())
+            .map_err(|e| SendError::Rule(e.0))?;
+        let framed = encode_secret(0, slot, secret).map_err(|_| SendError::Rule("encode"))?;
+        if self.q.push_ctl(Out::Secret(framed)) {
+            Ok(())
+        } else {
+            Err(SendError::Closed)
+        }
+    }
+
+    /// `Ping` with a fresh nonce.
+    pub fn ping(&mut self) -> Result<(), SendError> {
+        self.nonce += 1;
+        self.send(&frame(pb::repo_frame::Frame::Ping(pb::Ping {
+            nonce: self.nonce,
+        })))
+    }
+
+    /// `Pong` for `nonce`.
+    pub fn pong(&mut self, nonce: u64) -> Result<(), SendError> {
+        self.send(&frame(pb::repo_frame::Frame::Pong(pb::Pong { nonce })))
+    }
+
+    /// Ends the link. With `bye` the session is closed in order (`Bye`, then everything queued
+    /// before it is written, then the close); without it the queue is dropped and the socket is
+    /// shut down at once.
+    pub fn close(&mut self, bye: bool) {
+        if !self.open {
+            return;
+        }
+        self.open = false;
+        if bye && self.state.is_open() {
+            let _ = self.send(&frame(pb::repo_frame::Frame::Bye(pb::Bye {})));
+            if self.q.push_ctl(Out::Close) {
+                return;
+            }
+        }
+        self.q.close();
+        let _ = self.shutdown.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+impl Drop for Link {
+    fn drop(&mut self) {
+        self.q.close();
+        let _ = self.shutdown.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+/// A one-variant frame.
+pub fn frame(f: pb::repo_frame::Frame) -> pb::RepoFrame {
+    pb::RepoFrame { frame: Some(f) }
+}
+
+/// Connects to a unix socket, retrying every `retry` until `window_ms` of the monotonic clock
+/// have passed. The stream is returned in blocking mode.
+pub async fn connect_unix(
+    path: &Path,
+    window_ms: u64,
+    retry: Duration,
+    mono: &dyn Monotonic,
+) -> io::Result<UnixStream> {
+    let started = mono.now_ms();
+    loop {
+        match tokio::net::UnixStream::connect(path).await {
+            Ok(s) => {
+                let s = s.into_std()?;
+                s.set_nonblocking(false)?;
+                return Ok(s);
+            }
+            Err(e) => {
+                if mono.now_ms().saturating_sub(started) >= window_ms {
+                    return Err(e);
+                }
+                tokio::time::sleep(retry).await;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_frames_are_written_before_data_and_a_closed_queue_stops() {
+        let q = OutQueue::new();
+        q.push_data(
+            Out::Data {
+                header: [0; DATA_FRAME_HEADER_LEN],
+                payload: Bytes::from_static(b"abc"),
+                _permit: None,
+            },
+            3,
+        );
+        q.push_ctl(Out::Msg(vec![1]));
+        assert_eq!(q.data_bytes(), 3);
+        assert!(matches!(q.pop(), Some((Out::Msg(_), 0))));
+        assert!(matches!(q.pop(), Some((Out::Data { .. }, 3))));
+        q.written(3);
+        assert_eq!(q.data_bytes(), 0);
+        q.close();
+        assert!(q.pop().is_none());
+        assert!(!q.push_ctl(Out::Msg(vec![2])));
+    }
+
+    #[test]
+    fn the_reader_waits_while_the_other_link_is_backed_up() {
+        let q = OutQueue::new();
+        assert!(q.wait_below(10, Duration::from_millis(5)));
+        q.push_data(
+            Out::Data {
+                header: [0; DATA_FRAME_HEADER_LEN],
+                payload: Bytes::from(vec![0u8; 20]),
+                _permit: None,
+            },
+            20,
+        );
+        assert!(!q.wait_below(10, Duration::from_millis(5)));
+        q.written(20);
+        assert!(q.wait_below(10, Duration::from_millis(5)));
+    }
+}

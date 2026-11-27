@@ -21,6 +21,11 @@ use hx_provision::orchestrate::destroy_instance;
 
 use super::audit::{self, AuditSink, FileAudit, RequestRecord};
 use super::auth;
+use super::backup::BackupConfig;
+use super::backup::clock::SystemMono;
+use super::backup::env::{DaemonEnv, DaemonRunner};
+use super::backup::host::IncusHost;
+use super::backup::runner::JobRunner;
 use super::cancel::{CancelToken, Guard, LOCK_WAIT, LockKey, Locks};
 use super::clock::{Clock, SystemClock};
 use super::cmd;
@@ -172,6 +177,8 @@ pub struct Daemon<T: Transport + Clone + 'static> {
     pub(crate) image_dir_lock: tokio::sync::Mutex<()>,
     /// Serialises the read-decide-write of `uninstall-state` (`cmd::uninstall`).
     pub(crate) uninstall_gate: Mutex<()>,
+    /// The backup job runner (ipc.md Part 3; its commands are W5b).
+    pub(crate) backup: DaemonRunner<T>,
     /// This daemon's own `Arc`, so that a command can hand work to a task that outlives it (the
     /// restarts after `ApplyUpdate` answers).
     pub(crate) me: Weak<Self>,
@@ -226,6 +233,13 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
             &cfg.update.admin_socket,
         );
         let image_deps = ImageDeps::system(deps.runner.clone());
+        let backup_cfg = BackupConfig::from_privd(&cfg);
+        let backup_host = IncusHost::new(
+            incus.clone(),
+            cfg.naming.clone(),
+            deps.runner.clone(),
+            deps.probe.clone(),
+        );
         Ok(Arc::new_cyclic(|me| Self {
             cfg,
             incus,
@@ -248,6 +262,12 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
             image_state_gate: Mutex::new(()),
             image_dir_lock: tokio::sync::Mutex::new(()),
             uninstall_gate: Mutex::new(()),
+            backup: JobRunner::new(
+                backup_cfg,
+                backup_host,
+                Arc::new(DaemonEnv::new(me.clone())),
+                Arc::new(SystemMono::new()),
+            ),
             me: me.clone(),
         }))
     }

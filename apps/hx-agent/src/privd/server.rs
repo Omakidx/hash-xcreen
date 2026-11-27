@@ -241,6 +241,9 @@ where
         // stopped now, not when someone next asks for it.
         let d = daemon.clone();
         tokio::spawn(async move { d.enforce_isolation_all().await });
+        // Crash recovery of the backup runner, before any backup job is admitted (ipc.md 35).
+        let d = daemon.clone();
+        tokio::spawn(async move { d.recover_backups().await });
         // An update switched in by the previous process is judged by this one (ipc.md 6.12).
         let d = daemon.clone();
         tokio::spawn(async move { d.resume_update().await });
