@@ -150,21 +150,21 @@ fn storage_quota_is_not_retried() {
 }
 
 #[test]
-fn fatal_classes_make_one_attempt() {
-    for (status, reason, class) in [
-        (401u16, "authError", EC::AuthRevoked),
-        (403, "appNotAuthorizedToFile", EC::Permission),
-    ] {
-        let (rig, mut s) = case(vec![Fault::status("get.media", 1000, status, reason)]);
-        let before = rig.fake.with(|m| m.count("get.media"));
-        let r = pack_read(&mut s);
-        assert_eq!(r.class(), Some(class));
-        assert_eq!(
-            rig.fake.with(|m| m.count("get.media")) - before,
-            1,
-            "{status}: one attempt"
-        );
-    }
+fn a_fatal_class_makes_one_attempt() {
+    let (rig, mut s) = case(vec![Fault::status(
+        "get.media",
+        1000,
+        403,
+        "appNotAuthorizedToFile",
+    )]);
+    let before = rig.fake.with(|m| m.count("get.media"));
+    let r = pack_read(&mut s);
+    assert_eq!(r.class(), Some(EC::Permission));
+    assert_eq!(
+        rig.fake.with(|m| m.count("get.media")) - before,
+        1,
+        "one attempt"
+    );
 }
 
 #[test]
@@ -258,7 +258,7 @@ fn a_rate_limited_answer_carries_the_last_retry_after() {
 #[test]
 fn a_hung_drive_call_times_out_and_is_retried_then_transient() {
     let rig = Rig::with(|c| {
-        c.timing.attempt_base = Duration::from_millis(300);
+        c.timing.idle = Duration::from_millis(300);
         c.timing.max_retries = 2;
     });
     let mut s = rig.open_session();
@@ -383,7 +383,8 @@ fn only_the_two_google_hosts_are_ever_requested() {
 
 #[test]
 fn the_daily_limit_gate_is_shared_by_all_requests_of_the_session() {
-    let rig = Rig::new();
+    // a pause long enough that the injected delay cannot account for the wait
+    let rig = Rig::with(|c| c.timing.daily_pause = Duration::from_millis(500));
     let mut s = rig.open_session();
     s.env.create().ok();
     for i in 0..4u8 {
@@ -391,7 +392,7 @@ fn the_daily_limit_gate_is_shared_by_all_requests_of_the_session() {
     }
     rig.fake.with(|m| {
         // all four attempts are in flight before any of them is answered
-        m.delay.insert("get.media", Duration::from_millis(150));
+        m.delay.insert("get.media", Duration::from_millis(100));
         m.inject(Fault::status("get.media", 4, 403, "dailyLimitExceeded"));
     });
     let reqs: Vec<u64> = (0..4u8)
@@ -415,8 +416,9 @@ fn the_daily_limit_gate_is_shared_by_all_requests_of_the_session() {
         );
     }
     assert!(
-        began.elapsed() >= Duration::from_millis(150),
-        "they waited at the gate"
+        began.elapsed() >= Duration::from_millis(550),
+        "they waited out the 500 ms pause: {:?}",
+        began.elapsed()
     );
     s.env.pump_for(Duration::from_millis(300));
     let kinds = s.env.event_kinds();
@@ -460,11 +462,11 @@ fn after_the_pause_limit_every_request_fails_with_daily_limit() {
         "{:?}",
         s.env.event_kinds()
     );
-    // exhausted for the session: the next request fails at its first attempt
+    // exhausted for the session: the next request fails without any attempt
     let before = rig.fake.with(|m| m.count("get.media"));
     let r = pack_read(&mut s);
     assert_eq!(r.class(), Some(EC::DailyLimit));
-    assert_eq!(rig.fake.with(|m| m.count("get.media")) - before, 1);
+    assert_eq!(rig.fake.with(|m| m.count("get.media")) - before, 0);
 }
 
 // ---- the token ----

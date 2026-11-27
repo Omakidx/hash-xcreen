@@ -53,6 +53,12 @@ pub enum Action {
     Redirect(&'static str),
     /// Close the connection without answering.
     Drop,
+    /// Answer 200 with no `Content-Length` and this many body bytes, then close (a body of
+    /// unknown length that is far longer than what was asked for).
+    Unbounded(usize),
+    /// Send the headers and a little of the body, then keep the connection open (and read until
+    /// the client closes it).
+    StallBody,
     /// Send the headers and half of the body, then close.
     TruncateBody,
     /// Read this many bytes of the request body, then close.
@@ -91,6 +97,8 @@ pub struct Req {
     pub method: String,
     pub path: String,
     pub category: &'static str,
+    pub at: std::time::Instant,
+    pub has_query: bool,
 }
 
 #[derive(Default)]
@@ -109,6 +117,14 @@ pub struct Model {
     pub fail_list_page: u32,
     /// Fail every request for a page after the first one of a listing.
     pub fail_continuations: bool,
+    /// Answer every list with one file and the same `nextPageToken` for ever.
+    pub repeat_token: bool,
+    /// The refresh token the token endpoint accepts (default [`REFRESH_TOKEN`]).
+    pub expected_refresh: Option<String>,
+    /// An `Unbounded` body was written to the end (the client did not stop reading).
+    pub big_written_ok: bool,
+    /// Bytes of media bodies served so far.
+    pub media_bytes: u64,
     /// Answer every list with at most this many files per page (0 = the requested size).
     pub force_page_size: usize,
     /// Delay before answering each request in these categories.
@@ -487,17 +503,27 @@ fn not_found() -> Response {
 }
 
 fn handle(m: &mut Model, req: &Request) -> Response {
+    let r = handle_inner(m, req);
+    if category(&req.method, &req.path, &req.query) == "get.media" && r.status < 300 {
+        m.media_bytes += r.body.len() as u64;
+    }
+    r
+}
+
+fn handle_inner(m: &mut Model, req: &Request) -> Response {
     let cat = category(&req.method, &req.path, &req.query);
     m.log.push(Req {
         method: req.method.clone(),
         path: req.path.clone(),
         category: cat,
+        at: std::time::Instant::now(),
+        has_query: !req.query.is_empty(),
     });
     if cat == "token" {
         let form = String::from_utf8_lossy(&req.body).into_owned();
         let all = format!("{}&{}", req.query, form);
         let rt = query_param(&all, "refresh_token").unwrap_or_default();
-        if rt != REFRESH_TOKEN
+        if rt != m.expected_refresh.as_deref().unwrap_or(REFRESH_TOKEN)
             || query_param(&all, "client_id").as_deref() != Some(CLIENT_ID)
             || query_param(&all, "client_secret").as_deref() != Some(CLIENT_SECRET)
         {
@@ -551,6 +577,14 @@ fn handle(m: &mut Model, req: &Request) -> Response {
             } else {
                 page_size
             };
+            if m.repeat_token && !qs.contains("name = ") {
+                let first = m.files.values().find(|f| m.matches_q(f, &qs)).cloned();
+                let page = first.map(|f| Model::file_json(&f)).unwrap_or_default();
+                return json(
+                    200,
+                    format!(r#"{{"files":[{page}],"nextPageToken":"again"}}"#).replace("[,", "["),
+                );
+            }
             let start: usize = query_param(q, "pageToken")
                 .and_then(|t| t.parse().ok())
                 .unwrap_or(0);
@@ -840,6 +874,8 @@ async fn serve_conn(tcp: TcpStream, acceptor: TlsAcceptor, model: Arc<Mutex<Mode
                 method: req.method.clone(),
                 path: req.path.clone(),
                 category: cat,
+                at: std::time::Instant::now(),
+                has_query: !req.query.is_empty(),
             });
         };
         let mut truncate = false;
@@ -847,6 +883,36 @@ async fn serve_conn(tcp: TcpStream, acceptor: TlsAcceptor, model: Arc<Mutex<Mode
             Some(Action::Hang) => {
                 note(&mut model.lock().unwrap());
                 tokio::time::sleep(Duration::from_secs(3600)).await;
+                return;
+            }
+            Some(Action::StallBody) => {
+                note(&mut model.lock().unwrap());
+                let _ = tls
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                    )
+                    .await;
+                let _ = tls.flush().await;
+                let mut buf = [0u8; 256];
+                while matches!(tls.read(&mut buf).await, Ok(n) if n > 0) {}
+                return;
+            }
+            Some(Action::Unbounded(n)) => {
+                note(&mut model.lock().unwrap());
+                let mut ok = tls
+                    .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                    .await
+                    .is_ok();
+                let block = vec![0u8; 64 * 1024];
+                let mut left = n;
+                while ok && left > 0 {
+                    let k = left.min(block.len());
+                    ok = tls.write_all(&block[..k]).await.is_ok();
+                    left -= k;
+                }
+                if ok && tls.flush().await.is_ok() {
+                    model.lock().unwrap().big_written_ok = true;
+                }
                 return;
             }
             Some(Action::Drop | Action::DropAfterBody(_)) => {

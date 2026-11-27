@@ -10,6 +10,7 @@
 //! and the Drive reason.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -33,17 +34,72 @@ pub struct Observed {
     pub token_endpoint: bool,
 }
 
-type Slot = Arc<Mutex<Option<Observed>>>;
+/// What one attempt shares with the HTTP layer: the last request's outcome, the time of the last
+/// progress (the no-progress timer), the ceiling of the next media body and the request count.
+pub(crate) struct AttemptState {
+    obs: Mutex<Option<Observed>>,
+    last: Mutex<Instant>,
+    body_limit: AtomicU64,
+    requests: AtomicU32,
+}
+
+impl AttemptState {
+    fn new() -> Self {
+        Self {
+            obs: Mutex::new(None),
+            last: Mutex::new(Instant::now()),
+            body_limit: AtomicU64::new(0),
+            requests: AtomicU32::new(0),
+        }
+    }
+
+    fn last(&self) -> Instant {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
 
 tokio::task_local! {
-    static ATTEMPT: Slot;
+    static ATTEMPT: Arc<AttemptState>;
 }
 
 /// Records the outcome of an HTTP request for the attempt that is running (a no-op outside one).
 pub(crate) fn record(obs: Observed) {
-    let _ = ATTEMPT.try_with(|slot| {
-        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(obs);
+    let _ = ATTEMPT.try_with(|s| {
+        *s.obs.lock().unwrap_or_else(|e| e.into_inner()) = Some(obs);
     });
+}
+
+impl AttemptState {
+    /// Progress of the attempt: a request byte written, a response byte read, a header received, a
+    /// chunk waiting for the upload cap. Resets the no-progress timer.
+    pub(crate) fn touch(&self) {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    }
+}
+
+/// The attempt that is running, for tasks that outlive the call (the body relay, hyper's connection
+/// task), which cannot read the task-local themselves.
+pub(crate) fn current() -> Option<Arc<AttemptState>> {
+    ATTEMPT.try_with(Arc::clone).ok()
+}
+
+/// Sets the ceiling of the media bodies of this attempt (the bytes the caller asked for).
+pub(crate) fn set_body_limit(bytes: u64) {
+    let _ = ATTEMPT.try_with(|s| s.body_limit.store(bytes, Ordering::Relaxed));
+}
+
+/// The ceiling set by [`set_body_limit`], or 0 when none is set.
+pub(crate) fn body_limit() -> u64 {
+    ATTEMPT
+        .try_with(|s| s.body_limit.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+/// Counts one request of the attempt; `false` when `max` is exceeded.
+pub(crate) fn count_request(max: u32) -> bool {
+    ATTEMPT
+        .try_with(|s| s.requests.fetch_add(1, Ordering::Relaxed) < max)
+        .unwrap_or(true)
 }
 
 /// How a failure is handled.
@@ -61,6 +117,8 @@ pub enum Outcome {
     },
     /// 403 `dailyLimitExceeded`: the shared gate.
     DailyLimit,
+    /// A 401 from the API: the access token may have expired; the caller refreshes once.
+    Unauthorized,
     /// No retry; the class goes to privd.
     Fatal(EC),
 }
@@ -80,8 +138,15 @@ pub fn classify(obs: Option<&Observed>, e: &opendal::Error) -> Outcome {
         if s == 0 {
             return Outcome::Transient { retry_after: None };
         }
-        if s == 401 || (o.token_endpoint && o.oauth_error == "invalid_grant") {
+        if o.token_endpoint && o.oauth_error == "invalid_grant" {
             return Outcome::Fatal(EC::AuthRevoked);
+        }
+        if s == 401 {
+            return if o.token_endpoint {
+                Outcome::Fatal(EC::AuthRevoked)
+            } else {
+                Outcome::Unauthorized
+            };
         }
         if s == 429 {
             return Outcome::RateLimited { retry_after: ra };
@@ -123,6 +188,9 @@ pub struct DriveError {
     pub class: EC,
     /// `RepoError.retry_after_ms` (0 = none), at most 24 h.
     pub retry_after_ms: u32,
+    /// The failure was a 401 of the API (not `invalid_grant`): refresh the access token and repeat
+    /// the request once before it is final (ipc.md §29).
+    pub unauthorized: bool,
 }
 
 impl DriveError {
@@ -132,6 +200,7 @@ impl DriveError {
         Self {
             class,
             retry_after_ms: 0,
+            unauthorized: false,
         }
     }
 
@@ -142,6 +211,7 @@ impl DriveError {
         Self {
             class,
             retry_after_ms: ms,
+            unauthorized: false,
         }
     }
 }
@@ -152,7 +222,8 @@ impl std::fmt::Display for DriveError {
     }
 }
 
-/// All the durations of the helper. Production values are the contract's; tests scale them down.
+/// All the durations and counts of the helper. Production values are the contract's; tests scale
+/// them down.
 #[derive(Debug, Clone, Copy)]
 pub struct Timing {
     /// First retry delay (§29: 1 s).
@@ -165,14 +236,18 @@ pub struct Timing {
     pub daily_pause: Duration,
     /// Pauses per session (26).
     pub max_pauses: u32,
-    /// Per-attempt timeout, fixed part (60 s).
-    pub attempt_base: Duration,
-    /// Per-attempt timeout, per MiB of the object (4 s).
-    pub attempt_per_mib: Duration,
+    /// An attempt that makes no progress for this long fails (60 s).
+    pub idle: Duration,
+    /// Each address is tried for this long when connecting (5 s).
+    pub connect_each: Duration,
     /// A request is given up after this long of its own time (30 min, §32).
     pub request_budget: Duration,
     /// The lease may be served from a read this old (60 s).
     pub lease_cache: Duration,
+    /// Entries of one listing (100 000).
+    pub max_list_entries: usize,
+    /// HTTP requests of one attempt (4 096).
+    pub max_requests: u32,
 }
 
 impl Timing {
@@ -185,10 +260,12 @@ impl Timing {
             max_retries: repo::MAX_RETRIES,
             daily_pause: repo::DAILY_LIMIT_PAUSE,
             max_pauses: repo::MAX_DAILY_LIMIT_PAUSES,
-            attempt_base: Duration::from_secs(60),
-            attempt_per_mib: Duration::from_secs(4),
+            idle: Duration::from_secs(60),
+            connect_each: Duration::from_secs(5),
             request_budget: repo::REQUEST_ANSWER_BUDGET,
             lease_cache: repo::LEASE_CACHE_MAX,
+            max_list_entries: 100_000,
+            max_requests: 4_096,
         }
     }
 
@@ -199,8 +276,8 @@ impl Timing {
             initial: self.initial / factor,
             max_delay: self.max_delay / factor,
             daily_pause: self.daily_pause / factor,
-            attempt_base: self.attempt_base / factor,
-            attempt_per_mib: self.attempt_per_mib / factor,
+            idle: self.idle / factor,
+            connect_each: self.connect_each / factor,
             request_budget: self.request_budget / factor,
             lease_cache: self.lease_cache / factor,
             ..self
@@ -217,41 +294,93 @@ impl Timing {
         exp.min(self.max_delay)
             .mul_f64(0.5 + 0.5 * u.clamp(0.0, 1.0))
     }
+}
 
-    /// The bound of one attempt that moves `bytes`.
+/// The one deadline of a request, carried through every Drive call it makes (ipc.md §29).
+#[derive(Debug)]
+pub struct Budget {
+    started: Instant,
+    paused: Mutex<Duration>,
+    limit: Duration,
+}
+
+impl Budget {
+    fn new(limit: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            paused: Mutex::new(Duration::ZERO),
+            limit,
+        }
+    }
+
+    /// Time at the daily-limit gate does not count.
+    fn add_paused(&self, d: Duration) {
+        *self.paused.lock().unwrap_or_else(|e| e.into_inner()) += d;
+    }
+
+    /// What is left of the request's own time.
     #[must_use]
-    pub fn attempt_timeout(&self, bytes: u64) -> Duration {
-        let mib = u32::try_from(bytes.div_ceil(1024 * 1024)).unwrap_or(u32::MAX);
-        self.attempt_base + self.attempt_per_mib.saturating_mul(mib)
+    pub fn remaining(&self) -> Duration {
+        let paused = *self.paused.lock().unwrap_or_else(|e| e.into_inner());
+        self.limit
+            .saturating_sub(self.started.elapsed().saturating_sub(paused))
     }
 }
 
-/// Cancellation of one request: set from the link's reader, awaited at every wait of the work.
+/// Cancellation and the deadline of one request: set from the link's reader, awaited at every wait
+/// of the work.
 #[derive(Clone)]
 pub struct Cancel {
     rx: watch::Receiver<bool>,
     _keep: Option<Arc<watch::Sender<bool>>>,
+    budget: Arc<Budget>,
 }
 
 /// The sending side of a [`Cancel`].
 pub type CancelHandle = watch::Sender<bool>;
 
 impl Cancel {
-    /// A cancel pair.
+    /// A cancel pair with the production 30 minute deadline.
     #[must_use]
     pub fn new() -> (CancelHandle, Cancel) {
-        let (tx, rx) = watch::channel(false);
-        (tx, Cancel { rx, _keep: None })
+        Self::with_limit(repo::REQUEST_ANSWER_BUDGET)
     }
 
-    /// A cancel that never fires.
+    /// A cancel pair whose request has `limit` of its own time.
+    #[must_use]
+    pub fn with_limit(limit: Duration) -> (CancelHandle, Cancel) {
+        let (tx, rx) = watch::channel(false);
+        (
+            tx,
+            Cancel {
+                rx,
+                _keep: None,
+                budget: Arc::new(Budget::new(limit)),
+            },
+        )
+    }
+
+    /// A cancel that never fires, with the production deadline.
     #[must_use]
     pub fn never() -> Cancel {
+        Self::never_with_limit(repo::REQUEST_ANSWER_BUDGET)
+    }
+
+    /// A cancel that never fires, with `limit` of time.
+    #[must_use]
+    pub fn never_with_limit(limit: Duration) -> Cancel {
         let (tx, rx) = watch::channel(false);
         Cancel {
             rx,
             _keep: Some(Arc::new(tx)),
+            budget: Arc::new(Budget::new(limit)),
         }
+    }
+
+    /// The request's deadline.
+    #[must_use]
+    pub fn budget(&self) -> &Budget {
+        &self.budget
     }
 
     /// Has it fired?
@@ -286,7 +415,29 @@ struct Gate {
     set_at: Option<Instant>,
     pauses: u32,
     exhausted: bool,
-    resume_pending: bool,
+    /// A pause was started and no request has succeeded since it ended.
+    pausing: bool,
+    /// One request is the probe after the pause.
+    probing: bool,
+}
+
+enum Entry {
+    Exhausted,
+    Go { probe: bool },
+}
+
+/// Releases the probe when its attempt ends any way at all (including a cancelled request).
+struct ProbeGuard<'a> {
+    retrier: &'a Retrier,
+    active: bool,
+}
+
+impl Drop for ProbeGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.retrier.release_probe();
+        }
+    }
 }
 
 /// Runs operations with the retry policy of §29. One per session: the daily-limit gate is shared
@@ -306,7 +457,6 @@ fn unix_ms(after: Duration) -> u64 {
 }
 
 fn random_unit() -> f64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
     static S: AtomicU64 = AtomicU64::new(0);
     let mut x = S.load(Ordering::Relaxed);
     if x == 0 {
@@ -377,16 +527,36 @@ impl Retrier {
         }
     }
 
-    /// Waits while the gate is closed. Returns how long it waited.
-    async fn wait_gate(&self, cancel: &Cancel) -> Result<Duration, DriveError> {
-        let began = Instant::now();
+    fn release_probe(&self) {
+        self.gate.lock().unwrap_or_else(|e| e.into_inner()).probing = false;
+    }
+
+    /// Waits at the daily-limit gate. After a pause one request is let through as the probe; the
+    /// rest wait for its attempt to finish. An exhausted gate fails everyone without an attempt.
+    async fn enter_gate(&self, cancel: &Cancel) -> Result<Entry, DriveError> {
         loop {
-            let until = self.gate.lock().unwrap_or_else(|e| e.into_inner()).until;
-            match until {
-                Some(t) if t > Instant::now() => {
-                    cancel.guard(tokio::time::sleep_until(t.into())).await?;
+            let wait = {
+                let mut g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+                if g.exhausted {
+                    return Ok(Entry::Exhausted);
                 }
-                _ => return Ok(began.elapsed()),
+                match g.until {
+                    Some(t) if t > Instant::now() => Some(t - Instant::now()),
+                    _ if g.pausing => {
+                        if g.probing {
+                            Some(Duration::from_millis(10))
+                        } else {
+                            g.probing = true;
+                            return Ok(Entry::Go { probe: true });
+                        }
+                    }
+                    _ => return Ok(Entry::Go { probe: false }),
+                }
+            };
+            if let Some(d) = wait {
+                let began = Instant::now();
+                cancel.guard(tokio::time::sleep(d)).await?;
+                cancel.budget.add_paused(began.elapsed());
             }
         }
     }
@@ -414,7 +584,8 @@ impl Retrier {
             g.pauses += 1;
             g.until = Some(now + self.timing.daily_pause);
             g.set_at = Some(now);
-            g.resume_pending = true;
+            g.pausing = true;
+            g.probing = false;
             self.timing.daily_pause
         };
         self.emit(pb::EventKind::PausedDailyLimit, unix_ms(until))
@@ -426,8 +597,9 @@ impl Retrier {
         let resume = {
             let mut g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
             let open = g.until.is_none_or(|u| u <= Instant::now());
-            if g.resume_pending && open {
-                g.resume_pending = false;
+            if g.pausing && open {
+                g.pausing = false;
+                g.probing = false;
                 true
             } else {
                 false
@@ -438,16 +610,44 @@ impl Retrier {
         }
     }
 
-    /// Runs `f` with retries. `bytes` is the size of the object the attempt moves (0 for none):
-    /// it sets the per-attempt timeout. `f` is called again for each attempt and must be safe to
-    /// repeat (every operation of the helper is: content is addressed, a write overwrites).
+    /// Runs `attempt` until it ends, fails to make progress for the idle time, or `remaining` is
+    /// used up.
+    async fn watch<T>(
+        &self,
+        state: &AttemptState,
+        remaining: Duration,
+        attempt: impl Future<Output = T>,
+    ) -> Option<T> {
+        tokio::pin!(attempt);
+        let deadline = Instant::now() + remaining;
+        loop {
+            let wake = (state.last() + self.timing.idle).min(deadline);
+            tokio::select! {
+                r = &mut attempt => return Some(r),
+                () = tokio::time::sleep_until(wake.into()) => {
+                    let now = Instant::now();
+                    if now >= deadline || now >= state.last() + self.timing.idle {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Runs `f` with retries. `size` is the size of the object the attempt moves (for the log
+    /// only: there is no timeout by size). `f` is called again for each attempt and must be safe
+    /// to repeat (every operation of the helper is: content is addressed, a write overwrites).
+    ///
+    /// An attempt fails when it makes no progress for the idle time; every attempt is capped at what
+    /// is left of the request's deadline ([`Cancel::budget`]), which is shared by all the calls of
+    /// the request.
     ///
     /// # Errors
     /// The [`DriveError`] of the last attempt, or `CANCELLED`.
     pub async fn run<T, F, Fut>(
         &self,
         cancel: &Cancel,
-        bytes: u64,
+        size: u64,
         what: &'static str,
         mut f: F,
     ) -> Result<T, DriveError>
@@ -455,54 +655,77 @@ impl Retrier {
         F: FnMut() -> Fut,
         Fut: Future<Output = opendal::Result<T>>,
     {
-        let started = Instant::now();
-        let mut gate_time = Duration::ZERO;
         let mut retries = 0u32;
+        let mut probe = ProbeGuard {
+            retrier: self,
+            active: false,
+        };
+        let mut last = DriveError::new(EC::Transient);
         loop {
-            gate_time += self.wait_gate(cancel).await?;
+            match self.enter_gate(cancel).await? {
+                Entry::Exhausted => return Err(DriveError::new(EC::DailyLimit)),
+                Entry::Go { probe: p } => probe.active = p,
+            }
             if cancel.is_cancelled() {
                 return Err(DriveError::new(EC::Cancelled));
             }
+            let remaining = cancel.budget.remaining();
+            if remaining.is_zero() {
+                tracing::warn!(what, "drive request out of time");
+                return Err(last);
+            }
             let attempt_started = Instant::now();
-            let slot: Slot = Arc::new(Mutex::new(None));
-            let attempt = ATTEMPT.scope(slot.clone(), f());
-            let timed = tokio::time::timeout(self.timing.attempt_timeout(bytes), attempt);
-            let result = cancel.guard(timed).await?;
+            let state = Arc::new(AttemptState::new());
+            let attempt = ATTEMPT.scope(state.clone(), f());
+            let result = cancel.guard(self.watch(&state, remaining, attempt)).await?;
             let outcome = match result {
-                Ok(Ok(v)) => {
+                Some(Ok(v)) => {
                     self.note_success().await;
+                    probe.active = false;
                     return Ok(v);
                 }
-                Ok(Err(e)) => {
-                    let obs = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+                Some(Err(e)) => {
+                    let obs = state.obs.lock().unwrap_or_else(|e| e.into_inner()).take();
                     let o = classify(obs.as_ref(), &e);
-                    tracing::debug!(what, status = obs.as_ref().map_or(0, |o| o.status), reason = obs.as_ref().map_or("", |o| o.reason.as_str()), outcome = ?o, "drive attempt failed");
+                    tracing::debug!(what, size, status = obs.as_ref().map_or(0, |o| o.status), reason = obs.as_ref().map_or("", |o| o.reason.as_str()), outcome = ?o, "drive attempt failed");
                     o
                 }
-                Err(_elapsed) => {
-                    tracing::debug!(what, "drive attempt timed out");
+                None => {
+                    tracing::debug!(what, "drive attempt made no progress");
                     Outcome::Transient { retry_after: None }
                 }
             };
             let (class, hint) = match outcome {
                 Outcome::Fatal(c) => return Err(DriveError::new(c)),
+                Outcome::Unauthorized => {
+                    return Err(DriveError {
+                        unauthorized: true,
+                        ..DriveError::new(EC::AuthRevoked)
+                    });
+                }
                 Outcome::DailyLimit => {
+                    // A failed probe starts the next pause (or exhausts the gate).
                     self.on_daily_limit(attempt_started).await?;
-                    // The next iteration waits at the gate shared with every other request.
+                    probe.active = false;
                     continue;
                 }
                 Outcome::Transient { retry_after } => (EC::Transient, retry_after),
                 Outcome::RateLimited { retry_after } => (EC::RateLimited, retry_after),
             };
+            if probe.active {
+                // The probe failed for another reason: let the next waiter probe.
+                probe.active = false;
+                self.release_probe();
+            }
             retries += 1;
-            let spent = started.elapsed().saturating_sub(gate_time);
             let mut delay = self.timing.delay(retries, (self.rng)());
             if let Some(ra) = hint {
                 delay = delay.max(ra);
             }
-            if retries > self.timing.max_retries || spent + delay > self.timing.request_budget {
+            last = DriveError::with_hint(class, hint.or(Some(delay)));
+            if retries > self.timing.max_retries || cancel.budget.remaining() < delay {
                 tracing::warn!(what, retries, class = ?class, "drive request given up");
-                return Err(DriveError::with_hint(class, hint.or(Some(delay))));
+                return Err(last);
             }
             tracing::warn!(what, retry = retries, class = ?class, delay_ms = u64::try_from(delay.as_millis()).unwrap_or(0), "drive retry");
             self.emit_retrying(delay);
@@ -554,7 +777,12 @@ mod tests {
             Outcome::Fatal(EC::Permission)
         );
         assert_eq!(c(obs(403, "")), Outcome::Fatal(EC::Permission));
-        assert_eq!(c(obs(401, "")), Outcome::Fatal(EC::AuthRevoked));
+        assert_eq!(c(obs(401, "")), Outcome::Unauthorized);
+        let tok401 = Observed {
+            token_endpoint: true,
+            ..obs(401, "")
+        };
+        assert_eq!(c(tok401), Outcome::Fatal(EC::AuthRevoked));
         let grant = Observed {
             token_endpoint: true,
             oauth_error: "invalid_grant".into(),
@@ -602,12 +830,6 @@ mod tests {
         {
             assert!((h - full).abs() < 0.001, "{h} vs {full}");
         }
-        assert_eq!(t.attempt_timeout(0), Duration::from_secs(60));
-        assert_eq!(t.attempt_timeout(1), Duration::from_secs(64));
-        assert_eq!(
-            t.attempt_timeout(96 << 20),
-            Duration::from_secs(60 + 4 * 96)
-        );
     }
 
     fn fast() -> Timing {
@@ -673,7 +895,6 @@ mod tests {
     async fn fatal_classes_are_not_retried() {
         let r = Retrier::new(fast());
         for (o, class) in [
-            (obs(401, ""), EC::AuthRevoked),
             (obs(403, "storageQuotaExceeded"), EC::QuotaExceeded),
             (obs(403, "other"), EC::Permission),
         ] {
@@ -788,5 +1009,87 @@ mod tests {
         let e = task.await.unwrap().unwrap_err();
         assert_eq!(e.class, EC::Cancelled);
         assert!(began.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn the_deadline_belongs_to_the_request_not_to_each_call() {
+        let mut t = fast();
+        t.max_retries = 0;
+        t.idle = Duration::from_secs(10);
+        let r = Retrier::with_rng(t, Box::new(|| 0.0));
+        let cancel = Cancel::never_with_limit(Duration::from_millis(250));
+        let began = Instant::now();
+        let slow = || async {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            Ok::<u32, opendal::Error>(1)
+        };
+        // each call alone fits in the budget...
+        assert_eq!(r.run(&cancel, 0, "a", slow).await.unwrap(), 1);
+        // ...but the second finds only 100 ms left and is cut off there
+        let e = r.run(&cancel, 0, "b", slow).await.unwrap_err();
+        assert_eq!(e.class, EC::Transient);
+        assert!(
+            began.elapsed() < Duration::from_millis(330),
+            "{:?}",
+            began.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_lack_of_progress_times_an_attempt_out() {
+        let mut t = fast();
+        t.max_retries = 0;
+        t.idle = Duration::from_millis(120);
+        let r = Retrier::with_rng(t, Box::new(|| 0.0));
+        // 500 ms in all, but progress every 50 ms: fine
+        let steady = || async {
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                current().unwrap().touch();
+            }
+            Ok::<u32, opendal::Error>(7)
+        };
+        assert_eq!(r.run(&Cancel::never(), 0, "t", steady).await.unwrap(), 7);
+        // 300 ms with no progress at all: out after 120 ms
+        let began = Instant::now();
+        let stuck = || async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            Ok::<u32, opendal::Error>(7)
+        };
+        let e = r.run(&Cancel::never(), 0, "t", stuck).await.unwrap_err();
+        assert_eq!(e.class, EC::Transient);
+        assert!(
+            began.elapsed() < Duration::from_millis(250),
+            "{:?}",
+            began.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_gate_fails_every_request_without_an_attempt() {
+        let mut t = fast();
+        t.daily_pause = Duration::from_millis(20);
+        t.max_pauses = 1;
+        let r = Retrier::with_rng(t, Box::new(|| 0.0));
+        let n = Arc::new(AtomicU32::new(0));
+        let e = r
+            .run(
+                &Cancel::never(),
+                0,
+                "t",
+                failing(&n, obs(403, "dailyLimitExceeded")),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(e.class, EC::DailyLimit);
+        let before = n.load(Ordering::SeqCst);
+        for _ in 0..3 {
+            let e = r
+                .run(&Cancel::never(), 0, "t", failing(&n, obs(200, "")))
+                .await
+                .unwrap_err();
+            assert_eq!(e.class, EC::DailyLimit);
+        }
+        assert_eq!(n.load(Ordering::SeqCst), before, "no attempt was made");
     }
 }

@@ -2,15 +2,19 @@
 //!
 //! ```text
 //! reader (the calling thread)          writer thread               session runtime (tokio)
-//!   Decoder -> decode -> LinkState  --> Out channel --> LinkState --> socket
-//!   Hello, Ping, Cancel: answered here                               one task per request:
-//!   Write: data frames collected here, the task starts at END        OpenDAL + retries -> Out
+//!   Decoder -> decode -> LinkState  --> ctl queue  --\
+//!   Hello, Ping, Cancel: answered here  out queue  ---+-> LinkState --> socket   one task per request:
+//!   Write: data frames collected here, the task starts at END                    OpenDAL + retries -> out
 //! ```
 //!
-//! The reader never waits for Drive: uploads are held whole until their `END`, so a request that is
-//! stuck in a backoff or at the daily-limit gate cannot stop the link from answering `Ping`. Every
-//! frame goes through [`LinkState`] in both directions, so a local bug shows as an error here and
-//! not as a peer's closed link. Nothing a peer sent is logged.
+//! The reader never waits for Drive or for the data queue: uploads are held whole until their
+//! `END`, so a request that is stuck in a backoff or at the daily-limit gate cannot stop the link
+//! from answering `Ping`, and the replies that only the reader sends (`HelloAck`, `Pong`, the
+//! answer to a cancelled upload) go through the `ctl` queue, which is unbounded (a few frames per
+//! request at most) and which the writer empties before it takes anything from the data queue. So a
+//! link whose data frames are backed up still answers. Every frame goes through [`LinkState`] in
+//! both directions, so a local bug shows as an error here and not as a peer's closed link. Nothing
+//! a peer sent is logged.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -18,7 +22,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use hx_ipc::frame::Decoder;
 use hx_ipc::recv::NoCmsgReader;
 use hx_ipc::repo::{
@@ -29,7 +33,7 @@ use tokio::sync::{mpsc, watch};
 
 use super::DriveConfig;
 use super::creds::Token;
-use super::gdrive::{Drive, Id, OpenParams, Repo};
+use super::gdrive::{Drive, Id, OpenParams, ReadStream, Repo};
 use super::rate::UploadRate;
 use super::retry::{Cancel, CancelHandle, DriveError, Retrier};
 use super::transport::GoogleTransport;
@@ -74,6 +78,12 @@ type RepoCell = Option<Result<Arc<Repo>, DriveError>>;
 struct Shared {
     state: Arc<Mutex<LinkState>>,
     out: mpsc::Sender<Out>,
+    /// Replies of the reader: the writer empties this queue first.
+    ctl: mpsc::UnboundedSender<Out>,
+    /// A clone of the link, to close it when a read fails after `ReadBegin`.
+    kill: UnixStream,
+    /// The deadline of each request.
+    budget: Duration,
     cancels: Mutex<HashMap<u64, CancelHandle>>,
     drive: Result<Arc<Drive>, DriveError>,
     repo: watch::Sender<RepoCell>,
@@ -137,7 +147,17 @@ impl Shared {
         let _ = self.out.send(o).await;
     }
 
+    /// `OpenRepo`. Whatever happens, the cell is set, so that no later request waits for ever.
     async fn serve_open(&self, o: &pb::OpenRepo, cancel: &Cancel) -> Result<(), DriveError> {
+        let r = self.open_repo(o, cancel).await;
+        match &r {
+            Ok(repo) => self.repo.send_replace(Some(Ok(repo.clone()))),
+            Err(e) => self.repo.send_replace(Some(Err(*e))),
+        };
+        r.map(|_| ())
+    }
+
+    async fn open_repo(&self, o: &pb::OpenRepo, cancel: &Cancel) -> Result<Arc<Repo>, DriveError> {
         let drive = self.drive.clone()?;
         // The codec has checked the length; a wrong one is still no panic.
         let server_id = <[u8; 16]>::try_from(o.server_id.as_ref())
@@ -148,16 +168,7 @@ impl Shared {
             server_id,
             takeover: o.takeover,
         };
-        match drive.open(&params, cancel).await {
-            Ok(repo) => {
-                self.repo.send_replace(Some(Ok(Arc::new(repo))));
-                Ok(())
-            }
-            Err(e) => {
-                self.repo.send_replace(Some(Err(e)));
-                Err(e)
-            }
-        }
+        drive.open(&params, cancel).await.map(Arc::new)
     }
 
     /// Answers one request; the answer is sent here.
@@ -214,23 +225,22 @@ impl Shared {
                 }
                 Op::ReadFull(r) => {
                     let repo = self.wait_repo(&cancel).await?;
-                    let bytes = repo
-                        .read_full(object_type(r.object_type), &id_of(&r.id), &cancel)
+                    let rs = repo
+                        .open_read(object_type(r.object_type), &id_of(&r.id), None, &cancel)
                         .await?;
-                    self.begin_read(req_id, bytes, &cancel).await
+                    self.stream_read(req_id, rs, &cancel).await
                 }
                 Op::ReadPartial(r) => {
                     let repo = self.wait_repo(&cancel).await?;
-                    let bytes = repo
-                        .read_partial(
+                    let rs = repo
+                        .open_read(
                             object_type(r.object_type),
                             &id_of(&r.id),
-                            r.offset,
-                            r.length,
+                            Some((r.offset, r.length)),
                             &cancel,
                         )
                         .await?;
-                    self.begin_read(req_id, bytes, &cancel).await
+                    self.stream_read(req_id, rs, &cancel).await
                 }
             }
         }
@@ -279,39 +289,81 @@ impl Shared {
         }
     }
 
-    /// `ReadBegin` and the data stream. From `ReadBegin` on the stream runs to its `END`,
-    /// whatever happens to the request (ipc.md §29).
-    async fn begin_read(
+    /// `ReadBegin` and the data stream, a chunk at a time. From `ReadBegin` on the stream runs to
+    /// its `END`, whatever happens to the request (ipc.md §29), and a failure of the source cannot
+    /// be an answer (§25): the link is closed. The permit of a chunk is kept until its frames are
+    /// queued.
+    async fn stream_read(
         &self,
         req_id: u64,
-        bytes: Bytes,
+        mut rs: ReadStream,
         cancel: &Cancel,
     ) -> Result<Answer, DriveError> {
         if cancel.is_cancelled() {
             return Err(DriveError::new(EC::Cancelled));
         }
-        let size = u32::try_from(bytes.len()).map_err(|_| DriveError::new(EC::Internal))?;
+        let size = rs.size() as usize;
         self.send(response(
             req_id,
-            pb::repo_response::Result::ReadBegin(pb::ReadBegin { size }),
+            pb::repo_response::Result::ReadBegin(pb::ReadBegin { size: rs.size() }),
         ))
         .await;
-        let mut at = 0usize;
-        loop {
-            let to = (at + repo::MAX_DATA_PAYLOAD).min(bytes.len());
-            let end = to == bytes.len();
+        // Cancelling no longer applies; the deadline still does.
+        let go = Cancel::never_with_limit(cancel.budget().remaining());
+        if size == 0 {
             self.send(Out::Data {
                 stream_id: req_id,
-                end,
-                payload: bytes.slice(at..to),
+                end: true,
+                payload: Bytes::new(),
             })
             .await;
-            if end {
-                break;
-            }
-            at = to;
+            return Ok(Answer::Sent);
         }
-        // Nothing more to send: the stream's END completes the request.
+        let mut sent = 0usize;
+        while sent < size {
+            let chunk = match rs.next_chunk(&go).await {
+                Ok(Some(c)) if sent + c.len() <= size => c,
+                _ => {
+                    eprintln!(
+                        "hx-backup-worker: a download failed after ReadBegin: closing the link"
+                    );
+                    let _ = self.kill.shutdown(std::net::Shutdown::Both);
+                    return Ok(Answer::Sent);
+                }
+            };
+            let mut frame = BytesMut::with_capacity(repo::MAX_DATA_PAYLOAD.min(size - sent));
+            for part in &chunk.parts {
+                let mut part = part.clone();
+                while !part.is_empty() {
+                    let room = repo::MAX_DATA_PAYLOAD - frame.len();
+                    let take = part.len().min(room);
+                    frame.extend_from_slice(&part.split_to(take));
+                    if frame.len() == repo::MAX_DATA_PAYLOAD {
+                        sent += frame.len();
+                        let payload = std::mem::replace(
+                            &mut frame,
+                            BytesMut::with_capacity(repo::MAX_DATA_PAYLOAD.min(size - sent)),
+                        );
+                        self.send(Out::Data {
+                            stream_id: req_id,
+                            end: sent == size,
+                            payload: payload.freeze(),
+                        })
+                        .await;
+                    }
+                }
+            }
+            if !frame.is_empty() {
+                sent += frame.len();
+                self.send(Out::Data {
+                    stream_id: req_id,
+                    end: sent == size,
+                    payload: frame.freeze(),
+                })
+                .await;
+            }
+            // `chunk` (and its permit) ends here: its frames are queued.
+        }
         Ok(Answer::Sent)
     }
 }
@@ -406,6 +458,7 @@ fn serve(
     let rate = Arc::new(UploadRate::new());
     let retrier = Arc::new(Retrier::new(cfg.timing));
     let (out_tx, out_rx) = mpsc::channel::<Out>(16);
+    let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<Out>();
     let (ev_tx, mut ev_rx) = mpsc::channel::<pb::Event>(64);
     retrier.set_events(ev_tx);
     let drive = build_drive(rt, cfg, rate.clone(), retrier);
@@ -414,6 +467,12 @@ fn serve(
     let shared = Arc::new(Shared {
         state: state.clone(),
         out: out_tx.clone(),
+        ctl: ctl_tx,
+        kill: match stream.try_clone() {
+            Ok(k) => k,
+            Err(_) => return (End::Lost, None),
+        },
+        budget: cfg.timing.request_budget,
         cancels: Mutex::new(HashMap::new()),
         drive,
         repo: repo_tx,
@@ -427,17 +486,34 @@ fn serve(
     let writer = {
         let state = state.clone();
         let mut out_rx = out_rx;
+        let mut ctl_rx = ctl_rx;
         std::thread::Builder::new()
             .name("hx-drive-writer".into())
             .spawn(move || {
-                while let Some(item) = out_rx.blocking_recv() {
-                    if let Err(rule) = write_out(&mut wstream, &state, item) {
-                        eprintln!("hx-backup-worker: drive link write failed: {rule}");
-                        let _ = wstream.shutdown(std::net::Shutdown::Both);
-                        return false;
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread().build() else {
+                    return false;
+                };
+                rt.block_on(async move {
+                    loop {
+                        // The control queue first, always.
+                        let item = tokio::select! {
+                            biased;
+                            Some(c) = ctl_rx.recv() => c,
+                            o = out_rx.recv() => match o {
+                                Some(o) => o,
+                                None => match ctl_rx.try_recv() {
+                                    Ok(c) => c,
+                                    Err(_) => return true,
+                                },
+                            },
+                        };
+                        if let Err(rule) = write_out(&mut wstream, &state, item) {
+                            eprintln!("hx-backup-worker: drive link write failed: {rule}");
+                            let _ = wstream.shutdown(std::net::Shutdown::Both);
+                            return false;
+                        }
                     }
-                }
-                true
+                })
             })
     };
     let Ok(writer) = writer else {
@@ -541,8 +617,8 @@ fn read_loop(handle: &Handle, stream: &UnixStream, shared: &Arc<Shared>, silence
                 match m.frame {
                     Some(F::Hello(_)) => {
                         shared
-                            .out
-                            .blocking_send(Out::Message(frame(F::HelloAck(pb::HelloAck {
+                            .ctl
+                            .send(Out::Message(frame(F::HelloAck(pb::HelloAck {
                                 major: repo::VERSION_MAJOR,
                                 minor: repo::VERSION_MINOR,
                                 software: crate::SOFTWARE.to_owned(),
@@ -551,17 +627,15 @@ fn read_loop(handle: &Handle, stream: &UnixStream, shared: &Arc<Shared>, silence
                     }
                     Some(F::Ping(p)) => {
                         shared
-                            .out
-                            .blocking_send(Out::Message(frame(F::Pong(pb::Pong {
-                                nonce: p.nonce,
-                            }))))
+                            .ctl
+                            .send(Out::Message(frame(F::Pong(pb::Pong { nonce: p.nonce }))))
                             .ok();
                     }
                     Some(F::Request(r)) => {
                         let req_id = r.req_id;
                         let Some(op) = r.op else { continue };
                         if let pb::repo_request::Op::Write(w) = &op {
-                            let (h, cancel) = Cancel::new();
+                            let (h, cancel) = Cancel::with_limit(shared.budget);
                             shared
                                 .cancels
                                 .lock()
@@ -591,11 +665,8 @@ fn read_loop(handle: &Handle, stream: &UnixStream, shared: &Arc<Shared>, silence
                                 .unwrap_or_else(|e| e.into_inner())
                                 .remove(&c.req_id);
                             shared
-                                .out
-                                .blocking_send(error_response(
-                                    c.req_id,
-                                    DriveError::new(EC::Cancelled),
-                                ))
+                                .ctl
+                                .send(error_response(c.req_id, DriveError::new(EC::Cancelled)))
                                 .ok();
                         } else if let Some(h) = shared
                             .cancels
@@ -625,7 +696,7 @@ fn start(
     let cancel = match &upload {
         Some(u) => u.cancel.clone(),
         None => {
-            let (h, c) = Cancel::new();
+            let (h, c) = Cancel::with_limit(shared.budget);
             shared
                 .cancels
                 .lock()
@@ -637,10 +708,21 @@ fn start(
     let shared = shared.clone();
     // A panic in the work of one request (a bug) must not leave privd waiting for an answer: the
     // outer task answers `INTERNAL` if the request is still outstanding.
+    let is_open = matches!(op, pb::repo_request::Op::OpenRepo(_));
     let inner = handle.spawn(shared.clone().serve(req_id, op, upload, cancel));
     handle.spawn(async move {
         if inner.await.is_err_and(|e| e.is_panic()) {
             eprintln!("hx-backup-worker: a request task panicked (answered INTERNAL)");
+            if is_open {
+                // No later request may wait for a repository that will never come.
+                shared.repo.send_if_modified(|c| {
+                    let unset = c.is_none();
+                    if unset {
+                        *c = Some(Err(DriveError::new(EC::Internal)));
+                    }
+                    unset
+                });
+            }
             let live = shared
                 .state
                 .lock()

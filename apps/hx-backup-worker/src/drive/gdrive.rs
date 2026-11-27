@@ -1,34 +1,38 @@
 //! The repository on Google Drive: S4's `HxDrive` ported to the helper's raw object operations
 //! (ipc.md §27, §29). OpenDAL's `gdrive` service does the Drive calls through [`GoogleTransport`];
 //! this module adds the layout, the retries ([`Retrier`]), the lease, the lazy `data/xx` folders,
-//! the read-memory budget and the quota.
+//! the streamed reads with their memory budget, and the quota.
 //!
 //! Layout below `OpenRepo.folder` (a folder under My Drive): `config`, `keys/<hex>`,
 //! `snapshots/<hex>`, `index/<hex>`, `data/<xx>/<hex>` and `hx-lease.json`.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::future::Future;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use futures_util::TryStreamExt;
 use hx_ipc::repo::{self, pb};
 use opendal::options::{ListOptions, ReadOptions};
 use opendal::services::Gdrive;
 use opendal::{Buffer, HttpTransport, HttpTransporter, OperationContext, Operator};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroizing;
 
 use super::creds::{ClientConfig, Token};
 use super::lease::{
     self, Found, LEASE_FILE, Lease, LeaseGuard, MAX_LEASE_BYTES, Mutation, OpenDecision, Unreadable,
 };
-use super::retry::{Cancel, DriveError, Retrier};
+use super::retry::{Cancel, DriveError, Retrier, set_body_limit};
 use super::transport::GoogleTransport;
 
 use pb::ErrorClass as EC;
 
-/// The read budget in KiB: reads reserve their size from this (ipc.md §29, "Memory").
-const READ_BUDGET_KIB: usize = 96 * 1024;
+/// The largest piece of an object read from Drive at once (ipc.md §29, "Reads").
+pub const READ_CHUNK: usize = 4 * 1024 * 1024;
+/// The read budget in KiB: the chunks in hand, from reading to being queued on the link.
+pub const READ_BUDGET_KIB: usize = 32 * 1024;
 
 /// A 32-byte object id.
 pub type Id = [u8; 32];
@@ -65,6 +69,24 @@ pub struct Drive {
     read_budget: Arc<Semaphore>,
 }
 
+type MakeOperator = Arc<dyn Fn() -> Result<Operator, DriveError> + Send + Sync>;
+
+/// OpenDAL's operator for the repository folder. The credentials go in percent-encoded: OpenDAL
+/// puts them in the query of its token request unencoded, and the transport moves that query into
+/// a form body as it is.
+fn build_operator(api: &Api, folder: &str) -> Result<Operator, DriveError> {
+    let builder = Gdrive::default()
+        .root(&format!("/{folder}/"))
+        .client_id(&percent(api.client.id()))
+        .client_secret(&percent(api.client.secret()))
+        .refresh_token(&percent(api.token.expose()));
+    let ctx =
+        OperationContext::new().with_http_transport(HttpTransporter::new(api.transport.clone()));
+    Operator::new(builder)
+        .map(|op| op.with_context(ctx))
+        .map_err(|_| DriveError::new(EC::Internal))
+}
+
 impl Drive {
     /// A context for one session.
     #[must_use]
@@ -89,17 +111,12 @@ impl Drive {
         }
     }
 
-    fn operator(&self, folder: &str) -> Result<Operator, DriveError> {
-        let builder = Gdrive::default()
-            .root(&format!("/{folder}/"))
-            .client_id(self.api.client.id())
-            .client_secret(self.api.client.secret())
-            .refresh_token(self.api.token.expose());
-        let ctx = OperationContext::new()
-            .with_http_transport(HttpTransporter::new(self.api.transport.clone()));
-        Operator::new(builder)
-            .map(|op| op.with_context(ctx))
-            .map_err(|_| DriveError::new(EC::Internal))
+    /// OpenDAL's operator for `folder` (the tests of the token request use it directly).
+    ///
+    /// # Errors
+    /// `INTERNAL` when OpenDAL refuses the options.
+    pub fn operator(&self, folder: &str) -> Result<Operator, DriveError> {
+        build_operator(&self.api, folder)
     }
 
     /// `OpenRepo` (§29): finds or creates the folder and settles the lease.
@@ -119,39 +136,44 @@ impl Drive {
         {
             return Err(DriveError::new(EC::Internal));
         }
-        let op = self.operator(&p.folder)?;
-        let r = &self.retrier;
+        let make_op: MakeOperator = {
+            let api = self.api.clone();
+            let folder = p.folder.clone();
+            Arc::new(move || build_operator(&api, &folder))
+        };
+        let ours = lease::hex_id(&p.server_id);
+        let mut repo = Repo {
+            op: RwLock::new(make_op()?),
+            make_op,
+            retrier: self.retrier.clone(),
+            api: self.api.clone(),
+            folders: Mutex::new(HashSet::new()),
+            read_budget: self.read_budget.clone(),
+            lease: LeaseGuard::new(ours.clone(), 0, self.retrier.timing().lease_cache),
+            ours,
+        };
         // OpenDAL answers a stat of its root without asking Drive, so the folder is asked for
         // directly.
         if !self.api.folder_exists(&p.folder, cancel).await? {
             if !p.create {
                 return Err(DriveError::new(EC::NotFound));
             }
-            r.run(cancel, 0, "create folder", || op.create_dir("/"))
-                .await?;
+            repo.run(cancel, 0, "create folder", || {
+                let op = repo.op();
+                async move { op.create_dir("/").await }
+            })
+            .await?;
         }
-        let repo = Repo {
-            op,
-            retrier: self.retrier.clone(),
-            api: self.api.clone(),
-            folders: Mutex::new(HashSet::new()),
-            read_budget: self.read_budget.clone(),
-            lease: LeaseGuard::new(
-                lease::hex_id(&p.server_id),
-                0,
-                self.retrier.timing().lease_cache,
-            ),
-            ours: lease::hex_id(&p.server_id),
-        };
         let found = repo.read_lease(cancel).await?;
         let generation = match lease::decide_open(&found, &repo.ours, p.takeover) {
             OpenDecision::Accept(g) => g,
             OpenDecision::Write(g) => {
                 let l = Lease::new(&repo.ours, g, unix_secs(), &self.hint);
                 let bytes = l.to_bytes();
-                r.run(cancel, bytes.len() as u64, "write lease", || {
-                    repo.op
-                        .write(LEASE_FILE, Buffer::from(Bytes::from(bytes.clone())))
+                repo.run(cancel, bytes.len() as u64, "write lease", || {
+                    let op = repo.op();
+                    let bytes = bytes.clone();
+                    async move { op.write(LEASE_FILE, Buffer::from(Bytes::from(bytes))).await }
                 })
                 .await?;
                 g
@@ -159,14 +181,12 @@ impl Drive {
             OpenDecision::Held => return Err(DriveError::new(EC::LeaseHeld)),
             OpenDecision::Unreadable => return Err(DriveError::new(EC::Internal)),
         };
-        Ok(Repo {
-            lease: LeaseGuard::new(
-                repo.ours.clone(),
-                generation,
-                self.retrier.timing().lease_cache,
-            ),
-            ..repo
-        })
+        repo.lease = LeaseGuard::new(
+            repo.ours.clone(),
+            generation,
+            self.retrier.timing().lease_cache,
+        );
+        Ok(repo)
     }
 }
 
@@ -176,17 +196,23 @@ fn unix_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// The path of an object below the repository folder.
+/// The path of an object below the repository folder; `None` for [`pb::ObjectType::Unspecified`],
+/// which names no object.
 #[must_use]
-pub fn object_path(ty: pb::ObjectType, id: &Id) -> String {
+pub fn object_path(ty: pb::ObjectType, id: &Id) -> Option<String> {
     let hex = lease::hex_id(id);
-    match ty {
-        pb::ObjectType::Config | pb::ObjectType::Unspecified => "config".to_owned(),
+    Some(match ty {
+        pb::ObjectType::Unspecified => return None,
+        pb::ObjectType::Config => "config".to_owned(),
         pb::ObjectType::Key => format!("keys/{hex}"),
         pb::ObjectType::Snapshot => format!("snapshots/{hex}"),
         pb::ObjectType::Index => format!("index/{hex}"),
         pb::ObjectType::Pack => format!("data/{}/{hex}", &hex[..2]),
-    }
+    })
+}
+
+fn path_of(ty: pb::ObjectType, id: &Id) -> Result<String, DriveError> {
+    object_path(ty, id).ok_or(DriveError::new(EC::Internal))
 }
 
 fn parse_id(name: &str) -> Option<Id> {
@@ -234,9 +260,53 @@ struct Api {
 }
 
 impl Api {
+    /// One authorised GET of `url` with the access token. A 401 drops the cached token and the
+    /// request is made once more with a fresh one (ipc.md §29).
+    async fn get(
+        &self,
+        url: &str,
+        what: &'static str,
+        cancel: &Cancel,
+    ) -> Result<Bytes, DriveError> {
+        for round in 0..2 {
+            let token = self.access_token(cancel).await?;
+            let r = self
+                .retrier
+                .run(cancel, 0, what, || async {
+                    let req = http::Request::get(url)
+                        .header(
+                            http::header::AUTHORIZATION,
+                            format!("Bearer {}", token.as_str()),
+                        )
+                        .body(Buffer::new())
+                        .map_err(|_| {
+                            opendal::Error::new(opendal::ErrorKind::Unexpected, "request")
+                        })?;
+                    let resp = self.transport.fetch(req).await?;
+                    if resp.status() != http::StatusCode::OK {
+                        return Err(opendal::Error::new(opendal::ErrorKind::Unexpected, what));
+                    }
+                    Ok(resp.into_body().to_buffer().await?.to_bytes())
+                })
+                .await;
+            match r {
+                Err(e) if e.unauthorized && round == 0 => {
+                    *self.access.lock().await = None;
+                }
+                Err(e) => {
+                    return Err(DriveError {
+                        unauthorized: false,
+                        ..e
+                    });
+                }
+                Ok(b) => return Ok(b),
+            }
+        }
+        Err(DriveError::new(EC::AuthRevoked))
+    }
+
     /// Is there a live folder `name` directly under My Drive?
     async fn folder_exists(&self, name: &str, cancel: &Cancel) -> Result<bool, DriveError> {
-        let token = self.access_token(cancel).await?;
         let q = format!(
             "name = '{name}' and 'root' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
         );
@@ -244,26 +314,7 @@ impl Api {
             "https://www.googleapis.com/drive/v3/files?q={}&pageSize=1&fields=files(id)",
             percent(&q)
         );
-        let body = self
-            .retrier
-            .run(cancel, 0, "find folder", || async {
-                let req = http::Request::get(url.as_str())
-                    .header(
-                        http::header::AUTHORIZATION,
-                        format!("Bearer {}", token.as_str()),
-                    )
-                    .body(Buffer::new())
-                    .map_err(|_| opendal::Error::new(opendal::ErrorKind::Unexpected, "request"))?;
-                let resp = self.transport.fetch(req).await?;
-                if resp.status() != http::StatusCode::OK {
-                    return Err(opendal::Error::new(
-                        opendal::ErrorKind::Unexpected,
-                        "find folder",
-                    ));
-                }
-                Ok(resp.into_body().to_buffer().await?.to_bytes())
-            })
-            .await?;
+        let body = self.get(&url, "find folder", cancel).await?;
         let v: serde_json::Value =
             serde_json::from_slice(&body).map_err(|_| DriveError::new(EC::Internal))?;
         Ok(v["files"].as_array().is_some_and(|a| !a.is_empty()))
@@ -318,25 +369,12 @@ impl Api {
     }
 
     async fn quota(&self, cancel: &Cancel) -> Result<QuotaInfo, DriveError> {
-        let token = self.access_token(cancel).await?;
         let body = self
-            .retrier
-            .run(cancel, 0, "about", || async {
-                let req = http::Request::get(
-                    "https://www.googleapis.com/drive/v3/about?fields=storageQuota",
-                )
-                .header(
-                    http::header::AUTHORIZATION,
-                    format!("Bearer {}", token.as_str()),
-                )
-                .body(Buffer::new())
-                .map_err(|_| opendal::Error::new(opendal::ErrorKind::Unexpected, "request"))?;
-                let resp = self.transport.fetch(req).await?;
-                if resp.status() != http::StatusCode::OK {
-                    return Err(opendal::Error::new(opendal::ErrorKind::Unexpected, "about"));
-                }
-                Ok(resp.into_body().to_buffer().await?.to_bytes())
-            })
+            .get(
+                "https://www.googleapis.com/drive/v3/about?fields=storageQuota",
+                "about",
+                cancel,
+            )
             .await?;
         let v: serde_json::Value =
             serde_json::from_slice(&body).map_err(|_| DriveError::new(EC::Internal))?;
@@ -355,9 +393,72 @@ impl Api {
     }
 }
 
+/// One chunk of an object in hand: its parts (not copied from what OpenDAL read) and the permit of
+/// the read budget, which is given back when the chunk is dropped, that is, when its frames are
+/// queued on the link.
+pub struct Chunk {
+    /// The bytes, in order.
+    pub parts: Vec<Bytes>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Chunk {
+    /// Its length.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.parts.iter().map(Bytes::len).sum()
+    }
+
+    /// Is it empty?
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.parts.iter().all(Bytes::is_empty)
+    }
+}
+
+/// A read in progress: the size is known before the first byte is sent, and the data comes one
+/// chunk at a time (ipc.md §29, "Reads").
+pub struct ReadStream {
+    repo: Arc<Repo>,
+    path: String,
+    size: u32,
+    offset: u64,
+    end: u64,
+    first: Option<Chunk>,
+}
+
+impl ReadStream {
+    /// The size `ReadBegin` announces.
+    #[must_use]
+    pub fn size(&self) -> u32 {
+        self.size
+    }
+
+    /// The next chunk, or `None` at the end. Each chunk is read (and retried) as a whole.
+    ///
+    /// # Errors
+    /// The class of a Drive failure, `INTERNAL` for a short or long answer.
+    pub async fn next_chunk(&mut self, cancel: &Cancel) -> Result<Option<Chunk>, DriveError> {
+        if let Some(c) = self.first.take() {
+            return Ok(Some(c));
+        }
+        if self.offset >= self.end {
+            return Ok(None);
+        }
+        let len = (self.end - self.offset).min(READ_CHUNK as u64) as usize;
+        let c = self
+            .repo
+            .read_range(&self.path, self.offset, len, cancel)
+            .await?;
+        self.offset += len as u64;
+        Ok(Some(c))
+    }
+}
+
 /// One opened repository (a folder, a lease, an operator).
 pub struct Repo {
-    op: Operator,
+    op: RwLock<Operator>,
+    make_op: MakeOperator,
     retrier: Arc<Retrier>,
     api: Arc<Api>,
     folders: Mutex<HashSet<u8>>,
@@ -367,17 +468,56 @@ pub struct Repo {
 }
 
 impl Repo {
+    fn op(&self) -> Operator {
+        self.op.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Builds a fresh operator, which makes a fresh token exchange (after a 401).
+    fn reauth(&self) -> Result<(), DriveError> {
+        *self.op.write().unwrap_or_else(|e| e.into_inner()) = (self.make_op)()?;
+        Ok(())
+    }
+
+    /// [`Retrier::run`] with the one repeat that a 401 earns: the access token may have expired, so
+    /// the operator is rebuilt and the call made once more. A second 401 is `AUTH_REVOKED`.
+    async fn run<T, F, Fut>(
+        &self,
+        cancel: &Cancel,
+        size: u64,
+        what: &'static str,
+        mut f: F,
+    ) -> Result<T, DriveError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = opendal::Result<T>>,
+    {
+        match self.retrier.run(cancel, size, what, &mut f).await {
+            Err(e) if e.unauthorized => {
+                self.reauth()?;
+                self.retrier.run(cancel, size, what, &mut f).await
+            }
+            r => r,
+        }
+        .map_err(|e| DriveError {
+            unauthorized: false,
+            ..e
+        })
+    }
+
     async fn read_lease(&self, cancel: &Cancel) -> Result<Found, DriveError> {
         // A ranged read of a file shorter than the range is an error in OpenDAL, so the size is
         // asked first: a lease object over the cap is never downloaded.
         let got = self
-            .retrier
-            .run(cancel, 0, "read lease", || async {
-                let m = self.op.stat(LEASE_FILE).await?;
-                if m.content_length() > MAX_LEASE_BYTES as u64 {
-                    return Ok(None);
+            .run(cancel, 0, "read lease", || {
+                let op = self.op();
+                async move {
+                    let m = op.stat(LEASE_FILE).await?;
+                    if m.content_length() > MAX_LEASE_BYTES as u64 {
+                        return Ok(None);
+                    }
+                    set_body_limit(MAX_LEASE_BYTES as u64);
+                    op.read(LEASE_FILE).await.map(Some)
                 }
-                self.op.read(LEASE_FILE).await.map(Some)
             })
             .await;
         match got {
@@ -389,14 +529,39 @@ impl Repo {
     }
 
     async fn check_lease(&self, m: Mutation, cancel: &Cancel) -> Result<(), DriveError> {
-        self.lease.check(m, || self.read_lease(cancel)).await
+        self.lease
+            .check(m, cancel, || self.read_lease(cancel))
+            .await
+    }
+
+    /// `stat` of an object: its size and whether it is a file; `None` when absent.
+    async fn stat(
+        &self,
+        path: &str,
+        what: &'static str,
+        cancel: &Cancel,
+    ) -> Result<Option<(u64, bool)>, DriveError> {
+        let r = self
+            .run(cancel, 0, what, || {
+                let op = self.op();
+                let path = path.to_owned();
+                async move { op.stat(&path).await }
+            })
+            .await;
+        match r {
+            Ok(m) => Ok(Some((m.content_length(), m.is_file()))),
+            Err(e) if e.class == EC::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Lists the objects of `ty`. The whole listing is collected before anything is returned: a
-    /// failed page is an error, never a short list.
+    /// failed page is an error, never a short list. Entries and requests are counted as Drive
+    /// pages, so an endless listing ends in `INTERNAL`.
     ///
     /// # Errors
-    /// The class of a Drive failure; `INTERNAL` for an object over its type's cap.
+    /// The class of a Drive failure; `INTERNAL` for an object over its type's cap or a listing over
+    /// the limits.
     pub async fn list(
         &self,
         ty: pb::ObjectType,
@@ -404,20 +569,15 @@ impl Repo {
     ) -> Result<Vec<(Id, u32)>, DriveError> {
         let cap = repo::max_object_size(ty).ok_or(DriveError::new(EC::Internal))?;
         if ty == pb::ObjectType::Config {
-            return match self
-                .retrier
-                .run(cancel, 0, "stat config", || self.op.stat("config"))
-                .await
-            {
-                Ok(m) => {
-                    let size = u32::try_from(m.content_length())
+            return match self.stat("config", "stat config", cancel).await? {
+                Some((len, _)) => {
+                    let size = u32::try_from(len)
                         .ok()
                         .filter(|s| *s <= cap)
                         .ok_or(DriveError::new(EC::Internal))?;
                     Ok(vec![([0u8; 32], size)])
                 }
-                Err(e) if e.class == EC::NotFound => Ok(vec![]),
-                Err(e) => Err(e),
+                None => Ok(vec![]),
             };
         }
         let dir = match ty {
@@ -426,118 +586,202 @@ impl Repo {
             pb::ObjectType::Index => "index/",
             _ => "data/",
         };
-        let opts = ListOptions {
-            recursive: ty == pb::ObjectType::Pack,
-            ..ListOptions::default()
-        };
-        let entries = match self
-            .retrier
+        let max = self.retrier.timing().max_list_entries;
+        let r = self
             .run(cancel, 0, "list", || {
-                self.op.list_options(dir, opts.clone())
+                let op = self.op();
+                async move {
+                    let opts = ListOptions {
+                        recursive: ty == pb::ObjectType::Pack,
+                        ..ListOptions::default()
+                    };
+                    let mut lister = op.lister_options(dir, opts).await?;
+                    let mut seen = HashSet::new();
+                    let mut out = Vec::new();
+                    let mut counted = 0usize;
+                    while let Some(entry) = lister.try_next().await? {
+                        counted += 1;
+                        if counted > max {
+                            return Err(opendal::Error::new(
+                                opendal::ErrorKind::Unexpected,
+                                "listing is longer than the limit",
+                            ));
+                        }
+                        let md = entry.metadata();
+                        if !md.is_file() {
+                            continue;
+                        }
+                        let Some(id) = parse_id(entry.name()) else {
+                            continue;
+                        };
+                        if id == [0u8; 32]
+                            || object_path(ty, &id).as_deref() != Some(entry.path())
+                            || !seen.insert(id)
+                        {
+                            continue;
+                        }
+                        let size = u32::try_from(md.content_length())
+                            .ok()
+                            .filter(|s| *s <= cap)
+                            .ok_or_else(|| {
+                                opendal::Error::new(
+                                    opendal::ErrorKind::Unexpected,
+                                    "a listed object is larger than its type's cap",
+                                )
+                            })?;
+                        out.push((id, size));
+                    }
+                    Ok(out)
+                }
             })
-            .await
-        {
-            Ok(v) => v,
-            Err(e) if e.class == EC::NotFound => return Ok(vec![]),
-            Err(e) => return Err(e),
-        };
-        let mut seen = HashSet::new();
-        let mut out = Vec::new();
-        for entry in entries {
-            let md = entry.metadata();
-            if !md.is_file() {
-                continue;
-            }
-            let Some(id) = parse_id(entry.name()) else {
-                continue;
-            };
-            if id == [0u8; 32] || entry.path() != object_path(ty, &id) {
-                continue;
-            }
-            if !seen.insert(id) {
-                continue;
-            }
-            let size = u32::try_from(md.content_length())
-                .ok()
-                .filter(|s| *s <= cap)
-                .ok_or_else(|| {
-                    tracing::warn!("a listed object is larger than its type's cap");
-                    DriveError::new(EC::Internal)
-                })?;
-            out.push((id, size));
-            if out.len() > repo::MAX_LIST_ENTRIES as usize {
-                return Err(DriveError::new(EC::Internal));
-            }
+            .await;
+        match r {
+            Err(e) if e.class == EC::NotFound => Ok(vec![]),
+            r => r,
         }
-        Ok(out)
     }
 
-    async fn reserve(
+    /// Reads `len` bytes at `offset` as one chunk: a permit of the read budget first, then the
+    /// ranged read, whose body may not exceed `len`. Anything but exactly `len` is `INTERNAL`.
+    async fn read_range(
         &self,
-        bytes: usize,
+        path: &str,
+        offset: u64,
+        len: usize,
         cancel: &Cancel,
-    ) -> Result<tokio::sync::OwnedSemaphorePermit, DriveError> {
-        let n = kib(bytes).min(READ_BUDGET_KIB as u32);
-        cancel
+    ) -> Result<Chunk, DriveError> {
+        let n = kib(len).min(READ_BUDGET_KIB as u32);
+        let permit = cancel
             .guard(self.read_budget.clone().acquire_many_owned(n))
             .await?
-            .map_err(|_| DriveError::new(EC::Internal))
-    }
-
-    /// Reads a whole object.
-    ///
-    /// # Errors
-    /// `NOT_FOUND`, or the class of a Drive failure.
-    pub async fn read_full(
-        &self,
-        ty: pb::ObjectType,
-        id: &Id,
-        cancel: &Cancel,
-    ) -> Result<Bytes, DriveError> {
-        let cap = repo::max_object_size(ty).ok_or(DriveError::new(EC::Internal))? as usize;
-        let _permit = self.reserve(cap, cancel).await?;
-        let path = object_path(ty, id);
+            .map_err(|_| DriveError::new(EC::Internal))?;
         let buf = self
-            .retrier
-            .run(cancel, cap as u64, "read", || self.op.read(&path))
-            .await?;
-        if buf.len() > cap {
-            return Err(DriveError::new(EC::Internal));
-        }
-        Ok(buf.to_bytes())
-    }
-
-    /// Reads `length` bytes at `offset`; anything shorter is `INTERNAL`.
-    ///
-    /// # Errors
-    /// `NOT_FOUND`, `INTERNAL` for a short answer, or the class of a Drive failure.
-    pub async fn read_partial(
-        &self,
-        ty: pb::ObjectType,
-        id: &Id,
-        offset: u32,
-        length: u32,
-        cancel: &Cancel,
-    ) -> Result<Bytes, DriveError> {
-        let _permit = self.reserve(length as usize, cancel).await?;
-        let path = object_path(ty, id);
-        let range = u64::from(offset)..u64::from(offset) + u64::from(length);
-        let buf = self
-            .retrier
-            .run(cancel, u64::from(length), "read range", || {
-                let opts = ReadOptions {
-                    range: range.clone().into(),
-                    ..ReadOptions::default()
-                };
-                self.op.read_options(&path, opts)
+            .run(cancel, len as u64, "read range", || {
+                let op = self.op();
+                let path = path.to_owned();
+                async move {
+                    set_body_limit(len as u64);
+                    let opts = ReadOptions {
+                        range: (offset..offset + len as u64).into(),
+                        ..ReadOptions::default()
+                    };
+                    op.read_options(&path, opts).await
+                }
             })
             .await?;
-        let bytes = buf.to_bytes();
-        if bytes.len() != length as usize {
+        if buf.len() != len {
             tracing::warn!("a ranged read answered a different length");
             return Err(DriveError::new(EC::Internal));
         }
-        Ok(bytes)
+        Ok(Chunk {
+            parts: buf.into_iter().collect(),
+            _permit: permit,
+        })
+    }
+
+    /// Starts a read of a whole object (`range` is `None`) or of `(offset, length)` of it.
+    ///
+    /// An object of at most one chunk is read here and now, so that its failure is an ordinary
+    /// answer. A larger one is `stat`ed first (a size over the type's cap, or a range past the end,
+    /// is `INTERNAL`) and its first chunk is read; the rest comes from
+    /// [`ReadStream::next_chunk`].
+    ///
+    /// # Errors
+    /// `NOT_FOUND`, `INTERNAL` for a size that is wrong, or the class of a Drive failure.
+    pub async fn open_read(
+        self: &Arc<Self>,
+        ty: pb::ObjectType,
+        id: &Id,
+        range: Option<(u32, u32)>,
+        cancel: &Cancel,
+    ) -> Result<ReadStream, DriveError> {
+        let cap = repo::max_object_size(ty).ok_or(DriveError::new(EC::Internal))? as usize;
+        let path = path_of(ty, id)?;
+        let internal = || DriveError::new(EC::Internal);
+        let (offset, end) = match range {
+            Some((off, len)) if (len as usize) <= READ_CHUNK => {
+                let c = self
+                    .read_range(&path, u64::from(off), len as usize, cancel)
+                    .await?;
+                return Ok(ReadStream {
+                    repo: self.clone(),
+                    path,
+                    size: len,
+                    offset: u64::from(off) + u64::from(len),
+                    end: u64::from(off) + u64::from(len),
+                    first: Some(c),
+                });
+            }
+            None if cap <= READ_CHUNK => {
+                // CONFIG, KEY, SNAPSHOT: one read of an unknown length, at most the cap.
+                let n = kib(cap).min(READ_BUDGET_KIB as u32);
+                let permit = cancel
+                    .guard(self.read_budget.clone().acquire_many_owned(n))
+                    .await?
+                    .map_err(|_| internal())?;
+                let buf = self
+                    .run(cancel, cap as u64, "read", || {
+                        let op = self.op();
+                        let path = path.clone();
+                        async move {
+                            set_body_limit(cap as u64);
+                            op.read(&path).await
+                        }
+                    })
+                    .await?;
+                let len = buf.len();
+                if len > cap {
+                    return Err(internal());
+                }
+                return Ok(ReadStream {
+                    repo: self.clone(),
+                    path,
+                    size: u32::try_from(len).map_err(|_| internal())?,
+                    offset: len as u64,
+                    end: len as u64,
+                    first: Some(Chunk {
+                        parts: buf.into_iter().collect(),
+                        _permit: permit,
+                    }),
+                });
+            }
+            Some((off, len)) => (u64::from(off), u64::from(off) + u64::from(len)),
+            None => (0, 0),
+        };
+        // Larger than one chunk: the size first.
+        let Some((size, is_file)) = self.stat(&path, "stat object", cancel).await? else {
+            return Err(DriveError::new(EC::NotFound));
+        };
+        if !is_file {
+            return Err(internal());
+        }
+        let (offset, end) = match range {
+            None => {
+                if size > cap as u64 {
+                    return Err(internal());
+                }
+                (0, size)
+            }
+            Some(_) => {
+                if end > size {
+                    return Err(internal());
+                }
+                (offset, end)
+            }
+        };
+        let total = u32::try_from(end - offset).map_err(|_| internal())?;
+        let mut rs = ReadStream {
+            repo: self.clone(),
+            path,
+            size: total,
+            offset,
+            end,
+            first: None,
+        };
+        if total > 0 {
+            rs.first = rs.next_chunk(cancel).await?;
+        }
+        Ok(rs)
     }
 
     async fn ensure_pack_folder(&self, xx: u8, cancel: &Cancel) -> Result<(), DriveError> {
@@ -546,9 +790,12 @@ impl Repo {
             return Ok(());
         }
         let dir = format!("data/{xx:02x}/");
-        self.retrier
-            .run(cancel, 0, "create data folder", || self.op.create_dir(&dir))
-            .await?;
+        self.run(cancel, 0, "create data folder", || {
+            let op = self.op();
+            let dir = dir.clone();
+            async move { op.create_dir(&dir).await }
+        })
+        .await?;
         ready.insert(xx);
         Ok(())
     }
@@ -565,46 +812,55 @@ impl Repo {
         chunks: Vec<Bytes>,
         cancel: &Cancel,
     ) -> Result<(), DriveError> {
+        let path = path_of(ty, id)?;
         self.check_lease(Mutation::Write, cancel).await?;
-        let path = object_path(ty, id);
-        if ty == pb::ObjectType::Config {
-            match self
-                .retrier
-                .run(cancel, 0, "stat config", || self.op.stat("config"))
-                .await
-            {
-                Ok(_) => return Err(DriveError::new(EC::Permission)),
-                Err(e) if e.class == EC::NotFound => {}
-                Err(e) => return Err(e),
-            }
+        if ty == pb::ObjectType::Config
+            && self.stat("config", "stat config", cancel).await?.is_some()
+        {
+            return Err(DriveError::new(EC::Permission));
         }
         if ty == pb::ObjectType::Pack {
             self.ensure_pack_folder(id[0], cancel).await?;
         }
         let size: usize = chunks.iter().map(Bytes::len).sum();
-        self.retrier
-            .run(cancel, size as u64, "write", || {
-                self.op.write(&path, Buffer::from(chunks.clone()))
-            })
-            .await
-            .map(|_| ())
+        self.run(cancel, size as u64, "write", || {
+            let op = self.op();
+            let path = path.clone();
+            let chunks = chunks.clone();
+            async move { op.write(&path, Buffer::from(chunks)).await }
+        })
+        .await
+        .map(|_| ())
     }
 
-    /// Removes an object permanently (`DELETE files/{id}`); an absent object is not an error.
+    /// Removes an object permanently (`DELETE files/{id}`); an absent object is not an error. Only
+    /// a file is removed: a folder at an object's path is refused, because deleting it would delete
+    /// its subtree.
     ///
     /// # Errors
-    /// `LEASE_HELD`, or the class of a Drive failure.
+    /// `LEASE_HELD`, `INTERNAL` for a folder, or the class of a Drive failure.
     pub async fn remove(
         &self,
         ty: pb::ObjectType,
         id: &Id,
         cancel: &Cancel,
     ) -> Result<(), DriveError> {
+        let path = path_of(ty, id)?;
         self.check_lease(Mutation::Remove, cancel).await?;
-        let path = object_path(ty, id);
-        self.retrier
-            .run(cancel, 0, "remove", || self.op.delete(&path))
-            .await
+        match self.stat(&path, "stat object", cancel).await? {
+            None => return Ok(()),
+            Some((_, false)) => {
+                tracing::warn!("a folder is at an object's path: not removed");
+                return Err(DriveError::new(EC::Internal));
+            }
+            Some((_, true)) => {}
+        }
+        self.run(cancel, 0, "remove", || {
+            let op = self.op();
+            let path = path.clone();
+            async move { op.delete(&path).await }
+        })
+        .await
     }
 
     /// Creates `keys`, `snapshots`, `index` and `data` (never the `data/xx` folders).
@@ -614,9 +870,11 @@ impl Repo {
     pub async fn create(&self, cancel: &Cancel) -> Result<(), DriveError> {
         self.check_lease(Mutation::Create, cancel).await?;
         for dir in ["keys/", "snapshots/", "index/", "data/"] {
-            self.retrier
-                .run(cancel, 0, "create folder", || self.op.create_dir(dir))
-                .await?;
+            self.run(cancel, 0, "create folder", || {
+                let op = self.op();
+                async move { op.create_dir(dir).await }
+            })
+            .await?;
         }
         Ok(())
     }
@@ -628,14 +886,16 @@ impl Repo {
     /// `LEASE_HELD`, or the class of a Drive failure.
     pub async fn purge_tree(&self, cancel: &Cancel) -> Result<(), DriveError> {
         self.check_lease(Mutation::Remove, cancel).await?;
-        let opts = ListOptions {
-            recursive: true,
-            ..ListOptions::default()
-        };
         let mut entries = self
-            .retrier
             .run(cancel, 0, "list tree", || {
-                self.op.list_options("/", opts.clone())
+                let op = self.op();
+                async move {
+                    let opts = ListOptions {
+                        recursive: true,
+                        ..ListOptions::default()
+                    };
+                    op.list_options("/", opts).await
+                }
             })
             .await?;
         // Deepest first; files before the folders that hold them.
@@ -644,13 +904,18 @@ impl Repo {
         });
         for e in entries.iter().filter(|e| e.path() != "/") {
             let path = e.path().to_owned();
-            self.retrier
-                .run(cancel, 0, "delete", || self.op.delete(&path))
-                .await?;
+            self.run(cancel, 0, "delete", || {
+                let op = self.op();
+                let path = path.clone();
+                async move { op.delete(&path).await }
+            })
+            .await?;
         }
-        self.retrier
-            .run(cancel, 0, "delete root", || self.op.delete("/"))
-            .await
+        self.run(cancel, 0, "delete root", || {
+            let op = self.op();
+            async move { op.delete("/").await }
+        })
+        .await
     }
 
     /// `about.storageQuota` (counts the trash).
@@ -682,19 +947,23 @@ mod tests {
         let mut id = [0xab; 32];
         id[0] = 0x0f;
         let hex = lease::hex_id(&id);
-        assert_eq!(object_path(pb::ObjectType::Config, &[0; 32]), "config");
-        assert_eq!(object_path(pb::ObjectType::Key, &id), format!("keys/{hex}"));
+        let p = |t| object_path(t, &id).unwrap();
+        assert_eq!(p(pb::ObjectType::Config), "config");
+        assert_eq!(p(pb::ObjectType::Key), format!("keys/{hex}"));
+        assert_eq!(p(pb::ObjectType::Snapshot), format!("snapshots/{hex}"));
+        assert_eq!(p(pb::ObjectType::Index), format!("index/{hex}"));
+        assert_eq!(p(pb::ObjectType::Pack), format!("data/0f/{hex}"));
+    }
+
+    #[test]
+    fn an_unspecified_type_names_no_object() {
+        assert_eq!(object_path(pb::ObjectType::Unspecified, &[1; 32]), None);
         assert_eq!(
-            object_path(pb::ObjectType::Snapshot, &id),
-            format!("snapshots/{hex}")
-        );
-        assert_eq!(
-            object_path(pb::ObjectType::Index, &id),
-            format!("index/{hex}")
-        );
-        assert_eq!(
-            object_path(pb::ObjectType::Pack, &id),
-            format!("data/0f/{hex}")
+            path_of(pb::ObjectType::Unspecified, &[1; 32])
+                .unwrap_err()
+                .class,
+            EC::Internal,
+            "never the config object"
         );
     }
 

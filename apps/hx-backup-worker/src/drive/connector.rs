@@ -85,6 +85,21 @@ pub struct Connector {
     addr: Option<SocketAddr>,
 }
 
+/// Alternates the address families, so that a blackholed one (typically IPv6 on a host with no
+/// route for it) costs one short connect timeout, not all of them.
+#[must_use]
+pub fn interleave(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let (mut v6, mut v4): (Vec<_>, Vec<_>) = addrs.into_iter().partition(SocketAddr::is_ipv6);
+    let mut out = Vec::with_capacity(v4.len() + v6.len());
+    v4.reverse();
+    v6.reverse();
+    while !v4.is_empty() || !v6.is_empty() {
+        out.extend(v6.pop());
+        out.extend(v4.pop());
+    }
+    out
+}
+
 impl Connector {
     /// # Errors
     /// [`BuildError`] when TLS cannot be set up (for example no root certificates).
@@ -119,7 +134,7 @@ impl Connector {
         if found.is_empty() {
             return Err("no global address".into());
         }
-        Ok(found)
+        Ok(interleave(found))
     }
 
     async fn connect(&self, uri: http::Uri) -> Result<Conn, BoxError> {
@@ -197,5 +212,26 @@ impl Write for Conn {
 impl Connection for Conn {
     fn connected(&self) -> Connected {
         Connected::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn families_alternate_so_one_dead_family_costs_one_timeout() {
+        let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let got = interleave(vec![
+            a("[2001:db8::1]:443"),
+            a("[2001:db8::2]:443"),
+            a("1.1.1.1:443"),
+            a("1.1.1.2:443"),
+            a("1.1.1.3:443"),
+        ]);
+        let fam: Vec<bool> = got.iter().map(SocketAddr::is_ipv6).collect();
+        assert_eq!(fam, [true, false, true, false, false]);
+        assert_eq!(got.len(), 5);
+        assert!(interleave(vec![]).is_empty());
     }
 }

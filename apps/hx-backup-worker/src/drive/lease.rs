@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use hx_ipc::repo::pb;
 use serde::{Deserialize, Serialize};
 
-use super::retry::DriveError;
+use super::retry::{Cancel, DriveError};
 
 /// The lease object's name, in the repository folder, outside rustic's file types.
 pub const LEASE_FILE: &str = "hx-lease.json";
@@ -194,25 +194,41 @@ impl LeaseGuard {
     /// Checks the lease before `m`. The first mutation of the session, and every `Remove`, reads
     /// the lease from Drive through `read`; the others accept a read at most `cache` old.
     ///
+    /// The state lock is never held across the read, and waiting for it can be cancelled: a
+    /// request queued behind a stuck lease read is still answered `CANCELLED`.
+    ///
     /// # Errors
     /// `LEASE_HELD` when the lease does not name this server at the held generation (and for every
-    /// later mutation), or the error of `read`.
-    pub async fn check<F, Fut>(&self, m: Mutation, read: F) -> Result<(), DriveError>
+    /// later mutation), `CANCELLED`, or the error of `read`.
+    pub async fn check<F, Fut>(
+        &self,
+        m: Mutation,
+        cancel: &Cancel,
+        read: F,
+    ) -> Result<(), DriveError>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Found, DriveError>>,
     {
-        let mut st = self.st.lock().await;
+        let (ours, generation) = {
+            let st = cancel.guard(self.st.lock()).await?;
+            if st.lost {
+                return Err(DriveError::new(pb::ErrorClass::LeaseHeld));
+            }
+            let fresh =
+                !st.first_done || m == Mutation::Remove || st.read_at.elapsed() > self.cache;
+            if !fresh {
+                return Ok(());
+            }
+            (st.ours.clone(), st.generation)
+        };
+        let found = read().await?;
+        let mut st = cancel.guard(self.st.lock()).await?;
         if st.lost {
             return Err(DriveError::new(pb::ErrorClass::LeaseHeld));
         }
-        let fresh = !st.first_done || m == Mutation::Remove || st.read_at.elapsed() > self.cache;
-        if !fresh {
-            return Ok(());
-        }
-        let found = read().await?;
         match found {
-            Some(Ok(l)) if l.server_id == st.ours && l.generation == st.generation => {
+            Some(Ok(l)) if l.server_id == ours && l.generation == generation => {
                 st.read_at = Instant::now();
                 st.first_done = true;
                 Ok(())
@@ -314,16 +330,28 @@ mod tests {
             std::future::ready(Ok(lease(US, 2)))
         };
         let n = || reads.load(std::sync::atomic::Ordering::SeqCst);
-        g.check(Mutation::Write, read).await.unwrap();
+        g.check(Mutation::Write, &Cancel::never(), read)
+            .await
+            .unwrap();
         assert_eq!(n(), 1, "the first mutation always reads");
-        g.check(Mutation::Write, read).await.unwrap();
-        g.check(Mutation::Create, read).await.unwrap();
+        g.check(Mutation::Write, &Cancel::never(), read)
+            .await
+            .unwrap();
+        g.check(Mutation::Create, &Cancel::never(), read)
+            .await
+            .unwrap();
         assert_eq!(n(), 1, "within the cache window a write does not");
-        g.check(Mutation::Remove, read).await.unwrap();
-        g.check(Mutation::Remove, read).await.unwrap();
+        g.check(Mutation::Remove, &Cancel::never(), read)
+            .await
+            .unwrap();
+        g.check(Mutation::Remove, &Cancel::never(), read)
+            .await
+            .unwrap();
         assert_eq!(n(), 3, "every remove reads");
         tokio::time::sleep(Duration::from_millis(120)).await;
-        g.check(Mutation::Write, read).await.unwrap();
+        g.check(Mutation::Write, &Cancel::never(), read)
+            .await
+            .unwrap();
         assert_eq!(n(), 4, "the cache expired");
     }
 
@@ -331,7 +359,7 @@ mod tests {
     async fn a_lost_lease_is_sticky_and_a_read_error_is_not_a_loss() {
         let g = LeaseGuard::new(US.into(), 2, Duration::from_secs(60));
         let e = g
-            .check(Mutation::Write, || {
+            .check(Mutation::Write, &Cancel::never(), || {
                 std::future::ready(Err(DriveError::new(pb::ErrorClass::Transient)))
             })
             .await
@@ -340,17 +368,23 @@ mod tests {
         assert!(!g.is_lost().await);
         for found in [lease(THEM, 2), lease(US, 3), None, Some(Err(Unreadable))] {
             let g = LeaseGuard::new(US.into(), 2, Duration::from_secs(60));
-            g.check(Mutation::Write, || std::future::ready(Ok(lease(US, 2))))
-                .await
-                .unwrap();
+            g.check(Mutation::Write, &Cancel::never(), || {
+                std::future::ready(Ok(lease(US, 2)))
+            })
+            .await
+            .unwrap();
             let e = g
-                .check(Mutation::Remove, || std::future::ready(Ok(found)))
+                .check(Mutation::Remove, &Cancel::never(), || {
+                    std::future::ready(Ok(found))
+                })
                 .await
                 .unwrap_err();
             assert_eq!(e.class, pb::ErrorClass::LeaseHeld);
             // never read again, never allowed again
             let e = g
-                .check(Mutation::Write, || std::future::ready(Ok(lease(US, 2))))
+                .check(Mutation::Write, &Cancel::never(), || {
+                    std::future::ready(Ok(lease(US, 2)))
+                })
                 .await
                 .unwrap_err();
             assert_eq!(e.class, pb::ErrorClass::LeaseHeld);

@@ -332,11 +332,28 @@ fn a_cancelled_request_in_a_hung_drive_call_is_answered_cancelled() {
         object_type: T::Pack as i32,
         id: bytes::Bytes::copy_from_slice(&id(0x40)),
     }));
-    std::thread::sleep(Duration::from_millis(300));
+    // the request is really stuck in the hung call (it reached the fake) before it is cancelled
+    let t0 = Instant::now();
+    while rig
+        .fake
+        .with(|m| m.log.iter().filter(|q| q.category == "get.media").count())
+        < 2
+    {
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "the read never reached Drive"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let began = Instant::now();
     s.env.cancel(r);
     assert_eq!(s.env.wait(r).class(), Some(EC::Cancelled));
-    assert!(began.elapsed() < Duration::from_secs(3));
+    // the attempt's own timer is 10 s: only the cancel can have ended it this fast
+    assert!(
+        began.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        began.elapsed()
+    );
 }
 
 #[test]

@@ -142,8 +142,8 @@ fn activated_listener() -> Result<UnixListener, ActivationError> {
     if !ok {
         return Err(ActivationError::NotAListener);
     }
-    // The children of this process must not inherit it (there are none), and the variables must
-    // not reach them either.
+    // `LISTEN_PID` and `LISTEN_FDS` stay in the environment: the helper starts no process, so
+    // nothing can inherit them.
     Ok(UnixListener::from(fd))
 }
 
@@ -165,6 +165,21 @@ fn peer_uid(stream: &UnixStream) -> Option<u32> {
     rustix::net::sockopt::socket_peercred(stream)
         .ok()
         .map(|c| c.uid.as_raw())
+}
+
+/// Errors of `accept` that mean "try again": an interrupted call, a connection that was reset or
+/// aborted before it was accepted (`ECONNABORTED`, `EPROTO`), and a lack of buffers (`ENOBUFS`,
+/// `ENOMEM`). Everything else (a closed descriptor, `EMFILE`) ends the helper with 71.
+#[must_use]
+pub fn accept_error_is_transient(e: &io::Error) -> bool {
+    use io::ErrorKind as K;
+    matches!(
+        e.kind(),
+        K::Interrupted | K::ConnectionAborted | K::ConnectionReset
+    ) || matches!(
+        e.raw_os_error(),
+        Some(libc::EPROTO | libc::ENOBUFS | libc::ENOMEM | libc::ECONNABORTED)
+    )
 }
 
 /// Serves connections from `listener` until `idle_exit` has passed with none open. Returns the
@@ -195,7 +210,12 @@ pub fn serve_listener(listener: &UnixListener, cfg: &RoleConfig, drive: &DriveCo
         let stream = match listener.accept() {
             Ok((s, _)) => s,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if accept_error_is_transient(&e) => {
+                // A client that left before it was accepted, or a moment without buffers: not a
+                // reason to stop serving.
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
             Err(e) => {
                 eprintln!("hx-backup-worker: accept: {e}");
                 return EXIT_LISTEN;
@@ -270,6 +290,28 @@ pub fn run(cfg: &RoleConfig) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_accept_errors_do_not_end_the_helper() {
+        for raw in [
+            libc::ECONNABORTED,
+            libc::EPROTO,
+            libc::ENOBUFS,
+            libc::ENOMEM,
+            libc::EINTR,
+        ] {
+            assert!(
+                accept_error_is_transient(&io::Error::from_raw_os_error(raw)),
+                "{raw}"
+            );
+        }
+        for raw in [libc::EBADF, libc::EMFILE, libc::EINVAL] {
+            assert!(
+                !accept_error_is_transient(&io::Error::from_raw_os_error(raw)),
+                "{raw}"
+            );
+        }
+    }
 
     #[test]
     fn activation_follows_the_sd_listen_fds_rules() {

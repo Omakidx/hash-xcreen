@@ -34,7 +34,7 @@ use opendal::{Buffer, HttpBody, HttpTransport};
 use super::connector::Connector;
 pub use super::connector::{BuildError, HttpConfig};
 use super::rate::{CHUNK, UploadRate};
-use super::retry::{Observed, Timing, record};
+use super::retry::{AttemptState, Observed, Timing, body_limit, count_request, current, record};
 
 /// The Drive API host.
 pub const API_HOST: &str = "www.googleapis.com";
@@ -116,25 +116,43 @@ pub fn is_global_unicast(ip: IpAddr) -> bool {
     }
 }
 
-/// A piece of an upload body: at most [`CHUNK`] bytes, released at the shared rate.
+/// An upload body: pieces of at most [`CHUNK`] bytes, released at the shared rate. Every piece
+/// written, and every slice of a wait for the cap, counts as progress for the attempt.
 pub struct UploadBody {
     chunks: Buffer,
     current: Bytes,
     pending: Option<Bytes>,
     sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+    wait_left: Duration,
+    slice: Duration,
     remaining: u64,
     rate: Option<Arc<UploadRate>>,
+    progress: Option<Arc<AttemptState>>,
 }
 
 impl UploadBody {
-    fn new(body: Buffer, rate: Option<Arc<UploadRate>>) -> Self {
+    fn new(
+        body: Buffer,
+        rate: Option<Arc<UploadRate>>,
+        progress: Option<Arc<AttemptState>>,
+        slice: Duration,
+    ) -> Self {
         Self {
             remaining: body.len() as u64,
             chunks: body,
             current: Bytes::new(),
             pending: None,
             sleep: None,
+            wait_left: Duration::ZERO,
+            slice,
             rate,
+            progress,
+        }
+    }
+
+    fn touch(&self) {
+        if let Some(p) = &self.progress {
+            p.touch();
         }
     }
 }
@@ -152,9 +170,17 @@ impl Body for UploadBody {
             if let Some(s) = this.sleep.as_mut() {
                 ready!(s.as_mut().poll(cx));
                 this.sleep = None;
-                if let Some(piece) = this.pending.take() {
-                    return Poll::Ready(Some(Ok(Frame::data(piece))));
-                }
+                this.touch();
+            }
+            if !this.wait_left.is_zero() {
+                let d = this.wait_left.min(this.slice);
+                this.wait_left -= d;
+                this.sleep = Some(Box::pin(tokio::time::sleep(d)));
+                continue;
+            }
+            if let Some(piece) = this.pending.take() {
+                this.touch();
+                return Poll::Ready(Some(Ok(Frame::data(piece))));
             }
             if this.current.is_empty() {
                 match this.chunks.next() {
@@ -167,11 +193,8 @@ impl Body for UploadBody {
             let piece = this.current.split_to(n);
             this.remaining = this.remaining.saturating_sub(n as u64);
             let wait = this.rate.as_ref().map_or(Duration::ZERO, |r| r.reserve(n));
-            if wait.is_zero() {
-                return Poll::Ready(Some(Ok(Frame::data(piece))));
-            }
             this.pending = Some(piece);
-            this.sleep = Some(Box::pin(tokio::time::sleep(wait)));
+            this.wait_left = wait;
         }
     }
 
@@ -236,6 +259,14 @@ fn is_trash_request(req: &Request<Buffer>) -> bool {
     if req.method() != http::Method::PATCH {
         return false;
     }
+    // OpenDAL marks the requests of its operations: when the marker is there it must be `Delete`.
+    if req
+        .extensions()
+        .get::<opendal::raw::Operation>()
+        .is_some_and(|op| *op != opendal::raw::Operation::Delete)
+    {
+        return false;
+    }
     let Some(id) = req.uri().path().strip_prefix("/drive/v3/files/") else {
         return false;
     };
@@ -270,7 +301,7 @@ impl GoogleTransport {
         rate: Arc<UploadRate>,
         timing: Timing,
     ) -> Result<Self, BuildError> {
-        let connector = Connector::new(cfg, timing.attempt_base)?;
+        let connector = Connector::new(cfg, timing.connect_each)?;
         // No redirect following, no proxy and no HTTP/2: this client has none of them to turn off.
         let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
             .pool_timer(TokioTimer::new())
@@ -315,13 +346,39 @@ async fn read_capped(mut body: Incoming, cap: usize) -> Result<Vec<u8>, ()> {
     Ok(buf)
 }
 
+/// The URI without its query: the only form that is ever attached to a response (OpenDAL's token
+/// request carries the token and the secret in its query).
+fn without_query(uri: &http::Uri) -> http::Uri {
+    let mut parts = http::uri::Parts::default();
+    parts.scheme = uri.scheme().cloned();
+    parts.authority = uri.authority().cloned();
+    parts.path_and_query = http::uri::PathAndQuery::try_from(uri.path()).ok();
+    http::Uri::from_parts(parts).unwrap_or_else(|_| http::Uri::from_static("/"))
+}
+
+/// The ceiling of a response body that is not a media read.
+const JSON_BODY_CEILING: u64 = 4 * 1024 * 1024;
+
+fn too_large() -> opendal::Error {
+    opendal::Error::new(
+        opendal::ErrorKind::Unexpected,
+        "response is larger than asked for",
+    )
+}
+
 impl HttpTransport for GoogleTransport {
     async fn fetch(&self, mut req: Request<Buffer>) -> opendal::Result<Response<HttpBody>> {
         let host = check_uri(req.uri()).map_err(refuse)?;
+        if !count_request(self.timing.max_requests) {
+            return Err(refuse(Refused("too many requests in one attempt")));
+        }
         let trash = is_trash_request(&req);
-        let uri = req.uri().clone();
+        let mut uri = req.uri().clone();
         let is_upload = uri.path().starts_with("/upload/");
-        let target = self.target(&uri)?;
+        let media = uri
+            .query()
+            .is_some_and(|q| q.split('&').any(|kv| kv == "alt=media"));
+        let progress = current();
         let method = if trash {
             http::Method::DELETE
         } else {
@@ -337,23 +394,42 @@ impl HttpTransport for GoogleTransport {
             headers.remove(http::header::CONTENT_TYPE);
             headers.remove(http::header::CONTENT_LENGTH);
             Buffer::new()
+        } else if host == Host::Token && uri.query().is_some() {
+            // OpenDAL puts the refresh token, the client id and the secret in the query of a POST
+            // with no body. They go in the body instead, as the form they are (already
+            // percent-encoded by the caller), and the query is dropped from the URI.
+            let form = Bytes::from(uri.query().unwrap_or_default().to_owned());
+            uri = without_query(&uri);
+            headers.insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("application/x-www-form-urlencoded"),
+            );
+            headers.remove(http::header::CONTENT_LENGTH);
+            Buffer::from(form)
         } else {
             std::mem::take(req.body_mut())
         };
-        let body_len = body.len();
+        let target = self.target(&uri)?;
         let rate = (is_upload && !body.is_empty()).then(|| self.rate.clone());
         let mut hreq = hyper::Request::builder()
             .method(method)
             .uri(target)
-            .body(UploadBody::new(body, rate))
+            .body(UploadBody::new(
+                body,
+                rate,
+                progress.clone(),
+                self.timing.idle / 2,
+            ))
             .map_err(|_| opendal::Error::new(opendal::ErrorKind::Unexpected, "bad request"))?;
         *hreq.headers_mut() = headers;
-        let timeout = self.timing.attempt_timeout(body_len as u64);
-        let resp = match tokio::time::timeout(timeout, self.client.request(hreq)).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(_)) => return Err(network_error("send failed")),
-            Err(_) => return Err(network_error("no response in time")),
+        // No timer here: the attempt's no-progress timer (ipc.md §29) watches this request.
+        let resp = match self.client.request(hreq).await {
+            Ok(r) => r,
+            Err(_) => return Err(network_error("send failed")),
         };
+        if let Some(p) = &progress {
+            p.touch();
+        }
         let status = resp.status();
         let mut obs = Observed {
             status: status.as_u16(),
@@ -367,6 +443,7 @@ impl HttpTransport for GoogleTransport {
             ..Observed::default()
         };
         let (parts, incoming) = resp.into_parts();
+        let uri = without_query(&uri);
         if status.as_u16() >= 400 {
             // Read the error body (bounded) for its reason; it is rebuilt for OpenDAL, which maps
             // the status itself.
@@ -395,25 +472,53 @@ impl HttpTransport for GoogleTransport {
                 .body(single_buffer_body(Bytes::from_static(b"{}")))
                 .expect("static parts"));
         }
+        let ceiling = if media {
+            match body_limit() {
+                0 => u64::from(hx_ipc::repo::MAX_OBJECT_SIZE),
+                l => l,
+            }
+        } else {
+            JSON_BODY_CEILING
+        };
         let content_length = parts
             .headers
             .get(http::header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok());
+        if content_length.is_some_and(|l| l > ceiling) {
+            return Err(too_large());
+        }
         let mut out = Response::builder()
             .status(status)
             .version(parts.version)
             .extension(uri);
         *out.headers_mut().expect("builder is valid") = parts.headers;
         // OpenDAL wants a `Sync` stream and hyper's body is not: a task relays it, two chunks
-        // ahead at most. It ends when the stream is dropped or the body ends.
+        // ahead at most. It ends when the stream is dropped (the attempt timed out, or was
+        // cancelled), when the body ends, or when the body is longer than the ceiling.
         let (tx, rx) = tokio::sync::mpsc::channel::<opendal::Result<Buffer>>(2);
         tokio::spawn(async move {
             let mut body = incoming;
-            while let Some(frame) = body.frame().await {
+            let mut total = 0u64;
+            loop {
+                let frame = tokio::select! {
+                    () = tx.closed() => return,
+                    f = body.frame() => f,
+                };
+                let Some(frame) = frame else { return };
                 let item = match frame {
                     Ok(f) => match f.into_data() {
-                        Ok(d) if !d.is_empty() => Ok(Buffer::from(d)),
+                        Ok(d) if !d.is_empty() => {
+                            total += d.len() as u64;
+                            if let Some(p) = &progress {
+                                p.touch();
+                            }
+                            if total > ceiling {
+                                let _ = tx.send(Err(too_large())).await;
+                                return;
+                            }
+                            Ok(Buffer::from(d))
+                        }
                         _ => continue,
                     },
                     Err(_) => Err(opendal::Error::new(
@@ -559,6 +664,27 @@ mod tests {
             "/upload/drive/v3/files/1AbC",
             r#"{"trashed":true}"#
         ));
+    }
+
+    #[test]
+    fn the_operation_marker_of_a_request_must_be_delete_when_present() {
+        use opendal::raw::Operation;
+        let mk = |op: Option<Operation>| {
+            let mut b = Request::builder()
+                .method("PATCH")
+                .uri("https://www.googleapis.com/drive/v3/files/1AbC");
+            if let Some(op) = op {
+                b = b.extension(op);
+            }
+            is_trash_request(
+                &b.body(Buffer::from(Bytes::from_static(br#"{"trashed":true}"#)))
+                    .unwrap(),
+            )
+        };
+        assert!(mk(None));
+        assert!(mk(Some(Operation::Delete)));
+        assert!(!mk(Some(Operation::Write)));
+        assert!(!mk(Some(Operation::Rename)));
     }
 
     #[test]

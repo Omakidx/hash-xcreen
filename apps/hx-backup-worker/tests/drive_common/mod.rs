@@ -104,6 +104,8 @@ pub struct PrivdEnd {
     pub events: Vec<pb::Event>,
     pub pongs: Vec<u64>,
     pub pages_seen: usize,
+    pub frames_seen: usize,
+    pub pong_at_frame: Option<usize>,
     pub software: Option<String>,
     done: HashMap<u64, Reply>,
     partial: HashMap<u64, Partial>,
@@ -122,6 +124,8 @@ impl PrivdEnd {
             events: vec![],
             pongs: vec![],
             pages_seen: 0,
+            frames_seen: 0,
+            pong_at_frame: None,
             software: None,
             done: HashMap::new(),
             partial: HashMap::new(),
@@ -206,6 +210,7 @@ impl PrivdEnd {
         };
         let incoming = repo::decode(raw, Endpoint::PrivdDriveLink).map_err(|e| e.to_string())?;
         self.st.received(&incoming).map_err(|e| e.0.to_string())?;
+        self.frames_seen += 1;
         match incoming {
             Incoming::Data(d) => {
                 let p = self
@@ -227,7 +232,10 @@ impl PrivdEnd {
                 use pb::repo_response::Result as R;
                 match m.frame.unwrap() {
                     F::HelloAck(a) => self.software = Some(a.software),
-                    F::Pong(p) => self.pongs.push(p.nonce),
+                    F::Pong(p) => {
+                        self.pongs.push(p.nonce);
+                        self.pong_at_frame.get_or_insert(self.frames_seen);
+                    }
                     F::Event(e) => self.events.push(e),
                     F::Response(r) => {
                         let req = r.req_id;
@@ -384,8 +392,7 @@ pub fn test_timing() -> Timing {
     t.initial = Duration::from_millis(10);
     t.max_delay = Duration::from_millis(80);
     t.daily_pause = Duration::from_millis(150);
-    t.attempt_base = Duration::from_secs(10);
-    t.attempt_per_mib = Duration::from_secs(1);
+    t.idle = Duration::from_secs(10);
     t.request_budget = Duration::from_secs(120);
     t.lease_cache = Duration::from_millis(400);
     t
