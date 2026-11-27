@@ -74,7 +74,7 @@ jobs:
           rustup toolchain install
           rustup target add x86_64-unknown-linux-musl
           sudo apt-get update
-          # zstd (rustic) needs a C compiler for musl
+          # zstd (rustic) and ring (the Drive helper's TLS) need a C compiler for musl
           sudo apt-get install -y --no-install-recommends musl-tools
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Build the worker with the test hooks, for musl
@@ -90,7 +90,7 @@ jobs:
         # tests/binary.rs skips itself, with a message, where user namespaces are unavailable.
         env:
           HX_WORKER_BIN: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/debug/hx-backup-worker
-        run: cargo test -p hx-backup-worker --locked --test binary -- --nocapture
+        run: cargo test -p hx-backup-worker --locked --test binary --test drive_binary -- --nocapture
 
   deny:
     name: Licences and advisories (cargo-deny)

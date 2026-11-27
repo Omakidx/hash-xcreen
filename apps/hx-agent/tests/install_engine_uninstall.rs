@@ -119,9 +119,16 @@ fn destroy_removes_everything_in_order() {
         &l,
         "systemctl disable --now hx-privd.socket hx-privd.service hx-privd-rescue.service var-lib-hx-updates.mount var-lib-hx-imagein.mount hx-host-firewall.service hx-docker-user.service",
     );
+    // the Drive units have a call of their own, after privd's, so that a failure of it (an install
+    // from before they existed) cannot leave privd running
+    let drive = index_of(
+        &l,
+        "systemctl disable --now hx-drive.socket hx-drive.service",
+    );
+    assert!(u3 < drive, "{l:#?}");
     let fetch = index_of(
         &l,
-        "systemctl stop hx-update-fetcher@*.service hx-image-fetcher@*.service",
+        "systemctl stop hx-update-fetcher@*.service hx-image-fetcher@*.service hx-drive.socket hx-drive.service",
     );
     let user = index_of(&l, "userdel hx-gatewayd");
     let reload = index_of(&l, "systemctl daemon-reload");

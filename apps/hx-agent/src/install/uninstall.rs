@@ -310,6 +310,7 @@ pub fn exact_files(keep: bool) -> Vec<String> {
         paths::PORT_DROPIN,
         paths::RESOLVERS_DROPIN,
         paths::IMAGE_RESOLVERS_DROPIN,
+        paths::DRIVE_RESOLVERS_DROPIN,
         paths::RESCUE_BIN,
         paths::GATEWAYD_TOML,
         paths::PRIVD_TOML,
@@ -328,10 +329,11 @@ pub fn exact_files(keep: bool) -> Vec<String> {
 
 /// The installer's own drop-in directories: the only directories that are `rmdir`'d (and only
 /// when empty).
-const DROPIN_DIRS: [&str; 3] = [
+const DROPIN_DIRS: [&str; 4] = [
     "/etc/systemd/system/hx-gatewayd-public.socket.d",
     "/etc/systemd/system/hx-update-fetcher@.service.d",
     "/etc/systemd/system/hx-image-fetcher@.service.d",
+    "/etc/systemd/system/hx-drive.service.d",
 ];
 
 /// Unlinks one file (never a directory, never through a link at the last component): the parent
@@ -580,12 +582,21 @@ pub fn run(
                         )
                         .timeout_secs(120),
                     );
+                    // The Drive helper in a call of its own: on an install from before it existed
+                    // the unit files are missing, `disable` of a missing unit can fail, and that
+                    // must not take the privd set above with it (it runs first and alone).
+                    let _ = d.runner.run(&Call::new(
+                        Tool::Systemctl,
+                        &["disable", "--now", "hx-drive.socket", "hx-drive.service"],
+                    ));
                     let _ = d.runner.run(&Call::new(
                         Tool::Systemctl,
                         &[
                             "stop",
                             "hx-update-fetcher@*.service",
                             "hx-image-fetcher@*.service",
+                            "hx-drive.socket",
+                            "hx-drive.service",
                         ],
                     ));
                 }
@@ -756,6 +767,7 @@ mod tests {
         assert!(all.iter().any(|f| f == paths::PORT_DROPIN));
         assert!(all.iter().any(|f| f == paths::RESOLVERS_DROPIN));
         assert!(all.iter().any(|f| f == paths::IMAGE_RESOLVERS_DROPIN));
+        assert!(all.iter().any(|f| f == paths::DRIVE_RESOLVERS_DROPIN));
         assert!(all.iter().any(|f| f == paths::RESCUE_BIN));
         assert!(all.iter().any(|f| f == paths::HOST_FIREWALL));
         for f in &all {

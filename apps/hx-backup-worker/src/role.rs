@@ -11,8 +11,7 @@ use std::ffi::{OsStr, OsString};
 pub const EXIT_OK: i32 = 0;
 /// The role fails closed (unknown role, or arguments).
 pub const EXIT_ROLE: i32 = 64;
-/// The Drive role is not built yet.
-pub const EXIT_DRIVE_NOT_IMPLEMENTED: i32 = 65;
+// 65 is withdrawn (it meant "the Drive role is not built yet", ipc.md §24) and never reused.
 /// The sandbox could not be set up.
 pub const EXIT_SANDBOX: i32 = 70;
 /// No listener, or no connection within 60 s.
@@ -23,6 +22,8 @@ pub const EXIT_PROTOCOL: i32 = 72;
 pub const EXIT_LINK_LOST: i32 = 73;
 /// Internal failure outside the job runner.
 pub const EXIT_INTERNAL: i32 = 74;
+/// Drive role: the OAuth client file is missing or invalid (ipc.md §29 a).
+pub const EXIT_DRIVE_CLIENT: i32 = 75;
 /// Terminated by `SIGTERM` (128 + 15).
 pub const EXIT_SIGTERM: i32 = 143;
 

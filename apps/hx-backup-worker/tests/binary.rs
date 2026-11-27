@@ -13,7 +13,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use common::*;
-use hx_backup_worker::role::{EXIT_DRIVE_NOT_IMPLEMENTED, EXIT_ROLE};
+use hx_backup_worker::role::{EXIT_DRIVE_CLIENT, EXIT_ROLE};
 
 /// The binary under test: the one Cargo built, or `HX_WORKER_BIN` (CI runs this file against the
 /// static musl build).
@@ -23,7 +23,7 @@ fn bin() -> String {
 }
 
 #[test]
-fn the_role_fails_closed_and_the_drive_role_is_a_stub() {
+fn the_role_fails_closed_and_the_drive_role_fails_closed_without_its_client() {
     let run = |role: Option<&str>, args: &[&str]| {
         let mut c = Command::new(bin());
         c.args(args).stdin(Stdio::null());
@@ -36,9 +36,15 @@ fn the_role_fails_closed_and_the_drive_role_is_a_stub() {
     assert_eq!(run(Some("bogus"), &[]).status.code(), Some(EXIT_ROLE));
     assert_eq!(run(Some(""), &[]).status.code(), Some(EXIT_ROLE));
     assert_eq!(run(None, &["--version"]).status.code(), Some(EXIT_ROLE));
-    let d = run(Some("drive"), &[]);
-    assert_eq!(d.status.code(), Some(EXIT_DRIVE_NOT_IMPLEMENTED));
-    assert!(String::from_utf8_lossy(&d.stderr).contains("not implemented"));
+    // The drive role without its OAuth client file serves nothing (ipc.md §29 a).
+    let d = Command::new(bin())
+        .env("HX_BACKUP_ROLE", "drive")
+        .env("HX_WORKER_DRIVE_CLIENT", "/nonexistent/drive-client.json")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(d.status.code(), Some(EXIT_DRIVE_CLIENT));
+    assert!(String::from_utf8_lossy(&d.stderr).contains("OAuth client file"));
 }
 
 fn userns_works() -> bool {

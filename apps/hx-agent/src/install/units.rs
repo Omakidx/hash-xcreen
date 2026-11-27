@@ -106,6 +106,15 @@ pub const FILES: &[EmbeddedFile] = &[
         Dest::Unit,
         Enable::No
     ),
+    // The Drive helper (docs/ipc.md section 24): installed, not enabled. The Drive-connect flow
+    // (W5) enables the socket once a token exists.
+    file!("hx-drive.socket", "hx-drive.socket", Dest::Unit, Enable::No),
+    file!(
+        "hx-drive.service",
+        "hx-drive.service",
+        Dest::Unit,
+        Enable::No
+    ),
     file!(
         "hx-privd.socket",
         "hx-privd.socket",

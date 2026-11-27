@@ -467,12 +467,21 @@ fn the_resolver_dropin_follows_resolv_conf() {
     assert_eq!(full_install(&mut m, &dir), 0);
     let d = m.read(paths::RESOLVERS_DROPIN).unwrap();
     assert!(d.contains("IPAddressAllow=10.0.0.2/32") && !d.contains("8.8.8.8"));
-    // The image fetcher runs under the same IPAddressDeny and gets the same allowance.
+    // The image fetcher and the Drive helper run under the same IPAddressDeny and get the same
+    // allowance.
     assert_eq!(
         m.read(paths::IMAGE_RESOLVERS_DROPIN).as_deref(),
         Some(d.as_str())
     );
-    for dropin in [paths::RESOLVERS_DROPIN, paths::IMAGE_RESOLVERS_DROPIN] {
+    assert_eq!(
+        m.read(paths::DRIVE_RESOLVERS_DROPIN).as_deref(),
+        Some(d.as_str())
+    );
+    for dropin in [
+        paths::RESOLVERS_DROPIN,
+        paths::IMAGE_RESOLVERS_DROPIN,
+        paths::DRIVE_RESOLVERS_DROPIN,
+    ] {
         assert!(
             m.state()
                 .unwrap()
@@ -485,7 +494,11 @@ fn the_resolver_dropin_follows_resolv_conf() {
     }
     std::fs::write(path(&m, "/etc/resolv.conf"), "nameserver 8.8.8.8\n").unwrap();
     assert_eq!(rerun(&mut m, &[], &[]), 0);
-    for dropin in [paths::RESOLVERS_DROPIN, paths::IMAGE_RESOLVERS_DROPIN] {
+    for dropin in [
+        paths::RESOLVERS_DROPIN,
+        paths::IMAGE_RESOLVERS_DROPIN,
+        paths::DRIVE_RESOLVERS_DROPIN,
+    ] {
         assert!(
             !exists(&m, dropin),
             "{dropin}: removed when no resolver needs it"

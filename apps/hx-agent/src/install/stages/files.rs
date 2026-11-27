@@ -288,9 +288,13 @@ pub fn resolver_plan(resolv_conf: &str) -> ResolverPlan {
     plan
 }
 
-/// The two fetcher templates that get the resolver drop-in (the update fetcher and, for prebuilt
-/// images, the image fetcher): both run with `IPAddressDeny` of the private ranges.
-pub const RESOLVER_DROPINS: [&str; 2] = [paths::RESOLVERS_DROPIN, paths::IMAGE_RESOLVERS_DROPIN];
+/// The units that get the resolver drop-in (the update fetcher, the image fetcher for prebuilt
+/// images, and the Drive helper): all run with `IPAddressDeny` of the private ranges.
+pub const RESOLVER_DROPINS: [&str; 3] = [
+    paths::RESOLVERS_DROPIN,
+    paths::IMAGE_RESOLVERS_DROPIN,
+    paths::DRIVE_RESOLVERS_DROPIN,
+];
 
 /// The resolver drop-in text, or `None` when no resolver needs an allowance.
 pub fn resolvers_dropin(resolvers: &[IpAddr]) -> Option<String> {
@@ -298,7 +302,7 @@ pub fn resolvers_dropin(resolvers: &[IpAddr]) -> Option<String> {
         return None;
     }
     let mut s = String::from(
-        "# Written by hx-agent install: the host's resolvers, so that the update fetcher and the image fetcher can resolve names.\n[Service]\n",
+        "# Written by hx-agent install: the host's resolvers, so that the update fetcher, the image fetcher and the Drive helper can resolve names.\n[Service]\n",
     );
     for r in resolvers {
         let bits = if r.is_ipv4() { 32 } else { 128 };

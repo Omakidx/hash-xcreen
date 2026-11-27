@@ -48,7 +48,9 @@ fn no_hx_agent_binary_can_contain_rustic() {
     let Some(normal) = tree(&["-p", "hx-agent", "-e", "normal"]) else {
         panic!("cargo tree must work offline in this workspace");
     };
-    for forbidden in ["rustic", "hx-backup-worker"] {
+    // The Drive helper's HTTP stack (OpenDAL, reqwest) is the worker package's alone: privd and
+    // gatewayd never link it either (ipc.md section 36, decision 11).
+    for forbidden in ["rustic", "hx-backup-worker", "opendal", "reqwest"] {
         assert!(
             !normal.contains(forbidden),
             "hx-agent's dependency tree contains {forbidden}:\n{normal}"
@@ -61,6 +63,52 @@ fn no_hx_agent_binary_can_contain_rustic() {
         "hx-agent enables the engine feature of hx-backup"
     );
     assert!(!features.contains("rustic"), "{features}");
+    assert!(!features.contains("opendal"), "{features}");
+}
+
+#[test]
+fn the_drive_helpers_http_stack_is_small_and_has_no_openssl() {
+    let normal = tree(&["-p", "hx-backup-worker", "-e", "normal"]).expect("cargo tree");
+    for wanted in ["opendal", "hyper-util", "tokio-rustls"] {
+        assert!(normal.contains(wanted), "the Drive role links {wanted}");
+    }
+    // pure Rust TLS with ring: no OpenSSL, no native-tls, no aws-lc; and not reqwest, whose rustls
+    // stack enables `tls12` and brings a certificate bundle outside the licence allowlist
+    for forbidden in [
+        "openssl-sys",
+        "native-tls",
+        "aws-lc",
+        "reqwest",
+        "hyper-rustls",
+        "webpki-root-certs",
+    ] {
+        assert!(
+            !normal.contains(forbidden),
+            "the worker's tree contains {forbidden}:\n{normal}"
+        );
+    }
+    // OpenDAL with only the Google Drive service and none of its other services or layers
+    let features = tree(&["-p", "hx-backup-worker", "-e", "normal,features"]).expect("cargo tree");
+    let opendal: Vec<&str> = features
+        .lines()
+        .filter(|l| l.contains("opendal feature "))
+        .collect();
+    assert!(
+        opendal.iter().any(|l| l.contains("\"services-gdrive\"")),
+        "{opendal:?}"
+    );
+    for l in &opendal {
+        assert!(
+            l.contains("\"services-gdrive\"") || !l.contains("\"services-"),
+            "another OpenDAL service is enabled: {l}"
+        );
+    }
+    assert!(
+        !features.contains("opendal-service-s3") && !features.contains("opendal-service-fs"),
+        "{features}"
+    );
+    // TLS 1.3 only (deny.toml bans rustls's `tls12` feature)
+    assert!(!features.contains("rustls feature \"tls12\""), "{features}");
 }
 
 #[test]

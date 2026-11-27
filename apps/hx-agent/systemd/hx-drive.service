@@ -1,0 +1,99 @@
+# hx-drive.service: the Drive helper (docs/ipc.md section 24 "Drive link", section 29).
+#
+# The `drive` role of hx-backup-worker. It is the only process that speaks HTTPS to Google and
+# the only one that holds the Drive refresh token; it serves hx-privd alone, over the repository
+# link, on the socket systemd activates (hx-drive.socket, descriptor 3), one connection at a time,
+# and exits 60 s after the last connection closes. It never sees the repository password.
+# tests/privd_drive_units.rs asserts the hardening below.
+#
+# The binary reads the fixed OAuth client from /usr/lib/hx/current/drive-client.json (shipped by
+# the release; without it the role exits 75) and the user's token from the credential below.
+# The binary itself connects only to www.googleapis.com and oauth2.googleapis.com (ipc.md
+# section 29 c).
+
+[Unit]
+Description=hash-xcreen Drive helper
+Documentation=https://github.com/Omakidx/hash-xcreen/blob/main/docs/ipc.md
+# Do not race the network at boot; privd only connects on demand.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/hx/current/hx-backup-worker
+Environment=HX_BACKUP_ROLE=drive
+# The platform's root store is read from the system's paths only: a variable set for the manager
+# must not point the helper at another one.
+UnsetEnvironment=SSL_CERT_FILE SSL_CERT_DIR
+# The binary keeps the worker's SIGTERM handler (exit 143, ipc.md section 24): a stopped unit is
+# not a failed one.
+SuccessExitStatus=143
+
+# The refresh token, decrypted by the service manager (sealed to this host); privd never loads
+# it, and the binary reads it from $CREDENTIALS_DIRECTORY/drive-token.
+LoadCredentialEncrypted=drive-token:/etc/hx/creds/drive-token.cred
+
+# Identity: a dynamic user, no groups, nothing it could keep between runs.
+DynamicUser=yes
+User=hx-drive
+SupplementaryGroups=
+UMask=0077
+
+# It writes nothing and sees nothing of the agent's: only the activated socket, the client file
+# and the credential directory.
+InaccessiblePaths=/etc/hx /var/log /var/lib/hx /var/lib/hx-gatewayd /var/lib/private /run/hx
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RemoveIPC=yes
+PrivateIPC=yes
+
+# No privilege at all.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+
+# The network, and nothing else: no AF_UNIX of its own (the activated descriptor is inherited and
+# needs none), so it cannot reach privd's, Incus's or gatewayd's sockets. Egress is limited in the
+# kernel as well as in the binary, exactly as the update fetcher's: loopback, link-local,
+# multicast and the private and shared ranges are denied; only systemd-resolved's stubs stay
+# reachable (allow wins over deny). A host whose resolvers are on a LAN needs the installer's
+# drop-in, /etc/systemd/system/hx-drive.service.d/resolvers.conf, with IPAddressAllow= lines for
+# them. Google's addresses are not listed: they are many and they change.
+RestrictAddressFamilies=AF_INET AF_INET6
+IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7 64:ff9b::/96 64:ff9b:1::/48
+IPAddressAllow=127.0.0.53/32 127.0.0.54/32
+
+# System calls: the common service set without anything privileged or resource-changing; the same
+# filter as the fetchers. There is no filter of the binary's own (ipc.md section 29 f).
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @debug @module @reboot @swap @raw-io @obsolete @cpu-emulation
+SystemCallFilter=~mkdir mkdirat symlink symlinkat link linkat rename renameat renameat2 mknod mknodat chmod fchmod fchmodat fchmodat2
+SystemCallErrorNumber=EPERM
+
+# Bounds: it writes no file, a few descriptors (the link and up to ten TLS connections), a few
+# threads (two runtime workers, the link's writer, a resolver or two), and 512 MiB, which backs the
+# helper's own memory budget (four uploads of up to 96 MiB held whole, and 96 MiB of reads;
+# ipc.md section 29, "Memory"). No core files. The binary exits itself when idle.
+LimitFSIZE=0
+LimitCORE=0
+LimitNOFILE=128
+TasksMax=32
+MemoryMax=512M
+MemorySwapMax=0
+TimeoutStopSec=10

@@ -2,7 +2,7 @@
 //!
 //! One binary, two roles (ipc.md §6.12, §36): the **worker** runs as PID 1 of a network-less helper
 //! container, speaks the repository link to `hx-privd` and runs `rustic_core` for one job; the
-//! **Drive helper** (workstream W4, not built yet) is the only process that speaks to Google.
+//! **Drive helper** ([`drive`], workstream W4) is the only process that speaks to Google.
 //!
 //! This package exists apart from `hx-agent` so that `rustic_core` is never linked into
 //! `hx-privd` or `hx-gatewayd` (ipc.md §36): Cargo unifies the features of one package across all
@@ -11,6 +11,7 @@
 //! | Module | What it does |
 //! |---|---|
 //! | [`role`] | Picks the role from the environment and the arguments; the exit codes. |
+//! | [`drive`] | The Drive helper role: OpenDAL `gdrive`, the retrier, the lease, the Drive end of the link. |
 //! | [`session`] | Start-up (the one listener), the handshake, the job, the end of the session. |
 //! | [`sandbox`] | `NO_NEW_PRIVS`, capabilities by job kind, the seccomp allowlist, signals. The only `unsafe`. |
 //! | [`job`] | The job runner of ipc.md §28 and the choice of a `WorkerError`. |
@@ -19,6 +20,7 @@
 //! The link itself (framing state, the reader and writer threads, the `rustic_core` backend) is
 //! `hx_backup::engine::link`.
 
+pub mod drive;
 pub mod job;
 pub mod progress;
 pub mod role;
@@ -39,10 +41,7 @@ pub fn run(args: &[std::ffi::OsString], env_role: Option<&std::ffi::OsStr>) -> i
     }
     match role::select(args, env_role) {
         Ok(role::Role::Worker) => session::run_worker(&session::WorkerConfig::production()),
-        Ok(role::Role::Drive) => {
-            eprintln!("hx-backup-worker: the drive role is not implemented");
-            role::EXIT_DRIVE_NOT_IMPLEMENTED
-        }
+        Ok(role::Role::Drive) => drive::run(&drive::RoleConfig::production()),
         Err(e) => {
             eprintln!("hx-backup-worker: {e}");
             role::EXIT_ROLE

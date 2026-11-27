@@ -127,7 +127,9 @@ jobs:
           # would unify their features.
           cargo build -p hx-backup-worker --release --locked --target x86_64-unknown-linux-musl
           # a shipped worker honours no test override (docs/ipc.md section 24)
-          if strings -a target/x86_64-unknown-linux-musl/release/hx-backup-worker | grep -q HX_WORKER_RUN_DIR; then
+          # (the worker's and the Drive role's hooks: HX_WORKER_RUN_DIR, _SRC, _DST, _NO_OWNERSHIP and
+          # every HX_WORKER_DRIVE_*; the bare prefix is in the binary on purpose, it refuses them)
+          if strings -a target/x86_64-unknown-linux-musl/release/hx-backup-worker | grep -qE 'HX_WORKER_(RUN_DIR|SRC|DST|NO_OWNERSHIP|DRIVE_)'; then
             echo "::error::the release worker contains the test hooks"; exit 1
           fi
       - name: Collect and check the binaries
