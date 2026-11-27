@@ -28,20 +28,34 @@ async fn a_full_backup_round_trip() {
     let mono = rig.mono.clone();
     rig.worker(move |w| {
         *sent2.lock().unwrap() = Some((w.job.clone(), w.secrets.clone()));
+        // Every clock step and every Progress frame is followed by a round trip, so that privd
+        // has handled the one before the next step moves the clock.
+        let sync = |w: &mut WorkerPeer| {
+            assert!(matches!(w.list(T::Config), Reply::List(_)));
+        };
+        sync(w);
         mono.advance_ms(150);
+        sync(w);
         w.progress(P::RepairIndex, 0, 0);
+        sync(w);
         let Reply::List(v) = w.list(T::Config) else {
             panic!("config list")
         };
         assert_eq!(v.len(), 1);
         let pack = w.put(T::Pack, &body(1_500_000, 1)); // two data frames
         let _index = w.put(T::Index, &body(300, 2));
+        sync(w);
         mono.advance_ms(150);
+        sync(w);
         w.progress(P::ScanAndUpload, 50, 100);
+        sync(w);
         let snap = w.put(T::Snapshot, &body(500, 3));
         assert_eq!(w.read(T::Pack, &pack), Reply::Read(body(1_500_000, 1)));
+        sync(w);
         mono.advance_ms(150);
+        sync(w);
         w.progress(P::WriteSnapshot, 0, 0);
+        sync(w);
         w.finish_ok(pb::JobResult {
             snapshot_id: Bytes::copy_from_slice(&snap),
             files_new: 5,

@@ -965,7 +965,7 @@ impl<H: BackupHost, E: BackupEnv> JobTask<H, E> {
                 };
                 if existed {
                     env.audit(&format!(
-                        "backup job {j2}: the snapshot already existed in the repository; it is not recorded"
+                        "backup job {j2}: the snapshot was listed or read before the job wrote it; it is not recorded"
                     ));
                     return;
                 }

@@ -15,6 +15,16 @@ use crate::privd::daemon::{Ctx, Daemon};
 use crate::privd::log;
 use crate::privd::state::Flag;
 
+/// The first wait between two runs of crash recovery.
+const RECOVERY_WAIT_FIRST: std::time::Duration = std::time::Duration::from_secs(30);
+/// The longest wait between two runs.
+const RECOVERY_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// The wait after `wait`: doubled, never over 15 minutes (ipc.md section 35).
+fn next_recovery_wait(wait: std::time::Duration) -> std::time::Duration {
+    (wait * 2).min(RECOVERY_WAIT_MAX)
+}
+
 /// The runner's view of the daemon. It holds the daemon weakly, so the runner (which the daemon
 /// owns) makes no cycle; a daemon that is gone answers with the safe defaults.
 pub struct DaemonEnv<T: Transport + Clone + 'static> {
@@ -119,7 +129,7 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
     pub async fn recover_backups(self: &Arc<Self>) {
         // Repeated with a back-off (30 s, doubling to 15 minutes) until the host-wide steps have
         // looked at everything and no desktop is blocked; the state is `recovery_state()`.
-        let mut wait = std::time::Duration::from_secs(30);
+        let mut wait = RECOVERY_WAIT_FIRST;
         loop {
             let rep = self.backup.recover().await;
             if rep.complete && rep.blocked.is_empty() {
@@ -130,7 +140,7 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
                 wait.as_secs()
             ));
             tokio::time::sleep(wait).await;
-            wait = (wait * 2).min(std::time::Duration::from_secs(900));
+            wait = next_recovery_wait(wait);
         }
     }
 
@@ -142,5 +152,21 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
         if !rep.complete {
             log::error("the backup cleanup before the teardown was incomplete");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_recovery_back_off_doubles_from_30_seconds_to_15_minutes() {
+        let mut w = RECOVERY_WAIT_FIRST;
+        let mut seen = vec![w.as_secs()];
+        for _ in 0..7 {
+            w = next_recovery_wait(w);
+            seen.push(w.as_secs());
+        }
+        assert_eq!(seen, vec![30, 60, 120, 240, 480, 900, 900, 900]);
     }
 }

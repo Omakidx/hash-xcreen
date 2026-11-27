@@ -117,6 +117,12 @@ async fn a_worker_that_floods_pings_and_never_reads_fails_the_job_and_costs_no_m
         "{}",
         rig.audit()
     );
+    // Only one Pong is ever pending: a million Pings cost no queue at all.
+    assert!(
+        out.peak_ctl_bytes < 64 * 1024,
+        "the queue stayed small: {}",
+        out.peak_ctl_bytes
+    );
     assert_eq!(rig.runner.relay_slots_free(), 16);
 }
 
@@ -135,6 +141,11 @@ async fn a_drive_helper_that_floods_pings_and_never_reads_fails_the_job() {
         &Failure::Silent(LinkName::Drive),
         "{}",
         rig.audit()
+    );
+    assert!(
+        out.peak_ctl_bytes < 64 * 1024,
+        "the queue stayed small: {}",
+        out.peak_ctl_bytes
     );
 }
 
@@ -181,6 +192,11 @@ async fn a_worker_that_sends_requests_and_does_not_read_the_answers_fails_not_th
             "partial={partial}: {f:?}"
         );
         assert_ne!(f, &Failure::Silent(LinkName::Drive));
+        assert!(
+            out.peak_ctl_bytes <= hx_agent::privd::backup::link_io::CTL_LIMIT,
+            "partial={partial}: the queue stayed inside its bound: {}",
+            out.peak_ctl_bytes
+        );
         rig.until("the slots to come back", || {
             rig.runner.relay_slots_free() == 16
         })
@@ -277,7 +293,7 @@ async fn a_snapshot_the_worker_read_and_wrote_back_is_not_recorded() {
     let h = rig.runner.start(rig.backup_request()).await.unwrap();
     assert!(rig.outcome(&h).await.result.is_ok());
     assert_eq!(rig.runner.completed("main").unwrap().backups.len(), 0);
-    assert!(rig.audit().contains("already existed"));
+    assert!(rig.audit().contains("listed or read before the job wrote it"));
     // An honest backup is still recorded.
     rig.worker(snapshot_result);
     let h = rig.runner.start(rig.backup_request()).await.unwrap();
@@ -518,7 +534,10 @@ async fn an_accepted_success_wins_over_a_violation_that_follows_it() {
         .unwrap();
         // A frame after the result: a violation, written past the worker's own checks.
         let b = frame_bytes(
-            pb::repo_frame::Frame::Progress(pb::Progress::default()),
+            pb::repo_frame::Frame::Progress(pb::Progress {
+                phase: pb::ProgressPhase::ScanAndUpload as i32,
+                ..Default::default()
+            }),
             Endpoint::PrivdWorkerLink,
         );
         w.p.send_raw(&b);
@@ -921,4 +940,499 @@ async fn the_guard_holds_with_normal_ping_traffic_and_small_clock_steps() {
     );
     rig.drive.knobs.lock().unwrap().hold_lists = false;
     assert!(rig.outcome(&h).await.result.is_ok());
+}
+
+// ===== review round 2 ============================================================================
+
+fn restore_of(snapshot: u8, resumable: bool, verify: bool) -> JobSpec {
+    JobSpec::Restore {
+        snapshot_id: [snapshot; 32],
+        verify_existing: verify,
+        resumable,
+    }
+}
+
+fn start_other(rig: &Rig) -> hx_agent::privd::backup::runner::JobRequest {
+    let mut r = rig.backup_request();
+    r.desktop_id = "other".into();
+    r
+}
+
+// ----- N1: a resume is for the same snapshot -------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resume_for_another_snapshot_deletes_the_kept_target_and_starts_fresh() {
+    let rig = Rig::ready().await;
+    let t = "hx-restore-aaaa";
+    rig.host.add_target(t, Some(job(3)));
+    write_resume(&rig, "main", job(3), t); // written for the snapshot [1; 32]
+    let verify = Arc::new(Mutex::new(None));
+    let v2 = verify.clone();
+    rig.worker(move |w| {
+        let Some(pb::job::Spec::Restore(r)) = &w.job.spec else {
+            panic!("not a restore")
+        };
+        *v2.lock().unwrap() = Some(r.verify_existing);
+        w.finish_ok(pb::JobResult::default());
+    });
+    let h = rig
+        .runner
+        .start(rig.request(restore_of(2, true, false)))
+        .await
+        .unwrap();
+    let out = rig.outcome(&h).await;
+    assert!(out.result.is_ok(), "{:?}\n{}", out.result, rig.audit());
+    let log = rig.host.log();
+    assert!(
+        log.iter()
+            .any(|l| l.starts_with(&format!("delete_restore_target {t}"))),
+        "the old target is deleted: {log:?}"
+    );
+    assert!(
+        log.iter()
+            .any(|l| l.contains("target=Some(\"hx-restore-") && l.contains("reuse=false")),
+        "a new target is made: {log:?}"
+    );
+    assert!(
+        !log.iter()
+            .any(|l| l.contains(&format!("target=Some(\"{t}\"")))
+    );
+    assert_eq!(
+        *verify.lock().unwrap(),
+        Some(false),
+        "nothing to verify on a fresh target"
+    );
+    let targets = rig.host.targets();
+    assert_eq!(targets.len(), 1);
+    assert_ne!(targets[0], t);
+    let rec = rig.runner.resume_point("main").unwrap().unwrap();
+    assert_eq!(rec.target, targets[0]);
+    assert_eq!(rec.snapshot_id, hex(&[2u8; 32]));
+    assert!(rig.audit().contains("was discarded"));
+}
+
+// ----- N2: discard_resume --------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn discarding_a_kept_target_frees_the_desktop_for_a_restore_that_is_not_resumable() {
+    let rig = Rig::ready().await;
+    rig.worker(|w| w.finish_ok(pb::JobResult::default()));
+    let h = rig
+        .runner
+        .start(rig.request(restore_of(1, true, false)))
+        .await
+        .unwrap();
+    assert!(rig.outcome(&h).await.result.is_ok());
+    // A successful resumable restore keeps its target and its record.
+    assert!(rig.runner.resume_point("main").unwrap().is_some());
+    assert_eq!(rig.host.targets().len(), 1);
+    assert_eq!(
+        rig.runner
+            .start(rig.request(restore_of(1, false, false)))
+            .await
+            .err()
+            .unwrap(),
+        StartError::ResumePending
+    );
+    // Not while the desktop's slot is held.
+    rig.worker(|w| w.until_closed());
+    let busy = rig
+        .runner
+        .start(rig.request(restore_of(1, true, false)))
+        .await
+        .unwrap();
+    running(&rig, &busy).await;
+    assert_eq!(
+        rig.runner.discard_resume("main").await,
+        Err(StartError::Busy)
+    );
+    busy.cancel();
+    rig.advance_until_done(&busy, 10_000, 600).await;
+    rig.outcome(&busy).await;
+    // Unknown desktops are refused.
+    assert_eq!(
+        rig.runner.discard_resume("nobody").await,
+        Err(StartError::UnknownDesktop)
+    );
+    assert_eq!(rig.runner.discard_resume("main").await, Ok(true));
+    assert!(rig.runner.resume_point("main").unwrap().is_none());
+    assert!(rig.host.targets().is_empty());
+    assert!(
+        rig.audit()
+            .contains("the kept restore target of main was discarded")
+    );
+    assert_eq!(
+        rig.runner.discard_resume("main").await,
+        Ok(false),
+        "nothing left"
+    );
+    rig.worker(|w| w.finish_ok(pb::JobResult::default()));
+    let h = rig
+        .runner
+        .start(rig.request(restore_of(1, false, false)))
+        .await
+        .unwrap();
+    assert!(rig.outcome(&h).await.result.is_ok());
+}
+
+// ----- N3: a kept target that is gone --------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kept_target_that_vanished_fails_the_job_once_and_clears_the_record() {
+    let rig = Rig::ready().await;
+    // The record says that a target is kept; the target was deleted outside privd.
+    write_resume(&rig, "main", job(3), "hx-restore-aaaa");
+    rig.host.fail_once(
+        "create_helper",
+        HostError::Precondition("the restore target is gone".into()),
+    );
+    let h = rig
+        .runner
+        .start(rig.request(restore_of(1, true, false)))
+        .await
+        .unwrap();
+    let out = rig.outcome(&h).await;
+    assert!(matches!(
+        out.result.as_ref().unwrap_err(),
+        Failure::Precondition(_)
+    ));
+    assert!(
+        rig.runner.resume_point("main").unwrap().is_none(),
+        "the record of a target that is gone is cleared\n{}",
+        rig.audit()
+    );
+    assert!(rig.audit().contains("resume.json was cleared"));
+    // The next restore starts, with or without `resumable`.
+    rig.worker(|w| w.finish_ok(pb::JobResult::default()));
+    let h = rig
+        .runner
+        .start(rig.request(restore_of(1, false, false)))
+        .await
+        .unwrap();
+    assert!(rig.outcome(&h).await.result.is_ok());
+}
+
+// ----- N4: recovery blocks one desktop, is surfaced and is audited once ---------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_desktop_whose_cleanup_fails_is_blocked_alone_and_audited_once() {
+    let rig = Rig::raw_with(&["main", "other"]);
+    rig.host.add_snapshot("hx-main", "hx-backup-old");
+    rig.host
+        .fail_always("delete_snapshot", HostError::Failed("Incus is down".into()));
+    let rep = rig.runner.recover().await;
+    assert!(
+        rep.complete,
+        "the host-wide steps looked at everything: {rep:?}"
+    );
+    assert!(rep.blocked.contains_key("main") && !rep.blocked.contains_key("other"));
+    let st = rig.runner.recovery_state();
+    assert!(st.done && st.blocked.contains_key("main"), "{st:?}");
+    assert!(rig.runner.is_recovered());
+    // The blocked desktop is refused, the other runs.
+    let e = rig.runner.start(rig.backup_request()).await.err().unwrap();
+    assert!(matches!(e, StartError::DesktopBlocked(_)), "{e:?}");
+    // (Incus works again for the moment: the other desktop's job cleans up after itself.)
+    rig.host.clear_failure("delete_snapshot");
+    rig.worker(snapshot_result);
+    let h = rig.runner.start(start_other(&rig)).await.unwrap();
+    assert!(rig.outcome(&h).await.result.is_ok(), "{}", rig.audit());
+    rig.host
+        .fail_always("delete_snapshot", HostError::Failed("Incus is down".into()));
+    // Three more failing runs: one line for the failure, a count (not a line) for the repeats.
+    for _ in 0..3 {
+        rig.runner.recover().await;
+    }
+    let lines = rig.env.audit_log();
+    let failure_lines = lines
+        .iter()
+        .filter(|l| l.contains("cannot delete snapshot"))
+        .count();
+    assert_eq!(failure_lines, 1, "{lines:?}");
+    let recovery_lines = lines
+        .iter()
+        .filter(|l| l.starts_with("backup recovery"))
+        .count();
+    assert!(recovery_lines <= 3, "{recovery_lines}: {lines:?}");
+    let st = rig.runner.recovery_state();
+    assert_eq!(st.attempts, 4);
+    assert!(st.repeats >= 1 && !st.failures.is_empty(), "{st:?}");
+    // The host recovers: the next run clears the block.
+    rig.host.clear_failure("delete_snapshot");
+    let rep = rig.runner.recover().await;
+    assert!(rep.blocked.is_empty() && rep.failures.is_empty(), "{rep:?}");
+    assert!(rig.runner.recovery_state().blocked.is_empty());
+    assert!(
+        rig.audit()
+            .contains("backup recovery: done after 5 attempt")
+    );
+    let h = rig.runner.start(rig.backup_request()).await.unwrap();
+    assert!(rig.outcome(&h).await.result.is_ok());
+}
+
+// ----- S-N2: an honest slow worker does not hit the control cap -----------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_that_stops_reading_for_a_while_during_a_long_listing_is_not_silent() {
+    let rig = Rig::ready().await;
+    // 100 000 entries: about 4 MiB of pages, far more than the control cap if nothing held back.
+    rig.drive.knobs.lock().unwrap().synthetic_pack_entries = 100_000;
+    rig.worker(|w| {
+        let id = w.request(pb::repo_request::Op::List(pb::List {
+            object_type: T::Pack as i32,
+        }));
+        // Busy with something else for a few seconds; nothing is read.
+        std::thread::sleep(Duration::from_secs(3));
+        let Reply::List(v) = w.wait(id) else {
+            panic!("not a listing")
+        };
+        assert_eq!(v.len(), 100_000);
+        snapshot_result(w);
+    });
+    let h = rig.runner.start(rig.backup_request()).await.unwrap();
+    let out = rig.outcome(&h).await;
+    assert!(out.result.is_ok(), "{:?}\n{}", out.result, rig.audit());
+    assert!(
+        out.peak_ctl_bytes <= hx_agent::privd::backup::link_io::CTL_LIMIT,
+        "{}",
+        out.peak_ctl_bytes
+    );
+    // The reader of the Drive link held back at the soft limit while the worker was away.
+    assert!(
+        out.peak_ctl_bytes >= hx_agent::privd::backup::link_io::CTL_SOFT,
+        "the queue did fill to the soft limit: {}",
+        out.peak_ctl_bytes
+    );
+}
+
+// ----- N5, S-N3, snapshot noting ---------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failure_after_an_accepted_result_is_audited_though_the_job_succeeded() {
+    let rig = Rig::ready().await;
+    rig.worker(|w| {
+        let s = w.put(T::Snapshot, &body(10, 1));
+        w.p.send(pb::repo_frame::Frame::Result(pb::JobResult {
+            ok: true,
+            snapshot_id: Bytes::copy_from_slice(&s),
+            ..Default::default()
+        }))
+        .unwrap();
+        let b = frame_bytes(
+            pb::repo_frame::Frame::Progress(pb::Progress {
+                phase: pb::ProgressPhase::ScanAndUpload as i32,
+                ..Default::default()
+            }),
+            Endpoint::PrivdWorkerLink,
+        );
+        w.p.send_raw(&b);
+        w.until_closed();
+    });
+    let h = rig.runner.start(rig.backup_request()).await.unwrap();
+    let out = rig.outcome(&h).await;
+    assert!(out.result.is_ok());
+    assert!(
+        rig.audit()
+            .contains("a failure after the accepted result was ignored"),
+        "{}",
+        rig.audit()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resumed_target_keeps_the_job_that_created_it() {
+    let rig = Rig::ready().await;
+    let t = "hx-restore-aaaa";
+    rig.host.add_target(t, Some(job(3)));
+    write_resume(&rig, "main", job(3), t);
+    let dirs = BackupDirs::new(&rig.cfg.state_dir);
+    let jp = dirs.job_path("main").unwrap();
+    let seen = Arc::new(Mutex::new(None));
+    let s2 = seen.clone();
+    rig.worker(move |w| {
+        *s2.lock().unwrap() = JobRecord::load(&jp).unwrap();
+        w.finish_ok(pb::JobResult::default());
+    });
+    let h = rig
+        .runner
+        .start(rig.request(restore_of(1, true, false)))
+        .await
+        .unwrap();
+    assert!(rig.outcome(&h).await.result.is_ok());
+    let rec = seen
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("job.json during the job");
+    assert_ne!(rec.job_id, job(3).hex());
+    assert_eq!(
+        rec.target_job,
+        Some(job(3).hex()),
+        "the target keeps its creator"
+    );
+    assert_eq!(rec.target.as_deref(), Some(t));
+    let kept = rig.runner.resume_point("main").unwrap().unwrap();
+    assert_eq!(
+        kept.job_id,
+        job(3).hex(),
+        "resume.json keeps the creator across a resume"
+    );
+    assert_eq!(kept.target, t);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recovery_writes_a_resume_record_that_names_the_creator_and_the_snapshot() {
+    let rig = Rig::raw();
+    let t = "hx-restore-aaaa";
+    rig.host.add_target(t, Some(job(3)));
+    write_job_record(&rig, "main", JobKind::Restore, job(9), Some(t), true, None);
+    let dirs = BackupDirs::new(&rig.cfg.state_dir);
+    let jp = dirs.job_path("main").unwrap();
+    let mut rec = JobRecord::load(&jp).unwrap().unwrap();
+    rec.target_job = Some(job(3).hex()); // job 9 resumed the target that job 3 made
+    rec.store(&jp).unwrap();
+    let rep = rig.runner.recover().await;
+    assert!(rep.complete, "{rep:?}");
+    let kept = rig.runner.resume_point("main").unwrap().unwrap();
+    assert_eq!(kept.job_id, job(3).hex());
+    assert_eq!(kept.snapshot_id, hex(&[1u8; 32]));
+    assert_eq!(rig.host.targets(), vec![t.to_string()]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_the_job_read_after_it_wrote_it_is_recorded() {
+    let rig = Rig::ready().await;
+    rig.worker(|w| {
+        let x = body(300, 7);
+        let id = sha(&x);
+        assert_eq!(w.write(T::Snapshot, &id, &x), Reply::Done);
+        // Reading and listing its own snapshot after the write changes nothing.
+        assert_eq!(w.read(T::Snapshot, &id), Reply::Read(x.clone()));
+        assert!(matches!(w.list(T::Snapshot), Reply::List(v) if v.len() == 1));
+        w.finish_ok(pb::JobResult {
+            snapshot_id: Bytes::copy_from_slice(&id),
+            ..Default::default()
+        });
+    });
+    let h = rig.runner.start(rig.backup_request()).await.unwrap();
+    assert!(rig.outcome(&h).await.result.is_ok(), "{}", rig.audit());
+    assert_eq!(
+        rig.runner.completed("main").unwrap().backups.len(),
+        1,
+        "{}",
+        rig.audit()
+    );
+    assert!(!rig.audit().contains("not recorded"));
+}
+
+// ----- the integration test of Overflow, guard, slots -------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_control_queue_that_fills_because_the_worker_never_reads_fails_silent_for_the_worker() {
+    let rig = Rig::ready().await;
+    rig.worker(|w| {
+        w.wait_cancel();
+        // After the cancel every request is answered CANCELLED at once, and each answer goes into
+        // the control queue of the worker link. This peer never reads them.
+        let mut all = Vec::new();
+        for i in 0..400_000u64 {
+            all.extend(frame_bytes(
+                pb::repo_frame::Frame::Request(pb::RepoRequest {
+                    req_id: 1000 + i,
+                    op: Some(pb::repo_request::Op::List(pb::List {
+                        object_type: T::Config as i32,
+                    })),
+                }),
+                Endpoint::PrivdWorkerLink,
+            ));
+        }
+        w.p.send_raw(&all);
+        std::thread::sleep(Duration::from_secs(20));
+    });
+    let h = rig.runner.start(rig.backup_request()).await.unwrap();
+    running(&rig, &h).await;
+    h.cancel();
+    let out = rig.outcome(&h).await;
+    assert_eq!(
+        out.result.as_ref().unwrap_err(),
+        &Failure::Silent(LinkName::Worker),
+        "{}",
+        rig.audit()
+    );
+    let peak = out.peak_ctl_bytes;
+    let limit = hx_agent::privd::backup::link_io::CTL_LIMIT;
+    assert!(
+        peak <= limit && peak > limit - 4096,
+        "the queue stopped at its cap: {peak} of {limit}"
+    );
+    assert_eq!(rig.runner.relay_slots_free(), 16);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_guard_fires_with_small_clock_steps_and_normal_ping_traffic_after_31_quiet_minutes() {
+    let rig = Rig::ready().await;
+    rig.drive.knobs.lock().unwrap().hold_lists = true;
+    rig.worker(|w| {
+        let id = w.request(pb::repo_request::Op::List(pb::List {
+            object_type: T::Pack as i32,
+        }));
+        let _ = w.try_wait(id);
+    });
+    let h = rig.runner.start(rig.backup_request()).await.unwrap();
+    rig.until("the list request", || {
+        rig.drive
+            .seen()
+            .iter()
+            .any(|s| matches!(s, Seen::Request(r) if r.starts_with("list")))
+    })
+    .await;
+    // 30 minutes in 10 s steps: pings and pongs go round, the guard has not fired.
+    rig.advance(30 * 60_000, 10_000).await;
+    assert_ne!(h.status().state, JobState::Finished);
+    // Past 31 minutes it fires, although the links answered every ping.
+    rig.advance(3 * 60_000, 10_000).await;
+    let out = rig.outcome(&h).await;
+    assert_eq!(
+        out.result.as_ref().unwrap_err(),
+        &Failure::Guard,
+        "{}",
+        rig.audit()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_long_job_that_aborts_many_uploads_neither_stalls_nor_leaks_a_frame_slot() {
+    let rig = Rig::ready().await;
+    // The helper aborts every upload as soon as it sees the request.
+    rig.drive.knobs.lock().unwrap().early_write_error = Some(ErrorClass::Cancelled);
+    let knobs = rig.drive.knobs.clone();
+    rig.worker(move |w| {
+        let data = body(3_000_000, 5);
+        for i in 0..60u8 {
+            let id = [i + 1; 32];
+            let req = w.request(pb::repo_request::Op::Write(pb::Write {
+                object_type: T::Pack as i32,
+                id: Bytes::copy_from_slice(&id),
+                size: data.len() as u32,
+            }));
+            // Two frames go before the error is seen; the worker then closes its side.
+            w.send_body(req, &data, 2);
+            assert_eq!(
+                w.wait(req),
+                Reply::Error(ErrorClass::Cancelled),
+                "upload {i}"
+            );
+            w.p.send_data(req, true, &[]).unwrap();
+        }
+        // The next upload must still go through: no slot was lost.
+        knobs.lock().unwrap().early_write_error = None;
+        snapshot_result(w);
+    });
+    let h = rig.runner.start(rig.backup_request()).await.unwrap();
+    let out = rig.outcome(&h).await;
+    assert!(out.result.is_ok(), "{:?}\n{}", out.result, rig.audit());
+    rig.until("the relay slots to come back", || {
+        rig.runner.relay_slots_free() == 16
+    })
+    .await;
 }

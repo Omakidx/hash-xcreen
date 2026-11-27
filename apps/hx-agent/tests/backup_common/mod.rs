@@ -505,6 +505,12 @@ pub struct DriveKnobs {
     pub list_error: Option<ErrorClass>,
     /// A `Write` of this type is answered with this error at once (after its `END`), every time.
     pub write_error_all: Option<(ObjectType, ErrorClass)>,
+    /// A `List` of `PACK` is answered with this many synthetic entries, in pages of 1 000
+    /// (on top of what the store holds).
+    pub synthetic_pack_entries: usize,
+    /// A `Write` is answered with this error as soon as the request arrives (before any data):
+    /// an upload that the helper aborts.
+    pub early_write_error: Option<ErrorClass>,
 }
 
 pub struct DriveCtl {
@@ -623,7 +629,7 @@ fn serve_drive(
         // Held lists are answered once released.
         if !knobs.lock().unwrap().hold_lists {
             for (id, ty) in std::mem::take(&mut held_lists) {
-                answer_list(&mut p, store, id, ty);
+                answer_list(&mut p, store, knobs, id, ty);
             }
         }
         let g = match p.poll() {
@@ -755,7 +761,7 @@ fn serve_drive(
                             } else if knobs.lock().unwrap().hold_lists {
                                 held_lists.push((id, ty));
                             } else {
-                                answer_list(&mut p, store, id, ty);
+                                answer_list(&mut p, store, knobs, id, ty);
                             }
                         }
                         Op::ReadFull(x) => {
@@ -809,7 +815,13 @@ fn serve_drive(
                         }
                         Op::Write(w) => {
                             note(Seen::Request(format!("write {}", w.object_type)));
-                            uploads.insert(id, (w, Vec::new()));
+                            let early = knobs.lock().unwrap().early_write_error;
+                            if let Some(c) = early {
+                                aborted.push(id);
+                                err(&mut p, c);
+                            } else {
+                                uploads.insert(id, (w, Vec::new()));
+                            }
                         }
                         Op::Remove(x) => {
                             note(Seen::Request(format!("remove {}", x.object_type)));
@@ -847,8 +859,14 @@ fn serve_drive(
     }
 }
 
-fn answer_list(p: &mut Peer, store: &Arc<Mutex<Store>>, id: u64, ty: ObjectType) {
-    let entries: Vec<pb::ListEntry> = store
+fn answer_list(
+    p: &mut Peer,
+    store: &Arc<Mutex<Store>>,
+    knobs: &Arc<Mutex<DriveKnobs>>,
+    id: u64,
+    ty: ObjectType,
+) {
+    let mut entries: Vec<pb::ListEntry> = store
         .lock()
         .unwrap()
         .iter()
@@ -858,13 +876,37 @@ fn answer_list(p: &mut Peer, store: &Arc<Mutex<Store>>, id: u64, ty: ObjectType)
             size: data.len() as u32,
         })
         .collect();
-    let _ = p.send(F::Response(pb::RepoResponse {
-        req_id: id,
-        result: Some(pb::repo_response::Result::ListPage(pb::ListPage {
-            entries,
-            last: true,
-        })),
-    }));
+    if ty == ObjectType::Pack {
+        let n = knobs.lock().unwrap().synthetic_pack_entries;
+        for k in 0..n {
+            let mut oid = [0u8; 32];
+            oid[..8].copy_from_slice(&(k as u64 + 1).to_be_bytes());
+            oid[31] = 0xEE;
+            entries.push(pb::ListEntry {
+                id: Bytes::copy_from_slice(&oid),
+                size: 1000,
+            });
+        }
+    }
+    let pages: Vec<&[pb::ListEntry]> = if entries.is_empty() {
+        vec![&[][..]]
+    } else {
+        entries.chunks(1000).collect()
+    };
+    let n = pages.len();
+    for (i, page) in pages.into_iter().enumerate() {
+        if p.send(F::Response(pb::RepoResponse {
+            req_id: id,
+            result: Some(pb::repo_response::Result::ListPage(pb::ListPage {
+                entries: page.to_vec(),
+                last: i + 1 == n,
+            })),
+        }))
+        .is_err()
+        {
+            return;
+        }
+    }
 }
 
 // ----- the rig --------------------------------------------------------------------------------

@@ -661,6 +661,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_control_cap_holds_what_a_reader_can_still_deliver_after_the_soft_limit() {
+        // The other link's reader stops at CTL_SOFT, but 16 frames sit in its channel and one is
+        // being decoded: an honest worker that is slow must never meet the cap (ipc.md section 25).
+        // A message of the repository link is at most 64 KiB (hx-ipc's MAX_MESSAGE_LENGTH) plus
+        // its 4-byte header.
+        let frame = 64 * 1024 + 4;
+        assert!(
+            CTL_LIMIT >= CTL_SOFT + 17 * frame,
+            "{CTL_LIMIT} < {}",
+            CTL_SOFT + 17 * frame
+        );
+    }
+
+    #[test]
     fn control_frames_are_written_before_data_and_a_closed_queue_stops() {
         let q = OutQueue::new();
         q.push_data(

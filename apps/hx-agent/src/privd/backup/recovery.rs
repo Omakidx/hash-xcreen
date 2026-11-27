@@ -251,7 +251,9 @@ impl<H: BackupHost, E: BackupEnv> Recovery<'_, H, E> {
             rep.records_cleared.len(),
             rep.failures.len()
         );
-        self.env.audit(&summary);
+        if self.audit_failures {
+            self.env.audit(&summary);
+        }
         rep
     }
 

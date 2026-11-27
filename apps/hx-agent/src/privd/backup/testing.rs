@@ -148,6 +148,7 @@ struct HostState {
     unmarked_targets: BTreeSet<String>,
     log: Vec<String>,
     fail: BTreeMap<String, HostError>,
+    sticky: BTreeMap<String, HostError>,
     delete_delay_ms: u64,
     fail_targets_once: bool,
     drive_stops: usize,
@@ -222,6 +223,16 @@ impl FakeHost {
     /// `stop_drive_service`) fail once.
     pub fn fail_once(&self, op: &str, e: HostError) {
         lock(&self.state).fail.insert(op.to_string(), e);
+    }
+
+    /// Makes every call of `op` fail until `clear_failure(op)`.
+    pub fn fail_always(&self, op: &str, e: HostError) {
+        lock(&self.state).sticky.insert(op.to_string(), e);
+    }
+
+    /// Ends `fail_always(op)`.
+    pub fn clear_failure(&self, op: &str) {
+        lock(&self.state).sticky.remove(op);
     }
 
     /// Makes the next `list_restore_targets` fail, once.
@@ -310,6 +321,9 @@ impl FakeHost {
     fn step(&self, entry: String, op: &str) -> Result<(), HostError> {
         let mut s = lock(&self.state);
         s.log.push(entry);
+        if let Some(e) = s.sticky.get(op) {
+            return Err(e.clone());
+        }
         match s.fail.remove(op) {
             Some(e) => Err(e),
             None => Ok(()),
