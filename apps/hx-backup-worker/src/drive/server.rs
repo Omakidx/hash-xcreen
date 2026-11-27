@@ -139,8 +139,9 @@ impl Shared {
 
     async fn serve_open(&self, o: &pb::OpenRepo, cancel: &Cancel) -> Result<(), DriveError> {
         let drive = self.drive.clone()?;
-        let mut server_id = [0u8; 16];
-        server_id.copy_from_slice(&o.server_id);
+        // The codec has checked the length; a wrong one is still no panic.
+        let server_id = <[u8; 16]>::try_from(o.server_id.as_ref())
+            .map_err(|_| DriveError::new(EC::Internal))?;
         let params = OpenParams {
             folder: o.folder.clone(),
             create: o.create,
@@ -634,5 +635,22 @@ fn start(
         }
     };
     let shared = shared.clone();
-    handle.spawn(shared.serve(req_id, op, upload, cancel));
+    // A panic in the work of one request (a bug) must not leave privd waiting for an answer: the
+    // outer task answers `INTERNAL` if the request is still outstanding.
+    let inner = handle.spawn(shared.clone().serve(req_id, op, upload, cancel));
+    handle.spawn(async move {
+        if inner.await.is_err_and(|e| e.is_panic()) {
+            eprintln!("hx-backup-worker: a request task panicked (answered INTERNAL)");
+            let live = shared
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_outstanding(req_id);
+            if live {
+                shared
+                    .send(error_response(req_id, DriveError::new(EC::Internal)))
+                    .await;
+            }
+        }
+    });
 }
