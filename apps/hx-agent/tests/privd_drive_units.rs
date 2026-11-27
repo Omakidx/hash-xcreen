@@ -221,6 +221,22 @@ fn memory_tasks_and_descriptors_are_bounded() {
 }
 
 #[test]
+fn a_stop_is_not_a_failure_and_the_environment_cannot_change_the_roots() {
+    let u = service();
+    assert_eq!(one(&u, "Service", "SuccessExitStatus"), "143");
+    assert_eq!(
+        words(&u, "UnsetEnvironment"),
+        ["SSL_CERT_FILE", "SSL_CERT_DIR"]
+    );
+    assert_eq!(
+        one(&u, "Service", "MemorySwapMax"),
+        "0",
+        "no swap: memory is the bound"
+    );
+    assert_eq!(one(&u, "Service", "PrivateIPC"), "yes");
+}
+
+#[test]
 fn the_units_are_installed_with_the_others_but_not_enabled() {
     for name in ["hx-drive.socket", "hx-drive.service"] {
         let row = units::find(name).unwrap_or_else(|| panic!("{name} is not in units::FILES"));

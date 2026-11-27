@@ -22,6 +22,12 @@ Wants=network-online.target
 Type=simple
 ExecStart=/usr/lib/hx/current/hx-backup-worker
 Environment=HX_BACKUP_ROLE=drive
+# The platform's root store is read from the system's paths only: a variable set for the manager
+# must not point the helper at another one.
+UnsetEnvironment=SSL_CERT_FILE SSL_CERT_DIR
+# The binary keeps the worker's SIGTERM handler (exit 143, ipc.md section 24): a stopped unit is
+# not a failed one.
+SuccessExitStatus=143
 
 # The refresh token, decrypted by the service manager (sealed to this host); privd never loads
 # it, and the binary reads it from $CREDENTIALS_DIRECTORY/drive-token.
@@ -49,6 +55,7 @@ ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
 RemoveIPC=yes
+PrivateIPC=yes
 
 # No privilege at all.
 CapabilityBoundingSet=
@@ -88,4 +95,5 @@ LimitCORE=0
 LimitNOFILE=128
 TasksMax=32
 MemoryMax=512M
+MemorySwapMax=0
 TimeoutStopSec=10

@@ -571,6 +571,9 @@ pub fn run(
                         // The image fetcher's tmpfs under /var/lib/hx (1D): still mounted, it
                         // makes U5's removal of /var/lib/hx fail with "resource busy".
                         "var-lib-hx-imagein.mount",
+                        // The Drive helper: stopped and disabled, so that nothing starts it again.
+                        "hx-drive.socket",
+                        "hx-drive.service",
                     ];
                     if !keep_desktop {
                         units.extend_from_slice(FIREWALL_UNITS);
