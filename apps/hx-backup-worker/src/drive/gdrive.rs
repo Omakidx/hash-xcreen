@@ -60,9 +60,7 @@ pub struct OpenParams {
 /// The session's Drive context: credentials, transport, retrier. One per link session.
 pub struct Drive {
     retrier: Arc<Retrier>,
-    transport: GoogleTransport,
-    client: ClientConfig,
-    token: Token,
+    api: Arc<Api>,
     hint: String,
     read_budget: Arc<Semaphore>,
 }
@@ -78,10 +76,14 @@ impl Drive {
         hostname: &[u8],
     ) -> Self {
         Self {
+            api: Arc::new(Api {
+                retrier: retrier.clone(),
+                transport,
+                client,
+                token,
+                access: Mutex::new(None),
+            }),
             retrier,
-            transport,
-            client,
-            token,
             hint: lease::sanitize_hint(hostname),
             read_budget: Arc::new(Semaphore::new(READ_BUDGET_KIB)),
         }
@@ -90,11 +92,11 @@ impl Drive {
     fn operator(&self, folder: &str) -> Result<Operator, DriveError> {
         let builder = Gdrive::default()
             .root(&format!("/{folder}/"))
-            .client_id(self.client.id())
-            .client_secret(self.client.secret())
-            .refresh_token(self.token.expose());
+            .client_id(self.api.client.id())
+            .client_secret(self.api.client.secret())
+            .refresh_token(self.api.token.expose());
         let ctx = OperationContext::new()
-            .with_http_transport(HttpTransporter::new(self.transport.clone()));
+            .with_http_transport(HttpTransporter::new(self.api.transport.clone()));
         Operator::new(builder)
             .map(|op| op.with_context(ctx))
             .map_err(|_| DriveError::new(EC::Internal))
@@ -106,25 +108,34 @@ impl Drive {
     /// `NOT_FOUND` (no folder and no `create`), `LEASE_HELD`, `INTERNAL` (unreadable lease), or the
     /// class of a Drive failure.
     pub async fn open(&self, p: &OpenParams, cancel: &Cancel) -> Result<Repo, DriveError> {
+        // The codec has checked this already; it is also what keeps the folder out of a query.
+        let b = p.folder.as_bytes();
+        if b.is_empty()
+            || b.len() > repo::MAX_FOLDER_LEN
+            || !b[0].is_ascii_alphanumeric()
+            || !b
+                .iter()
+                .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(c))
+        {
+            return Err(DriveError::new(EC::Internal));
+        }
         let op = self.operator(&p.folder)?;
         let r = &self.retrier;
-        match r.run(cancel, 0, "stat folder", || op.stat("/")).await {
-            Ok(_) => {}
-            Err(e) if e.class == EC::NotFound && p.create => {
-                r.run(cancel, 0, "create folder", || op.create_dir("/"))
-                    .await?;
+        // OpenDAL answers a stat of its root without asking Drive, so the folder is asked for
+        // directly.
+        if !self.api.folder_exists(&p.folder, cancel).await? {
+            if !p.create {
+                return Err(DriveError::new(EC::NotFound));
             }
-            Err(e) => return Err(e),
+            r.run(cancel, 0, "create folder", || op.create_dir("/"))
+                .await?;
         }
         let repo = Repo {
             op,
             retrier: self.retrier.clone(),
-            transport: self.transport.clone(),
-            client: self.client.clone(),
-            token: self.token.clone(),
+            api: self.api.clone(),
             folders: Mutex::new(HashSet::new()),
             read_budget: self.read_budget.clone(),
-            access: Mutex::new(None),
             lease: LeaseGuard::new(
                 lease::hex_id(&p.server_id),
                 0,
@@ -211,16 +222,146 @@ struct Access {
     until: Instant,
 }
 
-/// One opened repository (a folder, a lease, an operator).
-pub struct Repo {
-    op: Operator,
+/// The few Drive calls that OpenDAL has no operation for (an existence check of the repository
+/// folder, `about`), with the access token they need: a refresh of its own, through the same
+/// transport and retrier.
+struct Api {
     retrier: Arc<Retrier>,
     transport: GoogleTransport,
     client: ClientConfig,
     token: Token,
+    access: Mutex<Option<Access>>,
+}
+
+impl Api {
+    /// Is there a live folder `name` directly under My Drive?
+    async fn folder_exists(&self, name: &str, cancel: &Cancel) -> Result<bool, DriveError> {
+        let token = self.access_token(cancel).await?;
+        let q = format!(
+            "name = '{name}' and 'root' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        );
+        let url = format!(
+            "https://www.googleapis.com/drive/v3/files?q={}&pageSize=1&fields=files(id)",
+            percent(&q)
+        );
+        let body = self
+            .retrier
+            .run(cancel, 0, "find folder", || async {
+                let req = http::Request::get(url.as_str())
+                    .header(
+                        http::header::AUTHORIZATION,
+                        format!("Bearer {}", token.as_str()),
+                    )
+                    .body(Buffer::new())
+                    .map_err(|_| opendal::Error::new(opendal::ErrorKind::Unexpected, "request"))?;
+                let resp = self.transport.fetch(req).await?;
+                if resp.status() != http::StatusCode::OK {
+                    return Err(opendal::Error::new(
+                        opendal::ErrorKind::Unexpected,
+                        "find folder",
+                    ));
+                }
+                Ok(resp.into_body().to_buffer().await?.to_bytes())
+            })
+            .await?;
+        let v: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| DriveError::new(EC::Internal))?;
+        Ok(v["files"].as_array().is_some_and(|a| !a.is_empty()))
+    }
+
+    async fn access_token(&self, cancel: &Cancel) -> Result<Zeroizing<String>, DriveError> {
+        let mut slot = cancel.guard(self.access.lock()).await?;
+        if let Some(a) = slot.as_ref()
+            && a.until > Instant::now()
+        {
+            return Ok(a.token.clone());
+        }
+        let form = Zeroizing::new(format!(
+            "client_id={}&client_secret={}&refresh_token={}&grant_type=refresh_token",
+            percent(self.client.id()),
+            percent(self.client.secret()),
+            percent(self.token.expose())
+        ));
+        let (token, expires_in) = self
+            .retrier
+            .run(cancel, 0, "refresh token", || async {
+                let req = http::Request::post("https://oauth2.googleapis.com/token")
+                    .header(
+                        http::header::CONTENT_TYPE,
+                        "application/x-www-form-urlencoded",
+                    )
+                    .body(Buffer::from(Bytes::from(form.as_bytes().to_vec())))
+                    .map_err(|_| opendal::Error::new(opendal::ErrorKind::Unexpected, "request"))?;
+                let resp = self.transport.fetch(req).await?;
+                if resp.status() != http::StatusCode::OK {
+                    return Err(opendal::Error::new(opendal::ErrorKind::Unexpected, "token"));
+                }
+                let body = resp.into_body().to_buffer().await?.to_bytes();
+                let v: serde_json::Value = serde_json::from_slice(&body).map_err(|_| {
+                    opendal::Error::new(opendal::ErrorKind::Unexpected, "token body")
+                })?;
+                let t = v["access_token"].as_str().ok_or_else(|| {
+                    opendal::Error::new(opendal::ErrorKind::Unexpected, "token body")
+                })?;
+                Ok((
+                    Zeroizing::new(t.to_owned()),
+                    v["expires_in"].as_u64().unwrap_or(0),
+                ))
+            })
+            .await?;
+        let until = Instant::now() + Duration::from_secs(expires_in.saturating_sub(120));
+        *slot = Some(Access {
+            token: token.clone(),
+            until,
+        });
+        Ok(token)
+    }
+
+    async fn quota(&self, cancel: &Cancel) -> Result<QuotaInfo, DriveError> {
+        let token = self.access_token(cancel).await?;
+        let body = self
+            .retrier
+            .run(cancel, 0, "about", || async {
+                let req = http::Request::get(
+                    "https://www.googleapis.com/drive/v3/about?fields=storageQuota",
+                )
+                .header(
+                    http::header::AUTHORIZATION,
+                    format!("Bearer {}", token.as_str()),
+                )
+                .body(Buffer::new())
+                .map_err(|_| opendal::Error::new(opendal::ErrorKind::Unexpected, "request"))?;
+                let resp = self.transport.fetch(req).await?;
+                if resp.status() != http::StatusCode::OK {
+                    return Err(opendal::Error::new(opendal::ErrorKind::Unexpected, "about"));
+                }
+                Ok(resp.into_body().to_buffer().await?.to_bytes())
+            })
+            .await?;
+        let v: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| DriveError::new(EC::Internal))?;
+        let num = |k: &str| {
+            let q = &v["storageQuota"][k];
+            q.as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                .or_else(|| q.as_u64())
+                .unwrap_or(0)
+        };
+        Ok(QuotaInfo {
+            limit: num("limit"),
+            usage: num("usage"),
+            usage_in_trash: num("usageInDriveTrash"),
+        })
+    }
+}
+
+/// One opened repository (a folder, a lease, an operator).
+pub struct Repo {
+    op: Operator,
+    retrier: Arc<Retrier>,
+    api: Arc<Api>,
     folders: Mutex<HashSet<u8>>,
     read_budget: Arc<Semaphore>,
-    access: Mutex<Option<Access>>,
     lease: LeaseGuard,
     ours: String,
 }
@@ -512,93 +653,12 @@ impl Repo {
             .await
     }
 
-    async fn access_token(&self, cancel: &Cancel) -> Result<Zeroizing<String>, DriveError> {
-        let mut slot = cancel.guard(self.access.lock()).await?;
-        if let Some(a) = slot.as_ref()
-            && a.until > Instant::now()
-        {
-            return Ok(a.token.clone());
-        }
-        let form = Zeroizing::new(format!(
-            "client_id={}&client_secret={}&refresh_token={}&grant_type=refresh_token",
-            percent(self.client.id()),
-            percent(self.client.secret()),
-            percent(self.token.expose())
-        ));
-        let (token, expires_in) = self
-            .retrier
-            .run(cancel, 0, "refresh token", || async {
-                let req = http::Request::post("https://oauth2.googleapis.com/token")
-                    .header(
-                        http::header::CONTENT_TYPE,
-                        "application/x-www-form-urlencoded",
-                    )
-                    .body(Buffer::from(Bytes::from(form.as_bytes().to_vec())))
-                    .map_err(|_| opendal::Error::new(opendal::ErrorKind::Unexpected, "request"))?;
-                let resp = self.transport.fetch(req).await?;
-                if resp.status() != http::StatusCode::OK {
-                    return Err(opendal::Error::new(opendal::ErrorKind::Unexpected, "token"));
-                }
-                let body = resp.into_body().to_buffer().await?.to_bytes();
-                let v: serde_json::Value = serde_json::from_slice(&body).map_err(|_| {
-                    opendal::Error::new(opendal::ErrorKind::Unexpected, "token body")
-                })?;
-                let t = v["access_token"].as_str().ok_or_else(|| {
-                    opendal::Error::new(opendal::ErrorKind::Unexpected, "token body")
-                })?;
-                Ok((
-                    Zeroizing::new(t.to_owned()),
-                    v["expires_in"].as_u64().unwrap_or(0),
-                ))
-            })
-            .await?;
-        let until = Instant::now() + Duration::from_secs(expires_in.saturating_sub(120));
-        *slot = Some(Access {
-            token: token.clone(),
-            until,
-        });
-        Ok(token)
-    }
-
     /// `about.storageQuota` (counts the trash).
     ///
     /// # Errors
     /// The class of a Drive failure; `AUTH_REVOKED` for a revoked token.
     pub async fn quota(&self, cancel: &Cancel) -> Result<QuotaInfo, DriveError> {
-        let token = self.access_token(cancel).await?;
-        let body = self
-            .retrier
-            .run(cancel, 0, "about", || async {
-                let req = http::Request::get(
-                    "https://www.googleapis.com/drive/v3/about?fields=storageQuota",
-                )
-                .header(
-                    http::header::AUTHORIZATION,
-                    format!("Bearer {}", token.as_str()),
-                )
-                .body(Buffer::new())
-                .map_err(|_| opendal::Error::new(opendal::ErrorKind::Unexpected, "request"))?;
-                let resp = self.transport.fetch(req).await?;
-                if resp.status() != http::StatusCode::OK {
-                    return Err(opendal::Error::new(opendal::ErrorKind::Unexpected, "about"));
-                }
-                Ok(resp.into_body().to_buffer().await?.to_bytes())
-            })
-            .await?;
-        let v: serde_json::Value =
-            serde_json::from_slice(&body).map_err(|_| DriveError::new(EC::Internal))?;
-        let num = |k: &str| {
-            let q = &v["storageQuota"][k];
-            q.as_str()
-                .and_then(|s| s.parse::<u64>().ok())
-                .or_else(|| q.as_u64())
-                .unwrap_or(0)
-        };
-        Ok(QuotaInfo {
-            limit: num("limit"),
-            usage: num("usage"),
-            usage_in_trash: num("usageInDriveTrash"),
-        })
+        self.api.quota(cancel).await
     }
 
     /// This server's id (hex), as written in the lease.
