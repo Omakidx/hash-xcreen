@@ -14,7 +14,7 @@
 //! | [`lease`] | The repository lease rules (§29). |
 //! | [`gdrive`] | The repository over OpenDAL's `gdrive` service. |
 //! | [`server`] | One link session. |
-//! | [`run`] | Activation, one connection at a time, `SO_PEERCRED`, the idle exit. |
+//! | [`run`](mod@run) | Activation, one connection at a time, `SO_PEERCRED`, the idle exit. |
 
 pub mod connector;
 pub mod creds;
