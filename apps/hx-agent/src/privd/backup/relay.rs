@@ -175,6 +175,7 @@ pub struct Session<E: BackupEnv> {
     last_tick_ms: u64,
     open_life: Option<u64>,
     seen_snapshots: std::collections::HashSet<[u8; 32]>,
+    preexisting_snapshots: std::collections::HashSet<[u8; 32]>,
     permission_answers: u32,
     pub(super) open_repo_answer: Option<pb::repo_response::Result>,
     on_backup_ok: Option<BackupHook>,
@@ -241,6 +242,7 @@ impl<E: BackupEnv> Session<E> {
             last_tick_ms: now,
             open_life: None,
             seen_snapshots: std::collections::HashSet::new(),
+            preexisting_snapshots: std::collections::HashSet::new(),
             permission_answers: 0,
             open_repo_answer: None,
             on_backup_ok: None,
@@ -315,6 +317,13 @@ impl<E: BackupEnv> Session<E> {
         {
             self.first_err = Some(class);
         }
+    }
+
+    /// The most control bytes either link's queue has held at once.
+    pub fn peak_ctl_bytes(&self) -> usize {
+        self.worker_q
+            .peak_ctl_bytes()
+            .max(self.drive_q.peak_ctl_bytes())
     }
 
     /// Whether the Drive session is lost.
@@ -701,7 +710,7 @@ impl<E: BackupEnv> Session<E> {
             && let Some(h) = &self.on_backup_ok
         {
             let existed = <[u8; 32]>::try_from(r.snapshot_id.as_ref())
-                .is_ok_and(|id| self.seen_snapshots.contains(&id));
+                .is_ok_and(|id| self.preexisting_snapshots.contains(&id));
             h(&r, existed);
         }
         self.result = Some(r);
@@ -827,6 +836,14 @@ impl<E: BackupEnv> Session<E> {
                 return;
             }
         };
+        // A snapshot the job wrote after it had listed or read it was not made by this job.
+        if let Op::Write(w) = &op
+            && w.object_type == ObjectType::Snapshot as i32
+            && let Ok(id) = <[u8; 32]>::try_from(w.id.as_ref())
+            && self.seen_snapshots.contains(&id)
+        {
+            self.preexisting_snapshots.insert(id);
+        }
         let f = frame(pb::repo_frame::Frame::Request(pb::RepoRequest {
             req_id: d_id,
             op: Some(op),

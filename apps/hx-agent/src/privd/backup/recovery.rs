@@ -54,6 +54,9 @@ pub struct RecoveryReport {
     /// Whether every listing succeeded and every record could be read: only then is the host
     /// known to be clean.
     pub complete: bool,
+    /// Desktops whose own cleanup failed (their snapshots, their records), with the reason:
+    /// jobs of those desktops are refused, the others run (ipc.md section 35).
+    pub blocked: std::collections::BTreeMap<String, String>,
 }
 
 /// The collaborators of a recovery.
@@ -66,6 +69,9 @@ pub struct Recovery<'a, H: BackupHost, E: BackupEnv> {
     pub cfg: &'a BackupConfig,
     /// The records.
     pub dirs: &'a BackupDirs,
+    /// Write each failure to the audit log as it happens. The repeated recovery at start turns
+    /// this off and audits the changes itself (a line per change, a count per repeat).
+    pub audit_failures: bool,
 }
 
 fn is_sock_name(name: &str) -> bool {
@@ -74,7 +80,9 @@ fn is_sock_name(name: &str) -> bool {
 
 impl<H: BackupHost, E: BackupEnv> Recovery<'_, H, E> {
     fn fail(&self, rep: &mut RecoveryReport, what: String) {
-        self.env.audit(&format!("backup recovery: {what}"));
+        if self.audit_failures {
+            self.env.audit(&format!("backup recovery: {what}"));
+        }
         rep.failures.push(what);
         rep.complete = false;
     }
@@ -82,8 +90,19 @@ impl<H: BackupHost, E: BackupEnv> Recovery<'_, H, E> {
     /// A failure that does not make the run incomplete: a record that does not parse is left
     /// for an administrator and refuses jobs of its desktop (at admission), but it does not keep
     /// every other desktop from running jobs.
+    /// A failure that belongs to one desktop: that desktop is blocked, the run stays complete.
+    fn fail_desktop(&self, rep: &mut RecoveryReport, id: &str, what: String) {
+        if self.audit_failures {
+            self.env.audit(&format!("backup recovery: {what}"));
+        }
+        rep.failures.push(what.clone());
+        rep.blocked.entry(id.to_string()).or_insert(what);
+    }
+
     fn note(&self, rep: &mut RecoveryReport, what: String) {
-        self.env.audit(&format!("backup recovery: {what}"));
+        if self.audit_failures {
+            self.env.audit(&format!("backup recovery: {what}"));
+        }
         rep.failures.push(what);
     }
 
@@ -170,13 +189,17 @@ impl<H: BackupHost, E: BackupEnv> Recovery<'_, H, E> {
                     for n in names {
                         match self.host.delete_snapshot(&instance, &n).await {
                             Ok(()) => rep.snapshots_deleted.push(format!("{id}/{n}")),
-                            Err(e) => {
-                                self.fail(&mut rep, format!("cannot delete snapshot {n}: {e}"))
-                            }
+                            Err(e) => self.fail_desktop(
+                                &mut rep,
+                                &id,
+                                format!("cannot delete snapshot {n}: {e}"),
+                            ),
                         }
                     }
                 }
-                Err(e) => self.fail(&mut rep, format!("cannot list snapshots of {id}: {e}")),
+                Err(e) => {
+                    self.fail_desktop(&mut rep, &id, format!("cannot list snapshots of {id}: {e}"))
+                }
             }
         }
         // 4. restore targets
@@ -210,6 +233,10 @@ impl<H: BackupHost, E: BackupEnv> Recovery<'_, H, E> {
         // recovered: the records stay as they are and the whole recovery is repeated.
         if looked {
             for id in self.env.desktops() {
+                // A desktop whose snapshots could not be cleaned keeps its records for the repeat.
+                if rep.blocked.contains_key(&id) {
+                    continue;
+                }
                 self.drop_older_kept(&id, &mut rep).await;
                 self.clear_records(&id, &rep.targets_kept.clone(), &mut rep);
             }
@@ -274,16 +301,26 @@ impl<H: BackupHost, E: BackupEnv> Recovery<'_, H, E> {
                     .target
                     .as_deref()
                     .filter(|t| r.resumable && kept.iter().any(|k| k == t));
-                if let (Some(t), Some(job)) = (kept_target, r.job())
+                // The resume record names the job that created the target and the snapshot it
+                // was written for, so a resumed target keeps its original `user.hx.job`.
+                let creator = r
+                    .target_job
+                    .as_deref()
+                    .and_then(|j| JobId::from_hex(j).ok())
+                    .or_else(|| r.job());
+                if let (Some(t), Some(job), Some(snap)) =
+                    (kept_target, creator, r.snapshot_id.as_deref())
                     && let Ok(name) = RestoreTargetName::new(t)
-                    && let Err(e) = ResumeRecord::new(job, &name).store(&rp)
+                    && let Err(e) = ResumeRecord::new(job, &name, snap).store(&rp)
                 {
-                    self.fail(rep, format!("{id}: cannot write resume.json: {e}"));
+                    self.fail_desktop(rep, id, format!("{id}: cannot write resume.json: {e}"));
                     return;
                 }
                 match remove_record(&jp) {
                     Ok(()) => rep.records_cleared.push(id.to_string()),
-                    Err(e) => self.fail(rep, format!("{id}: cannot remove job.json: {e}")),
+                    Err(e) => {
+                        self.fail_desktop(rep, id, format!("{id}: cannot remove job.json: {e}"));
+                    }
                 }
             }
             Ok(None) => {}

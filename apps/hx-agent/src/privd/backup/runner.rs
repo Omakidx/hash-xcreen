@@ -108,6 +108,9 @@ pub enum StartError {
     /// The spec or the secrets are not valid (the rule's name).
     #[error("invalid job: {0}")]
     Invalid(String),
+    /// This desktop's own crash recovery failed and is being repeated; the other desktops run.
+    #[error("this desktop's crash recovery has not finished: {0}")]
+    DesktopBlocked(String),
     /// A restore target is kept (`resume.json`): resume it with a `resumable` restore, or tear
     /// it down first; it is never overwritten.
     #[error("a restore target is kept; resume it or remove it first")]
@@ -170,6 +173,7 @@ impl JobHandle {
                     desktop_id: self.desktop_id.clone(),
                     result: Err(Failure::Internal("the job task ended".into())),
                     permission_answers: 0,
+                    peak_ctl_bytes: 0,
                 });
             }
         }
@@ -193,6 +197,7 @@ struct Inner<H: BackupHost, E: BackupEnv> {
     active: Mutex<HashMap<String, Active>>,
     last: Mutex<HashMap<String, JobStatus>>,
     recovered: AtomicBool,
+    recovery: Mutex<RecoveryState>,
 }
 
 /// The runner. Cloning shares it.
@@ -210,6 +215,21 @@ impl<H: BackupHost, E: BackupEnv> Clone for JobRunner<H, E> {
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Where crash recovery stands (ipc.md section 35): what W5b shows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecoveryState {
+    /// The host-wide steps have all looked at everything.
+    pub done: bool,
+    /// Desktops whose own cleanup failed, with the reason; their jobs are refused.
+    pub blocked: std::collections::BTreeMap<String, String>,
+    /// Runs so far.
+    pub attempts: u32,
+    /// The failures of the last run.
+    pub failures: std::collections::BTreeSet<String>,
+    /// How many runs in a row had these same failures.
+    pub repeats: u32,
 }
 
 /// Which failures end in which state of privd (ipc.md section 31, "Effects"); separated from the
@@ -319,6 +339,7 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
                 active: Mutex::new(HashMap::new()),
                 last: Mutex::new(HashMap::new()),
                 recovered: AtomicBool::new(false),
+                recovery: Mutex::new(RecoveryState::default()),
             }),
         }
     }
@@ -333,7 +354,15 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
         self.inner.recovered.load(Ordering::SeqCst)
     }
 
-    /// Crash recovery (ipc.md section 35). Jobs are admitted once a run reports `complete`.
+    /// Where crash recovery stands.
+    pub fn recovery_state(&self) -> RecoveryState {
+        lock(&self.inner.recovery).clone()
+    }
+
+    /// Crash recovery (ipc.md section 35). Jobs are admitted once a run reports `complete`; a
+    /// desktop whose own cleanup failed stays blocked until a run finds it clean. The audit log
+    /// gets a line when the failures change and a count when they repeat, never one line per
+    /// retry.
     pub async fn recover(&self) -> RecoveryReport {
         let i = &self.inner;
         let rep = Recovery {
@@ -341,13 +370,70 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
             env: i.env.as_ref(),
             cfg: &i.cfg,
             dirs: &i.dirs,
+            audit_failures: false,
         }
         .recover_all()
         .await;
+        let failures: std::collections::BTreeSet<String> = rep.failures.iter().cloned().collect();
+        let mut st = lock(&i.recovery);
+        st.attempts += 1;
+        if failures != st.failures {
+            for f in &failures {
+                i.env.audit(&format!("backup recovery: {f}"));
+            }
+            st.repeats = 0;
+        } else if !failures.is_empty() {
+            st.repeats += 1;
+            if st.repeats.is_power_of_two() {
+                i.env.audit(&format!(
+                    "backup recovery: still failing after {} attempts ({} failure(s))",
+                    st.attempts,
+                    failures.len()
+                ));
+            }
+        }
+        if failures.is_empty() {
+            i.env.audit(&format!(
+                "backup recovery: done after {} attempt(s): {} helper(s), {} socket(s), {} snapshot(s), {} target(s) deleted, {} kept, {} record(s) cleared",
+                st.attempts,
+                rep.helpers_deleted.len(),
+                rep.sockets_removed.len(),
+                rep.snapshots_deleted.len(),
+                rep.targets_deleted.len(),
+                rep.targets_kept.len(),
+                rep.records_cleared.len()
+            ));
+        }
+        st.failures = failures;
+        st.done = rep.complete;
+        st.blocked = rep.blocked.clone();
+        drop(st);
         if rep.complete {
             i.recovered.store(true, Ordering::SeqCst);
         }
         rep
+    }
+
+    /// Deletes the restore target kept for `desktop` (marker and job checks as in ipc.md
+    /// section 24) and then its `resume.json`, audited. `Ok(false)` when nothing was kept.
+    /// Refused (`Busy`) while the desktop's slot is held. W5b exposes it.
+    pub async fn discard_resume(&self, desktop: &str) -> Result<bool, StartError> {
+        let i = &self.inner;
+        if !i.env.desktop_known(desktop) || !crate::privd::is_safe_desktop_id(desktop) {
+            return Err(StartError::UnknownDesktop);
+        }
+        let _slot = i.slots.take(desktop).ok_or(StartError::Busy)?;
+        let path = i
+            .dirs
+            .resume_path(desktop)
+            .map_err(|e| StartError::Record(e.to_string()))?;
+        let Some(kept) =
+            ResumeRecord::load(&path).map_err(|e| StartError::Record(e.to_string()))?
+        else {
+            return Ok(false);
+        };
+        discard_kept(i, desktop, &kept).await?;
+        Ok(true)
     }
 
     /// The cleanup for `DestroyDesktop` (`all` false: the scope is `desktops`) and `Uninstall`
@@ -379,6 +465,7 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
             env: i.env.as_ref(),
             cfg: &i.cfg,
             dirs: &i.dirs,
+            audit_failures: true,
         }
         .teardown(desktops, all, &jobs)
         .await
@@ -441,6 +528,9 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
         if i.env.uninstalling() {
             return Err(StartError::Uninstalling);
         }
+        if let Some(why) = lock(&i.recovery).blocked.get(&desktop).cloned() {
+            return Err(StartError::DesktopBlocked(why));
+        }
         if !i.env.desktop_known(&desktop) || !crate::privd::is_safe_desktop_id(&desktop) {
             return Err(StartError::UnknownDesktop);
         }
@@ -464,6 +554,7 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
                 env: i.env.as_ref(),
                 cfg: &i.cfg,
                 dirs: &i.dirs,
+                audit_failures: true,
             }
             .recover_desktop(&desktop)
             .await;
@@ -534,34 +625,53 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
                 tail[1]
             )
         });
-        // A kept restore target is resumed by a resumable restore (the helper is built on it and
-        // the worker verifies what is there), and refuses any other restore: `resume.json` is
-        // never silently overwritten and the older target is never abandoned.
+        // A kept restore target is resumed by a resumable restore for the **same snapshot** (the
+        // helper is built on it and the worker verifies what is there). For another snapshot a
+        // resume would mix two (a restore never removes files), so the kept target is discarded
+        // first and the restore starts fresh. A restore that is not resumable is refused while a
+        // target is kept: `resume.json` is never silently overwritten.
         let mut spec = req.spec.clone();
-        let (target, reuse_target) = if kind == JobKind::Restore {
+        let snapshot_hex = match &spec {
+            JobSpec::Restore { snapshot_id, .. } => Some(hex(snapshot_id)),
+            _ => None,
+        };
+        let (target, reuse_target, target_job) = if kind == JobKind::Restore {
             let kept = ResumeRecord::load(
                 &i.dirs
                     .resume_path(&desktop)
                     .map_err(|e| StartError::Record(e.to_string()))?,
             )
             .map_err(rec_err)?;
-            match (&mut spec, kept) {
-                (
-                    JobSpec::Restore {
-                        resumable: true,
+            let fresh = |job: JobId| (Some(format!("hx-restore-{}", job.hex())), false, Some(job));
+            match kept {
+                None => fresh(job),
+                Some(k) => {
+                    let JobSpec::Restore {
+                        resumable,
                         verify_existing,
                         ..
-                    },
-                    Some(k),
-                ) => {
-                    *verify_existing = true;
-                    (Some(k.target), true)
+                    } = &mut spec
+                    else {
+                        unreachable!("a restore kind has a restore spec")
+                    };
+                    if !*resumable {
+                        return Err(StartError::ResumePending);
+                    }
+                    if Some(&k.snapshot_id) == snapshot_hex.as_ref() {
+                        *verify_existing = true;
+                        (
+                            Some(k.target.clone()),
+                            true,
+                            JobId::from_hex(&k.job_id).ok(),
+                        )
+                    } else {
+                        discard_kept(i, &desktop, &k).await?;
+                        fresh(job)
+                    }
                 }
-                (_, Some(_)) => return Err(StartError::ResumePending),
-                (_, None) => (Some(format!("hx-restore-{}", job.hex())), false),
             }
         } else {
-            (None, false)
+            (None, false, None)
         };
         let instance = format!("{}{desktop}", i.cfg.instance_prefix);
         let facts = if kind == JobKind::Backup {
@@ -627,7 +737,9 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
             started_unix: now,
             helper: job.helper_name().to_string(),
             snapshot: snapshot.clone(),
+            snapshot_id: snapshot_hex.clone(),
             target: target.clone(),
+            target_job: target_job.map(|j| j.hex()),
             resumable: matches!(
                 spec,
                 JobSpec::Restore {
@@ -671,6 +783,8 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
             snapshot,
             target,
             reuse_target,
+            target_job,
+            snapshot_hex,
             job_msg,
             secrets: JobSecrets {
                 slot0,
@@ -701,6 +815,30 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
     }
 }
 
+/// Deletes a kept restore target (it must still be the one the record names: the host checks the
+/// marker and the creating job) and then the record.
+async fn discard_kept<H: BackupHost, E: BackupEnv>(
+    i: &Inner<H, E>,
+    desktop: &str,
+    kept: &ResumeRecord,
+) -> Result<(), StartError> {
+    let name = hx_provision::incus::RestoreTargetName::new(&kept.target)
+        .map_err(|e| StartError::Record(e.to_string()))?;
+    i.host
+        .delete_restore_target(&name, JobId::from_hex(&kept.job_id).ok())
+        .await
+        .map_err(|e| StartError::Host(e.to_string()))?;
+    let path = i
+        .dirs
+        .resume_path(desktop)
+        .map_err(|e| StartError::Record(e.to_string()))?;
+    remove_record(&path).map_err(|e| StartError::Record(e.to_string()))?;
+    i.env.audit(&format!(
+        "backup: the kept restore target of {desktop} was discarded"
+    ));
+    Ok(())
+}
+
 struct JobTask<H: BackupHost, E: BackupEnv> {
     inner: Arc<Inner<H, E>>,
     job: JobId,
@@ -711,6 +849,8 @@ struct JobTask<H: BackupHost, E: BackupEnv> {
     snapshot: Option<String>,
     target: Option<String>,
     reuse_target: bool,
+    target_job: Option<JobId>,
+    snapshot_hex: Option<String>,
     job_msg: pb::Job,
     secrets: JobSecrets,
     open: OpenParams,
@@ -793,6 +933,8 @@ impl<H: BackupHost, E: BackupEnv> JobTask<H, E> {
             guard,
             reserved,
             reuse_target,
+            target_job,
+            snapshot_hex,
             resumable,
         } = self;
         let kind = spec.kind();
@@ -952,9 +1094,20 @@ impl<H: BackupHost, E: BackupEnv> JobTask<H, E> {
             .as_ref()
             .is_some_and(|e| e.result.is_some() && e.forced.is_none());
         let forced_failure = end.as_ref().is_some_and(|e| e.forced.is_some());
+        let forced_name = end
+            .as_ref()
+            .and_then(|e| e.forced.as_ref().map(|f| f.name()));
         let first_err = end.as_ref().and_then(|e| e.first_err);
         let permission_answers = end.as_ref().map_or(0, |e| e.permission_answers);
         let mut result = classify(setup, end);
+
+        if result.is_ok()
+            && let Some(n) = forced_name
+        {
+            i.env.audit(&format!(
+                "backup job {job_hex}: a failure after the accepted result was ignored: {n}"
+            ));
+        }
 
         // The manifest of a `RESTORE_PLAN` is untrusted input.
         if let (Ok(r), JobSpec::RestorePlan { snapshot_id }) = (&result, &spec) {
@@ -1019,6 +1172,8 @@ impl<H: BackupHost, E: BackupEnv> JobTask<H, E> {
             resumable,
             graceful,
             forced_failure,
+            target_job,
+            snapshot_hex.as_deref(),
         )
         .await;
         // The `active` entry goes before the slot is released, and only if it is this job's: a
@@ -1029,6 +1184,7 @@ impl<H: BackupHost, E: BackupEnv> JobTask<H, E> {
                 a.remove(&desktop);
             }
         }
+        let peak_ctl_bytes = s.peak_ctl_bytes();
         drop(guard);
         drop(reserved);
         JobOutcome {
@@ -1040,6 +1196,7 @@ impl<H: BackupHost, E: BackupEnv> JobTask<H, E> {
                 restore_target: kept_target,
             }),
             permission_answers,
+            peak_ctl_bytes,
         }
     }
 }
@@ -1109,6 +1266,8 @@ async fn cleanup<H: BackupHost, E: BackupEnv>(
     resumable: bool,
     graceful: bool,
     forced_failure: bool,
+    target_job: Option<JobId>,
+    snapshot_hex: Option<&str>,
 ) -> Option<String> {
     let job_hex = job.hex();
     let mut leftovers = false;
@@ -1163,18 +1322,31 @@ async fn cleanup<H: BackupHost, E: BackupEnv>(
     // Only a target that exists is kept or deleted: a precondition that failed before the
     // target was created leaves nothing to record.
     let target_exists = match target {
-        Some(t) if made.target_attempted => {
-            made.reuse_target || i.host.restore_target_exists(t).await.unwrap_or(true)
-        }
+        Some(t) if made.target_attempted => i.host.restore_target_exists(t).await.unwrap_or(true),
         _ => false,
     };
+    if !target_exists
+        && made.reuse_target
+        && let Ok(p) = i.dirs.resume_path(desktop)
+    {
+        // The kept target has vanished (deleted outside privd): the job fails once, and the
+        // record is cleared so that the next restore can start.
+        let _ = remove_record(&p);
+        note("the kept restore target is gone; resume.json was cleared".to_string());
+    }
     if target_exists
         && let Some(t) = target
         && let Ok(name) = hx_provision::incus::RestoreTargetName::new(t)
     {
         if resumable {
             match i.dirs.resume_path(desktop) {
-                Ok(p) => match ResumeRecord::new(job, &name).store(&p) {
+                Ok(p) => match ResumeRecord::new(
+                    target_job.unwrap_or(job),
+                    &name,
+                    snapshot_hex.unwrap_or_default(),
+                )
+                .store(&p)
+                {
                     Ok(()) => kept = Some(t.to_string()),
                     Err(e) => {
                         leftovers = true;

@@ -43,9 +43,11 @@ use super::clock::Monotonic;
 /// The reader waits while the other link has this many data bytes queued: two full frames.
 pub const SINK_LIMIT: usize = 2 * 1024 * 1024;
 
-/// The control queue of a link holds at most this many bytes; a peer that lets it fill by not
-/// reading is dead (ipc.md section 25).
-pub const CTL_LIMIT: usize = 256 * 1024;
+/// The control queue of a link holds at most this many bytes: [`CTL_SOFT`] plus the 17 frames of
+/// 64 KiB that the channel and the decoder can still deliver after the other link's reader has
+/// seen the soft limit, rounded up. Honest traffic never reaches it; a peer that lets it fill by
+/// not reading is dead (ipc.md section 25).
+pub const CTL_LIMIT: usize = 1280 * 1024;
 
 /// The reader of the other link waits while this many control bytes are queued.
 pub const CTL_SOFT: usize = 64 * 1024;
@@ -103,6 +105,8 @@ struct QueueInner {
     closed: bool,
     /// Bumped by `reopen`: a writer thread of an earlier generation stops.
     generation: u64,
+    /// The most control bytes ever queued at once.
+    peak_ctl: usize,
 }
 
 /// Why a push to a queue failed.
@@ -151,6 +155,7 @@ impl OutQueue {
             return Err(PushError::Overflow);
         }
         g.ctl_bytes += n;
+        g.peak_ctl = g.peak_ctl.max(g.ctl_bytes);
         g.ctl.push_back(out);
         self.cv.notify_all();
         Ok(())
@@ -163,6 +168,7 @@ impl OutQueue {
             return Err(PushError::Closed);
         }
         g.pong = Some(bytes);
+        g.peak_ctl = g.peak_ctl.max(g.ctl_bytes);
         self.cv.notify_all();
         Ok(())
     }
@@ -205,11 +211,29 @@ impl OutQueue {
         }
     }
 
-    /// Called by the writer after it wrote a data frame of `len` bytes.
-    fn written(&self, len: usize) {
+    /// Called by the writer of `generation` after it wrote a data frame of `len` bytes; a writer
+    /// of an earlier generation does not touch the counters of the queue it no longer owns.
+    fn written(&self, generation: u64, len: usize) {
         let mut g = self.lock();
+        if g.generation != generation {
+            return;
+        }
         g.data_bytes = g.data_bytes.saturating_sub(len);
         self.cv.notify_all();
+    }
+
+    /// The most control bytes this queue has ever held at once.
+    pub fn peak_ctl_bytes(&self) -> usize {
+        self.lock().peak_ctl
+    }
+
+    /// Closes the queue only if it still belongs to `generation` (the writer of a connection
+    /// that has been replaced must not close the next connection's queue).
+    pub fn close_if(&self, generation: u64) {
+        let same = self.lock().generation == generation;
+        if same {
+            self.close();
+        }
     }
 
     /// Data bytes queued and not yet written.
@@ -359,10 +383,23 @@ fn run_reader(
     }
 }
 
-fn run_writer(mut stream: UnixStream, q: Arc<OutQueue>, tx: mpsc::Sender<LinkEvent>) {
+fn run_writer(stream: UnixStream, q: Arc<OutQueue>, tx: mpsc::Sender<LinkEvent>, generation: u64) {
+    writer_loop(stream, q, tx, generation, &|| {});
+}
+
+/// The writer's loop. `generation` is the one the queue had when the link was made (taken by the
+/// spawner, not here): everything the loop does to the shared queue is checked against it.
+/// `before_write` is a seam for the tests.
+fn writer_loop(
+    mut stream: UnixStream,
+    q: Arc<OutQueue>,
+    tx: mpsc::Sender<LinkEvent>,
+    generation: u64,
+    before_write: &dyn Fn(),
+) {
     let _ = stream.set_write_timeout(Some(WRITE_STALL));
-    let generation = q.generation();
     while let Some((item, data_len)) = q.pop(generation) {
+        before_write();
         let r = match &item {
             Out::Msg(b) => stream.write_all(b),
             Out::Secret(b) => stream.write_all(b),
@@ -373,17 +410,17 @@ fn run_writer(mut stream: UnixStream, q: Arc<OutQueue>, tx: mpsc::Sender<LinkEve
                 .and_then(|()| stream.write_all(payload)),
             Out::Close => {
                 let _ = stream.shutdown(std::net::Shutdown::Both);
-                q.close();
+                q.close_if(generation);
                 return;
             }
         };
         if matches!(item, Out::Data { .. }) {
-            q.written(data_len);
+            q.written(generation, data_len);
         }
         if r.is_err() {
             let _ = tx.blocking_send(LinkEvent::WriteFailed);
             let _ = stream.shutdown(std::net::Shutdown::Both);
-            q.close();
+            q.close_if(generation);
             return;
         }
     }
@@ -476,9 +513,12 @@ impl Link {
         }
         {
             let q = own_q.clone();
+            // The generation is read here, before the thread exists: a thread that starts late
+            // must not adopt the generation of a reconnect.
+            let generation = q.generation();
             std::thread::Builder::new()
                 .name(format!("hx-bkp-{name}-wr"))
-                .spawn(move || run_writer(wstream, q, tx))?;
+                .spawn(move || run_writer(wstream, q, tx, generation))?;
         }
         Ok(Self {
             name,
@@ -635,7 +675,7 @@ mod tests {
         assert_eq!(q.data_bytes(), 3);
         assert!(matches!(q.pop(q.generation()), Some((Out::Msg(_), 0))));
         assert!(matches!(q.pop(q.generation()), Some((Out::Data { .. }, 3))));
-        q.written(3);
+        q.written(q.generation(), 3);
         assert_eq!(q.data_bytes(), 0);
         q.close();
         assert!(q.pop(q.generation()).is_none());
@@ -655,7 +695,7 @@ mod tests {
             20,
         );
         assert!(!q.wait_below(10, Duration::from_millis(5)));
-        q.written(20);
+        q.written(q.generation(), 20);
         assert!(q.wait_below(10, Duration::from_millis(5)));
     }
 
@@ -783,5 +823,67 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
+    }
+
+    #[test]
+    fn an_old_writer_that_starts_late_neither_steals_frames_nor_closes_the_new_queue() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let q = OutQueue::new();
+        let old_gen = q.generation();
+        let (tx, _rx) = mpsc::channel(4);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let (q2, b2) = (q.clone(), barrier.clone());
+        // The old writer exists, but runs only after the reconnect.
+        let old = std::thread::spawn(move || {
+            b2.wait();
+            writer_loop(a, q2, tx, old_gen, &|| {});
+        });
+        q.close();
+        q.reopen();
+        assert_ne!(q.generation(), old_gen);
+        q.push_ctl(Out::Msg(vec![1, 2, 3])).unwrap();
+        barrier.wait();
+        old.join().unwrap();
+        assert!(!q.is_closed(), "the old writer closed the new queue");
+        assert_eq!(
+            q.ctl_bytes(),
+            3,
+            "the old writer took a frame of the new connection"
+        );
+        // Nothing reached the old connection's peer.
+        let mut buf = [0u8; 8];
+        b.set_nonblocking(true).unwrap();
+        assert!(std::io::Read::read(&mut &b, &mut buf).map_or(true, |n| n == 0));
+    }
+
+    #[test]
+    fn an_old_writer_that_fails_after_the_reconnect_does_not_close_the_new_queue() {
+        let (a, b) = UnixStream::pair().unwrap();
+        drop(b); // the peer is gone: the write fails
+        let q = OutQueue::new();
+        let old_gen = q.generation();
+        q.push_ctl(Out::Msg(vec![9; 4])).unwrap();
+        let (tx, _rx) = mpsc::channel(4);
+        let at_write = Arc::new(std::sync::Barrier::new(2));
+        let go = Arc::new(std::sync::Barrier::new(2));
+        let (q2, at2, go2) = (q.clone(), at_write.clone(), go.clone());
+        let old = std::thread::spawn(move || {
+            writer_loop(a, q2, tx, old_gen, &|| {
+                at2.wait(); // popped, about to write
+                go2.wait();
+            });
+        });
+        at_write.wait();
+        // The reconnect happens between the pop and the failing write.
+        q.close();
+        q.reopen();
+        q.push_ctl(Out::Msg(vec![1])).unwrap();
+        go.wait();
+        old.join().unwrap();
+        assert!(
+            !q.is_closed(),
+            "the failure of the old connection closed the new queue"
+        );
+        assert_eq!(q.ctl_bytes(), 1);
     }
 }

@@ -263,8 +263,13 @@ pub struct JobRecord {
     pub helper: String,
     /// The snapshot's name (`BACKUP` only).
     pub snapshot: Option<String>,
+    /// The snapshot a `RESTORE` restores (64 hex digits).
+    pub snapshot_id: Option<String>,
     /// The restore target's instance name (`RESTORE` only).
     pub target: Option<String>,
+    /// The job that created the target (its `user.hx.job`): this job for a new target, the kept
+    /// record's for a resumed one.
+    pub target_job: Option<String>,
     /// The caller's flag of a `RESTORE`: keep the target for resuming or promotion.
     pub resumable: bool,
 }
@@ -288,6 +293,14 @@ impl JobRecord {
                 .target
                 .as_deref()
                 .is_none_or(|t| RestoreTargetName::new(t).is_ok())
+            && self
+                .snapshot_id
+                .as_deref()
+                .is_none_or(|s| parse_hex32(s).is_some())
+            && self
+                .target_job
+                .as_deref()
+                .is_none_or(|j| JobId::from_hex(j).is_ok())
     }
 
     /// The job id, if the record is valid.
@@ -323,17 +336,20 @@ pub struct ResumeRecord {
     pub job_id: String,
     /// The target's instance name.
     pub target: String,
+    /// The snapshot the target was written for (64 hex digits).
+    pub snapshot_id: String,
     /// Always true (a record exists only for a resumable restore).
     pub resumable: bool,
 }
 
 impl ResumeRecord {
-    /// A record for `target` of `job`.
-    pub fn new(job: JobId, target: &RestoreTargetName) -> Self {
+    /// A record for `target`, created by `job`, for the snapshot `snapshot_id` (64 hex digits).
+    pub fn new(job: JobId, target: &RestoreTargetName, snapshot_id: &str) -> Self {
         Self {
             format: FORMAT,
             job_id: job.hex(),
             target: target.to_string(),
+            snapshot_id: snapshot_id.to_string(),
             resumable: true,
         }
     }
@@ -343,6 +359,7 @@ impl ResumeRecord {
             && self.resumable
             && JobId::from_hex(&self.job_id).is_ok()
             && RestoreTargetName::new(&self.target).is_ok()
+            && parse_hex32(&self.snapshot_id).is_some()
     }
 
     /// Reads `resume.json`.
@@ -485,7 +502,9 @@ mod tests {
             started_unix: 1_800_000_000,
             helper: job.helper_name().to_string(),
             snapshot: Some("hx-backup-20261127T030000Z-ab12".into()),
+            snapshot_id: None,
             target: None,
+            target_job: None,
             resumable: false,
         }
     }
@@ -517,8 +536,10 @@ mod tests {
                 "kind",
                 "resumable",
                 "snapshot",
+                "snapshot_id",
                 "started_unix",
-                "target"
+                "target",
+                "target_job"
             ]
         );
     }

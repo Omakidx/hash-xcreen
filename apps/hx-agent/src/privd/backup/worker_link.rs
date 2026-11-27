@@ -32,8 +32,16 @@ pub async fn open<E: BackupEnv>(
     // worker listens and then closes: such a connection is dropped and tried again.
     let ack_by = helper_started_ms + u64::try_from(s.timing.ack_timeout.as_millis()).unwrap_or(0);
     loop {
+        // Each attempt is bounded by the time left to `HelloAck`, not by a fresh window.
+        let left = ack_by.saturating_sub(s.mono.now_ms());
+        if left == 0 {
+            return Err(Failure::HelperFailed(
+                "no HelloAck within 30 s of the start".into(),
+            ));
+        }
+        let attempt = window.min(left);
         let stream = s
-            .service(connect_unix(socket, window, retry, mono.as_ref()))
+            .service(connect_unix(socket, attempt, retry, mono.as_ref()))
             .await
             .map_err(|_| Failure::HelperFailed("the worker's socket cannot be reached".into()))?;
         if let Some(f) = s.abort_reason() {

@@ -291,6 +291,9 @@ pub struct JobOutcome {
     /// How many `PERMISSION` answers of the Drive helper privd relayed in the job (the first is
     /// audited when it happens, the count is in the job's last audit line).
     pub permission_answers: u32,
+    /// The most control bytes that were ever queued at once on either link of the job (the
+    /// bound of ipc.md section 25 is observable).
+    pub peak_ctl_bytes: usize,
 }
 
 /// Where a job is.

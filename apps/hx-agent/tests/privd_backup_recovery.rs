@@ -41,7 +41,9 @@ fn record(rig: &Rig, kind: JobKind, job: JobId, target: Option<&str>, resumable:
         started_unix: 1_800_000_000,
         helper: job.helper_name().to_string(),
         snapshot: (kind == JobKind::Backup).then(|| "hx-backup-20261127T030000Z-ab12".to_string()),
+        snapshot_id: (kind == JobKind::Restore).then(|| hex(&[1u8; 32])),
         target: target.map(str::to_string),
+        target_job: target.map(|_| job.hex()),
         resumable,
     }
     .store(&dirs.job_path("main").unwrap())
@@ -124,6 +126,7 @@ async fn a_target_whose_record_does_not_say_resumable_is_deleted_by_recovery() {
     ResumeRecord::new(
         job(5),
         &hx_provision::incus::RestoreTargetName::new("hx-restore-gone").unwrap(),
+        &hex(&[1u8; 32]),
     )
     .store(
         &BackupDirs::new(&rig.cfg.state_dir)
@@ -282,8 +285,10 @@ fn seed_leftovers(h: &Harness) {
         desktop_id: "main".into(),
         started_unix: 1_800_000_000,
         helper: job(1).helper_name().to_string(),
+        snapshot_id: Some(hex(&[1u8; 32])),
         snapshot: None,
         target: Some(format!("hx-restore-{}", job(2).hex())),
+        target_job: Some(job(2).hex()),
         resumable: false,
     }
     .store(&dirs.job_path("main").unwrap())

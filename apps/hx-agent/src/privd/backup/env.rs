@@ -117,13 +117,20 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
     /// could look at everything. Backup jobs are refused until it has. Called once at start by
     /// `serve`.
     pub async fn recover_backups(self: &Arc<Self>) {
+        // Repeated with a back-off (30 s, doubling to 15 minutes) until the host-wide steps have
+        // looked at everything and no desktop is blocked; the state is `recovery_state()`.
+        let mut wait = std::time::Duration::from_secs(30);
         loop {
             let rep = self.backup.recover().await;
-            if rep.complete {
+            if rep.complete && rep.blocked.is_empty() {
                 return;
             }
-            log::error("backup recovery is incomplete; it will be repeated in 30 s");
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            log::error(&format!(
+                "backup recovery is incomplete; it will be repeated in {} s",
+                wait.as_secs()
+            ));
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(std::time::Duration::from_secs(900));
         }
     }
 

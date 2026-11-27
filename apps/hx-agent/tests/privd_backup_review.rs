@@ -64,7 +64,9 @@ fn write_job_record(
         started_unix: 1_800_000_000,
         helper: j.helper_name().to_string(),
         snapshot: snapshot.map(str::to_string),
+        snapshot_id: (kind == JobKind::Restore).then(|| hex(&[1u8; 32])),
         target: target.map(str::to_string),
+        target_job: target.map(|_| j.hex()),
         resumable,
     }
     .store(&dirs.job_path(desktop).unwrap())
@@ -74,9 +76,13 @@ fn write_job_record(
 fn write_resume(rig: &Rig, desktop: &str, j: JobId, target: &str) {
     let dirs = BackupDirs::new(&rig.cfg.state_dir);
     dirs.ensure_desktop_dir(desktop).unwrap();
-    ResumeRecord::new(j, &RestoreTargetName::new(target).unwrap())
-        .store(&dirs.resume_path(desktop).unwrap())
-        .unwrap();
+    ResumeRecord::new(
+        j,
+        &RestoreTargetName::new(target).unwrap(),
+        &hex(&[1u8; 32]),
+    )
+    .store(&dirs.resume_path(desktop).unwrap())
+    .unwrap();
 }
 
 // ----- S-H1: unbounded queues ---------------------------------------------------------------------
