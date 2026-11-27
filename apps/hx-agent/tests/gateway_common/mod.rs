@@ -36,6 +36,32 @@ pub use fake_privd::FakePrivd;
 
 pub const WAIT: Duration = Duration::from_secs(20);
 pub const PIN: &str = "482913";
+
+/// Whether `pin` appears in `text` as a value of its own: the "no PIN in any log line" check.
+///
+/// A plain substring search is not enough. Six digits occur by chance inside other values: in
+/// the microsecond field of every tracing timestamp (`10:46:34.482913Z`), in the fraction of a
+/// duration (`1.482913ms`) and in the hex of device ids and keys (`key=e2d0482913f8`). With a few
+/// hundred lines per test binary, all in one shared buffer, a chance match fails every check
+/// that runs after it. So an occurrence counts unless it is part of a longer value: next to a
+/// hex digit, or after or before a decimal point. A PIN logged as a value (`pin=482913`,
+/// `"482913"`, `Pin(482913)`, a sentence ending in `482913.`) still counts.
+pub fn contains_pin(text: &str, pin: &str) -> bool {
+    let b = text.as_bytes();
+    text.match_indices(pin).any(|(start, _)| {
+        let end = start + pin.len();
+        let before = start.checked_sub(1).map(|i| b[i]);
+        let after = b.get(end).copied();
+        let decimal_point_before =
+            before == Some(b'.') && start >= 2 && b[start - 2].is_ascii_digit();
+        let decimal_point_after =
+            after == Some(b'.') && b.get(end + 1).is_some_and(u8::is_ascii_digit);
+        !(before.is_some_and(|c| c.is_ascii_hexdigit())
+            || after.is_some_and(|c| c.is_ascii_hexdigit())
+            || decimal_point_before
+            || decimal_point_after)
+    })
+}
 /// Cheap Argon2id parameters so that tests are fast; the production floor is a config value.
 pub const CHEAP: PinParams = PinParams {
     memory_kib: 64,

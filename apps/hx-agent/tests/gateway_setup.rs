@@ -7,7 +7,7 @@ mod gateway_common;
 use std::time::Duration;
 
 use gateway_common::setup::*;
-use gateway_common::{PIN, new_key, within};
+use gateway_common::{PIN, contains_pin, new_key, within};
 use hx_crypto::setup::SetupAuth;
 use hx_crypto::{Error, PairingCredential, Pin};
 use hx_ipc::admin::pb as apb;
@@ -46,9 +46,8 @@ async fn wait_job(e: &SetupEnv, want: apb::SetupJobState) {
 
 fn no_secrets_in_logs() {
     let logs = captured_logs();
-    for secret in [PIN, PASSWORD] {
-        assert!(!logs.contains(secret), "a secret reached a log line");
-    }
+    assert!(!contains_pin(&logs, PIN), "the PIN reached a log line");
+    assert!(!logs.contains(PASSWORD), "the password reached a log line");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -121,13 +120,13 @@ async fn the_happy_path_sets_the_pin_builds_the_desktop_and_finishes() {
     assert!(e.h.incus.with(|s| {
         s.execs
             .iter()
-            .all(|x| !x.contains(PASSWORD) && !x.contains(PIN))
+            .all(|x| !x.contains(PASSWORD) && !contains_pin(x, PIN))
     }));
     assert!(
         e.h.audit
             .lines()
             .iter()
-            .all(|l| !l.contains(PASSWORD) && !l.contains(PIN))
+            .all(|l| !l.contains(PASSWORD) && !contains_pin(l, PIN))
     );
     no_secrets_in_logs();
 }

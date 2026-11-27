@@ -477,9 +477,10 @@ async fn secrets_never_reach_the_binarys_log_even_at_debug_level() {
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .collect();
+    for (what, pin) in [("PIN", PIN), ("wrong PIN", "975310")] {
+        assert!(!contains_pin(&log, pin), "{what} is in the log:\n{log}");
+    }
     for (what, secret) in [
-        ("PIN", PIN),
-        ("wrong PIN", "975310"),
         ("pairing code", code.code.as_str()),
         ("pairing code digits", code_digits.as_str()),
         ("token", token.as_str()),
