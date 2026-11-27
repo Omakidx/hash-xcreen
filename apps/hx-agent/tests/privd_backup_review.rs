@@ -293,7 +293,10 @@ async fn a_snapshot_the_worker_read_and_wrote_back_is_not_recorded() {
     let h = rig.runner.start(rig.backup_request()).await.unwrap();
     assert!(rig.outcome(&h).await.result.is_ok());
     assert_eq!(rig.runner.completed("main").unwrap().backups.len(), 0);
-    assert!(rig.audit().contains("listed or read before the job wrote it"));
+    assert!(
+        rig.audit()
+            .contains("listed or read before the job wrote it")
+    );
     // An honest backup is still recorded.
     rig.worker(snapshot_result);
     let h = rig.runner.start(rig.backup_request()).await.unwrap();

@@ -900,4 +900,64 @@ mod tests {
         );
         assert_eq!(q.ctl_bytes(), 1);
     }
+
+    #[test]
+    fn an_old_writer_that_pops_close_after_the_reconnect_does_not_close_the_new_queue() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let q = OutQueue::new();
+        let old_gen = q.generation();
+        q.push_ctl(Out::Close).unwrap();
+        let (tx, _rx) = mpsc::channel(4);
+        let at_pop = Arc::new(std::sync::Barrier::new(2));
+        let go = Arc::new(std::sync::Barrier::new(2));
+        let (q2, at2, go2) = (q.clone(), at_pop.clone(), go.clone());
+        let old = std::thread::spawn(move || {
+            writer_loop(a, q2, tx, old_gen, &|| {
+                at2.wait(); // popped the Close, about to act on it
+                go2.wait();
+            });
+        });
+        at_pop.wait();
+        q.close();
+        q.reopen();
+        q.push_ctl(Out::Msg(vec![1])).unwrap();
+        go.wait();
+        old.join().unwrap();
+        assert!(!q.is_closed(), "the old Close closed the new queue");
+        assert_eq!(q.ctl_bytes(), 1);
+    }
+
+    #[test]
+    fn an_old_writer_does_not_touch_the_data_counters_of_the_new_queue() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let q = OutQueue::new();
+        let old_gen = q.generation();
+        let frame = |n: usize| Out::Data {
+            header: [0; DATA_FRAME_HEADER_LEN],
+            payload: Bytes::from(vec![7u8; n]),
+            _permit: None,
+        };
+        assert!(q.push_data(frame(3), 3));
+        let (tx, _rx) = mpsc::channel(4);
+        let at_pop = Arc::new(std::sync::Barrier::new(2));
+        let go = Arc::new(std::sync::Barrier::new(2));
+        let (q2, at2, go2) = (q.clone(), at_pop.clone(), go.clone());
+        let old = std::thread::spawn(move || {
+            writer_loop(a, q2, tx, old_gen, &|| {
+                at2.wait(); // popped its frame, about to write it
+                go2.wait();
+            });
+        });
+        at_pop.wait();
+        q.close();
+        q.reopen();
+        assert!(q.push_data(frame(5), 5));
+        go.wait();
+        old.join().unwrap();
+        assert_eq!(
+            q.data_bytes(),
+            5,
+            "the old writer took its 3 bytes off the new queue's counter"
+        );
+    }
 }
