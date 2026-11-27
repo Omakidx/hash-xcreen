@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gateway_common::setup::*;
-use gateway_common::{PIN, new_key, within};
+use gateway_common::{PIN, contains_pin, new_key, within};
 use hx_agent::privd::clock::Clock as _;
 use hx_crypto::server_admin::ServerAdmin;
 use hx_crypto::setup::Password;
@@ -90,8 +90,42 @@ fn pwcheck(e: &SetupEnv, exit: i32) {
 
 fn no_secrets_in_logs() {
     let logs = captured_logs();
-    for secret in [PIN, NEW_PIN, PASSWORD, NEW_PASSWORD] {
-        assert!(!logs.contains(secret), "a secret reached a log line");
+    for pin in [PIN, NEW_PIN] {
+        assert!(!contains_pin(&logs, pin), "a PIN reached a log line");
+    }
+    for password in [PASSWORD, NEW_PASSWORD] {
+        assert!(!logs.contains(password), "a password reached a log line");
+    }
+}
+
+/// The PIN check of the "no secret in any log line" assertions: the PIN's digits inside a
+/// longer value (a timestamp, a duration, a hex id) are chance, the PIN as a value is a leak.
+#[test]
+fn the_pin_check_ignores_chance_digits_and_catches_a_real_leak() {
+    for chance in [
+        // The microsecond field of a tracing timestamp.
+        "2026-11-27T10:46:34.135790Z DEBUG hx_agent::gateway::admin: admin request",
+        // The fraction of a duration, the hex of a key or a device id, a longer number.
+        "took 1.135790ms",
+        "key=e2d0135790f8 intent=Pair",
+        "device=135790dce237",
+        "device=5da471f5ff9bc3fc7d420d5135790a",
+        "pid=1357901 port=1135790",
+        "1357.135790",
+    ] {
+        assert!(!contains_pin(chance, NEW_PIN), "a false positive: {chance}");
+    }
+    for leak in [
+        "pin=135790",
+        "pin: \"135790\"",
+        "Pin(135790) rejected",
+        "the new PIN is 135790.",
+        "135790",
+        // A real leak still counts on a line that also has a chance match.
+        "2026-11-27T10:46:34.135790Z DEBUG change pin new=135790",
+        "\n135790\n",
+    ] {
+        assert!(contains_pin(leak, NEW_PIN), "a missed leak: {leak}");
     }
 }
 
@@ -199,7 +233,7 @@ async fn changing_the_pin_checks_the_current_one_stores_the_new_one_and_audits()
         e.h.audit
             .lines()
             .iter()
-            .all(|l| !l.contains(PIN) && !l.contains(NEW_PIN))
+            .all(|l| !contains_pin(l, PIN) && !contains_pin(l, NEW_PIN))
     );
     no_secrets_in_logs();
 }
