@@ -1654,11 +1654,12 @@ async fn a_destroy_clears_the_blocked_entry_so_a_desktop_created_again_is_not_re
     rig.outcome(&h).await;
 }
 
-// ----- S-R2: the snapshot-id set is bounded and fails closed ------------------------------------------------------------
+// ----- S-R2, F1: the snapshot-id set is bounded and does not fail closed ---------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn past_the_cap_of_noted_snapshot_ids_a_snapshot_write_is_not_recorded() {
-    for (listed, recorded) in [(100usize, 1usize), (5_000, 0)] {
+async fn past_the_cap_of_noted_snapshot_ids_backups_are_still_recorded_and_the_cap_is_audited_once()
+{
+    for (listed, said_expected) in [(100usize, 0usize), (5_000, 1)] {
         let rig = Rig::ready().await;
         rig.drive.knobs.lock().unwrap().synthetic_snapshot_entries = listed;
         rig.worker(|w| {
@@ -1672,16 +1673,85 @@ async fn past_the_cap_of_noted_snapshot_ids_a_snapshot_write_is_not_recorded() {
         assert!(rig.outcome(&h).await.result.is_ok(), "{}", rig.audit());
         assert_eq!(
             rig.runner.completed("main").unwrap().backups.len(),
-            recorded,
-            "{listed} ids listed\n{}",
+            1,
+            "{listed} ids listed: the backup must be recorded\n{}",
             rig.audit()
         );
         let said = rig
             .env
             .audit_log()
             .iter()
-            .filter(|l| l.contains("snapshot ids were listed or read; later snapshot writes"))
+            .filter(|l| l.contains("snapshot ids were listed or read; privd notes no more"))
             .count();
-        assert_eq!(said, 1 - recorded, "audited once when it failed closed");
+        assert_eq!(said, said_expected, "{listed} ids listed");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_id_noted_before_the_cap_is_still_not_recorded_when_it_is_written_back() {
+    let rig = Rig::ready().await;
+    let x = body(300, 4);
+    let xid = sha(&x);
+    // In the store, so it is listed first: noted long before the 4 096th id.
+    rig.drive.put(T::Snapshot, &xid, &x);
+    rig.drive.knobs.lock().unwrap().synthetic_snapshot_entries = 5_000;
+    let x2 = x.clone();
+    rig.worker(move |w| {
+        let Reply::List(v) = w.list(T::Snapshot) else {
+            panic!("not a listing")
+        };
+        assert!(v.len() > 4_096);
+        assert_eq!(w.write(T::Snapshot, &xid, &x2), Reply::Done);
+        w.finish_ok(pb::JobResult {
+            snapshot_id: Bytes::copy_from_slice(&xid),
+            ..Default::default()
+        });
+    });
+    let h = rig.runner.start(rig.backup_request()).await.unwrap();
+    assert!(rig.outcome(&h).await.result.is_ok(), "{}", rig.audit());
+    assert_eq!(rig.runner.completed("main").unwrap().backups.len(), 0);
+    assert!(
+        rig.audit()
+            .contains("listed or read before the job wrote it")
+    );
+}
+
+// ----- F3: a record that names a missing target keeps the real kept target ------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leftover_record_naming_a_missing_target_does_not_delete_the_real_kept_one() {
+    let rig = Rig::ready().await;
+    let real = "hx-restore-aaaa";
+    rig.host.add_target(real, Some(job(3)));
+    write_resume(&rig, "main", job(3), real);
+    // A leftover job.json of a resumable restore whose target is gone.
+    write_job_record(
+        &rig,
+        "main",
+        JobKind::Restore,
+        job(9),
+        Some("hx-restore-gone"),
+        true,
+        None,
+    );
+    rig.worker(snapshot_result);
+    // The admission cleans the leftover record first.
+    let h = rig.runner.start(rig.backup_request()).await.unwrap();
+    assert!(rig.outcome(&h).await.result.is_ok(), "{}", rig.audit());
+    assert_eq!(
+        rig.host.targets(),
+        vec![real.to_string()],
+        "the real target was deleted"
+    );
+    assert!(
+        !rig.host
+            .log()
+            .iter()
+            .any(|l| l.starts_with("delete_restore_target")),
+        "{:?}",
+        rig.host.log()
+    );
+    let kept = rig.runner.resume_point("main").unwrap().unwrap();
+    assert_eq!(kept.target, real, "resume.json must keep the real target");
+    assert_eq!(kept.job_id, job(3).hex());
 }

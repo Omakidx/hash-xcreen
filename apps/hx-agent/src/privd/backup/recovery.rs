@@ -394,13 +394,39 @@ impl<H: BackupHost, E: BackupEnv> Recovery<'_, H, E> {
             && let Ok(name) = RestoreTargetName::new(t)
         {
             if record.resumable {
-                kept.push(t.clone());
-                rep.targets_kept.push(t.clone());
+                // Kept only if it exists: a record that names a missing target must not make
+                // `drop_older_kept` delete the real kept target of `resume.json`.
+                match self.host.restore_target_exists(t).await {
+                    Ok(true) => {
+                        kept.push(t.clone());
+                        rep.targets_kept.push(t.clone());
+                    }
+                    Ok(false) => {}
+                    Err(e) => self.fail(&mut rep, format!("cannot look for target {t}: {e}")),
+                }
             } else {
                 match self.host.delete_restore_target(&name, record.job()).await {
                     Ok(_) => rep.targets_deleted.push(t.clone()),
                     Err(e) => self.fail(&mut rep, format!("cannot delete target {t}: {e}")),
                 }
+            }
+        }
+        // The target that `resume.json` already keeps stays kept, if it exists.
+        if rep.complete
+            && let Ok(rp) = self.dirs.resume_path(desktop)
+            && let Ok(Some(r)) = ResumeRecord::load(&rp)
+            && !kept.contains(&r.target)
+        {
+            match self.host.restore_target_exists(&r.target).await {
+                Ok(true) => {
+                    kept.push(r.target.clone());
+                    rep.targets_kept.push(r.target.clone());
+                }
+                Ok(false) => {}
+                Err(e) => self.fail(
+                    &mut rep,
+                    format!("cannot look for target {}: {e}", r.target),
+                ),
             }
         }
         if rep.complete {

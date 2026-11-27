@@ -180,10 +180,9 @@ pub struct Session<E: BackupEnv> {
     open_life: Option<u64>,
     seen_snapshots: std::collections::HashSet<[u8; 32]>,
     preexisting_snapshots: std::collections::HashSet<[u8; 32]>,
-    /// More ids were listed or read than `MAX_SEEN_SNAPSHOTS`: privd no longer knows which it saw.
+    /// The cap was reached (audited once): privd's own check is best-effort from there on, the
+    /// Drive helper's create-only rule is the control (ipc.md section 29).
     seen_overflow: bool,
-    /// A `SNAPSHOT` write came after that: the job's snapshot counts as pre-existing.
-    snapshots_untrusted: bool,
     permission_answers: u32,
     pub(super) open_repo_answer: Option<pb::repo_response::Result>,
     on_backup_ok: Option<BackupHook>,
@@ -252,7 +251,6 @@ impl<E: BackupEnv> Session<E> {
             seen_snapshots: std::collections::HashSet::new(),
             preexisting_snapshots: std::collections::HashSet::new(),
             seen_overflow: false,
-            snapshots_untrusted: false,
             permission_answers: 0,
             open_repo_answer: None,
             on_backup_ok: None,
@@ -298,8 +296,10 @@ impl<E: BackupEnv> Session<E> {
 
     fn note_snapshot(&mut self, id: &[u8]) {
         // Bounded (ipc.md section 25): the worker controls what is listed, so the set holds at
-        // most `MAX_SEEN_SNAPSHOTS` ids. Past that privd fails closed (section 29): it can no
-        // longer tell which ids it saw, so a later `SNAPSHOT` write counts as pre-existing.
+        // most `MAX_SEEN_SNAPSHOTS` ids. Past that privd stops noting new ids and audits it once
+        // (section 29): its own check is best-effort, and what keeps a worker from adopting an
+        // existing snapshot is the Drive helper's create-only rule. It does not fail closed:
+        // that would stop every backup from being recorded for good.
         let Ok(id) = <[u8; 32]>::try_from(id) else {
             return;
         };
@@ -308,8 +308,12 @@ impl<E: BackupEnv> Session<E> {
         }
         if self.seen_snapshots.len() < MAX_SEEN_SNAPSHOTS {
             self.seen_snapshots.insert(id);
-        } else {
+        } else if !self.seen_overflow {
             self.seen_overflow = true;
+            self.env.audit(&format!(
+                "backup job {}: more than {MAX_SEEN_SNAPSHOTS} snapshot ids were listed or read; privd notes no more of them (the Drive helper's create-only rule still applies)",
+                self.job_hex
+            ));
         }
     }
 
@@ -334,6 +338,11 @@ impl<E: BackupEnv> Session<E> {
         {
             self.first_err = Some(class);
         }
+    }
+
+    /// Object bytes relayed in both directions so far.
+    pub fn transfer_bytes(&self) -> u64 {
+        self.mapper.current().transfer_bytes
     }
 
     /// The most control bytes either link's queue has held at once.
@@ -726,9 +735,8 @@ impl<E: BackupEnv> Session<E> {
             && self.kind == JobKind::Backup
             && let Some(h) = &self.on_backup_ok
         {
-            let existed = self.snapshots_untrusted
-                || <[u8; 32]>::try_from(r.snapshot_id.as_ref())
-                    .is_ok_and(|id| self.preexisting_snapshots.contains(&id));
+            let existed = <[u8; 32]>::try_from(r.snapshot_id.as_ref())
+                .is_ok_and(|id| self.preexisting_snapshots.contains(&id));
             h(&r, existed);
         }
         self.result = Some(r);
@@ -858,18 +866,9 @@ impl<E: BackupEnv> Session<E> {
         if let Op::Write(w) = &op
             && w.object_type == ObjectType::Snapshot as i32
             && let Ok(id) = <[u8; 32]>::try_from(w.id.as_ref())
+            && self.seen_snapshots.contains(&id)
         {
-            if self.seen_overflow {
-                if !self.snapshots_untrusted {
-                    self.snapshots_untrusted = true;
-                    self.env.audit(&format!(
-                        "backup job {}: more than {MAX_SEEN_SNAPSHOTS} snapshot ids were listed or read; later snapshot writes are not recorded",
-                        self.job_hex
-                    ));
-                }
-            } else if self.seen_snapshots.contains(&id) {
-                self.preexisting_snapshots.insert(id);
-            }
+            self.preexisting_snapshots.insert(id);
         }
         let f = frame(pb::repo_frame::Frame::Request(pb::RepoRequest {
             req_id: d_id,

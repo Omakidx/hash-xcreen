@@ -176,6 +176,7 @@ impl JobHandle {
                     result: Err(Failure::Internal("the job task ended".into())),
                     permission_answers: 0,
                     peak_ctl_bytes: 0,
+                    transfer_bytes: 0,
                 });
             }
         }
@@ -400,21 +401,25 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
             rep.targets_kept.len(),
             rep.records_cleared.len()
         );
-        self.settle(failures, rep.complete, rep.blocked.clone(), &summary);
+        {
+            let mut st = lock(&i.recovery);
+            st.done = rep.complete;
+            st.blocked = rep.blocked.clone();
+            self.settle(&mut st, failures, &summary);
+        }
         rep
     }
 
-    /// Records a recovery run: the state, and the audit lines (a line per change of the failures,
-    /// a count per repeat).
+    /// Records a recovery run in `st` (the caller holds the lock and has updated `done` and
+    /// `blocked`): the counters, and the audit lines (a line per change of the failures, a count
+    /// per repeat).
     fn settle(
         &self,
+        st: &mut RecoveryState,
         failures: std::collections::BTreeSet<String>,
-        done: bool,
-        blocked: std::collections::BTreeMap<String, String>,
         summary: &str,
     ) {
         let i = &self.inner;
-        let mut st = lock(&i.recovery);
         st.attempts += 1;
         st.changed = failures != st.failures;
         if st.changed {
@@ -439,8 +444,6 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
             ));
         }
         st.failures = failures;
-        st.done = done;
-        st.blocked = blocked;
     }
 
     /// The cleanup of one blocked desktop, the caller holding its slot: `None` when it is clean
@@ -463,26 +466,26 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
     }
 
     /// Applies the results of retries (`Ok` clears the desktop, `Err` keeps it blocked with the
-    /// new reason) to the state.
+    /// new reason) to the state. Each result is applied to **its own desktop's key, under the
+    /// one lock guard that also settles the counters**: a loop retry and an admission retry of
+    /// different desktops run concurrently, and a read, release and whole-map write-back would
+    /// let one overwrite the other's result.
     fn apply_retries(&self, results: Vec<(String, Result<RecoveryReport, String>)>, summary: &str) {
         let i = &self.inner;
-        let (mut blocked, done) = {
-            let st = lock(&i.recovery);
-            (st.blocked.clone(), st.done)
-        };
+        let mut st = lock(&i.recovery);
         for (d, r) in results {
             match r {
                 Ok(_) => {
-                    blocked.remove(&d);
+                    st.blocked.remove(&d);
                     lock(&i.retried_at).remove(&d);
                 }
                 Err(why) => {
-                    blocked.insert(d, why);
+                    st.blocked.insert(d, why);
                 }
             }
         }
-        let failures = blocked.values().cloned().collect();
-        self.settle(failures, done, blocked, summary);
+        let failures = st.blocked.values().cloned().collect();
+        self.settle(&mut st, failures, summary);
     }
 
     /// The later retries of crash recovery: every blocked desktop whose slot is free, one at a
@@ -1336,6 +1339,7 @@ impl<H: BackupHost, E: BackupEnv> JobTask<H, E> {
             }
         }
         let peak_ctl_bytes = s.peak_ctl_bytes();
+        let transfer_bytes = s.transfer_bytes();
         drop(guard);
         drop(reserved);
         JobOutcome {
@@ -1348,6 +1352,7 @@ impl<H: BackupHost, E: BackupEnv> JobTask<H, E> {
             }),
             permission_answers,
             peak_ctl_bytes,
+            transfer_bytes,
         }
     }
 }

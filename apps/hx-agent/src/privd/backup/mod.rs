@@ -294,6 +294,9 @@ pub struct JobOutcome {
     /// The most control bytes that were ever queued at once on either link of the job (the
     /// bound of ipc.md section 25 is observable).
     pub peak_ctl_bytes: usize,
+    /// Object bytes privd relayed in both directions in the job (what the progress frames
+    /// report as `transfer_bytes`, final).
+    pub transfer_bytes: u64,
 }
 
 /// Where a job is.

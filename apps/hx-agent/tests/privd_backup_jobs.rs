@@ -77,6 +77,10 @@ async fn a_full_backup_round_trip() {
         .as_ref()
         .unwrap_or_else(|e| panic!("{e:?}\n{}", rig.audit()));
     let snap_id = ok.result.snapshot_id.to_vec();
+    // privd's own count of the object bytes it relayed, both directions, exactly what the fake
+    // peers moved: the pack (1 500 000), the index (300) and the snapshot (500) up, the pack
+    // (1 500 000) down.
+    assert_eq!(out.transfer_bytes, 3_000_800);
     assert_eq!(h.status().state, JobState::Finished);
 
     // The repository got the objects, each under its own hash.
