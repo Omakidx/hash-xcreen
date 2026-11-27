@@ -647,6 +647,7 @@ fn connection_frames_round_trip_in_their_direction_only() {
             step: "launch".into(),
             percent: 255,
             ok: true,
+            ..Default::default()
         }),
     ];
     for v in to_client {
@@ -709,6 +710,8 @@ fn schema_enums_cover_the_contract_names() {
         "PASSWORD_LOCKED",
         "UPDATE_ROLLED_BACK",
         "HOST_DOCKER_FORWARDING",
+        "DRIVE_RECONNECT",
+        "BACKUP_TAKEN_OVER",
     ] {
         assert!(
             pb::NeedsAttention::from_str_name(&format!("NEEDS_ATTENTION_{n}")).is_some(),

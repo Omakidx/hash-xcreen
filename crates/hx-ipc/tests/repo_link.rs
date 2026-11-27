@@ -314,6 +314,7 @@ fn the_drive_link_has_no_job_progress_result_or_cancel() {
     let ev = frame(F::Event(pb::Event {
         kind: 1,
         until_ms: 0,
+        error_class: 0,
     }));
     let mut p = Pair::drive().open(JobKind::Check);
     p.msg(Who::Other, ev.clone()).unwrap();
@@ -329,7 +330,8 @@ fn the_drive_link_has_no_job_progress_result_or_cancel() {
             Who::Other,
             frame(F::Event(pb::Event {
                 kind: 1,
-                until_ms: 0
+                until_ms: 0,
+                error_class: 0,
             }))
         )
         .is_err()

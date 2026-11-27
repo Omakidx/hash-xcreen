@@ -256,6 +256,7 @@ async fn hostile_docker_progress_and_container_output_are_scrubbed() {
                         step: EVIL.into(),
                         percent: 40,
                         ok: false,
+                        ..Default::default()
                     }],
                     result: R::EnableDocker(pb::EnableDockerResult {
                         outcome: Some(pb::DockerOutcome {

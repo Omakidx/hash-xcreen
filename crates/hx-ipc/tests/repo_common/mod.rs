@@ -382,6 +382,7 @@ pub fn every_frame() -> Vec<(String, pb::RepoFrame, Vec<Endpoint>)> {
         frame(F::Event(pb::Event {
             kind: pb::EventKind::PausedDailyLimit as i32,
             until_ms: 1_764_000_000_000,
+            error_class: 0,
         })),
         vec![PrivdDriveLink],
     ));

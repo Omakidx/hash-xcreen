@@ -103,6 +103,9 @@ enum EventKind {
   EVENT_KIND_PAUSED_DAILY_LIMIT = 1;
   EVENT_KIND_RESUMED = 2;
   EVENT_KIND_RETRYING = 3;
+  // The helper is about to close the link because a download failed after ReadBegin; error_class
+  // says why (section 29, v0.8). Sent before the close.
+  EVENT_KIND_SESSION_FAILED = 4;
 }
 
 // Section 34.
@@ -425,4 +428,7 @@ message Event {
   EventKind kind = 1;
   // Unix time in milliseconds, 0 = unknown.
   uint64 until_ms = 2;
+  // Set exactly for SESSION_FAILED: never UNSPECIFIED and never one of privd's own classes
+  // (POLICY_DENIED, INTEGRITY, TOO_LARGE, UNAVAILABLE); 0 for every other kind.
+  ErrorClass error_class = 3;
 }

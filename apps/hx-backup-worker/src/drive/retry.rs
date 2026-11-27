@@ -555,6 +555,7 @@ impl Retrier {
                 .send(pb::Event {
                     kind: kind as i32,
                     until_ms,
+                    error_class: 0,
                 })
                 .await;
         }
@@ -565,6 +566,7 @@ impl Retrier {
             let _ = tx.try_send(pb::Event {
                 kind: pb::EventKind::Retrying as i32,
                 until_ms: unix_ms(delay),
+                error_class: 0,
             });
         }
     }
@@ -603,6 +605,7 @@ impl Retrier {
                 let _ = tx.try_send(pb::Event {
                     kind: pb::EventKind::Resumed as i32,
                     until_ms: 0,
+                    error_class: 0,
                 });
             }
         })

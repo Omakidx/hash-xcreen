@@ -652,6 +652,47 @@ fn a_failed_download_ends_the_link_between_frames_not_inside_one() {
         end, "closed",
         "privd's decoder must end at a frame boundary, not inside a frame"
     );
+    // W5-2 (ipc.md section 29, v0.8): the class of the failure reached privd, as an event that
+    // came before the end of the stream.
+    let failed: Vec<_> = s
+        .env
+        .events
+        .iter()
+        .filter(|e| e.kind == pb::EventKind::SessionFailed as i32)
+        .collect();
+    assert_eq!(failed.len(), 1, "one SESSION_FAILED before the close");
+    assert_eq!(failed[0].error_class, EC::Permission as i32);
+}
+
+#[test]
+fn a_revoked_token_in_the_middle_of_a_download_reaches_privd_as_a_session_failure() {
+    let rig = Rig::new();
+    let mut s = rig.open_session();
+    s.env.create().ok();
+    rig.fake.with(|m| {
+        m.put(&path_of(T::Pack, &id(0x40)), &data(12 * MIB, 3));
+        m.inject(Fault {
+            category: "get.media",
+            skip: 1,
+            times: 1000,
+            action: Action::Status {
+                status: 401,
+                reason: "authError",
+                retry_after: None,
+            },
+        });
+    });
+    read_full_req(&mut s, T::Pack, &id(0x40));
+    std::thread::sleep(Duration::from_millis(1500));
+    while s.env.pump().is_ok() {}
+    let classes: Vec<i32> = s
+        .env
+        .events
+        .iter()
+        .filter(|e| e.kind == pb::EventKind::SessionFailed as i32)
+        .map(|e| e.error_class)
+        .collect();
+    assert_eq!(classes, [EC::AuthRevoked as i32]);
 }
 
 // ---- N2: the deadline does not run while the cap holds an upload back, or after ReadBegin ----

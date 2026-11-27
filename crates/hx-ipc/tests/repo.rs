@@ -735,12 +735,75 @@ fn drive_only_operations() {
     );
     bad(&frame(F::CancelRequest(pb::CancelRequest { req_id: 0 })), d);
     ok(&frame(F::CancelRequest(pb::CancelRequest { req_id: 1 })), d);
-    for kind in [0, 4, 99] {
+    for kind in [0, 5, 99] {
         bad(
-            &frame(F::Event(pb::Event { kind, until_ms: 0 })),
+            &frame(F::Event(pb::Event {
+                kind,
+                until_ms: 0,
+                error_class: 0,
+            })),
             Endpoint::PrivdDriveLink,
         );
     }
+    // SESSION_FAILED (ipc.md section 29, v0.8): a class of the Drive helper is required, and
+    // only SESSION_FAILED may carry one.
+    use pb::ErrorClass as C;
+    let ev = |kind: pb::EventKind, class: C| {
+        frame(F::Event(pb::Event {
+            kind: kind as i32,
+            until_ms: 0,
+            error_class: class as i32,
+        }))
+    };
+    let to = Endpoint::PrivdDriveLink;
+    for good in [
+        C::NotFound,
+        C::Transient,
+        C::RateLimited,
+        C::DailyLimit,
+        C::QuotaExceeded,
+        C::AuthRevoked,
+        C::Permission,
+        C::LeaseHeld,
+        C::Cancelled,
+        C::Internal,
+    ] {
+        ok(&ev(pb::EventKind::SessionFailed, good), to);
+    }
+    for refused in [
+        C::Unspecified,
+        C::PolicyDenied,
+        C::Integrity,
+        C::TooLarge,
+        C::Unavailable,
+    ] {
+        bad(&ev(pb::EventKind::SessionFailed, refused), to);
+    }
+    bad(
+        &frame(F::Event(pb::Event {
+            kind: pb::EventKind::SessionFailed as i32,
+            until_ms: 0,
+            error_class: 99,
+        })),
+        to,
+    );
+    for kind in [
+        pb::EventKind::PausedDailyLimit,
+        pb::EventKind::Resumed,
+        pb::EventKind::Retrying,
+    ] {
+        ok(&ev(kind, C::Unspecified), to);
+        bad(&ev(kind, C::AuthRevoked), to);
+    }
+    // Drive helper to privd only, like every event.
+    bad(
+        &ev(pb::EventKind::SessionFailed, C::AuthRevoked),
+        Endpoint::DriveHelper,
+    );
+    bad(
+        &ev(pb::EventKind::SessionFailed, C::AuthRevoked),
+        Endpoint::Worker,
+    );
 }
 
 #[test]
@@ -1290,6 +1353,7 @@ fn retry_after_is_at_most_a_day_and_text_rules_refuse_format_characters() {
         &frame(F::Event(pb::Event {
             kind: 1,
             until_ms: u64::MAX,
+            error_class: 0,
         })),
         Endpoint::PrivdDriveLink,
     );

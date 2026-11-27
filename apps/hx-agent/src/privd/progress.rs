@@ -94,6 +94,7 @@ impl ProgressSender {
             step: sanitize_text(step, hx_ipc::privd::MAX_PROGRESS_STEP_LEN),
             percent: if percent <= 100 { percent } else { 255 },
             ok,
+            ..Default::default()
         };
         if let Ok(mut q) = self.queue.q.lock() {
             if q.len() >= MAX_QUEUED {
