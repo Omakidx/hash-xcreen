@@ -706,4 +706,82 @@ mod tests {
         assert!(!q.wait_below(SINK_LIMIT, Duration::from_millis(5)));
         assert_eq!(q.data_frames(), MAX_DATA_FRAMES);
     }
+
+    fn parts(budget: Arc<Semaphore>, mono: Arc<super::super::clock::ManualMono>) -> LinkParts {
+        LinkParts {
+            budget,
+            handle: Handle::current(),
+            mono,
+            ping_interval: Duration::from_secs(15),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ping_flood_on_a_link_queues_nothing() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let mono = Arc::new(super::super::clock::ManualMono::new());
+        let p = parts(Arc::new(Semaphore::new(4)), mono);
+        let mut link = Link::spawn(
+            "worker",
+            a,
+            Endpoint::PrivdWorkerLink,
+            OutQueue::new(),
+            OutQueue::new(),
+            &p,
+        )
+        .unwrap();
+        link.send(&frame(pb::repo_frame::Frame::Hello(pb::Hello {
+            major: repo::VERSION_MAJOR,
+            minor: 0,
+            job_id: Bytes::from(vec![1u8; 16]),
+        })))
+        .unwrap();
+        // The peer never reads: 100 000 pongs are still only one pending frame.
+        for n in 0..100_000u64 {
+            link.pong(n).expect("a pong is never refused");
+        }
+        assert_eq!(link.q.ctl_bytes(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reader_that_is_held_back_keeps_the_silence_clock_of_its_link_fresh() {
+        // Held back by the other link's queue (4 data frames), and by an empty budget.
+        for starve_budget in [false, true] {
+            let (a, _b) = UnixStream::pair().unwrap();
+            let mono = Arc::new(super::super::clock::ManualMono::new());
+            let other = OutQueue::new();
+            let budget = Arc::new(Semaphore::new(if starve_budget { 0 } else { 4 }));
+            if !starve_budget {
+                for _ in 0..MAX_DATA_FRAMES {
+                    other.push_data(
+                        Out::Data {
+                            header: [0; DATA_FRAME_HEADER_LEN],
+                            payload: Bytes::from_static(b"x"),
+                            _permit: None,
+                        },
+                        1,
+                    );
+                }
+            }
+            let start = mono.now_ms();
+            let link = Link::spawn(
+                "drive",
+                a,
+                Endpoint::PrivdDriveLink,
+                OutQueue::new(),
+                other,
+                &parts(budget, mono.clone()),
+            )
+            .unwrap();
+            mono.advance_ms(10_000);
+            let t = std::time::Instant::now();
+            while link.last_rx.load(Ordering::SeqCst) < start + 10_000 {
+                assert!(
+                    t.elapsed() < Duration::from_secs(5),
+                    "starve_budget={starve_budget}: the clock of a held-back reader went stale"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
 }
