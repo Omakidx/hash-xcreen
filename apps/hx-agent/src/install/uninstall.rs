@@ -571,9 +571,6 @@ pub fn run(
                         // The image fetcher's tmpfs under /var/lib/hx (1D): still mounted, it
                         // makes U5's removal of /var/lib/hx fail with "resource busy".
                         "var-lib-hx-imagein.mount",
-                        // The Drive helper: stopped and disabled, so that nothing starts it again.
-                        "hx-drive.socket",
-                        "hx-drive.service",
                     ];
                     if !keep_desktop {
                         units.extend_from_slice(FIREWALL_UNITS);
@@ -585,6 +582,13 @@ pub fn run(
                         )
                         .timeout_secs(120),
                     );
+                    // The Drive helper in a call of its own: on an install from before it existed
+                    // the unit files are missing, `disable` of a missing unit can fail, and that
+                    // must not take the privd set above with it (it runs first and alone).
+                    let _ = d.runner.run(&Call::new(
+                        Tool::Systemctl,
+                        &["disable", "--now", "hx-drive.socket", "hx-drive.service"],
+                    ));
                     let _ = d.runner.run(&Call::new(
                         Tool::Systemctl,
                         &[

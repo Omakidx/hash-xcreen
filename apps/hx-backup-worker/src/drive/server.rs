@@ -63,7 +63,12 @@ enum Out {
         end: bool,
         payload: Bytes,
     },
+    /// Close the link. Only the writer closes it, between two frames (ipc.md §29, §32).
+    Close,
 }
+
+/// The largest `Write` of a `PACK` or an `INDEX` the helper buffers (ipc.md §29, "Memory").
+const WRITE_CAP: u32 = 72 * 1024 * 1024;
 
 /// What a request task has to send at its end.
 enum Answer {
@@ -80,8 +85,6 @@ struct Shared {
     out: mpsc::Sender<Out>,
     /// Replies of the reader: the writer empties this queue first.
     ctl: mpsc::UnboundedSender<Out>,
-    /// A clone of the link, to close it when a read fails after `ReadBegin`.
-    kill: UnixStream,
     /// The deadline of each request.
     budget: Duration,
     cancels: Mutex<HashMap<u64, CancelHandle>>,
@@ -308,8 +311,9 @@ impl Shared {
             pb::repo_response::Result::ReadBegin(pb::ReadBegin { size: rs.size() }),
         ))
         .await;
-        // Cancelling no longer applies; the deadline still does.
-        let go = Cancel::never_with_limit(cancel.budget().remaining());
+        // Cancelling no longer applies, and neither does the request's deadline: the request has
+        // been answered, and only the no-progress timer watches the rest.
+        let go = Cancel::never_with_limit(Duration::from_secs(u64::from(u32::MAX)));
         if size == 0 {
             self.send(Out::Data {
                 stream_id: req_id,
@@ -327,7 +331,8 @@ impl Shared {
                     eprintln!(
                         "hx-backup-worker: a download failed after ReadBegin: closing the link"
                     );
-                    let _ = self.kill.shutdown(std::net::Shutdown::Both);
+                    // The writer closes the link between two frames, so privd sees a clean end.
+                    let _ = self.ctl.send(Out::Close);
                     return Ok(Answer::Sent);
                 }
             };
@@ -383,6 +388,7 @@ fn write_out(
             let bytes = encode_message(&f, Endpoint::PrivdDriveLink).map_err(|_| "encode")?;
             stream.write_all(&bytes).map_err(|_| "write")
         }
+        Out::Close => Err("closed"),
         Out::Data {
             stream_id,
             end,
@@ -457,7 +463,7 @@ fn serve(
 ) -> (End, Option<std::thread::JoinHandle<bool>>) {
     let rate = Arc::new(UploadRate::new());
     let retrier = Arc::new(Retrier::new(cfg.timing));
-    let (out_tx, out_rx) = mpsc::channel::<Out>(16);
+    let (out_tx, out_rx) = mpsc::channel::<Out>(cfg.timing.out_queue);
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<Out>();
     let (ev_tx, mut ev_rx) = mpsc::channel::<pb::Event>(64);
     retrier.set_events(ev_tx);
@@ -468,10 +474,6 @@ fn serve(
         state: state.clone(),
         out: out_tx.clone(),
         ctl: ctl_tx,
-        kill: match stream.try_clone() {
-            Ok(k) => k,
-            Err(_) => return (End::Lost, None),
-        },
         budget: cfg.timing.request_budget,
         cancels: Mutex::new(HashMap::new()),
         drive,
@@ -507,6 +509,11 @@ fn serve(
                                 },
                             },
                         };
+                        if matches!(item, Out::Close) {
+                            // Between two frames: privd's decoder ends cleanly.
+                            let _ = wstream.shutdown(std::net::Shutdown::Both);
+                            return true;
+                        }
                         if let Err(rule) = write_out(&mut wstream, &state, item) {
                             eprintln!("hx-backup-worker: drive link write failed: {rule}");
                             let _ = wstream.shutdown(std::net::Shutdown::Both);
@@ -635,6 +642,18 @@ fn read_loop(handle: &Handle, stream: &UnixStream, shared: &Arc<Shared>, silence
                         let req_id = r.req_id;
                         let Some(op) = r.op else { continue };
                         if let pb::repo_request::Op::Write(w) = &op {
+                            let ty = object_type(w.object_type);
+                            if matches!(ty, pb::ObjectType::Pack | pb::ObjectType::Index)
+                                && w.size > WRITE_CAP
+                            {
+                                // Nothing of it is buffered: its data frames find no upload and
+                                // are dropped (ipc.md §29, "Memory").
+                                shared
+                                    .ctl
+                                    .send(error_response(req_id, DriveError::new(EC::Internal)))
+                                    .ok();
+                                continue;
+                            }
                             let (h, cancel) = Cancel::with_limit(shared.budget);
                             shared
                                 .cancels

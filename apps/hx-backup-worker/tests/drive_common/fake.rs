@@ -56,6 +56,10 @@ pub enum Action {
     /// Answer 200 with no `Content-Length` and this many body bytes, then close (a body of
     /// unknown length that is far longer than what was asked for).
     Unbounded(usize),
+    /// Like `Unbounded`, but with status 500 (an error body that never ends).
+    UnboundedError(usize),
+    /// Send the headers, wait this many milliseconds, then send the whole body.
+    SlowBody(u64),
     /// Send the headers and a little of the body, then keep the connection open (and read until
     /// the client closes it).
     StallBody,
@@ -879,7 +883,13 @@ async fn serve_conn(tcp: TcpStream, acceptor: TlsAcceptor, model: Arc<Mutex<Mode
             });
         };
         let mut truncate = false;
+        let mut slow: Option<u64> = None;
+        let action_kind = action.clone();
         let resp = match action {
+            Some(Action::SlowBody(ms)) => {
+                slow = Some(ms);
+                handle(&mut model.lock().unwrap(), &req)
+            }
             Some(Action::Hang) => {
                 note(&mut model.lock().unwrap());
                 tokio::time::sleep(Duration::from_secs(3600)).await;
@@ -897,12 +907,14 @@ async fn serve_conn(tcp: TcpStream, acceptor: TlsAcceptor, model: Arc<Mutex<Mode
                 while matches!(tls.read(&mut buf).await, Ok(n) if n > 0) {}
                 return;
             }
-            Some(Action::Unbounded(n)) => {
+            Some(Action::Unbounded(n) | Action::UnboundedError(n)) => {
                 note(&mut model.lock().unwrap());
-                let mut ok = tls
-                    .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
-                    .await
-                    .is_ok();
+                let head: &[u8] = if matches!(action_kind, Some(Action::UnboundedError(_))) {
+                    b"HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n"
+                } else {
+                    b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n"
+                };
+                let mut ok = tls.write_all(head).await.is_ok();
                 let block = vec![0u8; 64 * 1024];
                 let mut left = n;
                 while ok && left > 0 {
@@ -954,6 +966,12 @@ async fn serve_conn(tcp: TcpStream, acceptor: TlsAcceptor, model: Arc<Mutex<Mode
         }
         head.push_str("\r\n");
         let mut out = head.into_bytes();
+        if let Some(ms) = slow {
+            let _ = tls.write_all(&out).await;
+            let _ = tls.flush().await;
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            out = resp.body.clone();
+        }
         if truncate {
             out.extend_from_slice(&resp.body[..resp.body.len() / 2]);
             let _ = tls.write_all(&out).await;

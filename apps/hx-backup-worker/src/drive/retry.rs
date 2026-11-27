@@ -37,6 +37,8 @@ pub struct Observed {
 /// What one attempt shares with the HTTP layer: the last request's outcome, the time of the last
 /// progress (the no-progress timer), the ceiling of the next media body and the request count.
 pub(crate) struct AttemptState {
+    budget: Arc<Budget>,
+    probe: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     obs: Mutex<Option<Observed>>,
     last: Mutex<Instant>,
     body_limit: AtomicU64,
@@ -44,8 +46,10 @@ pub(crate) struct AttemptState {
 }
 
 impl AttemptState {
-    fn new() -> Self {
+    fn new(budget: Arc<Budget>) -> Self {
         Self {
+            budget,
+            probe: Mutex::new(None),
             obs: Mutex::new(None),
             last: Mutex::new(Instant::now()),
             body_limit: AtomicU64::new(0),
@@ -70,6 +74,22 @@ pub(crate) fn record(obs: Observed) {
 }
 
 impl AttemptState {
+    /// Time the attempt spent waiting for the upload cap: it is progress, and it does not count
+    /// against the request's deadline (ipc.md §29).
+    pub(crate) fn paced(&self, d: Duration) {
+        self.budget.add_paused(d);
+        self.touch();
+    }
+
+    /// The response is not `dailyLimitExceeded`: if this attempt is the probe after a pause, the
+    /// gate reopens now, not when the attempt ends.
+    pub(crate) fn not_limited(&self) {
+        let cb = self.probe.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(cb) = cb {
+            cb();
+        }
+    }
+
     /// Progress of the attempt: a request byte written, a response byte read, a header received, a
     /// chunk waiting for the upload cap. Resets the no-progress timer.
     pub(crate) fn touch(&self) {
@@ -248,6 +268,10 @@ pub struct Timing {
     pub max_list_entries: usize,
     /// HTTP requests of one attempt (4 096).
     pub max_requests: u32,
+    /// The read budget in KiB (32 MiB).
+    pub read_budget_kib: usize,
+    /// Frames in the outgoing data queue (16).
+    pub out_queue: usize,
 }
 
 impl Timing {
@@ -266,6 +290,8 @@ impl Timing {
             lease_cache: repo::LEASE_CACHE_MAX,
             max_list_entries: 100_000,
             max_requests: 4_096,
+            read_budget_kib: 32 * 1024,
+            out_queue: 16,
         }
     }
 
@@ -316,6 +342,10 @@ impl Budget {
     /// Time at the daily-limit gate does not count.
     fn add_paused(&self, d: Duration) {
         *self.paused.lock().unwrap_or_else(|e| e.into_inner()) += d;
+    }
+
+    fn paused(&self) -> Duration {
+        *self.paused.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// What is left of the request's own time.
@@ -440,12 +470,18 @@ impl Drop for ProbeGuard<'_> {
     }
 }
 
+/// The gate and what wakes its waiters.
+struct GateCell {
+    gate: Mutex<Gate>,
+    notify: tokio::sync::Notify,
+}
+
 /// Runs operations with the retry policy of §29. One per session: the daily-limit gate is shared
 /// by all the requests that use it.
 pub struct Retrier {
     timing: Timing,
     rng: Box<dyn Fn() -> f64 + Send + Sync>,
-    gate: Mutex<Gate>,
+    cell: Arc<GateCell>,
     events: Mutex<Option<mpsc::Sender<pb::Event>>>,
 }
 
@@ -484,7 +520,10 @@ impl Retrier {
         Self {
             timing,
             rng,
-            gate: Mutex::new(Gate::default()),
+            cell: Arc::new(GateCell {
+                gate: Mutex::new(Gate::default()),
+                notify: tokio::sync::Notify::new(),
+            }),
             events: Mutex::new(None),
         }
     }
@@ -528,15 +567,47 @@ impl Retrier {
     }
 
     fn release_probe(&self) {
-        self.gate.lock().unwrap_or_else(|e| e.into_inner()).probing = false;
+        self.cell
+            .gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .probing = false;
+        self.cell.notify.notify_waiters();
+    }
+
+    /// What the probe's attempt calls when its response is not `dailyLimitExceeded`.
+    fn reopen_callback(&self) -> Box<dyn FnOnce() + Send> {
+        let cell = self.cell.clone();
+        let sink = self.sink();
+        Box::new(move || {
+            let was = {
+                let mut g = cell.gate.lock().unwrap_or_else(|e| e.into_inner());
+                let was = g.pausing;
+                g.pausing = false;
+                g.probing = false;
+                was
+            };
+            cell.notify.notify_waiters();
+            if was && let Some(tx) = sink {
+                let _ = tx.try_send(pb::Event {
+                    kind: pb::EventKind::Resumed as i32,
+                    until_ms: 0,
+                });
+            }
+        })
     }
 
     /// Waits at the daily-limit gate. After a pause one request is let through as the probe; the
-    /// rest wait for its attempt to finish. An exhausted gate fails everyone without an attempt.
+    /// rest wait until it has a response that is not `dailyLimitExceeded`. An exhausted gate fails
+    /// everyone without an attempt.
     async fn enter_gate(&self, cancel: &Cancel) -> Result<Entry, DriveError> {
         loop {
+            // Registered before the state is read, so that a wake-up in between is not lost.
+            let notified = self.cell.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             let wait = {
-                let mut g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+                let mut g = self.cell.gate.lock().unwrap_or_else(|e| e.into_inner());
                 if g.exhausted {
                     return Ok(Entry::Exhausted);
                 }
@@ -544,7 +615,7 @@ impl Retrier {
                     Some(t) if t > Instant::now() => Some(t - Instant::now()),
                     _ if g.pausing => {
                         if g.probing {
-                            Some(Duration::from_millis(10))
+                            None
                         } else {
                             g.probing = true;
                             return Ok(Entry::Go { probe: true });
@@ -553,18 +624,23 @@ impl Retrier {
                     _ => return Ok(Entry::Go { probe: false }),
                 }
             };
-            if let Some(d) = wait {
-                let began = Instant::now();
-                cancel.guard(tokio::time::sleep(d)).await?;
-                cancel.budget.add_paused(began.elapsed());
+            let began = Instant::now();
+            match wait {
+                Some(d) => {
+                    cancel.guard(tokio::time::sleep(d)).await?;
+                }
+                None => {
+                    cancel.guard(notified).await?;
+                }
             }
+            cancel.budget.add_paused(began.elapsed());
         }
     }
 
     /// A request met `dailyLimitExceeded` in an attempt that began at `attempt_started`.
     async fn on_daily_limit(&self, attempt_started: Instant) -> Result<(), DriveError> {
         let until = {
-            let mut g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+            let mut g = self.cell.gate.lock().unwrap_or_else(|e| e.into_inner());
             if g.exhausted {
                 return Err(DriveError::new(EC::DailyLimit));
             }
@@ -579,6 +655,7 @@ impl Retrier {
             if g.pauses >= self.timing.max_pauses {
                 g.exhausted = true;
                 g.until = None;
+                self.cell.notify.notify_waiters();
                 return Err(DriveError::new(EC::DailyLimit));
             }
             g.pauses += 1;
@@ -586,6 +663,7 @@ impl Retrier {
             g.set_at = Some(now);
             g.pausing = true;
             g.probing = false;
+            self.cell.notify.notify_waiters();
             self.timing.daily_pause
         };
         self.emit(pb::EventKind::PausedDailyLimit, unix_ms(until))
@@ -595,11 +673,12 @@ impl Retrier {
 
     async fn note_success(&self) {
         let resume = {
-            let mut g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+            let mut g = self.cell.gate.lock().unwrap_or_else(|e| e.into_inner());
             let open = g.until.is_none_or(|u| u <= Instant::now());
             if g.pausing && open {
                 g.pausing = false;
                 g.probing = false;
+                self.cell.notify.notify_waiters();
                 true
             } else {
                 false
@@ -619,13 +698,17 @@ impl Retrier {
         attempt: impl Future<Output = T>,
     ) -> Option<T> {
         tokio::pin!(attempt);
-        let deadline = Instant::now() + remaining;
+        let started = Instant::now();
+        let paused0 = state.budget.paused();
         loop {
+            // The deadline moves out by the time the attempt spends waiting for the upload cap.
+            let deadline = started + remaining + state.budget.paused().saturating_sub(paused0);
             let wake = (state.last() + self.timing.idle).min(deadline);
             tokio::select! {
                 r = &mut attempt => return Some(r),
                 () = tokio::time::sleep_until(wake.into()) => {
                     let now = Instant::now();
+                    let deadline = started + remaining + state.budget.paused().saturating_sub(paused0);
                     if now >= deadline || now >= state.last() + self.timing.idle {
                         return None;
                     }
@@ -675,7 +758,11 @@ impl Retrier {
                 return Err(last);
             }
             let attempt_started = Instant::now();
-            let state = Arc::new(AttemptState::new());
+            let state = Arc::new(AttemptState::new(cancel.budget.clone()));
+            if probe.active {
+                *state.probe.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(self.reopen_callback());
+            }
             let attempt = ATTEMPT.scope(state.clone(), f());
             let result = cancel.guard(self.watch(&state, remaining, attempt)).await?;
             let outcome = match result {

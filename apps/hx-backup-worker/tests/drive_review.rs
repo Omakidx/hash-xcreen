@@ -36,7 +36,12 @@ fn open_fds() -> usize {
 
 #[test]
 fn reads_hold_their_memory_until_their_frames_are_queued() {
-    let rig = Rig::new();
+    // a budget of one chunk: ten readers cannot hold more than that between them, so a permit
+    // given back before the frames are queued lets them read ahead (about 40 MiB in all)
+    let rig = Rig::with(|c| {
+        c.timing.read_budget_kib = 4096;
+        c.timing.out_queue = 2;
+    });
     let mut s = rig.open_session();
     s.env.create().ok();
     // ten packs of 12 MiB; privd asks for all of them and reads nothing
@@ -50,16 +55,24 @@ fn reads_hold_their_memory_until_their_frames_are_queued() {
         .iter()
         .map(|i| read_full_req(&mut s, T::Pack, i))
         .collect();
-    std::thread::sleep(Duration::from_millis(2000));
-    let served = rig.fake.with(|m| m.media_bytes);
-    // the budget (32 MiB), the queue (16 MiB) and the socket: far less than the 120 MiB asked for
+    // wait until the fake has stopped serving: whatever was going to be read ahead has been
+    let mut served = 0;
+    for _ in 0..40 {
+        std::thread::sleep(Duration::from_millis(400));
+        let now = rig.fake.with(|m| m.media_bytes);
+        if now == served && now > 0 {
+            break;
+        }
+        served = now;
+    }
+    // the budget (4 MiB), a queue of two frames and the socket: far less than the 120 MiB asked for
     assert!(
-        served < 64 * MIB as u64,
+        served < 6 * MIB as u64,
         "{} MiB were read ahead of a link that reads nothing",
         served / MIB as u64
     );
     assert!(
-        served >= 8 * MIB as u64,
+        served >= 4 * MIB as u64,
         "the test did not start the reads: {served}"
     );
     // and nothing is lost: once privd reads, every download completes whole
@@ -463,16 +476,9 @@ fn when_the_pause_ends_one_request_probes_before_the_others_go() {
     for r in &reqs {
         assert!(matches!(s.env.wait(*r), Reply::Read(_)));
     }
-    let mut at: Vec<Instant> = rig.fake.with(|m| {
-        m.log
-            .iter()
-            .filter(|r| r.category == "get.media")
-            .map(|r| r.at)
-            .collect()
-    });
-    at.sort();
+    let at = pack_attempts(&rig, &ids);
     // four attempts before the pause, then the probe, then the other three after it
-    assert!(at.len() >= 8, "{}", at.len());
+    assert_eq!(at.len(), 8, "{at:?}");
     let probe = at[4];
     assert!(
         at[5].duration_since(probe) >= Duration::from_millis(100),
@@ -589,4 +595,180 @@ fn a_second_401_is_auth_revoked_and_invalid_grant_is_at_once() {
         m.inject(Fault::status("about", 1000, 401, "authError"));
     });
     assert_eq!(s.env.quota().class(), Some(EC::AuthRevoked));
+}
+
+/// The arrival times of the media reads of these packs (the lease read is a media read too and is
+/// left out), in order, as offsets from the first.
+fn pack_attempts(rig: &Rig, ids: &[[u8; 32]]) -> Vec<Instant> {
+    rig.fake.with(|m| {
+        let file_ids: Vec<String> = ids
+            .iter()
+            .map(|i| m.id_of(&path_of(T::Pack, i)).unwrap())
+            .collect();
+        let mut at: Vec<Instant> = m
+            .log
+            .iter()
+            .filter(|r| {
+                r.category == "get.media" && file_ids.iter().any(|f| r.path.ends_with(f.as_str()))
+            })
+            .map(|r| r.at)
+            .collect();
+        at.sort();
+        at
+    })
+}
+
+// ---- N1: a failed download ends the link between frames ----
+
+#[test]
+fn a_failed_download_ends_the_link_between_frames_not_inside_one() {
+    let rig = Rig::new();
+    let mut s = rig.open_session();
+    s.env.create().ok();
+    rig.fake.with(|m| {
+        m.put(&path_of(T::Pack, &id(0x40)), &data(12 * MIB, 3));
+        // the first chunk is served, the second is refused
+        m.inject(Fault {
+            category: "get.media",
+            skip: 1,
+            times: 1000,
+            action: Action::Status {
+                status: 403,
+                reason: "appNotAuthorizedToFile",
+                retry_after: None,
+            },
+        });
+    });
+    read_full_req(&mut s, T::Pack, &id(0x40));
+    // privd reads nothing for a while: the writer is blocked in the middle of a 1 MiB frame when
+    // the second chunk fails
+    std::thread::sleep(Duration::from_millis(1500));
+    let end = loop {
+        if let Err(e) = s.env.pump() {
+            break e;
+        }
+    };
+    assert_eq!(
+        end, "closed",
+        "privd's decoder must end at a frame boundary, not inside a frame"
+    );
+}
+
+// ---- N2: the deadline does not run while the cap holds an upload back, or after ReadBegin ----
+
+#[test]
+fn a_capped_upload_that_takes_longer_than_the_deadline_but_progresses_is_done() {
+    let rig = Rig::with(|c| c.timing.request_budget = Duration::from_millis(700));
+    let mut s = rig.open_session();
+    s.env.create().ok();
+    s.env.write(T::Pack, &id(0x40), &data(10, 0)).ok();
+    assert_eq!(s.env.set_rate(128 * 1024), Reply::Done);
+    let began = Instant::now();
+    s.env.write(T::Pack, &id(0x41), &data(256 * 1024, 1)).ok();
+    assert!(
+        began.elapsed() > Duration::from_millis(1200),
+        "{:?}",
+        began.elapsed()
+    );
+}
+
+#[test]
+fn a_slow_download_that_has_begun_outlives_the_request_deadline() {
+    let rig = Rig::with(|c| c.timing.request_budget = Duration::from_millis(400));
+    let mut s = rig.open_session();
+    s.env.create().ok();
+    rig.fake.with(|m| {
+        m.put(&path_of(T::Pack, &id(0x40)), &data(12 * MIB, 3));
+        m.delay.insert("get.media", Duration::from_millis(150));
+    });
+    let began = Instant::now();
+    assert_eq!(
+        s.env.read_full(T::Pack, &id(0x40)),
+        Reply::Read(data(12 * MIB, 3))
+    );
+    assert!(
+        began.elapsed() > Duration::from_millis(440),
+        "{:?}",
+        began.elapsed()
+    );
+}
+
+// ---- N4: the probe releases the gate at its first answer ----
+
+#[test]
+fn the_gate_reopens_when_the_probe_has_headers_not_when_it_has_finished() {
+    let rig = Rig::with(|c| c.timing.daily_pause = Duration::from_millis(300));
+    let mut s = rig.open_session();
+    s.env.create().ok();
+    let ids: Vec<[u8; 32]> = (0..3u8).map(|i| id(0x40 + i)).collect();
+    rig.fake.with(|m| {
+        for i in &ids {
+            m.put(&path_of(T::Pack, i), &data(2000, i[0]));
+        }
+        m.inject(Fault::status("get.media", 3, 403, "dailyLimitExceeded"));
+        // the probe is answered at once with a body that takes 700 ms to arrive
+        m.inject(Fault {
+            category: "get.media",
+            skip: 0,
+            times: 1,
+            action: Action::SlowBody(700),
+        });
+    });
+    let reqs: Vec<u64> = ids.iter().map(|i| partial_req(&mut s, i, 0, 100)).collect();
+    for r in &reqs {
+        assert!(matches!(s.env.wait(*r), Reply::Read(_)));
+    }
+    let at = pack_attempts(&rig, &ids);
+    assert_eq!(at.len(), 6, "three refused, the probe, two waiters: {at:?}");
+    let waited = at[4].duration_since(at[3]);
+    assert!(
+        waited < Duration::from_millis(400),
+        "the waiters started {waited:?} after the probe: they waited for it to finish"
+    );
+}
+
+// ---- N5: a Write over the cap is refused without buffering ----
+
+#[test]
+fn a_write_over_the_helpers_cap_is_refused_and_not_uploaded() {
+    let rig = Rig::new();
+    let mut s = rig.open_session();
+    s.env.create().ok();
+    let before = rig.fake.with(|m| m.count("upload"));
+    let r = s.env.write(T::Pack, &id(0x40), &vec![7u8; 80 * MIB]);
+    assert_eq!(r.class(), Some(EC::Internal), "{r:?}");
+    assert_eq!(
+        rig.fake.with(|m| m.count("upload")),
+        before,
+        "nothing reached Drive"
+    );
+    // the link is fine, and a pack at the cap is not refused for its size
+    assert_eq!(s.env.list(T::Pack), Reply::List(vec![]));
+}
+
+// ---- N6: an error body is read up to its cap and no further ----
+
+#[test]
+fn an_error_body_is_not_drained() {
+    let rig = Rig::new();
+    let mut s = rig.open_session();
+    s.env.create().ok();
+    rig.fake.with(|m| {
+        m.put(&path_of(T::Snapshot, &id(0x40)), &data(500, 1));
+        m.inject(Fault {
+            category: "get.media",
+            skip: 0,
+            times: 1,
+            action: Action::UnboundedError(256 * MIB),
+        });
+    });
+    // the 500 is retried and the retry succeeds
+    assert_eq!(
+        s.env.read_full(T::Snapshot, &id(0x40)),
+        Reply::Read(data(500, 1))
+    );
+    assert!(
+        !rig.fake.with(|m| m.big_written_ok),
+        "the helper read a 256 MiB error body to its end"
+    );
 }

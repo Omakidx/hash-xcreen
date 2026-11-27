@@ -31,8 +31,6 @@ use pb::ErrorClass as EC;
 
 /// The largest piece of an object read from Drive at once (ipc.md §29, "Reads").
 pub const READ_CHUNK: usize = 4 * 1024 * 1024;
-/// The read budget in KiB: the chunks in hand, from reading to being queued on the link.
-pub const READ_BUDGET_KIB: usize = 32 * 1024;
 
 /// A 32-byte object id.
 pub type Id = [u8; 32];
@@ -67,6 +65,7 @@ pub struct Drive {
     api: Arc<Api>,
     hint: String,
     read_budget: Arc<Semaphore>,
+    read_budget_kib: usize,
 }
 
 type MakeOperator = Arc<dyn Fn() -> Result<Operator, DriveError> + Send + Sync>;
@@ -97,6 +96,7 @@ impl Drive {
         token: Token,
         hostname: &[u8],
     ) -> Self {
+        let read_budget_kib = retrier.timing().read_budget_kib;
         Self {
             api: Arc::new(Api {
                 retrier: retrier.clone(),
@@ -107,7 +107,8 @@ impl Drive {
             }),
             retrier,
             hint: lease::sanitize_hint(hostname),
-            read_budget: Arc::new(Semaphore::new(READ_BUDGET_KIB)),
+            read_budget_kib,
+            read_budget: Arc::new(Semaphore::new(read_budget_kib)),
         }
     }
 
@@ -149,6 +150,7 @@ impl Drive {
             api: self.api.clone(),
             folders: Mutex::new(HashSet::new()),
             read_budget: self.read_budget.clone(),
+            read_budget_kib: self.read_budget_kib,
             lease: LeaseGuard::new(ours.clone(), 0, self.retrier.timing().lease_cache),
             ours,
         };
@@ -463,6 +465,7 @@ pub struct Repo {
     api: Arc<Api>,
     folders: Mutex<HashSet<u8>>,
     read_budget: Arc<Semaphore>,
+    read_budget_kib: usize,
     lease: LeaseGuard,
     ours: String,
 }
@@ -650,7 +653,7 @@ impl Repo {
         len: usize,
         cancel: &Cancel,
     ) -> Result<Chunk, DriveError> {
-        let n = kib(len).min(READ_BUDGET_KIB as u32);
+        let n = kib(len).min(self.read_budget_kib as u32);
         let permit = cancel
             .guard(self.read_budget.clone().acquire_many_owned(n))
             .await?
@@ -714,7 +717,7 @@ impl Repo {
             }
             None if cap <= READ_CHUNK => {
                 // CONFIG, KEY, SNAPSHOT: one read of an unknown length, at most the cap.
-                let n = kib(cap).min(READ_BUDGET_KIB as u32);
+                let n = kib(cap).min(self.read_budget_kib as u32);
                 let permit = cancel
                     .guard(self.read_budget.clone().acquire_many_owned(n))
                     .await?

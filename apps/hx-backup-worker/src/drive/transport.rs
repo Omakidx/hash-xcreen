@@ -124,6 +124,7 @@ pub struct UploadBody {
     pending: Option<Bytes>,
     sleep: Option<Pin<Box<tokio::time::Sleep>>>,
     wait_left: Duration,
+    waiting: Duration,
     slice: Duration,
     remaining: u64,
     rate: Option<Arc<UploadRate>>,
@@ -144,6 +145,7 @@ impl UploadBody {
             pending: None,
             sleep: None,
             wait_left: Duration::ZERO,
+            waiting: Duration::ZERO,
             slice,
             rate,
             progress,
@@ -170,11 +172,15 @@ impl Body for UploadBody {
             if let Some(s) = this.sleep.as_mut() {
                 ready!(s.as_mut().poll(cx));
                 this.sleep = None;
-                this.touch();
+                // Waiting for the cap is progress and does not count against the deadline.
+                if let Some(p) = &this.progress {
+                    p.paced(this.waiting);
+                }
             }
             if !this.wait_left.is_zero() {
                 let d = this.wait_left.min(this.slice);
                 this.wait_left -= d;
+                this.waiting = d;
                 this.sleep = Some(Box::pin(tokio::time::sleep(d)));
                 continue;
             }
@@ -336,11 +342,13 @@ impl GoogleTransport {
 async fn read_capped(mut body: Incoming, cap: usize) -> Result<Vec<u8>, ()> {
     let mut buf = Vec::new();
     while let Some(frame) = body.frame().await {
-        if let Ok(d) = frame.map_err(|_| ())?.into_data()
-            && buf.len() < cap
-        {
+        if let Ok(d) = frame.map_err(|_| ())?.into_data() {
             let room = cap - buf.len();
             buf.extend_from_slice(&d[..d.len().min(room)]);
+        }
+        if buf.len() >= cap {
+            // Enough: the rest is not read, and the connection goes with the body.
+            break;
         }
     }
     Ok(buf)
@@ -444,6 +452,12 @@ impl HttpTransport for GoogleTransport {
         };
         let (parts, incoming) = resp.into_parts();
         let uri = without_query(&uri);
+        if status.as_u16() < 400
+            && let Some(p) = &progress
+        {
+            // Not `dailyLimitExceeded`: the probe after a pause has its answer.
+            p.not_limited();
+        }
         if status.as_u16() >= 400 {
             // Read the error body (bounded) for its reason; it is rebuilt for OpenDAL, which maps
             // the status itself.
@@ -451,6 +465,11 @@ impl HttpTransport for GoogleTransport {
                 return Err(network_error("error body"));
             };
             let (reason, oauth) = parse_error_body(&buf);
+            if !(status.as_u16() == 403 && reason == "dailyLimitExceeded")
+                && let Some(p) = &progress
+            {
+                p.not_limited();
+            }
             obs.reason = reason;
             obs.oauth_error = oauth;
             record(obs);
