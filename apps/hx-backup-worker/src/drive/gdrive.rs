@@ -227,20 +227,21 @@ pub struct Repo {
 
 impl Repo {
     async fn read_lease(&self, cancel: &Cancel) -> Result<Found, DriveError> {
-        let opts = ReadOptions {
-            range: (0..=MAX_LEASE_BYTES as u64).into(),
-            ..ReadOptions::default()
-        };
-        match self
+        // A ranged read of a file shorter than the range is an error in OpenDAL, so the size is
+        // asked first: a lease object over the cap is never downloaded.
+        let got = self
             .retrier
-            .run(cancel, 0, "read lease", || {
-                self.op.read_options(LEASE_FILE, opts.clone())
+            .run(cancel, 0, "read lease", || async {
+                let m = self.op.stat(LEASE_FILE).await?;
+                if m.content_length() > MAX_LEASE_BYTES as u64 {
+                    return Ok(None);
+                }
+                self.op.read(LEASE_FILE).await.map(Some)
             })
-            .await
-        {
-            Ok(b) => Ok(Some(
-                Lease::parse(&b.to_bytes()).map_err(|Unreadable| Unreadable),
-            )),
+            .await;
+        match got {
+            Ok(Some(b)) => Ok(Some(Lease::parse(&b.to_bytes()))),
+            Ok(None) => Ok(Some(Err(Unreadable))),
             Err(e) if e.class == EC::NotFound => Ok(None),
             Err(e) => Err(e),
         }
@@ -497,7 +498,9 @@ impl Repo {
             })
             .await?;
         // Deepest first; files before the folders that hold them.
-        entries.sort_by_key(|e| std::cmp::Reverse(e.path().matches('/').count()));
+        entries.sort_by_key(|e| {
+            std::cmp::Reverse(e.path().trim_end_matches('/').matches('/').count())
+        });
         for e in entries.iter().filter(|e| e.path() != "/") {
             let path = e.path().to_owned();
             self.retrier

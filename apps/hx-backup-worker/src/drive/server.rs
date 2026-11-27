@@ -72,7 +72,7 @@ enum Answer {
 type RepoCell = Option<Result<Arc<Repo>, DriveError>>;
 
 struct Shared {
-    state: Mutex<LinkState>,
+    state: Arc<Mutex<LinkState>>,
     out: mpsc::Sender<Out>,
     cancels: Mutex<HashMap<u64, CancelHandle>>,
     drive: Result<Arc<Drive>, DriveError>,
@@ -360,8 +360,12 @@ pub fn serve_connection(stream: UnixStream, cfg: &DriveConfig) -> End {
         eprintln!("hx-backup-worker: cannot start the session runtime");
         return End::Lost;
     };
-    let end = serve(&rt, stream, cfg);
+    let (end, writer) = serve(&rt, stream, cfg);
     rt.shutdown_timeout(Duration::from_secs(3));
+    let write_failed = writer.is_some_and(|w| !w.join().unwrap_or(false));
+    if write_failed && !matches!(end, End::Bye | End::Violation(_)) {
+        return End::WriteFailed;
+    }
     end
 }
 
@@ -393,7 +397,11 @@ fn build_drive(
     )))
 }
 
-fn serve(rt: &tokio::runtime::Runtime, stream: UnixStream, cfg: &DriveConfig) -> End {
+fn serve(
+    rt: &tokio::runtime::Runtime,
+    stream: UnixStream,
+    cfg: &DriveConfig,
+) -> (End, Option<std::thread::JoinHandle<bool>>) {
     let rate = Arc::new(UploadRate::new());
     let retrier = Arc::new(Retrier::new(cfg.timing));
     let (out_tx, out_rx) = mpsc::channel::<Out>(16);
@@ -401,8 +409,9 @@ fn serve(rt: &tokio::runtime::Runtime, stream: UnixStream, cfg: &DriveConfig) ->
     retrier.set_events(ev_tx);
     let drive = build_drive(rt, cfg, rate.clone(), retrier);
     let (repo_tx, _) = watch::channel::<RepoCell>(None);
+    let state = Arc::new(Mutex::new(LinkState::new(Endpoint::DriveHelper)));
     let shared = Arc::new(Shared {
-        state: Mutex::new(LinkState::new(Endpoint::DriveHelper)),
+        state: state.clone(),
         out: out_tx.clone(),
         cancels: Mutex::new(HashMap::new()),
         drive,
@@ -412,16 +421,16 @@ fn serve(rt: &tokio::runtime::Runtime, stream: UnixStream, cfg: &DriveConfig) ->
 
     // The writer: the only owner of the write half.
     let Ok(mut wstream) = stream.try_clone() else {
-        return End::Lost;
+        return (End::Lost, None);
     };
     let writer = {
-        let shared = shared.clone();
+        let state = state.clone();
         let mut out_rx = out_rx;
         std::thread::Builder::new()
             .name("hx-drive-writer".into())
             .spawn(move || {
                 while let Some(item) = out_rx.blocking_recv() {
-                    if let Err(rule) = write_out(&mut wstream, &shared.state, item) {
+                    if let Err(rule) = write_out(&mut wstream, &state, item) {
                         eprintln!("hx-backup-worker: drive link write failed: {rule}");
                         let _ = wstream.shutdown(std::net::Shutdown::Both);
                         return false;
@@ -431,7 +440,7 @@ fn serve(rt: &tokio::runtime::Runtime, stream: UnixStream, cfg: &DriveConfig) ->
             })
     };
     let Ok(writer) = writer else {
-        return End::Lost;
+        return (End::Lost, None);
     };
     let events = {
         let out = out_tx.clone();
@@ -450,14 +459,10 @@ fn serve(rt: &tokio::runtime::Runtime, stream: UnixStream, cfg: &DriveConfig) ->
     events.abort();
     drop(shared);
     drop(out_tx);
-    // Dropping the runtime (by the caller) ends the request tasks, which drop their senders; the
-    // writer then drains and stops. Close the socket first so a blocked writer is released.
+    // Close the socket so that a blocked writer is released. The caller drops the runtime, which
+    // ends the request tasks and so drops their senders; the writer then stops, and is joined.
     let _ = stream.shutdown(std::net::Shutdown::Both);
-    let write_failed = writer.join().map(|ok| !ok).unwrap_or(true);
-    if write_failed && !matches!(end, End::Bye | End::Violation(_)) {
-        return End::WriteFailed;
-    }
-    end
+    (end, Some(writer))
 }
 
 fn read_loop(handle: &Handle, stream: &UnixStream, shared: &Arc<Shared>, silence: Duration) -> End {
