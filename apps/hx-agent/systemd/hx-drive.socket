@@ -1,0 +1,28 @@
+# hx-drive.socket: the Drive helper's socket (docs/ipc.md section 24, "Drive link").
+#
+# systemd owns the listening socket and hands it to hx-drive.service as descriptor 3 when
+# hx-privd connects. Only root may connect (mode 0600 under root): the helper holds the Drive
+# token and is the only process that speaks to Google, and it serves hx-privd alone. The helper
+# also checks SO_PEERCRED for uid 0 on every connection, so the mode is only a first filter.
+#
+# /run/hx comes from systemd-tmpfiles (tmpfiles.d/hx.conf), so the socket orders itself after it.
+#
+# Installed with the other units but NOT enabled by the installer: the Drive-connect flow enables
+# it once a token exists (there is nothing to serve before).
+
+[Unit]
+Description=hash-xcreen Drive helper socket
+Documentation=https://github.com/Omakidx/hash-xcreen/blob/main/docs/ipc.md
+Requires=systemd-tmpfiles-setup.service
+After=systemd-tmpfiles-setup.service
+
+[Socket]
+ListenStream=/run/hx/drive.sock
+SocketUser=root
+SocketMode=0600
+Accept=no
+Service=hx-drive.service
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

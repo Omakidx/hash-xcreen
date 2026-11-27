@@ -90,7 +90,12 @@ fn the_activated_binary_serves_a_session_and_exits_zero_when_idle() {
     let stream = std::os::unix::net::UnixStream::connect(&h.sock).unwrap();
     let mut env = PrivdEnd::new(stream);
     env.hello();
-    assert!(env.software.as_deref().unwrap().starts_with("hx-backup-worker-"));
+    assert!(
+        env.software
+            .as_deref()
+            .unwrap()
+            .starts_with("hx-backup-worker-")
+    );
     env.open("repo", true, SERVER_A, false).ok();
     env.create().ok();
     let config = data(300, 1);
@@ -98,7 +103,10 @@ fn the_activated_binary_serves_a_session_and_exits_zero_when_idle() {
     env.write(T::Pack, &id(0x40), &data(100_000, 2)).ok();
     assert_eq!(env.list(T::Config), Reply::List(vec![(vec![0; 32], 300)]));
     assert_eq!(env.read_full(T::Config, &[0; 32]), Reply::Read(config));
-    assert_eq!(env.read_partial(T::Pack, &id(0x40), 10, 20), Reply::Read(data(100_000, 2)[10..30].to_vec()));
+    assert_eq!(
+        env.read_partial(T::Pack, &id(0x40), 10, 20),
+        Reply::Read(data(100_000, 2)[10..30].to_vec())
+    );
     env.remove(T::Pack, &id(0x40)).ok();
     env.quota().ok();
     // it spoke TLS to the fake with the token and nothing else
@@ -114,7 +122,11 @@ fn the_activated_binary_serves_a_session_and_exits_zero_when_idle() {
     // idle for 1.5 s after the close, then exit 0
     let code = wait_exit(&mut h.child, Duration::from_secs(15));
     assert_eq!(code, Some(EXIT_OK));
-    assert!(closed.elapsed() >= Duration::from_millis(1200), "{:?}", closed.elapsed());
+    assert!(
+        closed.elapsed() >= Duration::from_millis(1200),
+        "{:?}",
+        closed.elapsed()
+    );
 }
 
 #[test]
@@ -127,7 +139,10 @@ fn a_peer_with_another_uid_is_refused_by_the_binary() {
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let mut b = [0u8; 16];
     assert!(matches!(s.read(&mut b), Ok(0) | Err(_)));
-    assert_eq!(wait_exit(&mut h.child, Duration::from_secs(10)), Some(EXIT_OK));
+    assert_eq!(
+        wait_exit(&mut h.child, Duration::from_secs(10)),
+        Some(EXIT_OK)
+    );
     assert_eq!(rig.fake.with(|m| m.log.len()), 0);
 }
 
@@ -146,7 +161,11 @@ fn without_a_usable_activation_the_binary_exits_71() {
     assert_eq!(cmd.status().unwrap().code(), Some(EXIT_LISTEN));
     // descriptor 3 is not a listening unix socket (here: a pipe through the shell's own fd 3)
     let mut cmd = Command::new("sh");
-    cmd.args(["-c", "LISTEN_PID=$$ LISTEN_FDS=1 exec \"$0\" 3</dev/null", &bin()]);
+    cmd.args([
+        "-c",
+        "LISTEN_PID=$$ LISTEN_FDS=1 exec \"$0\" 3</dev/null",
+        &bin(),
+    ]);
     env_for(&mut cmd, &rig, 500, my_uid());
     assert_eq!(cmd.status().unwrap().code(), Some(EXIT_LISTEN));
 }
@@ -158,9 +177,19 @@ fn the_binary_without_its_token_still_answers_hello_and_then_auth_revoked() {
     let mut h = start(&rig, 600, my_uid());
     let mut env = PrivdEnd::new(std::os::unix::net::UnixStream::connect(&h.sock).unwrap());
     env.hello();
-    assert_eq!(env.open("repo", true, SERVER_A, false).class(), Some(EC::AuthRevoked));
+    assert_eq!(
+        env.open("repo", true, SERVER_A, false).class(),
+        Some(EC::AuthRevoked)
+    );
     env.bye();
     drop(env);
-    assert_eq!(wait_exit(&mut h.child, Duration::from_secs(10)), Some(EXIT_OK));
-    assert_eq!(rig.fake.with(|m| m.log.len()), 0, "no request to Google without a token");
+    assert_eq!(
+        wait_exit(&mut h.child, Duration::from_secs(10)),
+        Some(EXIT_OK)
+    );
+    assert_eq!(
+        rig.fake.with(|m| m.log.len()),
+        0,
+        "no request to Google without a token"
+    );
 }

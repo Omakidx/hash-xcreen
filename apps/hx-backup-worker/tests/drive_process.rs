@@ -44,7 +44,10 @@ impl Loop {
         let listener = UnixListener::bind(&path).unwrap();
         let drive = rig.cfg.clone();
         let handle = std::thread::spawn(move || serve_listener(&listener, &role, &drive));
-        Loop { path, handle: Some(handle) }
+        Loop {
+            path,
+            handle: Some(handle),
+        }
     }
 
     fn connect(&self) -> UnixStream {
@@ -81,7 +84,11 @@ fn drain(s: &mut UnixStream, d: Duration) -> (Vec<u8>, bool) {
         match s.read(&mut buf) {
             Ok(0) => return (got, true),
             Ok(n) => got.extend_from_slice(&buf[..n]),
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
             Err(_) => return (got, true),
         }
     }
@@ -99,7 +106,10 @@ fn one_connection_is_served_at_a_time_and_the_next_waits() {
     let mut second = lp.connect();
     second.write_all(&hello_frame()).unwrap();
     let (got, closed) = drain(&mut second, Duration::from_millis(500));
-    assert!(got.is_empty() && !closed, "the helper answered a second connection: {got:?}");
+    assert!(
+        got.is_empty() && !closed,
+        "the helper answered a second connection: {got:?}"
+    );
     // the first goes on working meanwhile
     first.list(T::Pack).ok();
     first.bye();
@@ -141,7 +151,10 @@ fn the_helper_exits_zero_after_the_idle_time_and_the_clock_restarts_at_each_clos
     let code = lp.exit();
     let waited = closed.elapsed();
     assert_eq!(code, role::EXIT_OK);
-    assert!(waited >= Duration::from_millis(600), "{waited:?}: the idle time counts from the close");
+    assert!(
+        waited >= Duration::from_millis(600),
+        "{waited:?}: the idle time counts from the close"
+    );
     assert!(waited < Duration::from_secs(5));
 }
 
@@ -184,7 +197,9 @@ fn a_violation_closes_that_connection_silently_and_the_helper_serves_the_next() 
     let lp = Loop::start(&rig, role_cfg(&rig, Duration::from_secs(60)));
     let list_first = raw_message(pb::repo_frame::Frame::Request(pb::RepoRequest {
         req_id: 1,
-        op: Some(pb::repo_request::Op::List(pb::List { object_type: T::Pack as i32 })),
+        op: Some(pb::repo_request::Op::List(pb::List {
+            object_type: T::Pack as i32,
+        })),
     }));
     let hello_again = hello_frame();
     let too_long = {
@@ -197,9 +212,18 @@ fn a_violation_closes_that_connection_silently_and_the_helper_serves_the_next() 
         ("a second Hello", with_hello(hello_again)),
         ("an unknown frame kind", with_hello(vec![2, 0, 0, 0, 9, 0])),
         ("a frame longer than the limit", with_hello(too_long)),
-        ("a secret frame (worker link only)", with_hello(vec![3, 0, 0, 0, 2, 0, 0])),
-        ("a frame before Hello", raw_message(pb::repo_frame::Frame::Ping(pb::Ping { nonce: 1 }))),
-        ("a worker-only variant", with_hello(raw_message(pb::repo_frame::Frame::Cancel(pb::Cancel {})))),
+        (
+            "a secret frame (worker link only)",
+            with_hello(vec![3, 0, 0, 0, 2, 0, 0]),
+        ),
+        (
+            "a frame before Hello",
+            raw_message(pb::repo_frame::Frame::Ping(pb::Ping { nonce: 1 })),
+        ),
+        (
+            "a worker-only variant",
+            with_hello(raw_message(pb::repo_frame::Frame::Cancel(pb::Cancel {}))),
+        ),
         ("garbage", vec![0xff; 64]),
     ];
     for bad in ["", "../x", "a/b", ".hidden", "a b", "é", &"a".repeat(129)] {
@@ -211,14 +235,25 @@ fn a_violation_closes_that_connection_silently_and_the_helper_serves_the_next() 
         let (got, closed) = drain(&mut c, Duration::from_secs(5));
         // the only thing the helper may have sent is the HelloAck that answered the valid Hello
         assert!(closed, "{what}: the connection must be closed");
-        assert!(got.len() < 200, "{what}: nothing but a HelloAck may be sent ({} bytes)", got.len());
-        assert_eq!(rig.fake.with(|m| m.log.len()), 0, "{what}: no Google request");
+        assert!(
+            got.len() < 200,
+            "{what}: nothing but a HelloAck may be sent ({} bytes)",
+            got.len()
+        );
+        assert_eq!(
+            rig.fake.with(|m| m.log.len()),
+            0,
+            "{what}: no Google request"
+        );
         // and the helper is fine
         let mut p = lp.privd();
         p.hello();
         p.bye();
     }
-    assert!(!lp.handle.as_ref().unwrap().is_finished(), "a violation never ends the helper");
+    assert!(
+        !lp.handle.as_ref().unwrap().is_finished(),
+        "a violation never ends the helper"
+    );
 }
 
 #[test]
@@ -233,11 +268,20 @@ fn a_descriptor_sent_on_the_link_is_a_violation() {
     let mut ancillary = SendAncillaryBuffer::new(&mut space);
     assert!(ancillary.push(SendAncillaryMessage::ScmRights(&fds)));
     let hello = hello_frame();
-    sendmsg(&c, &[std::io::IoSlice::new(&hello)], &mut ancillary, SendFlags::empty()).unwrap();
+    sendmsg(
+        &c,
+        &[std::io::IoSlice::new(&hello)],
+        &mut ancillary,
+        SendFlags::empty(),
+    )
+    .unwrap();
     let mut c = c;
     let (got, closed) = drain(&mut c, Duration::from_secs(5));
     assert!(closed, "the connection must be closed");
-    assert!(got.is_empty(), "no HelloAck for a Hello that came with a descriptor");
+    assert!(
+        got.is_empty(),
+        "no HelloAck for a Hello that came with a descriptor"
+    );
     // still serving
     let mut p = lp.privd();
     p.hello();
@@ -265,7 +309,10 @@ fn the_exit_codes_of_the_role() {
     };
     // the OAuth client is missing, unreadable or malformed: fail closed, nothing served
     assert_eq!(
-        hx_backup_worker::drive::run(&base(Listen::Path(rig.dir.path().join("a.sock")), rig.dir.path().join("none"))),
+        hx_backup_worker::drive::run(&base(
+            Listen::Path(rig.dir.path().join("a.sock")),
+            rig.dir.path().join("none")
+        )),
         role::EXIT_DRIVE_CLIENT
     );
     let bad = rig.dir.path().join("bad.json");
@@ -274,7 +321,10 @@ fn the_exit_codes_of_the_role() {
         hx_backup_worker::drive::run(&base(Listen::Path(rig.dir.path().join("b.sock")), bad)),
         role::EXIT_DRIVE_CLIENT
     );
-    assert!(!rig.dir.path().join("a.sock").exists() && !rig.dir.path().join("b.sock").exists(), "no listener without the client");
+    assert!(
+        !rig.dir.path().join("a.sock").exists() && !rig.dir.path().join("b.sock").exists(),
+        "no listener without the client"
+    );
     // no activated socket (this process was not started by systemd)
     assert_eq!(
         hx_backup_worker::drive::run(&base(Listen::Activated, client.clone())),
@@ -282,7 +332,10 @@ fn the_exit_codes_of_the_role() {
     );
     // a path that cannot be bound
     assert_eq!(
-        hx_backup_worker::drive::run(&base(Listen::Path(PathBuf::from("/nonexistent/dir/x.sock")), client.clone())),
+        hx_backup_worker::drive::run(&base(
+            Listen::Path(PathBuf::from("/nonexistent/dir/x.sock")),
+            client.clone()
+        )),
         role::EXIT_LISTEN
     );
     // a good start that idles out

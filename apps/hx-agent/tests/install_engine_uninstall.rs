@@ -121,7 +121,7 @@ fn destroy_removes_everything_in_order() {
     );
     let fetch = index_of(
         &l,
-        "systemctl stop hx-update-fetcher@*.service hx-image-fetcher@*.service",
+        "systemctl stop hx-update-fetcher@*.service hx-image-fetcher@*.service hx-drive.socket hx-drive.service",
     );
     let user = index_of(&l, "userdel hx-gatewayd");
     let reload = index_of(&l, "systemctl daemon-reload");

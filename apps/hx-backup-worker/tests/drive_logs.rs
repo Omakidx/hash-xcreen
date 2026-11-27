@@ -63,8 +63,18 @@ fn nothing_secret_is_ever_logged_on_any_path() {
     }
     rig.fake.with(|m| {
         m.clear_faults();
-        m.inject(Fault { category: "list", skip: 0, times: 3, action: Action::Drop });
-        m.inject(Fault { category: "get.media", skip: 0, times: 3, action: Action::TruncateBody });
+        m.inject(Fault {
+            category: "list",
+            skip: 0,
+            times: 3,
+            action: Action::Drop,
+        });
+        m.inject(Fault {
+            category: "get.media",
+            skip: 0,
+            times: 3,
+            action: Action::TruncateBody,
+        });
     });
     let _ = s.env.list(T::Index);
     let _ = s.env.read_full(T::Pack, &id(0x40));
@@ -77,7 +87,10 @@ fn nothing_secret_is_ever_logged_on_any_path() {
             category: "token",
             skip: 0,
             times: 10,
-            action: Action::Raw { status: 400, body: r#"{"error":"invalid_grant"}"# },
+            action: Action::Raw {
+                status: 400,
+                body: r#"{"error":"invalid_grant"}"#,
+            },
         });
     });
     let mut s = rig.session();
@@ -86,7 +99,8 @@ fn nothing_secret_is_ever_logged_on_any_path() {
     drop(s);
     let rig = Rig::with(|c| {
         c.client = hx_backup_worker::drive::creds::ClientConfig::parse(
-            format!(r#"{{"client_id":"{CLIENT_ID}","client_secret":"wrong-secret-value"}}"#).as_bytes(),
+            format!(r#"{{"client_id":"{CLIENT_ID}","client_secret":"wrong-secret-value"}}"#)
+                .as_bytes(),
         )
         .unwrap();
     });
@@ -103,8 +117,15 @@ fn nothing_secret_is_ever_logged_on_any_path() {
     std::thread::sleep(Duration::from_millis(300));
 
     let log = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
-    assert!(log.contains("drive"), "the capture works: {} bytes", log.len());
-    assert!(log.contains("hyper_util"), "TRACE of the HTTP stack is captured too");
+    assert!(
+        log.contains("drive"),
+        "the capture works: {} bytes",
+        log.len()
+    );
+    assert!(
+        log.contains("hyper_util"),
+        "TRACE of the HTTP stack is captured too"
+    );
     for secret in [
         REFRESH_TOKEN,
         CLIENT_SECRET,
@@ -118,6 +139,14 @@ fn nothing_secret_is_ever_logged_on_any_path() {
         "googleapis.com/drive",
         "grant_type",
     ] {
-        assert!(!log.contains(secret), "{secret:?} was logged:\n{}", log.lines().filter(|l| l.contains(secret)).take(3).collect::<Vec<_>>().join("\n"));
+        assert!(
+            !log.contains(secret),
+            "{secret:?} was logged:\n{}",
+            log.lines()
+                .filter(|l| l.contains(secret))
+                .take(3)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
     }
 }

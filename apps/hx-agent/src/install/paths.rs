@@ -55,6 +55,8 @@ pub const RESOLVERS_DROPIN: &str =
 /// The image fetcher's resolver drop-in (the same resolvers as the update fetcher's).
 pub const IMAGE_RESOLVERS_DROPIN: &str =
     "/etc/systemd/system/hx-image-fetcher@.service.d/resolvers.conf";
+/// The Drive helper's resolver drop-in (the same resolvers as the fetchers').
+pub const DRIVE_RESOLVERS_DROPIN: &str = "/etc/systemd/system/hx-drive.service.d/resolvers.conf";
 /// Where an offline `--image-file` and its signed manifest are placed for privd (root, 0700).
 pub const IMPORT_DIR: &str = "/var/lib/hx/import";
 /// The image fetcher's tmpfs mount point under privd's state directory.
