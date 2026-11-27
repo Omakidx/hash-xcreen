@@ -15,7 +15,15 @@ workspace = true
 # The default build is pure (rules, manifest; no rustic), which is what hx-privd uses. `engine` links
 # rustic_core and is enabled only by the backup worker (ipc.md §36).
 default = []
-engine = ["dep:rustic_core", "dep:zeroize", "dep:tracing"]
+engine = [
+    "dep:rustic_core",
+    "dep:zeroize",
+    "dep:tracing",
+    "dep:bytes",
+    "dep:aes256ctr_poly1305aes",
+    "dep:sha2",
+    "dep:zstd",
+]
 
 [dependencies]
 rustic_core = { workspace = true, optional = true }
@@ -26,14 +34,21 @@ serde_json = "1"
 thiserror.workspace = true
 tracing = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }
+# The index trust checks (engine/integrity.rs) decrypt, decompress and hash blobs that are stored in
+# more than one pack with the primitives rustic_core uses (all already in the lock file).
+bytes = { workspace = true, optional = true }
+aes256ctr_poly1305aes = { version = "0.2.1", features = ["std"], optional = true }
+sha2 = { version = "0.10", optional = true }
+zstd = { version = "0.14.3", optional = true }
 
 [dev-dependencies]
 # Tests always build with the engine, also in `cargo nextest run --workspace` where nothing else enables it.
 hx-backup = { path = ".", features = ["engine"] }
 bytes.workspace = true
-# Only to check that `manifest::is_unsafe_char` stays a copy of `hx_ipc::text::is_unsafe_char`; with no
-# features hx-ipc is just framing and text (no prost), and it is not a normal dependency.
-hx-ipc.workspace = true
+# Checks that `manifest::is_unsafe_char` stays a copy of `hx_ipc::text::is_unsafe_char`, and (with the
+# `repo` feature) applies the real section 30 operation policy in tests/prune_safety.rs. Not a normal
+# dependency.
+hx-ipc = { workspace = true, features = ["repo"] }
 # The local backend, for offline integration tests (no `opendal`, `rest` or `rclone`).
 rustic_backend = { version = "=0.8.0", default-features = false }
 proptest = "1"

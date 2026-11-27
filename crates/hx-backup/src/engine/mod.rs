@@ -26,6 +26,7 @@
 //! password as a `String`, so a copy of it lives inside rustic for as long as the repository is
 //! open and is not wiped by this crate.
 
+mod integrity;
 mod progress;
 mod scan;
 
@@ -41,8 +42,7 @@ use rustic_core::repofile::SnapshotFile;
 use rustic_core::{
     BackupOptions, CheckOptions, ConfigOptions, Credentials, IndexedFullStatus, KeepOptions,
     KeyOptions, LocalDestination, LsOptions, OpenStatus, PathList, PruneOptions, ReadSubsetOption,
-    RepairIndexOptions, Repository, RepositoryOptions, RestoreOptions, RusticError,
-    SnapshotOptions,
+    Repository, RepositoryOptions, RestoreOptions, RusticError, SnapshotOptions,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -52,6 +52,8 @@ use crate::rules::{self, ResolvedRules, RuleSet, RulesError};
 pub use progress::{CancelToken, NullSink, Phase, ProgressEvent, ProgressSink, ProgressUnit};
 pub use rustic_core::{ReadBackend, RepositoryBackends, WriteBackend};
 
+pub use integrity::DUPLICATE_VERIFY_FLOOR_BYTES;
+use integrity::IndexGuard;
 use progress::{Bars, Shared};
 
 /// zstd level used for new repositories (architecture 9.4: level 9 cost about 70% more CPU for
@@ -130,6 +132,13 @@ pub enum EngineError {
     /// open the engine again.
     #[error("the engine is closed after a failed index load; open it again")]
     Closed,
+    /// A prune was refused because the repository does not read back as its index says (ipc.md
+    /// section 36, Q-S1): nothing was deleted.
+    #[error("prune refused, the repository failed verification: {finding}")]
+    Integrity {
+        /// What was found (never contains key material).
+        finding: String,
+    },
     /// `rustic_core` (or the backend behind it) failed.
     #[error("{operation} failed: {source}")]
     Repository {
@@ -543,6 +552,8 @@ pub struct Engine {
     /// `None` only after loading the index failed (the repository handle is consumed by that call).
     repo: Option<Repository<OpenStatus>>,
     shared: Arc<Shared>,
+    /// The repository backend as rustic sees it: hides unreadable index files, defers removals.
+    guard: Arc<IndexGuard>,
 }
 
 impl fmt::Debug for Engine {
@@ -606,7 +617,9 @@ impl Engine {
         shared.set_phase(Phase::OpenRepository);
         // No local cache, ever: the worker is sandboxed and must not create directories.
         let ropts = RepositoryOptions::default().no_cache(true);
-        let repo = Repository::new_with_progress(&ropts, backends, Bars(Arc::clone(&shared)))
+        let guard = Arc::new(IndexGuard::new(backends.repository()));
+        let guarded = RepositoryBackends::new(guard.clone(), backends.repo_hot());
+        let repo = Repository::new_with_progress(&ropts, &guarded, Bars(Arc::clone(&shared)))
             .map_err(rustic("opening the repository"))?;
         let mut creds = key.credentials()?;
         let opened = Self::open_or_init(repo, &creds, options);
@@ -618,6 +631,7 @@ impl Engine {
         Ok(Self {
             repo: Some(repo),
             shared,
+            guard,
         })
     }
 
@@ -777,9 +791,7 @@ impl Engine {
 
         // Step 0: orphan packs from an interrupted run become part of the index.
         self.shared.set_phase(Phase::RepairIndex);
-        self.repo()?
-            .repair_index(&RepairIndexOptions::default(), false)
-            .map_err(rustic("repairing the index"))?;
+        self.repair_index_for_backup()?;
         cancel.check()?;
 
         self.shared.set_phase(Phase::ResolveRules);
@@ -972,6 +984,7 @@ impl Engine {
         let snap = self.find_snapshot(&req.snapshot)?;
         let id: SnapshotId = hex_id(snap.id)?;
 
+        self.prepare_index(false)?;
         let open = self.repo.take().ok_or(EngineError::Closed)?;
         let indexed = open.to_indexed().map_err(rustic("loading the index"))?;
         let result = restore_indexed(&indexed, &self.shared, req, &id, target_str, cancel);
@@ -1001,6 +1014,12 @@ impl Engine {
     /// Apply retention rules to all snapshots of the repository (one group: a repository holds
     /// one desktop), removing what the rules do not keep, except the newest
     /// `req.protect_latest`. Space is only freed by [`Engine::prune`].
+    ///
+    /// **Never use this for the `FORGET_PRUNE` job** (ipc.md section 36, decision 10). It takes
+    /// the snapshots from the repository listing, and a compromised `BACKUP` worker can write
+    /// snapshots dated in the future that fill the keep slots and the protected newest ones, so that
+    /// every real snapshot is removed. That job deletes exactly the ids privd chose from its own
+    /// record of successful backups. This method is for tools that own the whole repository.
     ///
     /// # Errors
     /// [`EngineError::InvalidInput`] if no keep period is set, [`EngineError::Cancelled`],
@@ -1093,11 +1112,42 @@ impl Engine {
         })
     }
 
-    /// Remove data no snapshot uses, deleting immediately (`--instant`).
+    /// Remove data no snapshot uses, deleting immediately (`--instant`), **after making sure the
+    /// index can be trusted** (ipc.md section 36, Q-S1).
+    ///
+    /// A compromised `BACKUP` worker holds the repository password, so it can write validly
+    /// encrypted index files, remove index files and add pack files. `rustic_core`'s prune believes
+    /// the index: a forged one makes it delete the real packs that live snapshots need (a decoy pack
+    /// listing the same blobs, a marked-for-deletion entry, swapped blob locations). Pack files and
+    /// snapshots cannot be removed or overwritten by that worker, so the real data is always still
+    /// there; only the index and the decoys lie. Before planning, this method therefore:
+    ///
+    /// 1. removes index files that cannot be read (junk: they hold no data);
+    /// 2. rebuilds the index from the pack headers (`repair index --read-all-packs`), writing the new
+    ///    index before removing the old files, so the index says what the packs say whatever index
+    ///    files were written or removed, and a kill in between loses nothing;
+    /// 3. refuses if a pack file is in no index (an unreadable pack would be deleted as
+    ///    unreferenced);
+    /// 4. refuses if a pack lists a blob id twice (the packer never writes that), then reads every
+    ///    index entry of every blob that has more than one (ranged reads of those blobs only) and
+    ///    refuses unless each decrypts, decompresses to its declared length and hashes to the blob id.
+    ///    A decoy has to list real blobs to win over a real pack, so it always shows up here, and
+    ///    only a copy that verifies passes. `check --read-data` cannot settle it: it reads only the
+    ///    one copy per blob that the index lookup picks, while prune keeps the copy in the pack with
+    ///    the highest id. Honest duplicates (an interrupted prune leaves the repacked blobs in two
+    ///    packs) verify and are harmless; the prune then removes the extra copies.
+    ///
+    /// The cost is one header read per pack and one listing, plus a read of the duplicated blobs
+    /// (at most the larger of [`DUPLICATE_VERIFY_FLOOR_BYTES`] and a quarter of the pack bytes, else
+    /// the prune is refused) and about 100 bytes of
+    /// memory per blob while the index is scanned. The repository format does not change.
     ///
     /// # Errors
-    /// [`EngineError::Cancelled`] (before the plan), [`EngineError::Repository`].
+    /// [`EngineError::Cancelled`] (before the plan), [`EngineError::Integrity`] (nothing was
+    /// deleted), [`EngineError::Repository`].
     pub fn prune(&self, cancel: &CancelToken) -> Result<PruneOutcome, EngineError> {
+        cancel.check()?;
+        self.verify_index_before_prune(cancel)?;
         cancel.check()?;
         self.shared.set_phase(Phase::Prune);
         let opts = PruneOptions::default().instant_delete(true);
@@ -1105,6 +1155,16 @@ impl Engine {
             .repo()?
             .prune_plan(&opts)
             .map_err(rustic("planning the prune"))?;
+        // The plan deletes every pack file that is in no index (instant delete). The check above
+        // makes that impossible; this ties it to the exact listing the plan acted on.
+        if plan.stats.packs_unref != 0 {
+            return Err(EngineError::Integrity {
+                finding: format!(
+                    "{} pack files are in no index; the prune would delete them",
+                    plan.stats.packs_unref
+                ),
+            });
+        }
         let st = plan.stats.size_sum();
         let outcome = PruneOutcome {
             unused_bytes: st.unused,
@@ -1125,6 +1185,7 @@ impl Engine {
     /// [`EngineError::Repository`] when the check itself could not run.
     pub fn check(&self, read: ReadData, cancel: &CancelToken) -> Result<CheckReport, EngineError> {
         cancel.check()?;
+        self.prepare_index(false)?;
         let mut opts = CheckOptions::default();
         self.shared.reset_read_bytes();
         match read {
