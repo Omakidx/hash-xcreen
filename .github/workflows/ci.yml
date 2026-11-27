@@ -82,7 +82,10 @@ jobs:
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: |
           cargo build -p hx-backup-worker --features test-hooks --locked --target x86_64-unknown-linux-musl
-          readelf -l target/x86_64-unknown-linux-musl/debug/hx-backup-worker | grep -q INTERP && { echo "::error::the musl worker is dynamically linked"; exit 1; } || true
+          if readelf -l target/x86_64-unknown-linux-musl/debug/hx-backup-worker | grep -q INTERP; then
+            echo "::error::the musl worker is dynamically linked"
+            exit 1
+          fi
       - name: Run the binary tests against the musl worker
         # tests/binary.rs skips itself, with a message, where user namespaces are unavailable.
         env:

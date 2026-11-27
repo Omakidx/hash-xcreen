@@ -28,7 +28,7 @@ test-hooks = []
 
 [dependencies]
 bytes.workspace = true # the id fields of the generated messages
-hx-backup = { path = "../../crates/hx-backup", features = ["engine"] }
+hx-backup = { path = "../../crates/hx-backup", version = "0.1.0", features = ["engine"] }
 hx-ipc = { workspace = true, features = ["repo"] }
 libc = "0.2" # capset, prctl and sigaction in sandbox.rs, and the seccomp syscall numbers
 rustix = { workspace = true, features = ["process", "thread"] }
