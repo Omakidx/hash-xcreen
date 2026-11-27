@@ -161,7 +161,7 @@ pub fn run_worker(cfg: &WorkerConfig) -> i32 {
 
 /// A panic prints where it happened and nothing else: its payload may hold text built from a
 /// secret.
-fn install_panic_hook() {
+pub(crate) fn install_panic_hook() {
     panic::set_hook(Box::new(|info| {
         let loc = info.location().map_or_else(
             || "unknown".to_owned(),

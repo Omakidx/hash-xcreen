@@ -181,6 +181,21 @@ pub fn install_signal_handlers() -> io::Result<()> {
     sys::install_signals()
 }
 
+/// Takes ownership of the descriptor systemd passed (`LISTEN_FDS=1`: descriptor 3).
+///
+/// # Errors
+/// The OS error when `fd` is not an open descriptor.
+pub fn take_activated_fd(fd: i32) -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{BorrowedFd, FromRawFd};
+    // SAFETY: the caller has checked `LISTEN_PID` and `LISTEN_FDS`, so descriptor `fd` was opened by
+    // the service manager for this process and nobody else in it owns it. `fcntl(F_GETFD)` proves
+    // it is open before an `OwnedFd` is made, and the process calls this once.
+    unsafe {
+        rustix::io::fcntl_getfd(BorrowedFd::borrow_raw(fd))?;
+        Ok(std::os::fd::OwnedFd::from_raw_fd(fd))
+    }
+}
+
 // ----- seccomp -----
 
 macro_rules! syscalls {
