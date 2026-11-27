@@ -305,6 +305,8 @@ async fn a_finishing_job_never_removes_the_entry_of_the_job_that_follows_it() {
                 Err(e) => panic!("{e:?}"),
             }
         };
+        // Long enough for a finishing job's late bookkeeping to run, if it were late.
+        tokio::time::sleep(Duration::from_millis(60)).await;
         let st = rig.runner.status("main").unwrap();
         assert_eq!(
             st.job_id, b.job_id,
