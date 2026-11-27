@@ -173,6 +173,7 @@ pub fn backup_spec() -> pb::BackupSpec {
         excludes: vec!["/home/*/.cache".into(), "/var/tmp".into()],
         docker_mode: pb::DockerMode::Light as i32,
         tags: vec!["hx-backup-20261126T101500Z-0a1b".into(), "scheduled".into()],
+        docker_enabled: true,
     }
 }
 

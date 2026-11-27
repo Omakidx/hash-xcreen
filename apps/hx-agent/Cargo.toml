@@ -1,6 +1,6 @@
 [package]
 name = "hx-agent"
-description = "Server agent: hx-gatewayd, hx-privd, the backup worker and the hx-agent CLI."
+description = "Server agent: hx-gatewayd, hx-privd and the hx-agent CLI (the backup worker is apps/hx-backup-worker)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

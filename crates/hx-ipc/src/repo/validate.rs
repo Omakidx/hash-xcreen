@@ -408,7 +408,7 @@ fn validate_result(r: &pb::JobResult) -> Check {
         known::<pb::WorkerError>(r.error, "result.error")?;
         require(
             r.snapshot_id.is_empty()
-                && r.key_ids.is_empty()
+                && r.entries_unreadable == 0
                 && r.manifest.is_empty()
                 && r.snapshots.is_empty(),
             "result: payload on failure",
@@ -454,8 +454,12 @@ pub fn check_result_shape(kind: pb::JobKind, r: &pb::JobResult) -> Check {
         "result.snapshots: does not match the job kind",
     )?;
     require(
-        r.key_ids.is_empty() || matches!(kind, K::Init | K::Keys),
+        r.key_ids.is_empty() || (kind == K::Keys || (r.ok && kind == K::Init)),
         "result.key_ids: does not match the job kind",
+    )?;
+    require(
+        r.entries_unreadable == 0 || (r.ok && kind == K::Backup),
+        "result.entries_unreadable: does not match the job kind",
     )
 }
 

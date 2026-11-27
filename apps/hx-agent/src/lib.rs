@@ -1,5 +1,6 @@
-//! Server agent library: the code behind the `hx-privd`, `hx-gatewayd`,
-//! `hx-agent` and `hx-backup-worker` binaries.
+//! Server agent library: the code behind the `hx-privd`, `hx-gatewayd`, `hx-agent`,
+//! `hx-update-fetcher` and `hx-privd-rescue` binaries (never `hx-backup-worker`: it lives in its own
+//! package so that `rustic_core` stays out of everything here, ipc.md §36).
 //!
 //! - [`privd`]: the root daemon and its fixed command set ([ipc.md](../../docs/ipc.md) Part 1).
 //! - [`fetcher`]: the sandboxed update downloader (ipc.md 6.12).

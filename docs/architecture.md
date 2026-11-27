@@ -72,7 +72,8 @@ crates/
   hx-provision  declarative desktop recipe, Incus orchestration, image import/build
   hx-backup     rustic_core + Google Drive backend, scheduling, retention, verification
 apps/
-  hx-agent      hx-gatewayd, hx-privd, backup worker, the hx-agent CLI and the installer engine (`hx-agent install`, `hx-privd-rescue`)
+  hx-agent      hx-gatewayd, hx-privd, the hx-agent CLI and the installer engine (`hx-agent install`, `hx-privd-rescue`); never links rustic
+  hx-backup-worker  the backup worker and the Drive helper (two roles of one binary); the only package that builds `hx-backup`'s `engine` feature, kept apart from `hx-agent` so that no `hx-agent` binary contains rustic (ipc.md §36)
   hx-session    in-container session daemon
   hx-pwcheck    in-container current-password checker (dynamically linked, ships in the `hx-session` package)
   hx-desktop    Slint client
@@ -709,7 +710,7 @@ Login (passkey + PIN; password + PIN the first time), desktop view with the same
 **Release pipeline** (jobs, in order):
 
 1. `gate`: the tag equals `v` plus the workspace version; both release key files **and both image key files** (`apps/hx-agent/image-keys/{current,next}.pub`) are provisioned and parse (a release is refused while the image keys are `UNPROVISIONED`, so no shipped agent is stuck without prebuilt images until it updates; `release/gate.sh` and the `release-build` compile gate both check it); the keys embedded in `install.sh` equal those files (also a normal CI test); `cargo deny` and `cargo audit`; the `release-build` feature is on and cannot be combined with `test-support`, `test-release-key` or the other test-hook features (a compile-time assertion that `CURRENT` is not `UNPROVISIONED`).
-2. `agent`: `cargo build -p hx-agent --bins --release --locked --target x86_64-unknown-linux-musl --features release-build` (never `--workspace`), then a check that every output is statically linked. All binaries are bins of one crate, so they share one version by construction.
+2. `agent`: `cargo build -p hx-agent --bins --release --locked --target x86_64-unknown-linux-musl --features release-build` (never `--workspace`), then `cargo build -p hx-backup-worker --release --locked --target x86_64-unknown-linux-musl` as a separate invocation (the backup worker is its own package so that rustic never reaches an `hx-agent` binary, ipc.md §36), then a check that every output is statically linked. Both packages take their version from the workspace, so all binaries share one version by construction.
 3. `session`: a matrix over `ubuntu:24.04`, `ubuntu:26.04`, `debian:12` and `debian:13` job containers builds `hx-session` and `hx-pwcheck` against that distro's FFmpeg, assembles the `.deb`, computes `Depends` with `dpkg-shlibdeps`, asserts the expected `libavcodec`/`libavutil` packages are listed, and smoke-tests `apt-get install ./hx-session.deb` followed by `ldd` showing no unresolved library.
 4. `assemble`: the deterministic ustar tarball and the canonical manifest ([ipc.md](ipc.md) §6.12), at most 256 MiB.
 5. `sign` (environment `release-signing`): a prehashed signature over `manifest-x86_64.json` with the trusted comment `hx-manifest v<ver> channel=<c> arch=x86_64` (privd and the installer require exactly this comment for the manifest they verify), and one over `install.sh` for manual checks; then `install.sh`'s own verification function must accept the result, which proves the shipped script accepts the shipped signature.

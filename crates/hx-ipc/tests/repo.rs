@@ -867,14 +867,17 @@ fn job_result_rules() {
         result_frame(r)
     };
     ok(&failed(&|r| r.files_new = 3), p);
-    for e in [0, 10, 99] {
+    for e in [0, 11, 99] {
         bad(&failed(&|r| r.error = e), p);
     }
-    for e in 1..=9 {
+    for e in 1..=10 {
         ok(&failed(&|r| r.error = e), p);
     }
     bad(&failed(&|r| r.snapshot_id = id(1)), p);
-    bad(&failed(&|r| r.key_ids = vec![id(1)]), p);
+    // a failed KEYS job may report the key it added (checked by shape below); counters of a
+    // successful BACKUP cannot ride on a failure
+    ok(&failed(&|r| r.key_ids = vec![id(1)]), p);
+    bad(&failed(&|r| r.entries_unreadable = 1), p);
     bad(&failed(&|r| r.manifest = Bytes::from_static(b"{}")), p);
     bad(&failed(&|r| r.snapshots = vec![snapshot_info(1)]), p);
     // ids, key_ids at N and N+1.
@@ -971,6 +974,25 @@ fn job_result_shape_follows_the_job_kind() {
     // A successful BACKUP needs its snapshot; a successful RESTORE_PLAN its manifest.
     assert!(shape(JobKind::Backup, &ok_result()).is_err());
     assert!(shape(JobKind::RestorePlan, &ok_result()).is_err());
+    // A failed KEYS job reports the keys it added; no other failed kind carries key ids.
+    let failed_keys = pb::JobResult {
+        ok: false,
+        error: 1,
+        key_ids: vec![id(1)],
+        ..Default::default()
+    };
+    for kind in KINDS {
+        assert_eq!(
+            shape(kind, &failed_keys).is_ok(),
+            kind == JobKind::Keys,
+            "{kind:?}"
+        );
+    }
+    // entries_unreadable only on a successful BACKUP
+    let mut backup = result_for(JobKind::Backup);
+    backup.entries_unreadable = 3;
+    assert!(shape(JobKind::Backup, &backup).is_ok());
+    assert!(shape(JobKind::Check, &backup).is_err());
     // A failed job carries nothing.
     let failed = pb::JobResult {
         ok: false,

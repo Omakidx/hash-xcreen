@@ -133,6 +133,13 @@ pub fn build_artifacts() -> Artifacts {
         ]);
     run(c, "hx-agent (test key, test hooks)");
 
+    // The backup worker is its own package (docs/ipc.md section 36), so `-p hx-agent --bins` no
+    // longer builds it.
+    let mut c = cargo();
+    c.current_dir(&root)
+        .args(["build", "-p", "hx-backup-worker", "--release", "--locked"]);
+    run(c, "hx-backup-worker");
+
     let mut c = cargo();
     c.current_dir(&root).args([
         "build",
