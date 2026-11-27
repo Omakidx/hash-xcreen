@@ -70,6 +70,11 @@ enum Out {
 /// The largest `Write` of a `PACK` or an `INDEX` the helper buffers (ipc.md §29, "Memory").
 const WRITE_CAP: u32 = 72 * 1024 * 1024;
 
+/// Is a `Write` of `size` bytes of `ty` over the helper's cap? Exactly the cap is accepted.
+fn write_too_large(ty: pb::ObjectType, size: u32) -> bool {
+    matches!(ty, pb::ObjectType::Pack | pb::ObjectType::Index) && size > WRITE_CAP
+}
+
 /// What a request task has to send at its end.
 enum Answer {
     /// One final message (`Done`, `QuotaResult`).
@@ -87,6 +92,9 @@ struct Shared {
     ctl: mpsc::UnboundedSender<Out>,
     /// The deadline of each request.
     budget: Duration,
+    /// The writer has closed the link on purpose (a failed download): what the reader then sees
+    /// of a half-received frame is not a violation.
+    closing: Arc<std::sync::atomic::AtomicBool>,
     cancels: Mutex<HashMap<u64, CancelHandle>>,
     drive: Result<Arc<Drive>, DriveError>,
     repo: watch::Sender<RepoCell>,
@@ -465,6 +473,7 @@ fn serve(
     let retrier = Arc::new(Retrier::new(cfg.timing));
     let (out_tx, out_rx) = mpsc::channel::<Out>(cfg.timing.out_queue);
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<Out>();
+    let closing = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (ev_tx, mut ev_rx) = mpsc::channel::<pb::Event>(64);
     retrier.set_events(ev_tx);
     let drive = build_drive(rt, cfg, rate.clone(), retrier);
@@ -475,6 +484,7 @@ fn serve(
         out: out_tx.clone(),
         ctl: ctl_tx,
         budget: cfg.timing.request_budget,
+        closing: closing.clone(),
         cancels: Mutex::new(HashMap::new()),
         drive,
         repo: repo_tx,
@@ -489,6 +499,7 @@ fn serve(
         let state = state.clone();
         let mut out_rx = out_rx;
         let mut ctl_rx = ctl_rx;
+        let closing = closing.clone();
         std::thread::Builder::new()
             .name("hx-drive-writer".into())
             .spawn(move || {
@@ -511,6 +522,7 @@ fn serve(
                         };
                         if matches!(item, Out::Close) {
                             // Between two frames: privd's decoder ends cleanly.
+                            closing.store(true, std::sync::atomic::Ordering::SeqCst);
                             let _ = wstream.shutdown(std::net::Shutdown::Both);
                             return true;
                         }
@@ -558,6 +570,10 @@ fn read_loop(handle: &Handle, stream: &UnixStream, shared: &Arc<Shared>, silence
         let raw = match decoder.read_from(&mut reader) {
             Ok(Some(f)) => f,
             Ok(None) => return End::Lost,
+            Err(_) if shared.closing.load(std::sync::atomic::Ordering::SeqCst) => {
+                // We closed the link ourselves, in the middle of what privd was sending.
+                return End::Lost;
+            }
             Err(e) if e.is_violation() => {
                 eprintln!("hx-backup-worker: drive link violation: {e}");
                 return End::Violation("framing");
@@ -643,9 +659,7 @@ fn read_loop(handle: &Handle, stream: &UnixStream, shared: &Arc<Shared>, silence
                         let Some(op) = r.op else { continue };
                         if let pb::repo_request::Op::Write(w) = &op {
                             let ty = object_type(w.object_type);
-                            if matches!(ty, pb::ObjectType::Pack | pb::ObjectType::Index)
-                                && w.size > WRITE_CAP
-                            {
+                            if write_too_large(ty, w.size) {
                                 // Nothing of it is buffered: its data frames find no upload and
                                 // are dropped (ipc.md §29, "Memory").
                                 shared
@@ -754,4 +768,20 @@ fn start(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_write_of_exactly_the_cap_is_accepted_and_one_byte_more_is_not() {
+        use pb::ObjectType as T;
+        assert!(!write_too_large(T::Pack, WRITE_CAP));
+        assert!(write_too_large(T::Pack, WRITE_CAP + 1));
+        assert!(!write_too_large(T::Index, WRITE_CAP));
+        assert!(write_too_large(T::Index, WRITE_CAP + 1));
+        // the other types have much smaller caps of their own, enforced by the codec
+        assert!(!write_too_large(T::Snapshot, 4 * 1024 * 1024));
+    }
 }

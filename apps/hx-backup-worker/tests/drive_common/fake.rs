@@ -129,6 +129,8 @@ pub struct Model {
     pub big_written_ok: bool,
     /// Bytes of media bodies served so far.
     pub media_bytes: u64,
+    /// `expires_in` of the access tokens (default 3600; under 120 every call refreshes).
+    pub token_expires_in: Option<u64>,
     /// Answer every list with at most this many files per page (0 = the requested size).
     pub force_page_size: usize,
     /// Delay before answering each request in these categories.
@@ -541,8 +543,9 @@ fn handle_inner(m: &mut Model, req: &Request) -> Response {
         return json(
             200,
             format!(
-                r#"{{"access_token":"fake-access-{}","expires_in":3600,"token_type":"Bearer"}}"#,
-                m.tokens_issued
+                r#"{{"access_token":"fake-access-{}","expires_in":{},"token_type":"Bearer"}}"#,
+                m.tokens_issued,
+                m.token_expires_in.unwrap_or(3600)
             ),
         );
     }

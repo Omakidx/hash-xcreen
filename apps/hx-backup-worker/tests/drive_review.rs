@@ -772,3 +772,157 @@ fn an_error_body_is_not_drained() {
         "the helper read a 256 MiB error body to its end"
     );
 }
+
+// ---- the probe's evidence is a Drive answer, never a token exchange ----
+
+/// Arrival times of the requests of one fake category, sorted.
+fn arrivals(rig: &Rig, category: &str) -> Vec<Instant> {
+    let mut at: Vec<Instant> = rig.fake.with(|m| {
+        m.log
+            .iter()
+            .filter(|r| r.category == category)
+            .map(|r| r.at)
+            .collect()
+    });
+    at.sort();
+    at
+}
+
+#[test]
+fn a_token_refresh_is_not_the_probes_answer_for_an_object_request() {
+    let rig = Rig::with(|c| c.timing.daily_pause = Duration::from_millis(300));
+    // short-lived tokens from the start: every call of the session refreshes first
+    rig.fake.with(|m| m.token_expires_in = Some(60));
+    let mut s = rig.open_session();
+    s.env.create().ok();
+    let ids: Vec<[u8; 32]> = (0..3u8).map(|i| id(0x40 + i)).collect();
+    rig.fake.with(|m| {
+        for i in &ids {
+            m.put(&path_of(T::Pack, i), &data(2000, i[0]));
+        }
+        m.delay.insert("get.media", Duration::from_millis(150));
+        m.inject(Fault::status("get.media", 3, 403, "dailyLimitExceeded"));
+    });
+    let reqs: Vec<u64> = ids.iter().map(|i| partial_req(&mut s, i, 0, 100)).collect();
+    for r in &reqs {
+        assert!(matches!(s.env.wait(*r), Reply::Read(_)));
+    }
+    let at = pack_attempts(&rig, &ids);
+    assert_eq!(at.len(), 6, "{at:?}");
+    assert!(
+        at[4].duration_since(at[3]) >= Duration::from_millis(100),
+        "the waiters started {:?} after the probe: its token refresh reopened the gate",
+        at[4].duration_since(at[3])
+    );
+    s.env.pump_for(Duration::from_millis(300));
+    assert_eq!(
+        s.env.count_events(pb::EventKind::Resumed),
+        1,
+        "{:?}",
+        s.env.event_kinds()
+    );
+}
+
+#[test]
+fn a_token_exchange_of_the_helpers_own_is_never_the_probe_for_quota() {
+    let rig = Rig::with(|c| c.timing.daily_pause = Duration::from_millis(300));
+    // short-lived tokens from the start: every call of the session refreshes first
+    rig.fake.with(|m| m.token_expires_in = Some(60));
+    let mut s = rig.open_session();
+    rig.fake.with(|m| {
+        m.delay.insert("about", Duration::from_millis(150));
+        m.inject(Fault::status("about", 3, 403, "dailyLimitExceeded"));
+    });
+    let mut reqs: Vec<u64> = (0..3)
+        .map(|_| s.env.request(pb::repo_request::Op::Quota(pb::Quota {})))
+        .collect();
+    // a fourth request starts during the pause: its token exchange must neither wait for the gate
+    // nor be the probe (and so reopen it) when it succeeds
+    std::thread::sleep(Duration::from_millis(250));
+    reqs.push(s.env.request(pb::repo_request::Op::Quota(pb::Quota {})));
+    for r in &reqs {
+        assert!(matches!(s.env.wait(*r), Reply::Quota(_)));
+    }
+    let at = arrivals(&rig, "about");
+    assert_eq!(at.len(), 7, "three refused, the probe, three more: {at:?}");
+    assert!(
+        at[4].duration_since(at[3]) >= Duration::from_millis(100),
+        "the others started {:?} after the probe: a token exchange reopened the gate",
+        at[4].duration_since(at[3])
+    );
+    s.env.pump_for(Duration::from_millis(300));
+    assert_eq!(
+        s.env.count_events(pb::EventKind::Resumed),
+        1,
+        "{:?}",
+        s.env.event_kinds()
+    );
+}
+
+// ---- the upload cap ----
+
+#[test]
+fn lifting_or_raising_the_cap_releases_a_chunk_that_is_already_waiting() {
+    let rig = Rig::new();
+    let mut s = rig.open_session();
+    s.env.create().ok();
+    s.env.write(T::Pack, &id(0x40), &data(10, 0)).ok();
+    for (i, new_rate) in [(0u8, 0u64), (1, 4 * 1024 * 1024)] {
+        // 1 B/s is raised to the 2 KiB/s minimum: the second chunk would wait 32 s
+        assert_eq!(s.env.set_rate(1), Reply::Done);
+        let began = Instant::now();
+        let body = data(200 * 1024, i);
+        let r = s.env.request(pb::repo_request::Op::Write(pb::Write {
+            object_type: T::Pack as i32,
+            id: bytes::Bytes::copy_from_slice(&id(0x41 + i)),
+            size: body.len() as u32,
+        }));
+        s.env.upload(r, &body);
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(s.env.set_rate(new_rate), Reply::Done);
+        assert_eq!(s.env.wait(r), Reply::Done);
+        assert!(
+            began.elapsed() < Duration::from_secs(8),
+            "rate set to {new_rate}: the waiting chunk kept its old wait ({:?})",
+            began.elapsed()
+        );
+    }
+}
+
+// ---- a close of our own is not a violation ----
+
+#[test]
+fn a_link_the_helper_closed_itself_is_not_reported_as_a_violation() {
+    use hx_backup_worker::drive::server::End;
+    let rig = Rig::new();
+    let mut s = rig.open_session();
+    s.env.create().ok();
+    rig.fake.with(|m| {
+        m.put(&path_of(T::Pack, &id(0x40)), &data(12 * MIB, 3));
+        m.inject(Fault {
+            category: "get.media",
+            skip: 1,
+            times: 1000,
+            action: Action::Status {
+                status: 403,
+                reason: "appNotAuthorizedToFile",
+                retry_after: None,
+            },
+        });
+    });
+    read_full_req(&mut s, T::Pack, &id(0x40));
+    // privd is in the middle of an upload frame when the helper closes: a header and a few bytes
+    let w = s.env.request(pb::repo_request::Op::Write(pb::Write {
+        object_type: T::Pack as i32,
+        id: bytes::Bytes::copy_from_slice(&id(0x41)),
+        size: 3 * MIB as u32,
+    }));
+    let mut half = hx_ipc::repo::encode_data_header(w, false, MIB)
+        .unwrap()
+        .to_vec();
+    half.extend_from_slice(&[1u8; 1000]);
+    s.env.send_raw(&half);
+    std::thread::sleep(Duration::from_millis(1500));
+    while s.env.pump().is_ok() {}
+    assert_eq!(s.join_without_closing(), End::Lost);
+}

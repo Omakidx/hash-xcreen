@@ -125,6 +125,8 @@ pub struct UploadBody {
     sleep: Option<Pin<Box<tokio::time::Sleep>>>,
     wait_left: Duration,
     waiting: Duration,
+    /// The generation of the rate the current wait was worked out under.
+    resv_gen: u64,
     slice: Duration,
     remaining: u64,
     rate: Option<Arc<UploadRate>>,
@@ -146,6 +148,7 @@ impl UploadBody {
             sleep: None,
             wait_left: Duration::ZERO,
             waiting: Duration::ZERO,
+            resv_gen: 0,
             slice,
             rate,
             progress,
@@ -176,6 +179,14 @@ impl Body for UploadBody {
                 if let Some(p) = &this.progress {
                     p.paced(this.waiting);
                 }
+                // The rate may have been changed (lifted, raised, lowered) while this chunk
+                // waited: its wait is worked out again, under the new rate.
+                if let (Some(r), Some(piece)) = (&this.rate, &this.pending)
+                    && r.generation() != this.resv_gen
+                {
+                    this.resv_gen = r.generation();
+                    this.wait_left = r.reserve(piece.len());
+                }
             }
             if !this.wait_left.is_zero() {
                 let d = this.wait_left.min(this.slice);
@@ -198,7 +209,10 @@ impl Body for UploadBody {
             let n = this.current.len().min(CHUNK);
             let piece = this.current.split_to(n);
             this.remaining = this.remaining.saturating_sub(n as u64);
-            let wait = this.rate.as_ref().map_or(Duration::ZERO, |r| r.reserve(n));
+            let wait = this.rate.as_ref().map_or(Duration::ZERO, |r| {
+                this.resv_gen = r.generation();
+                r.reserve(n)
+            });
             this.pending = Some(piece);
             this.wait_left = wait;
         }
@@ -364,6 +378,15 @@ fn without_query(uri: &http::Uri) -> http::Uri {
     http::Uri::from_parts(parts).unwrap_or_else(|_| http::Uri::from_static("/"))
 }
 
+/// Does a response with this status, from this host, show that Drive's quota is usable, so that
+/// the probe after a daily-limit pause has its answer? Only a Drive API answer that is not an error
+/// (2xx, 3xx), or one that is clearly no limit (404, 412). Never the token endpoint (a probe's first
+/// request is usually a token refresh), a 5xx, a 429, a 401 or another 403 (ipc.md §29).
+#[must_use]
+pub fn answers_the_probe(host: Host, status: u16) -> bool {
+    host == Host::Api && (status < 400 || matches!(status, 404 | 412))
+}
+
 /// The ceiling of a response body that is not a media read.
 const JSON_BODY_CEILING: u64 = 4 * 1024 * 1024;
 
@@ -426,7 +449,7 @@ impl HttpTransport for GoogleTransport {
                 body,
                 rate,
                 progress.clone(),
-                self.timing.idle / 2,
+                self.timing.idle.min(Duration::from_secs(2)) / 2,
             ))
             .map_err(|_| opendal::Error::new(opendal::ErrorKind::Unexpected, "bad request"))?;
         *hreq.headers_mut() = headers;
@@ -452,10 +475,11 @@ impl HttpTransport for GoogleTransport {
         };
         let (parts, incoming) = resp.into_parts();
         let uri = without_query(&uri);
-        if status.as_u16() < 400
+        if answers_the_probe(host, status.as_u16())
             && let Some(p) = &progress
         {
-            // Not `dailyLimitExceeded`: the probe after a pause has its answer.
+            // A Drive API answer that is not an error: the probe after a pause has its answer.
+            // The token endpoint's is not (a probe's first request is usually a token refresh).
             p.not_limited();
         }
         if status.as_u16() >= 400 {
@@ -465,7 +489,9 @@ impl HttpTransport for GoogleTransport {
                 return Err(network_error("error body"));
             };
             let (reason, oauth) = parse_error_body(&buf);
-            if !(status.as_u16() == 403 && reason == "dailyLimitExceeded")
+            // Only an answer that is clearly not a limit shows that the quota is usable: not a 5xx,
+            // a 429, a 401 or another 403.
+            if answers_the_probe(host, status.as_u16())
                 && let Some(p) = &progress
             {
                 p.not_limited();
@@ -606,6 +632,22 @@ mod tests {
             "/relative",
         ] {
             assert!(check_uri(&uri(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_a_drive_answer_that_is_no_limit_answers_the_probe() {
+        for ok in [200, 204, 206, 302, 404, 412] {
+            assert!(answers_the_probe(Host::Api, ok), "{ok}");
+        }
+        for no in [400, 401, 403, 408, 429, 500, 503] {
+            assert!(!answers_the_probe(Host::Api, no), "{no}");
+        }
+        for status in [200, 400, 401, 404, 503] {
+            assert!(
+                !answers_the_probe(Host::Token, status),
+                "token endpoint {status}"
+            );
         }
     }
 

@@ -11,9 +11,13 @@ use std::time::{Duration, Instant};
 /// Largest piece of an upload body released at once.
 pub const CHUNK: usize = 64 * 1024;
 
+/// The lowest nonzero rate: a smaller one would make one chunk wait for hours (ipc.md §29 g).
+pub const MIN_RATE: u64 = 2048;
+
 /// The shared bucket.
 #[derive(Debug)]
 pub struct UploadRate {
+    generation: AtomicU64,
     bytes_per_s: AtomicU64,
     next_free: Mutex<Instant>,
 }
@@ -29,17 +33,32 @@ impl UploadRate {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            generation: AtomicU64::new(0),
             bytes_per_s: AtomicU64::new(0),
             next_free: Mutex::new(Instant::now()),
         }
     }
 
     /// `SetUploadRate`: the rate for chunks not yet released; 0 is unlimited.
+    ///
+    /// A nonzero rate below [`MIN_RATE`] is raised to it. Every change starts the schedule afresh
+    /// and bumps [`UploadRate::generation`], so that a chunk that is already waiting works its wait
+    /// out again under the new rate.
     pub fn set(&self, bytes_per_s: u64) {
-        self.bytes_per_s.store(bytes_per_s, Ordering::Relaxed);
-        if bytes_per_s == 0 {
-            *self.next_free.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
-        }
+        let rate = if bytes_per_s == 0 {
+            0
+        } else {
+            bytes_per_s.max(MIN_RATE)
+        };
+        self.bytes_per_s.store(rate, Ordering::Relaxed);
+        *self.next_free.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many times the rate has been set.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
     }
 
     /// The current rate.
@@ -84,6 +103,21 @@ mod tests {
         let third = r.reserve(CHUNK);
         assert!(second > Duration::from_millis(80) && second <= Duration::from_millis(100));
         assert!(third > Duration::from_millis(180) && third <= Duration::from_millis(200));
+    }
+
+    #[test]
+    fn a_tiny_rate_is_raised_to_the_minimum_and_every_change_is_counted() {
+        let r = UploadRate::new();
+        let g = r.generation();
+        r.set(1);
+        assert_eq!(r.get(), MIN_RATE);
+        assert!(r.generation() > g);
+        // a 64 KiB chunk at the minimum waits 32 s, not 18 hours
+        let _ = r.reserve(CHUNK);
+        let wait = r.reserve(CHUNK);
+        assert!(wait <= Duration::from_secs(33), "{wait:?}");
+        r.set(0);
+        assert_eq!(r.get(), 0);
     }
 
     #[test]

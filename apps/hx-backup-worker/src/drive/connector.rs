@@ -151,21 +151,15 @@ impl Connector {
     ) -> Result<Conn, BoxError> {
         let mut last: Option<io::Error> = None;
         for addr in addrs {
-            match tokio::time::timeout(self.connect_timeout, TcpStream::connect(addr)).await {
-                Ok(Ok(tcp)) => {
-                    let _ = tcp.set_nodelay(true);
-                    // A handshake that fails or stalls is a reason to try the next address too.
-                    match tokio::time::timeout(
-                        self.connect_timeout,
-                        self.tls.connect(name.clone(), tcp),
-                    )
-                    .await
-                    {
-                        Ok(Ok(tls)) => return Ok(Conn(TokioIo::new(tls))),
-                        Ok(Err(e)) => last = Some(e),
-                        Err(_) => last = Some(io::ErrorKind::TimedOut.into()),
-                    }
-                }
+            // One bound for the TCP connection and the handshake together; a failure of either
+            // is a reason to try the next address.
+            let one = async {
+                let tcp = TcpStream::connect(addr).await?;
+                let _ = tcp.set_nodelay(true);
+                self.tls.connect(name.clone(), tcp).await
+            };
+            match tokio::time::timeout(self.connect_timeout, one).await {
+                Ok(Ok(tls)) => return Ok(Conn(TokioIo::new(tls))),
                 Ok(Err(e)) => last = Some(e),
                 Err(_) => last = Some(io::ErrorKind::TimedOut.into()),
             }

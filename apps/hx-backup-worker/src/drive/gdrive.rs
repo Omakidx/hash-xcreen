@@ -337,7 +337,7 @@ impl Api {
         ));
         let (token, expires_in) = self
             .retrier
-            .run(cancel, 0, "refresh token", || async {
+            .run_token(cancel, "refresh token", || async {
                 let req = http::Request::post("https://oauth2.googleapis.com/token")
                     .header(
                         http::header::CONTENT_TYPE,

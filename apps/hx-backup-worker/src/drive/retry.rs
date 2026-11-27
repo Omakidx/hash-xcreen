@@ -449,23 +449,26 @@ struct Gate {
     pausing: bool,
     /// One request is the probe after the pause.
     probing: bool,
+    /// Which probe it is: only the current one may release or reopen the gate.
+    probe_gen: u64,
 }
 
 enum Entry {
     Exhausted,
-    Go { probe: bool },
+    Go { probe: Option<u64> },
 }
 
 /// Releases the probe when its attempt ends any way at all (including a cancelled request).
 struct ProbeGuard<'a> {
     retrier: &'a Retrier,
-    active: bool,
+    /// The generation of the probe this request is, if it is one.
+    active: Option<u64>,
 }
 
 impl Drop for ProbeGuard<'_> {
     fn drop(&mut self) {
-        if self.active {
-            self.retrier.release_probe();
+        if let Some(g) = self.active {
+            self.retrier.release_probe(g);
         }
     }
 }
@@ -566,22 +569,30 @@ impl Retrier {
         }
     }
 
-    fn release_probe(&self) {
-        self.cell
-            .gate
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .probing = false;
+    /// The probe `generation` is done without having reopened the gate. A probe that has been
+    /// replaced (the gate reopened and paused again since) releases nothing.
+    fn release_probe(&self, generation: u64) {
+        {
+            let mut g = self.cell.gate.lock().unwrap_or_else(|e| e.into_inner());
+            if g.probe_gen != generation {
+                return;
+            }
+            g.probing = false;
+        }
         self.cell.notify.notify_waiters();
     }
 
     /// What the probe's attempt calls when its response is not `dailyLimitExceeded`.
-    fn reopen_callback(&self) -> Box<dyn FnOnce() + Send> {
+    fn reopen_callback(&self, generation: u64) -> Box<dyn FnOnce() + Send> {
         let cell = self.cell.clone();
         let sink = self.sink();
         Box::new(move || {
             let was = {
                 let mut g = cell.gate.lock().unwrap_or_else(|e| e.into_inner());
+                if g.probe_gen != generation {
+                    // A probe of an earlier pause: the gate is not its to reopen.
+                    return;
+                }
                 let was = g.pausing;
                 g.pausing = false;
                 g.probing = false;
@@ -618,10 +629,13 @@ impl Retrier {
                             None
                         } else {
                             g.probing = true;
-                            return Ok(Entry::Go { probe: true });
+                            g.probe_gen += 1;
+                            return Ok(Entry::Go {
+                                probe: Some(g.probe_gen),
+                            });
                         }
                     }
-                    _ => return Ok(Entry::Go { probe: false }),
+                    _ => return Ok(Entry::Go { probe: None }),
                 }
             };
             let began = Instant::now();
@@ -732,6 +746,40 @@ impl Retrier {
         cancel: &Cancel,
         size: u64,
         what: &'static str,
+        f: F,
+    ) -> Result<T, DriveError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = opendal::Result<T>>,
+    {
+        self.run_inner(cancel, size, what, true, f).await
+    }
+
+    /// [`Retrier::run`] for a token exchange: it retries and has its deadline and no-progress
+    /// timer, but it does not wait at the daily-limit gate, is never the probe, and its success
+    /// never reopens the gate. The token endpoint is not Drive's quota.
+    ///
+    /// # Errors
+    /// As [`Retrier::run`].
+    pub async fn run_token<T, F, Fut>(
+        &self,
+        cancel: &Cancel,
+        what: &'static str,
+        f: F,
+    ) -> Result<T, DriveError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = opendal::Result<T>>,
+    {
+        self.run_inner(cancel, 0, what, false, f).await
+    }
+
+    async fn run_inner<T, F, Fut>(
+        &self,
+        cancel: &Cancel,
+        size: u64,
+        what: &'static str,
+        gated: bool,
         mut f: F,
     ) -> Result<T, DriveError>
     where
@@ -741,13 +789,15 @@ impl Retrier {
         let mut retries = 0u32;
         let mut probe = ProbeGuard {
             retrier: self,
-            active: false,
+            active: None,
         };
         let mut last = DriveError::new(EC::Transient);
         loop {
-            match self.enter_gate(cancel).await? {
-                Entry::Exhausted => return Err(DriveError::new(EC::DailyLimit)),
-                Entry::Go { probe: p } => probe.active = p,
+            if gated {
+                match self.enter_gate(cancel).await? {
+                    Entry::Exhausted => return Err(DriveError::new(EC::DailyLimit)),
+                    Entry::Go { probe: p } => probe.active = p,
+                }
             }
             if cancel.is_cancelled() {
                 return Err(DriveError::new(EC::Cancelled));
@@ -759,16 +809,18 @@ impl Retrier {
             }
             let attempt_started = Instant::now();
             let state = Arc::new(AttemptState::new(cancel.budget.clone()));
-            if probe.active {
+            if let Some(g) = probe.active {
                 *state.probe.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some(self.reopen_callback());
+                    Some(self.reopen_callback(g));
             }
             let attempt = ATTEMPT.scope(state.clone(), f());
             let result = cancel.guard(self.watch(&state, remaining, attempt)).await?;
             let outcome = match result {
                 Some(Ok(v)) => {
-                    self.note_success().await;
-                    probe.active = false;
+                    if gated {
+                        self.note_success().await;
+                    }
+                    probe.active = None;
                     return Ok(v);
                 }
                 Some(Err(e)) => {
@@ -790,19 +842,19 @@ impl Retrier {
                         ..DriveError::new(EC::AuthRevoked)
                     });
                 }
-                Outcome::DailyLimit => {
+                Outcome::DailyLimit if gated => {
                     // A failed probe starts the next pause (or exhausts the gate).
                     self.on_daily_limit(attempt_started).await?;
-                    probe.active = false;
+                    probe.active = None;
                     continue;
                 }
+                Outcome::DailyLimit => (EC::Transient, None),
                 Outcome::Transient { retry_after } => (EC::Transient, retry_after),
                 Outcome::RateLimited { retry_after } => (EC::RateLimited, retry_after),
             };
-            if probe.active {
+            if let Some(g) = probe.active.take() {
                 // The probe failed for another reason: let the next waiter probe.
-                probe.active = false;
-                self.release_probe();
+                self.release_probe(g);
             }
             retries += 1;
             let mut delay = self.timing.delay(retries, (self.rng)());
@@ -1178,5 +1230,39 @@ mod tests {
             assert_eq!(e.class, EC::DailyLimit);
         }
         assert_eq!(n.load(Ordering::SeqCst), before, "no attempt was made");
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_has_been_replaced_cannot_release_the_gate() {
+        let mut t = fast();
+        t.daily_pause = Duration::from_millis(20);
+        let r = Retrier::with_rng(t, Box::new(|| 0.0));
+        let cancel = Cancel::never();
+        let probing = |r: &Retrier| r.cell.gate.lock().unwrap().probing;
+        // a pause, and probe 1, which reopens the gate with its answer
+        r.on_daily_limit(Instant::now()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let Entry::Go { probe: Some(g1) } = r.enter_gate(&cancel).await.unwrap() else {
+            panic!("probe 1")
+        };
+        r.reopen_callback(g1)();
+        // another pause, and probe 2, which is in flight
+        r.on_daily_limit(Instant::now()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let Entry::Go { probe: Some(g2) } = r.enter_gate(&cancel).await.unwrap() else {
+            panic!("probe 2")
+        };
+        assert_ne!(g1, g2);
+        assert!(probing(&r));
+        // probe 1 ends late: neither its guard nor its callback may touch probe 2's gate
+        r.release_probe(g1);
+        r.reopen_callback(g1)();
+        assert!(probing(&r), "the old probe cleared the new probe's flag");
+        assert!(
+            r.cell.gate.lock().unwrap().pausing,
+            "the old probe reopened the gate"
+        );
+        r.release_probe(g2);
+        assert!(!probing(&r));
     }
 }
