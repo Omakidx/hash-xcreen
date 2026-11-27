@@ -122,7 +122,12 @@ async fn a_target_whose_record_does_not_say_resumable_is_deleted_by_recovery() {
     assert!(rig.host.targets().is_empty());
     assert!(rig.runner.resume_point("main").unwrap().is_none());
     assert!(!rig.desktop_dir().join("job.json").exists());
-    // A resume.json that names no instance is removed too.
+    // A resume.json that names no instance is removed too, at the next start (a second
+    // host-wide run does not happen in a running privd).
+    let rig = Rig::raw();
+    BackupDirs::new(&rig.cfg.state_dir)
+        .ensure_desktop_dir("main")
+        .unwrap();
     ResumeRecord::new(
         job(5),
         &hx_provision::incus::RestoreTargetName::new("hx-restore-gone").unwrap(),

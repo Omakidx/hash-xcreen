@@ -140,6 +140,10 @@ pub struct RunEnd {
     pub permission_answers: u32,
 }
 
+/// The most snapshot ids a job's session remembers having listed or read (128 KiB; ipc.md
+/// section 25).
+pub const MAX_SEEN_SNAPSHOTS: usize = 4_096;
+
 /// Both links of one job and everything the loop knows about them.
 pub struct Session<E: BackupEnv> {
     pub(super) env: Arc<E>,
@@ -176,6 +180,10 @@ pub struct Session<E: BackupEnv> {
     open_life: Option<u64>,
     seen_snapshots: std::collections::HashSet<[u8; 32]>,
     preexisting_snapshots: std::collections::HashSet<[u8; 32]>,
+    /// More ids were listed or read than `MAX_SEEN_SNAPSHOTS`: privd no longer knows which it saw.
+    seen_overflow: bool,
+    /// A `SNAPSHOT` write came after that: the job's snapshot counts as pre-existing.
+    snapshots_untrusted: bool,
     permission_answers: u32,
     pub(super) open_repo_answer: Option<pb::repo_response::Result>,
     on_backup_ok: Option<BackupHook>,
@@ -243,6 +251,8 @@ impl<E: BackupEnv> Session<E> {
             open_life: None,
             seen_snapshots: std::collections::HashSet::new(),
             preexisting_snapshots: std::collections::HashSet::new(),
+            seen_overflow: false,
+            snapshots_untrusted: false,
             permission_answers: 0,
             open_repo_answer: None,
             on_backup_ok: None,
@@ -287,12 +297,19 @@ impl<E: BackupEnv> Session<E> {
     }
 
     fn note_snapshot(&mut self, id: &[u8]) {
-        // Bounded: past 65 536 ids nothing more is remembered (a repository with that many
-        // snapshots is far beyond v1).
-        if self.seen_snapshots.len() < 65_536
-            && let Ok(id) = <[u8; 32]>::try_from(id)
-        {
+        // Bounded (ipc.md section 25): the worker controls what is listed, so the set holds at
+        // most `MAX_SEEN_SNAPSHOTS` ids. Past that privd fails closed (section 29): it can no
+        // longer tell which ids it saw, so a later `SNAPSHOT` write counts as pre-existing.
+        let Ok(id) = <[u8; 32]>::try_from(id) else {
+            return;
+        };
+        if self.seen_snapshots.contains(&id) {
+            return;
+        }
+        if self.seen_snapshots.len() < MAX_SEEN_SNAPSHOTS {
             self.seen_snapshots.insert(id);
+        } else {
+            self.seen_overflow = true;
         }
     }
 
@@ -709,8 +726,9 @@ impl<E: BackupEnv> Session<E> {
             && self.kind == JobKind::Backup
             && let Some(h) = &self.on_backup_ok
         {
-            let existed = <[u8; 32]>::try_from(r.snapshot_id.as_ref())
-                .is_ok_and(|id| self.preexisting_snapshots.contains(&id));
+            let existed = self.snapshots_untrusted
+                || <[u8; 32]>::try_from(r.snapshot_id.as_ref())
+                    .is_ok_and(|id| self.preexisting_snapshots.contains(&id));
             h(&r, existed);
         }
         self.result = Some(r);
@@ -840,9 +858,18 @@ impl<E: BackupEnv> Session<E> {
         if let Op::Write(w) = &op
             && w.object_type == ObjectType::Snapshot as i32
             && let Ok(id) = <[u8; 32]>::try_from(w.id.as_ref())
-            && self.seen_snapshots.contains(&id)
         {
-            self.preexisting_snapshots.insert(id);
+            if self.seen_overflow {
+                if !self.snapshots_untrusted {
+                    self.snapshots_untrusted = true;
+                    self.env.audit(&format!(
+                        "backup job {}: more than {MAX_SEEN_SNAPSHOTS} snapshot ids were listed or read; later snapshot writes are not recorded",
+                        self.job_hex
+                    ));
+                }
+            } else if self.seen_snapshots.contains(&id) {
+                self.preexisting_snapshots.insert(id);
+            }
         }
         let f = frame(pb::repo_frame::Frame::Request(pb::RepoRequest {
             req_id: d_id,

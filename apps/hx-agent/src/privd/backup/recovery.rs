@@ -17,6 +17,11 @@
 //! run, and the report says whether every listing succeeded (`complete`), because a recovery that
 //! could not look must be repeated before jobs are admitted.
 //!
+//! **Only at start** (and again while no job can exist, as long as a host-wide step failed): once a
+//! host-wide run has completed it never runs again while privd is up, because it would delete the
+//! objects of jobs that are running. `Recovery::recover_blocked` is what later retries run, for one
+//! desktop and nothing else.
+//!
 //! `Recovery::recover_desktop` is the same cleanup for the objects one `job.json` names (a job whose
 //! cleanup failed leaves its record behind; the next admission for that desktop runs it first),
 //! and `Recovery::teardown` is steps 1 and 4 plus the sockets and the records, for
@@ -95,8 +100,12 @@ impl<H: BackupHost, E: BackupEnv> Recovery<'_, H, E> {
         if self.audit_failures {
             self.env.audit(&format!("backup recovery: {what}"));
         }
-        rep.failures.push(what.clone());
-        rep.blocked.entry(id.to_string()).or_insert(what);
+        // One failure per desktop is kept (the first): the set of failures of a host-wide run
+        // and of a later per-desktop retry are then the same set when nothing changed.
+        if !rep.blocked.contains_key(id) {
+            rep.failures.push(what.clone());
+            rep.blocked.insert(id.to_string(), what);
+        }
     }
 
     fn note(&self, rep: &mut RecoveryReport, what: String) {
@@ -395,12 +404,59 @@ impl<H: BackupHost, E: BackupEnv> Recovery<'_, H, E> {
             }
         }
         if rep.complete {
+            self.drop_older_kept(desktop, &mut rep).await;
+        }
+        if rep.complete {
             self.clear_records(desktop, &kept, &mut rep);
         }
-        self.env.audit(&format!(
-            "backup recovery of {desktop}: {} failure(s)",
-            rep.failures.len()
-        ));
+        if self.audit_failures {
+            self.env.audit(&format!(
+                "backup recovery of {desktop}: {} failure(s)",
+                rep.failures.len()
+            ));
+        }
+        rep
+    }
+
+    /// What a later retry runs for a desktop that crash recovery blocked: its `hx-backup-*`
+    /// snapshots and the cleanup of its leftover job record. Nothing of another desktop is
+    /// touched, and the caller holds the desktop's slot. A failure leaves the desktop in
+    /// `blocked` of the report.
+    pub async fn recover_blocked(&self, id: &str) -> RecoveryReport {
+        let mut rep = RecoveryReport {
+            complete: true,
+            ..RecoveryReport::default()
+        };
+        let instance = format!("{}{id}", self.cfg.instance_prefix);
+        match self.host.list_backup_snapshots(&instance).await {
+            Ok(names) => {
+                for n in names {
+                    match self.host.delete_snapshot(&instance, &n).await {
+                        Ok(()) => rep.snapshots_deleted.push(format!("{id}/{n}")),
+                        Err(e) => self.fail_desktop(
+                            &mut rep,
+                            id,
+                            format!("cannot delete snapshot {n}: {e}"),
+                        ),
+                    }
+                }
+            }
+            Err(e) => {
+                self.fail_desktop(&mut rep, id, format!("cannot list snapshots of {id}: {e}"));
+            }
+        }
+        if rep.blocked.is_empty() {
+            let inner = self.recover_desktop(id).await;
+            if let Some(first) = inner.failures.first() {
+                self.fail_desktop(&mut rep, id, first.clone());
+            }
+            rep.helpers_deleted.extend(inner.helpers_deleted);
+            rep.sockets_removed.extend(inner.sockets_removed);
+            rep.snapshots_deleted.extend(inner.snapshots_deleted);
+            rep.targets_deleted.extend(inner.targets_deleted);
+            rep.targets_kept.extend(inner.targets_kept);
+            rep.records_cleared.extend(inner.records_cleared);
+        }
         rep
     }
 

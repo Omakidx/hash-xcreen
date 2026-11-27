@@ -1156,9 +1156,12 @@ async fn a_desktop_whose_cleanup_fails_is_blocked_alone_and_audited_once() {
         .iter()
         .filter(|l| l.starts_with("backup recovery"))
         .count();
-    assert!(recovery_lines <= 3, "{recovery_lines}: {lines:?}");
+    // One line for the failure, then a count only at the 1st, 2nd and 4th repeat: never a line
+    // per retry (an admission for the blocked desktop counts as a retry too).
+    assert!(recovery_lines <= 4, "{recovery_lines}: {lines:?}");
     let st = rig.runner.recovery_state();
-    assert_eq!(st.attempts, 4);
+    // The first run, the admission of the blocked desktop (a retry too) and three more runs.
+    assert_eq!(st.attempts, 5);
     assert!(st.repeats >= 1 && !st.failures.is_empty(), "{st:?}");
     // The host recovers: the next run clears the block.
     rig.host.clear_failure("delete_snapshot");
@@ -1167,7 +1170,7 @@ async fn a_desktop_whose_cleanup_fails_is_blocked_alone_and_audited_once() {
     assert!(rig.runner.recovery_state().blocked.is_empty());
     assert!(
         rig.audit()
-            .contains("backup recovery: done after 5 attempt")
+            .contains("backup recovery: done after 6 attempt")
     );
     let h = rig.runner.start(rig.backup_request()).await.unwrap();
     assert!(rig.outcome(&h).await.result.is_ok());
@@ -1438,4 +1441,247 @@ async fn a_long_job_that_aborts_many_uploads_neither_stalls_nor_leaks_a_frame_sl
         rig.runner.relay_slots_free() == 16
     })
     .await;
+}
+
+// ===== review round 3 ============================================================================
+
+fn block_main(rig: &Rig) {
+    rig.host.add_snapshot("hx-main", "hx-backup-old");
+    rig.host.fail_always_on(
+        "delete_snapshot",
+        "hx-main",
+        HostError::Failed("Incus is down".into()),
+    );
+}
+
+// ----- R1, R2: crash recovery is host-wide only while no job is admitted ----------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retries_of_a_blocked_desktop_never_touch_the_job_of_another_desktop() {
+    let rig = Rig::raw_with(&["main", "other"]);
+    block_main(&rig);
+    let rep = rig.runner.recover().await;
+    assert!(rep.complete && rep.blocked.contains_key("main"), "{rep:?}");
+    let stops = rig.host.drive_stops();
+    let go = Arc::new(AtomicBool::new(false));
+    let g2 = go.clone();
+    rig.worker(move |w| {
+        w.poll_every(Duration::from_millis(20));
+        while !g2.load(Ordering::SeqCst) {
+            if w.pump().is_err() {
+                return;
+            }
+        }
+        snapshot_result(w);
+    });
+    let h = rig.runner.start(start_other(&rig)).await.unwrap();
+    rig.until("the helper of the other desktop", || {
+        rig.host.helpers().len() == 1
+    })
+    .await;
+    let other_job = rig.cfg.state_dir.join("backup/other/job.json");
+    // Several retry periods of the blocked desktop go by while the other desktop's job runs.
+    for round in 0..4 {
+        rig.runner.recover().await;
+        rig.advance(60_000, 10_000).await;
+        assert_ne!(h.status().state, JobState::Finished, "round {round}");
+        assert_eq!(
+            rig.host.helpers().len(),
+            1,
+            "round {round}: the running job's helper was deleted"
+        );
+        assert_eq!(
+            rig.host.snapshots("hx-other").len(),
+            1,
+            "round {round}: the running backup's own snapshot was deleted"
+        );
+        assert_eq!(
+            std::fs::read_dir(&rig.cfg.run_dir).unwrap().count(),
+            1,
+            "round {round}: the running job's socket was removed"
+        );
+        assert!(other_job.exists(), "round {round}: job.json was removed");
+        assert_eq!(
+            rig.host.drive_stops(),
+            stops,
+            "round {round}: the Drive helper was stopped under the running session"
+        );
+    }
+    assert_eq!(
+        rig.runner.recovery_state().blocked.len(),
+        1,
+        "the blocked desktop stays blocked while its cause remains"
+    );
+    go.store(true, Ordering::SeqCst);
+    let out = rig.outcome(&h).await;
+    assert!(out.result.is_ok(), "{:?}\n{}", out.result, rig.audit());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admission_and_the_recovery_state_agree_and_a_later_host_failure_closes_nothing() {
+    let rig = Rig::raw();
+    rig.host.set_list_fails(true);
+    let rep = rig.runner.recover().await;
+    assert!(!rep.complete);
+    assert!(!rig.runner.is_recovered());
+    assert!(!rig.runner.recovery_state().done);
+    let e = rig.runner.start(rig.backup_request()).await.err().unwrap();
+    assert_eq!(e, StartError::Recovering);
+    rig.host.set_list_fails(false);
+    assert!(rig.runner.recover().await.complete);
+    assert!(rig.runner.is_recovered() && rig.runner.recovery_state().done);
+    // Incus fails now: the host-wide steps do not run again, so nothing can fail them, and the
+    // two views cannot disagree.
+    rig.host.set_list_fails(true);
+    let again = rig.runner.recover().await;
+    assert!(again.complete, "{again:?}");
+    assert!(rig.runner.is_recovered() && rig.runner.recovery_state().done);
+    rig.worker(snapshot_result);
+    let h = rig.runner.start(rig.backup_request()).await.unwrap();
+    assert!(rig.outcome(&h).await.result.is_ok(), "{}", rig.audit());
+}
+
+// ----- R3: an admission retries a blocked desktop -----------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_admission_for_a_blocked_desktop_retries_its_cleanup_at_most_every_ten_seconds() {
+    let rig = Rig::raw();
+    block_main(&rig);
+    let rep = rig.runner.recover().await;
+    assert!(rep.blocked.contains_key("main"));
+    assert!(rig.runner.recovery_state().changed);
+    // The cause is still there: refused, and the cleanup ran once.
+    let e = rig.runner.start(rig.backup_request()).await.err().unwrap();
+    assert!(matches!(e, StartError::DesktopBlocked(_)), "{e:?}");
+    // The cause goes away, but the last retry was a moment ago: refused without another one.
+    rig.host.clear_failure("delete_snapshot");
+    let e = rig.runner.start(rig.backup_request()).await.err().unwrap();
+    assert!(matches!(e, StartError::DesktopBlocked(_)), "{e:?}");
+    // Ten seconds later the admission itself retries, and the job starts: no 15 minutes wait.
+    rig.mono.advance_ms(10_000);
+    rig.worker(snapshot_result);
+    let h = rig.runner.start(rig.backup_request()).await.unwrap();
+    assert!(rig.outcome(&h).await.result.is_ok(), "{}", rig.audit());
+    assert!(rig.runner.recovery_state().blocked.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_back_off_starts_again_when_the_set_of_failures_changes() {
+    let rig = Rig::raw();
+    block_main(&rig);
+    rig.runner.recover().await;
+    assert!(rig.runner.recovery_state().changed, "the first failure");
+    rig.runner.recover().await;
+    let st = rig.runner.recovery_state();
+    assert!(!st.changed && st.repeats == 1, "the same failure: {st:?}");
+    rig.host.fail_always_on(
+        "delete_snapshot",
+        "hx-main",
+        HostError::Failed("another reason".into()),
+    );
+    rig.runner.recover().await;
+    let st = rig.runner.recovery_state();
+    assert!(st.changed && st.repeats == 0, "a new failure: {st:?}");
+}
+
+// ----- R4: a refused job leaves the kept target alone ---------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restore_that_is_refused_late_leaves_the_kept_target_of_another_snapshot_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let rig = Rig::ready().await;
+    let t = "hx-restore-aaaa";
+    rig.host.add_target(t, Some(job(3)));
+    write_resume(&rig, "main", job(3), t); // for the snapshot [1; 32]
+    // Admission passes the kept-target decision and then fails at the run directory check.
+    std::fs::set_permissions(&rig.cfg.run_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let e = rig
+        .runner
+        .start(rig.request(restore_of(2, true, false)))
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(e, StartError::Host(_)), "{e:?}");
+    assert_eq!(
+        rig.host.targets(),
+        vec![t.to_string()],
+        "the target was deleted"
+    );
+    assert_eq!(rig.runner.resume_point("main").unwrap().unwrap().target, t);
+    assert!(
+        !rig.host
+            .log()
+            .iter()
+            .any(|l| l.starts_with("delete_restore_target")),
+        "{:?}",
+        rig.host.log()
+    );
+    assert!(!rig.desktop_dir().join("job.json").exists());
+    assert!(!rig.audit().contains("was discarded"));
+    // Once the cause is gone the same request discards the target and starts fresh.
+    std::fs::set_permissions(&rig.cfg.run_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    rig.worker(|w| w.finish_ok(pb::JobResult::default()));
+    let h = rig
+        .runner
+        .start(rig.request(restore_of(2, true, false)))
+        .await
+        .unwrap();
+    assert!(rig.outcome(&h).await.result.is_ok(), "{}", rig.audit());
+    assert!(rig.audit().contains("was discarded"));
+    assert!(!rig.host.targets().contains(&t.to_string()));
+}
+
+// ----- R5: a destroy clears the blocked entry ----------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_destroy_clears_the_blocked_entry_so_a_desktop_created_again_is_not_refused() {
+    let rig = Rig::raw_with(&["main", "other"]);
+    block_main(&rig);
+    let rep = rig.runner.recover().await;
+    assert!(rep.blocked.contains_key("main"));
+    // The predecessor's failure is not gone (the fake keeps failing), but its desktop is.
+    rig.runner
+        .teardown_cleanup(&["main".to_string()], false)
+        .await;
+    let st = rig.runner.recovery_state();
+    assert!(!st.blocked.contains_key("main"), "{st:?}");
+    rig.worker(snapshot_result);
+    let h = rig
+        .runner
+        .start(rig.backup_request())
+        .await
+        .unwrap_or_else(|e| panic!("a re-created desktop was refused: {e:?}"));
+    rig.outcome(&h).await;
+}
+
+// ----- S-R2: the snapshot-id set is bounded and fails closed ------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn past_the_cap_of_noted_snapshot_ids_a_snapshot_write_is_not_recorded() {
+    for (listed, recorded) in [(100usize, 1usize), (5_000, 0)] {
+        let rig = Rig::ready().await;
+        rig.drive.knobs.lock().unwrap().synthetic_snapshot_entries = listed;
+        rig.worker(|w| {
+            let Reply::List(v) = w.list(T::Snapshot) else {
+                panic!("not a listing")
+            };
+            assert!(!v.is_empty());
+            snapshot_result(w);
+        });
+        let h = rig.runner.start(rig.backup_request()).await.unwrap();
+        assert!(rig.outcome(&h).await.result.is_ok(), "{}", rig.audit());
+        assert_eq!(
+            rig.runner.completed("main").unwrap().backups.len(),
+            recorded,
+            "{listed} ids listed\n{}",
+            rig.audit()
+        );
+        let said = rig
+            .env
+            .audit_log()
+            .iter()
+            .filter(|l| l.contains("snapshot ids were listed or read; later snapshot writes"))
+            .count();
+        assert_eq!(said, 1 - recorded, "audited once when it failed closed");
+    }
 }

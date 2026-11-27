@@ -230,10 +230,19 @@ impl OutQueue {
     /// Closes the queue only if it still belongs to `generation` (the writer of a connection
     /// that has been replaced must not close the next connection's queue).
     pub fn close_if(&self, generation: u64) {
-        let same = self.lock().generation == generation;
-        if same {
-            self.close();
+        self.close_if_with(generation, || {});
+    }
+
+    /// The comparison and the close under one lock guard: a `reopen` cannot fall between them.
+    /// `between` runs after the comparison, with the lock held (a seam for the tests).
+    fn close_if_with(&self, generation: u64, between: impl FnOnce()) {
+        let mut g = self.lock();
+        if g.generation != generation {
+            return;
         }
+        between();
+        Self::close_locked(&mut g);
+        self.cv.notify_all();
     }
 
     /// Data bytes queued and not yet written.
@@ -288,13 +297,17 @@ impl OutQueue {
     /// Closes the queue: the writer stops and what is queued is dropped.
     pub fn close(&self) {
         let mut g = self.lock();
+        Self::close_locked(&mut g);
+        self.cv.notify_all();
+    }
+
+    fn close_locked(g: &mut QueueInner) {
         g.closed = true;
         g.ctl.clear();
         g.data.clear();
         g.data_bytes = 0;
         g.ctl_bytes = 0;
         g.pong = None;
-        self.cv.notify_all();
     }
 
     /// Whether the queue is closed.
@@ -959,5 +972,28 @@ mod tests {
             5,
             "the old writer took its 3 bytes off the new queue's counter"
         );
+    }
+
+    #[test]
+    fn a_reopen_cannot_fall_between_the_generation_check_and_the_close() {
+        let q = OutQueue::new();
+        let old_gen = q.generation();
+        let (in_gap_tx, in_gap_rx) = std::sync::mpsc::channel::<()>();
+        let (q2, tx2) = (q.clone(), in_gap_tx);
+        let closer = std::thread::spawn(move || {
+            q2.close_if_with(old_gen, || {
+                // The check has passed. Let the reconnect try to happen now, and give it time.
+                tx2.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(150));
+            });
+        });
+        in_gap_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        q.reopen();
+        closer.join().unwrap();
+        assert!(
+            !q.is_closed(),
+            "the close of the old generation closed the new queue"
+        );
+        assert_ne!(q.generation(), old_gen);
     }
 }

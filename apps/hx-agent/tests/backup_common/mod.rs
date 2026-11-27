@@ -508,6 +508,8 @@ pub struct DriveKnobs {
     /// A `List` of `PACK` is answered with this many synthetic entries, in pages of 1 000
     /// (on top of what the store holds).
     pub synthetic_pack_entries: usize,
+    /// A `List` of `SNAPSHOT` is answered with this many synthetic entries on top of the store.
+    pub synthetic_snapshot_entries: usize,
     /// A `Write` is answered with this error as soon as the request arrives (before any data):
     /// an upload that the helper aborts.
     pub early_write_error: Option<ErrorClass>,
@@ -876,12 +878,16 @@ fn answer_list(
             size: data.len() as u32,
         })
         .collect();
-    if ty == ObjectType::Pack {
-        let n = knobs.lock().unwrap().synthetic_pack_entries;
+    let synthetic = match ty {
+        ObjectType::Pack => Some((knobs.lock().unwrap().synthetic_pack_entries, 0xEE)),
+        ObjectType::Snapshot => Some((knobs.lock().unwrap().synthetic_snapshot_entries, 0xDD)),
+        _ => None,
+    };
+    if let Some((n, tag)) = synthetic {
         for k in 0..n {
             let mut oid = [0u8; 32];
             oid[..8].copy_from_slice(&(k as u64 + 1).to_be_bytes());
-            oid[31] = 0xEE;
+            oid[31] = tag;
             entries.push(pb::ListEntry {
                 id: Bytes::copy_from_slice(&oid),
                 size: 1000,

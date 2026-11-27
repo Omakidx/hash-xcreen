@@ -12,7 +12,6 @@
 //! holds a `JobRunner<IncusHost<T>, DaemonEnv<T>>`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -44,6 +43,9 @@ use crate::privd::progress::ProgressSender;
 use crate::privd::state::Flag;
 
 const GIB: u64 = 1 << 30;
+
+/// An admission for a blocked desktop retries its cleanup at most this often (ipc.md section 26).
+const BLOCKED_RETRY_MIN_MS: u64 = 10_000;
 
 /// Where the repository password (slot 0) comes from.
 pub enum RepoPassword {
@@ -196,8 +198,12 @@ struct Inner<H: BackupHost, E: BackupEnv> {
     budget: Arc<Semaphore>,
     active: Mutex<HashMap<String, Active>>,
     last: Mutex<HashMap<String, JobStatus>>,
-    recovered: AtomicBool,
+    /// The single source of truth for admission and for `recovery_state()`.
     recovery: Mutex<RecoveryState>,
+    /// When each blocked desktop's cleanup last ran at an admission (monotonic ms).
+    retried_at: Mutex<HashMap<String, u64>>,
+    /// One recovery run at a time.
+    recovery_run: tokio::sync::Mutex<()>,
 }
 
 /// The runner. Cloning shares it.
@@ -230,6 +236,8 @@ pub struct RecoveryState {
     pub failures: std::collections::BTreeSet<String>,
     /// How many runs in a row had these same failures.
     pub repeats: u32,
+    /// Whether the last run changed the set of failures (the back-off starts again).
+    pub changed: bool,
 }
 
 /// Which failures end in which state of privd (ipc.md section 31, "Effects"); separated from the
@@ -338,8 +346,9 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
                 budget: Arc::new(Semaphore::new(RELAY_FRAME_SLOTS)),
                 active: Mutex::new(HashMap::new()),
                 last: Mutex::new(HashMap::new()),
-                recovered: AtomicBool::new(false),
                 recovery: Mutex::new(RecoveryState::default()),
+                retried_at: Mutex::new(HashMap::new()),
+                recovery_run: tokio::sync::Mutex::new(()),
             }),
         }
     }
@@ -351,7 +360,7 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
 
     /// Whether crash recovery has completed.
     pub fn is_recovered(&self) -> bool {
-        self.inner.recovered.load(Ordering::SeqCst)
+        lock(&self.inner.recovery).done
     }
 
     /// Where crash recovery stands.
@@ -359,12 +368,19 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
         lock(&self.inner.recovery).clone()
     }
 
-    /// Crash recovery (ipc.md section 35). Jobs are admitted once a run reports `complete`; a
-    /// desktop whose own cleanup failed stays blocked until a run finds it clean. The audit log
-    /// gets a line when the failures change and a count when they repeat, never one line per
-    /// retry.
+    /// Crash recovery (ipc.md section 35). **Host-wide** only while no job is admitted: the first
+    /// run, and again as long as a host-wide step failed (admission is closed for everyone until
+    /// one completes). Once it has completed it never runs again: a later call retries the
+    /// blocked desktops, one by one under their slots, and touches nothing of the others. The
+    /// audit log gets a line when the failures change and a count when they repeat, never one
+    /// line per retry.
     pub async fn recover(&self) -> RecoveryReport {
         let i = &self.inner;
+        let _run = i.recovery_run.lock().await;
+        let done = lock(&i.recovery).done;
+        if done {
+            return self.retry_blocked().await;
+        }
         let rep = Recovery {
             host: &i.host,
             env: i.env.as_ref(),
@@ -375,9 +391,33 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
         .recover_all()
         .await;
         let failures: std::collections::BTreeSet<String> = rep.failures.iter().cloned().collect();
+        let summary = format!(
+            "{} helper(s), {} socket(s), {} snapshot(s), {} target(s) deleted, {} kept, {} record(s) cleared",
+            rep.helpers_deleted.len(),
+            rep.sockets_removed.len(),
+            rep.snapshots_deleted.len(),
+            rep.targets_deleted.len(),
+            rep.targets_kept.len(),
+            rep.records_cleared.len()
+        );
+        self.settle(failures, rep.complete, rep.blocked.clone(), &summary);
+        rep
+    }
+
+    /// Records a recovery run: the state, and the audit lines (a line per change of the failures,
+    /// a count per repeat).
+    fn settle(
+        &self,
+        failures: std::collections::BTreeSet<String>,
+        done: bool,
+        blocked: std::collections::BTreeMap<String, String>,
+        summary: &str,
+    ) {
+        let i = &self.inner;
         let mut st = lock(&i.recovery);
         st.attempts += 1;
-        if failures != st.failures {
+        st.changed = failures != st.failures;
+        if st.changed {
             for f in &failures {
                 i.env.audit(&format!("backup recovery: {f}"));
             }
@@ -394,24 +434,80 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
         }
         if failures.is_empty() {
             i.env.audit(&format!(
-                "backup recovery: done after {} attempt(s): {} helper(s), {} socket(s), {} snapshot(s), {} target(s) deleted, {} kept, {} record(s) cleared",
-                st.attempts,
-                rep.helpers_deleted.len(),
-                rep.sockets_removed.len(),
-                rep.snapshots_deleted.len(),
-                rep.targets_deleted.len(),
-                rep.targets_kept.len(),
-                rep.records_cleared.len()
+                "backup recovery: done after {} attempt(s): {summary}",
+                st.attempts
             ));
         }
         st.failures = failures;
-        st.done = rep.complete;
-        st.blocked = rep.blocked.clone();
-        drop(st);
-        if rep.complete {
-            i.recovered.store(true, Ordering::SeqCst);
+        st.done = done;
+        st.blocked = blocked;
+    }
+
+    /// The cleanup of one blocked desktop, the caller holding its slot: `None` when it is clean
+    /// now, else why it is still blocked.
+    async fn retry_one(&self, desktop: &str) -> Result<RecoveryReport, String> {
+        let i = &self.inner;
+        let rep = Recovery {
+            host: &i.host,
+            env: i.env.as_ref(),
+            cfg: &i.cfg,
+            dirs: &i.dirs,
+            audit_failures: false,
         }
-        rep
+        .recover_blocked(desktop)
+        .await;
+        match rep.blocked.get(desktop) {
+            Some(why) => Err(why.clone()),
+            None => Ok(rep),
+        }
+    }
+
+    /// Applies the results of retries (`Ok` clears the desktop, `Err` keeps it blocked with the
+    /// new reason) to the state.
+    fn apply_retries(&self, results: Vec<(String, Result<RecoveryReport, String>)>, summary: &str) {
+        let i = &self.inner;
+        let (mut blocked, done) = {
+            let st = lock(&i.recovery);
+            (st.blocked.clone(), st.done)
+        };
+        for (d, r) in results {
+            match r {
+                Ok(_) => {
+                    blocked.remove(&d);
+                    lock(&i.retried_at).remove(&d);
+                }
+                Err(why) => {
+                    blocked.insert(d, why);
+                }
+            }
+        }
+        let failures = blocked.values().cloned().collect();
+        self.settle(failures, done, blocked, summary);
+    }
+
+    /// The later retries of crash recovery: every blocked desktop whose slot is free, one at a
+    /// time, under its own slot. Nothing else is touched.
+    async fn retry_blocked(&self) -> RecoveryReport {
+        let i = &self.inner;
+        let blocked: Vec<String> = lock(&i.recovery).blocked.keys().cloned().collect();
+        let mut results = Vec::new();
+        for d in blocked {
+            let Some(_slot) = i.slots.take(&d) else {
+                continue;
+            };
+            let r = self.retry_one(&d).await;
+            results.push((d, r));
+        }
+        if !results.is_empty() {
+            self.apply_retries(results, "the blocked desktops are clean");
+        }
+        let st = lock(&i.recovery).clone();
+        RecoveryReport {
+            complete: st.done,
+            failures: st.failures.iter().cloned().collect(),
+            blocked: st.blocked,
+            ..RecoveryReport::default()
+        }
     }
 
     /// Deletes the restore target kept for `desktop` (marker and job checks as in ipc.md
@@ -460,7 +556,7 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
         {
             tokio::time::sleep(i.cfg.timing.tick).await;
         }
-        Recovery {
+        let rep = Recovery {
             host: &i.host,
             env: i.env.as_ref(),
             cfg: &i.cfg,
@@ -468,7 +564,31 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
             audit_failures: true,
         }
         .teardown(desktops, all, &jobs)
-        .await
+        .await;
+        // The desktops are gone (or going): a failure of their predecessor must not refuse a
+        // desktop created again under the same id.
+        {
+            let mut st = lock(&i.recovery);
+            if all {
+                st.blocked.clear();
+            } else {
+                for d in desktops {
+                    st.blocked.remove(d);
+                }
+            }
+            st.failures = st.blocked.values().cloned().collect();
+        }
+        {
+            let mut r = lock(&i.retried_at);
+            if all {
+                r.clear();
+            } else {
+                for d in desktops {
+                    r.remove(d);
+                }
+            }
+        }
+        rep
     }
 
     /// The status of the latest job of `desktop`: the running one, else the last that ended
@@ -522,14 +642,11 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
     pub async fn start(&self, mut req: JobRequest) -> Result<JobHandle, StartError> {
         let i = &self.inner;
         let desktop = req.desktop_id.clone();
-        if !i.recovered.load(Ordering::SeqCst) {
+        if !lock(&i.recovery).done {
             return Err(StartError::Recovering);
         }
         if i.env.uninstalling() {
             return Err(StartError::Uninstalling);
-        }
-        if let Some(why) = lock(&i.recovery).blocked.get(&desktop).cloned() {
-            return Err(StartError::DesktopBlocked(why));
         }
         if !i.env.desktop_known(&desktop) || !crate::privd::is_safe_desktop_id(&desktop) {
             return Err(StartError::UnknownDesktop);
@@ -543,6 +660,31 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
             .clone()
             .try_acquire_many_owned(JOB_FRAME_SLOTS as u32)
             .map_err(|_| StartError::Busy)?;
+        // A desktop that crash recovery blocked: its cleanup is retried now, under the slot, at
+        // most once every 10 s; the job is refused only if it still fails.
+        let blocked = lock(&i.recovery).blocked.get(&desktop).cloned();
+        if let Some(why) = blocked {
+            let now_ms = i.mono.now_ms();
+            let due = {
+                let mut r = lock(&i.retried_at);
+                match r.get(&desktop) {
+                    Some(t) if now_ms.saturating_sub(*t) < BLOCKED_RETRY_MIN_MS => false,
+                    _ => {
+                        r.insert(desktop.clone(), now_ms);
+                        true
+                    }
+                }
+            };
+            if !due {
+                return Err(StartError::DesktopBlocked(why));
+            }
+            let r = self.retry_one(&desktop).await;
+            let still = r.as_ref().err().cloned();
+            self.apply_retries(vec![(desktop.clone(), r)], "the blocked desktops are clean");
+            if let Some(why) = still {
+                return Err(StartError::DesktopBlocked(why));
+            }
+        }
         // A leftover record of a job whose cleanup failed: clean it before anything else.
         let jp = i
             .dirs
@@ -635,6 +777,8 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
             JobSpec::Restore { snapshot_id, .. } => Some(hex(snapshot_id)),
             _ => None,
         };
+        // The deletion of a kept target of another snapshot waits for the end of admission.
+        let mut discard_after: Option<ResumeRecord> = None;
         let (target, reuse_target, target_job) = if kind == JobKind::Restore {
             let kept = ResumeRecord::load(
                 &i.dirs
@@ -665,7 +809,7 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
                             JobId::from_hex(&k.job_id).ok(),
                         )
                     } else {
-                        discard_kept(i, &desktop, &k).await?;
+                        discard_after = Some(k);
                         fresh(job)
                     }
                 }
@@ -749,6 +893,13 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
             ),
         };
         record.store(&jp).map_err(rec_err)?;
+        // Last: nothing above can refuse the job any more, so a refused job has changed nothing.
+        if let Some(k) = &discard_after
+            && let Err(e) = discard_kept(i, &desktop, k).await
+        {
+            let _ = remove_record(&jp);
+            return Err(e);
+        }
         let deadline = hx_ipc::repo::job_deadline(kind).unwrap_or(Duration::from_secs(600));
         let cancel = CancelToken::new();
         let initial = JobStatus {

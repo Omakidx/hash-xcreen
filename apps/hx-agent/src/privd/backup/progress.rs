@@ -297,6 +297,30 @@ mod tests {
     }
 
     #[test]
+    fn a_transfer_only_frame_uses_the_window_and_the_held_numbers_go_out_after_it() {
+        let mut m = ProgressMapper::new(JobKind::Backup);
+        m.enter(4);
+        assert!(m.poll(1_000).is_some());
+        // Bytes relayed: a frame, but inside the 100 ms window, so it is held...
+        m.add_transfer(1_500_001);
+        assert!(m.poll(1_050).is_none());
+        // ...and the worker's numbers that arrive meanwhile replace nothing: the next frame
+        // that is due carries both.
+        m.worker(&wp(ProgressPhase::ScanAndUpload, 50, 100));
+        let f = m.poll(1_100).unwrap();
+        assert_eq!(
+            (
+                f.index,
+                f.percent,
+                f.bytes_done,
+                f.bytes_total,
+                f.transfer_bytes
+            ),
+            (4, 50, 50, 100, 1_500_001)
+        );
+    }
+
+    #[test]
     fn the_step_text_is_privds_and_the_phase_table_is_fixed() {
         let mut m = ProgressMapper::new(JobKind::Backup);
         assert_eq!(m.current().step, "Taking a snapshot");

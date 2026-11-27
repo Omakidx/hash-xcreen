@@ -148,7 +148,7 @@ struct HostState {
     unmarked_targets: BTreeSet<String>,
     log: Vec<String>,
     fail: BTreeMap<String, HostError>,
-    sticky: BTreeMap<String, HostError>,
+    sticky: BTreeMap<String, (Option<String>, HostError)>,
     delete_delay_ms: u64,
     fail_targets_once: bool,
     drive_stops: usize,
@@ -227,7 +227,15 @@ impl FakeHost {
 
     /// Makes every call of `op` fail until `clear_failure(op)`.
     pub fn fail_always(&self, op: &str, e: HostError) {
-        lock(&self.state).sticky.insert(op.to_string(), e);
+        lock(&self.state).sticky.insert(op.to_string(), (None, e));
+    }
+
+    /// Makes every call of `op` whose log entry contains `needle` (an instance name, say) fail
+    /// until `clear_failure(op)`.
+    pub fn fail_always_on(&self, op: &str, needle: &str, e: HostError) {
+        lock(&self.state)
+            .sticky
+            .insert(op.to_string(), (Some(needle.to_string()), e));
     }
 
     /// Ends `fail_always(op)`.
@@ -320,8 +328,10 @@ impl FakeHost {
 
     fn step(&self, entry: String, op: &str) -> Result<(), HostError> {
         let mut s = lock(&self.state);
-        s.log.push(entry);
-        if let Some(e) = s.sticky.get(op) {
+        s.log.push(entry.clone());
+        if let Some((needle, e)) = s.sticky.get(op)
+            && needle.as_deref().is_none_or(|n| entry.contains(n))
+        {
             return Err(e.clone());
         }
         match s.fail.remove(op) {

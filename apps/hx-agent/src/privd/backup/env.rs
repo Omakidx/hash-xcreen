@@ -20,9 +20,14 @@ const RECOVERY_WAIT_FIRST: std::time::Duration = std::time::Duration::from_secs(
 /// The longest wait between two runs.
 const RECOVERY_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(900);
 
-/// The wait after `wait`: doubled, never over 15 minutes (ipc.md section 35).
-fn next_recovery_wait(wait: std::time::Duration) -> std::time::Duration {
-    (wait * 2).min(RECOVERY_WAIT_MAX)
+/// The wait after `wait`: doubled, never over 15 minutes, and back at 30 s when the set of
+/// failures changed (ipc.md section 35).
+fn recovery_wait(wait: std::time::Duration, changed: bool) -> std::time::Duration {
+    if changed {
+        RECOVERY_WAIT_FIRST
+    } else {
+        (wait * 2).min(RECOVERY_WAIT_MAX)
+    }
 }
 
 /// The runner's view of the daemon. It holds the daemon weakly, so the runner (which the daemon
@@ -127,20 +132,22 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
     /// could look at everything. Backup jobs are refused until it has. Called once at start by
     /// `serve`.
     pub async fn recover_backups(self: &Arc<Self>) {
-        // Repeated with a back-off (30 s, doubling to 15 minutes) until the host-wide steps have
-        // looked at everything and no desktop is blocked; the state is `recovery_state()`.
+        // Host-wide while no job is admitted (until one run completes), then per blocked desktop
+        // (ipc.md section 35). The wait is 30 s, doubling to 15 minutes, and starts again
+        // whenever the set of failures changes. The state is `recovery_state()`.
         let mut wait = RECOVERY_WAIT_FIRST;
         loop {
-            let rep = self.backup.recover().await;
-            if rep.complete && rep.blocked.is_empty() {
+            let _ = self.backup.recover().await;
+            let st = self.backup.recovery_state();
+            if st.done && st.blocked.is_empty() {
                 return;
             }
+            wait = recovery_wait(wait, st.changed);
             log::error(&format!(
                 "backup recovery is incomplete; it will be repeated in {} s",
                 wait.as_secs()
             ));
             tokio::time::sleep(wait).await;
-            wait = next_recovery_wait(wait);
         }
     }
 
@@ -160,13 +167,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_recovery_back_off_doubles_from_30_seconds_to_15_minutes() {
-        let mut w = RECOVERY_WAIT_FIRST;
+    fn the_recovery_back_off_doubles_from_30_seconds_to_15_minutes_and_restarts_on_a_change() {
+        // The first run always changes the failures (from none): 30 s.
+        let mut w = recovery_wait(RECOVERY_WAIT_FIRST, true);
         let mut seen = vec![w.as_secs()];
         for _ in 0..7 {
-            w = next_recovery_wait(w);
+            w = recovery_wait(w, false);
             seen.push(w.as_secs());
         }
         assert_eq!(seen, vec![30, 60, 120, 240, 480, 900, 900, 900]);
+        // A change of the set of failures starts it again.
+        assert_eq!(recovery_wait(w, true).as_secs(), 30);
+        assert_eq!(recovery_wait(recovery_wait(w, true), false).as_secs(), 60);
     }
 }
