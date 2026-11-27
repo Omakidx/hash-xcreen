@@ -331,6 +331,18 @@ impl WorkerPeer {
         }
     }
 
+    /// Like `wait`, but `None` when the link ends first.
+    pub fn try_wait(&mut self, id: u64) -> Option<Reply> {
+        loop {
+            if !self.partial.contains_key(&id)
+                && let Some(r) = self.done.remove(&id)
+            {
+                return Some(r);
+            }
+            self.pump().ok()?;
+        }
+    }
+
     pub fn call(&mut self, op: pb::repo_request::Op) -> Reply {
         let id = self.request(op);
         self.wait(id)

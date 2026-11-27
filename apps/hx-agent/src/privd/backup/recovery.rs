@@ -79,6 +79,14 @@ impl<H: BackupHost, E: BackupEnv> Recovery<'_, H, E> {
         rep.complete = false;
     }
 
+    /// A failure that does not make the run incomplete: a record that does not parse is left
+    /// for an administrator and refuses jobs of its desktop (at admission), but it does not keep
+    /// every other desktop from running jobs.
+    fn note(&self, rep: &mut RecoveryReport, what: String) {
+        self.env.audit(&format!("backup recovery: {what}"));
+        rep.failures.push(what);
+    }
+
     /// Removes `*.sock` from the run directory (a missing directory is fine).
     fn remove_sockets(&self, rep: &mut RecoveryReport) {
         let rd = match std::fs::read_dir(&self.cfg.run_dir) {
@@ -110,6 +118,9 @@ impl<H: BackupHost, E: BackupEnv> Recovery<'_, H, E> {
                 match JobRecord::load(&p) {
                     Ok(Some(r)) if r.resumable => keep.extend(r.target),
                     Ok(_) => {}
+                    Err(RecordError::Corrupt(_)) => {
+                        self.note(rep, format!("{id}: job.json is corrupt"))
+                    }
                     Err(e) => self.fail(rep, format!("{id}: {e}")),
                 }
             }
@@ -119,6 +130,9 @@ impl<H: BackupHost, E: BackupEnv> Recovery<'_, H, E> {
                         keep.insert(r.target);
                     }
                     Ok(None) => {}
+                    Err(RecordError::Corrupt(_)) => {
+                        self.note(rep, format!("{id}: resume.json is corrupt"))
+                    }
                     Err(e) => self.fail(rep, format!("{id}: {e}")),
                 }
             }
@@ -234,7 +248,7 @@ impl<H: BackupHost, E: BackupEnv> Recovery<'_, H, E> {
             Ok(None) => {}
             // Left for an administrator: the objects it can name were removed by their markers.
             Err(RecordError::Corrupt(what)) => {
-                self.fail(rep, format!("{id}: {what} is corrupt and was left alone"));
+                self.note(rep, format!("{id}: {what} is corrupt and was left alone"));
             }
             Err(e) => self.fail(rep, format!("{id}: {e}")),
         }
