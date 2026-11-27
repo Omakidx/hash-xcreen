@@ -130,8 +130,8 @@ impl<T: Transport + Clone + 'static> Daemon<T> {
     /// What `DestroyDesktop` and `Uninstall` run before they touch the instance or the pool
     /// (ipc.md section 35): the active job is cancelled and awaited, then the helpers, restore
     /// targets, sockets and records of `desktops` are removed.
-    pub async fn backup_teardown(&self, desktops: &[String]) {
-        let rep = self.backup.teardown_cleanup(desktops).await;
+    pub async fn backup_teardown(&self, desktops: &[String], all: bool) {
+        let rep = self.backup.teardown_cleanup(desktops, all).await;
         if !rep.complete {
             log::error("the backup cleanup before the teardown was incomplete");
         }

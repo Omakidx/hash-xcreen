@@ -192,8 +192,18 @@ impl WorkerPeer {
     /// Binds `socket`, accepts the one connection, and does the handshake of ipc.md section 26:
     /// `Hello`, `HelloAck`, `Job` and its secrets.
     pub fn accept(socket: &std::path::Path) -> Self {
+        Self::accept_skipping(socket, 0)
+    }
+
+    /// Like `accept`, but the first `skip` connections are closed at once (the Incus proxy
+    /// accepts before the worker listens, and then closes).
+    pub fn accept_skipping(socket: &std::path::Path, skip: usize) -> Self {
         let _ = std::fs::remove_file(socket);
         let l = UnixListener::bind(socket).expect("bind the worker socket");
+        for _ in 0..skip {
+            let (s, _) = l.accept().expect("accept privd");
+            drop(s);
+        }
         let (s, _) = l.accept().expect("accept privd");
         drop(l);
         let mut p = Peer::new(s, Endpoint::Worker);
@@ -461,6 +471,7 @@ pub enum Seen {
     Request(String),
     Data { stream: u64, len: usize, end: bool },
     CancelRequest(u64),
+    Bye,
 }
 
 pub enum DriveCmd {
@@ -469,6 +480,8 @@ pub enum DriveCmd {
     Close,
     /// Write half of a frame and close.
     CutClose,
+    /// Write this many `Ping` frames at once, then stop reading for a while.
+    FloodPings(usize),
 }
 
 #[derive(Default)]
@@ -486,6 +499,12 @@ pub struct DriveKnobs {
     pub hold_writes: bool,
     /// `OpenRepo` is never answered.
     pub hold_open: bool,
+    /// A download sends this many frames and then closes the link with no event.
+    pub eof_reads: Option<usize>,
+    /// `List` requests are answered with this error.
+    pub list_error: Option<ErrorClass>,
+    /// A `Write` of this type is answered with this error at once (after its `END`), every time.
+    pub write_error_all: Option<(ObjectType, ErrorClass)>,
 }
 
 pub struct DriveCtl {
@@ -579,6 +598,20 @@ fn serve_drive(
                     p.close();
                     return;
                 }
+                DriveCmd::FloodPings(n) => {
+                    let f = pb::RepoFrame {
+                        frame: Some(F::Ping(pb::Ping { nonce: 7 })),
+                    };
+                    let one = encode_message(&f, Endpoint::PrivdDriveLink).unwrap();
+                    let mut all = Vec::with_capacity(one.len() * n);
+                    for _ in 0..n {
+                        all.extend_from_slice(&one);
+                    }
+                    p.send_raw(&all);
+                    // Not reading: the peer that floods does not look at what comes back.
+                    std::thread::sleep(Duration::from_secs(20));
+                    return;
+                }
                 DriveCmd::CutClose => {
                     // The prefix of a frame that never completes.
                     p.send_raw(&[200, 0, 0, 0, 1, 1, 2, 3]);
@@ -621,7 +654,9 @@ fn serve_drive(
                             let k = knobs.lock().unwrap();
                             (
                                 k.hold_writes,
-                                k.write_error.filter(|(t, _)| *t as i32 == w.object_type),
+                                k.write_error
+                                    .or(k.write_error_all)
+                                    .filter(|(t, _)| *t as i32 == w.object_type),
                             )
                         };
                         if hold {
@@ -658,7 +693,10 @@ fn serve_drive(
                         software: "hx-fake-drive".into(),
                     }));
                 }
-                Some(F::Bye(_)) => return,
+                Some(F::Bye(_)) => {
+                    note(Seen::Bye);
+                    return;
+                }
                 Some(F::CancelRequest(c)) => {
                     note(Seen::CancelRequest(c.req_id));
                     held_lists.retain(|(id, _)| *id != c.req_id);
@@ -711,7 +749,10 @@ fn serve_drive(
                         Op::List(l) => {
                             note(Seen::Request(format!("list {}", l.object_type)));
                             let ty = ObjectType::try_from(l.object_type).unwrap();
-                            if knobs.lock().unwrap().hold_lists {
+                            let list_error = knobs.lock().unwrap().list_error;
+                            if let Some(c) = list_error {
+                                err(&mut p, c);
+                            } else if knobs.lock().unwrap().hold_lists {
                                 held_lists.push((id, ty));
                             } else {
                                 answer_list(&mut p, store, id, ty);
@@ -728,6 +769,7 @@ fn serve_drive(
                                 None => err(&mut p, ErrorClass::NotFound),
                                 Some(data) => {
                                     let fail = knobs.lock().unwrap().fail_reads;
+                                    let eof = knobs.lock().unwrap().eof_reads;
                                     let _ = p.send(F::Response(pb::RepoResponse {
                                         req_id: id,
                                         result: Some(pb::repo_response::Result::ReadBegin(
@@ -743,6 +785,12 @@ fn serve_drive(
                                     };
                                     let n = chunks.len();
                                     for (i, c) in chunks.into_iter().enumerate() {
+                                        if let Some(after) = eof
+                                            && i >= after
+                                        {
+                                            p.close();
+                                            return;
+                                        }
                                         if let Some((after, class)) = fail
                                             && i >= after
                                         {
@@ -771,9 +819,26 @@ fn serve_drive(
                                 .remove(&(x.object_type, x.id.to_vec()));
                             done(&mut p);
                         }
-                        Op::ReadPartial(_) | Op::Quota(_) | Op::SetUploadRate(_) => {
-                            err(&mut p, ErrorClass::Internal)
+                        Op::ReadPartial(x) => {
+                            note(Seen::Request(format!("readpartial {}", x.object_type)));
+                            let obj = store
+                                .lock()
+                                .unwrap()
+                                .get(&(x.object_type, x.id.to_vec()))
+                                .cloned()
+                                .unwrap_or_else(|| vec![0u8; 64]);
+                            let off = (x.offset as usize).min(obj.len());
+                            let end = (off + x.length as usize).min(obj.len());
+                            let part = obj[off..end].to_vec();
+                            let _ = p.send(F::Response(pb::RepoResponse {
+                                req_id: id,
+                                result: Some(pb::repo_response::Result::ReadBegin(pb::ReadBegin {
+                                    size: part.len() as u32,
+                                })),
+                            }));
+                            let _ = p.send_data(id, true, &part);
                         }
+                        Op::Quota(_) | Op::SetUploadRate(_) => err(&mut p, ErrorClass::Internal),
                     }
                 }
                 _ => {}
@@ -819,6 +884,11 @@ pub type Script = Arc<dyn Fn(&mut WorkerPeer) + Send + Sync>;
 impl Rig {
     /// A rig whose runner has not recovered yet.
     pub fn raw() -> Self {
+        Self::raw_with(&["main"])
+    }
+
+    /// A rig whose runner manages `desktops`.
+    pub fn raw_with(desktops: &[&str]) -> Self {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
@@ -847,7 +917,7 @@ impl Rig {
             timing: Timing::fast(),
         };
         let mono = Arc::new(ManualMono::new());
-        let env = FakeEnv::new(&["main"]);
+        let env = FakeEnv::new(desktops);
         let host = FakeHost::new(cfg.run_dir.clone());
         let drive = start_drive(cfg.drive_socket.clone());
         let runner = JobRunner::new(cfg.clone(), host.clone(), env.clone(), mono.clone());
@@ -865,6 +935,14 @@ impl Rig {
     /// A rig whose runner has recovered (admits jobs).
     pub async fn ready() -> Self {
         let r = Self::raw();
+        let rep = r.runner.recover().await;
+        assert!(rep.complete, "{rep:?}");
+        r
+    }
+
+    /// A rig with several desktops whose runner has recovered.
+    pub async fn ready_with(desktops: &[&str]) -> Self {
+        let r = Self::raw_with(desktops);
         let rep = r.runner.recover().await;
         assert!(rep.complete, "{rep:?}");
         r
@@ -910,6 +988,17 @@ impl Rig {
             let s = left.min(step_ms);
             self.mono.advance_ms(s);
             left -= s;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Moves the clock in steps until the job has finished (at most `max_steps`).
+    pub async fn advance_until_done(&self, h: &JobHandle, step_ms: u64, max_steps: usize) {
+        for _ in 0..max_steps {
+            if h.status().state == hx_agent::privd::backup::JobState::Finished {
+                return;
+            }
+            self.mono.advance_ms(step_ms);
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }

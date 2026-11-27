@@ -198,14 +198,21 @@ impl<H: BackupHost, E: BackupEnv> Recovery<'_, H, E> {
             }
             Err(e) => self.fail(&mut rep, format!("cannot list the restore targets: {e}")),
         }
+        // Steps 1 to 4 looked at everything, or they did not.
+        let looked = rep.complete;
         // 5. the Drive helper
         match self.host.stop_drive_service().await {
             Ok(()) => rep.drive_stopped = true,
             Err(e) => self.fail(&mut rep, format!("cannot stop the Drive helper: {e}")),
         }
-        // 6. the records
-        for id in self.env.desktops() {
-            self.clear_records(&id, &rep.targets_kept.clone(), &mut rep);
+        // 6. the records: only after a complete look. A listing that failed means that nothing
+        // is known about the targets that are kept, and a record dropped now could never be
+        // recovered: the records stay as they are and the whole recovery is repeated.
+        if looked {
+            for id in self.env.desktops() {
+                self.drop_older_kept(&id, &mut rep).await;
+                self.clear_records(&id, &rep.targets_kept.clone(), &mut rep);
+            }
         }
         let summary = format!(
             "backup recovery: {} helper(s), {} socket(s), {} snapshot(s), {} target(s) deleted, {} kept, {} record(s) cleared, {} failure(s)",
@@ -219,6 +226,40 @@ impl<H: BackupHost, E: BackupEnv> Recovery<'_, H, E> {
         );
         self.env.audit(&summary);
         rep
+    }
+
+    /// A desktop whose `job.json` names a resumable target and whose `resume.json` names
+    /// another: the older kept target is deleted (audited) and its record dropped, because only
+    /// one kept target per desktop is ever recorded (ipc.md section 35).
+    async fn drop_older_kept(&self, id: &str, rep: &mut RecoveryReport) {
+        let (Ok(jp), Ok(rp)) = (self.dirs.job_path(id), self.dirs.resume_path(id)) else {
+            return;
+        };
+        let (Ok(Some(j)), Ok(Some(r))) = (JobRecord::load(&jp), ResumeRecord::load(&rp)) else {
+            return;
+        };
+        let newer = j
+            .target
+            .as_deref()
+            .filter(|t| j.resumable && rep.targets_kept.iter().any(|k| k == t));
+        let Some(newer) = newer else { return };
+        if r.target == newer {
+            return;
+        }
+        let Ok(name) = RestoreTargetName::new(&r.target) else {
+            return;
+        };
+        match self.host.delete_restore_target(&name, None).await {
+            Ok(_) => {
+                rep.targets_kept.retain(|k| *k != r.target);
+                rep.targets_deleted.push(r.target.clone());
+                let _ = remove_record(&rp);
+                self.env.audit(&format!(
+                    "backup recovery: {id}: the older kept restore target was deleted"
+                ));
+            }
+            Err(e) => self.fail(rep, format!("cannot delete target {}: {e}", r.target)),
+        }
     }
 
     /// Step 6 for one desktop: the job record is removed (a kept target moves to `resume.json`
@@ -325,29 +366,84 @@ impl<H: BackupHost, E: BackupEnv> Recovery<'_, H, E> {
     }
 
     /// Steps 1 and 4 for `DestroyDesktop` and `Uninstall`, and the sockets and records of the
-    /// desktops in `desktops`. Every restore target goes, resumable or not.
-    pub async fn teardown(&self, desktops: &[String]) -> RecoveryReport {
+    /// desktops in `desktops`. Every restore target of the scope goes, resumable or not.
+    ///
+    /// With `all` (an uninstall) the scope is the host: every helper, target and socket. Without
+    /// it (a `DestroyDesktop`) the scope is what the desktops' records and `extra_jobs` (the
+    /// jobs that were active) attribute to them: helpers and sockets of those job ids, targets
+    /// named by their records or carrying one of those job ids. Another desktop's objects, and
+    /// objects that no record attributes, are left alone (crash recovery owns those).
+    pub async fn teardown(
+        &self,
+        desktops: &[String],
+        all: bool,
+        extra_jobs: &[String],
+    ) -> RecoveryReport {
         let mut rep = RecoveryReport {
             complete: true,
             ..RecoveryReport::default()
         };
+        let mut jobs: BTreeSet<String> = extra_jobs.iter().cloned().collect();
+        let mut target_names: BTreeSet<String> = BTreeSet::new();
+        for id in desktops {
+            if let Ok(p) = self.dirs.job_path(id) {
+                match JobRecord::load(&p) {
+                    Ok(Some(r)) => {
+                        jobs.insert(r.job_id.clone());
+                        target_names.extend(r.target);
+                    }
+                    Ok(None) => {}
+                    Err(_) => self.note(&mut rep, format!("{id}: job.json is unreadable")),
+                }
+            }
+            if let Ok(p) = self.dirs.resume_path(id) {
+                match ResumeRecord::load(&p) {
+                    Ok(Some(r)) => {
+                        jobs.insert(r.job_id.clone());
+                        target_names.insert(r.target);
+                    }
+                    Ok(None) => {}
+                    Err(_) => self.note(&mut rep, format!("{id}: resume.json is unreadable")),
+                }
+            }
+        }
         match self.host.list_helpers().await {
             Ok(list) => {
                 for h in list {
+                    if !all && !jobs.contains(&h.job.hex()) {
+                        continue;
+                    }
                     match self.host.force_delete_helper(h.job).await {
                         Ok(_) => rep.helpers_deleted.push(h.name.to_string()),
                         Err(e) => {
-                            self.fail(&mut rep, format!("cannot delete helper {}: {e}", h.name))
+                            self.fail(&mut rep, format!("cannot delete helper {}: {e}", h.name));
                         }
                     }
                 }
             }
             Err(e) => self.fail(&mut rep, format!("cannot list the helpers: {e}")),
         }
-        self.remove_sockets(&mut rep);
+        if all {
+            self.remove_sockets(&mut rep);
+        } else {
+            for j in &jobs {
+                let sock = self.cfg.run_dir.join(format!("{j}.sock"));
+                match unlink_beneath(&sock) {
+                    Ok(true) => rep.sockets_removed.push(format!("{j}.sock")),
+                    Ok(false) => {}
+                    Err(e) => self.fail(&mut rep, format!("cannot remove a socket: {e}")),
+                }
+            }
+        }
         match self.host.list_restore_targets().await {
             Ok(list) => {
                 for t in list {
+                    let mine = all
+                        || target_names.contains(t.name.as_str())
+                        || t.job.is_some_and(|j| jobs.contains(&j.hex()));
+                    if !mine {
+                        continue;
+                    }
                     match self.host.delete_restore_target(&t.name, t.job).await {
                         Ok(_) => rep.targets_deleted.push(t.name.to_string()),
                         Err(e) => {

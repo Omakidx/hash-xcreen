@@ -79,8 +79,10 @@ pub struct HelperPlan {
     pub desktop_instance: String,
     /// The snapshot of a `BACKUP`.
     pub snapshot: Option<String>,
-    /// The target of a `RESTORE`; the host creates it first.
+    /// The target of a `RESTORE`; the host creates it first, unless `reuse_target`.
     pub target: Option<String>,
+    /// The target already exists (a resumed restore): build the helper on it, create nothing.
+    pub reuse_target: bool,
     /// The worker binary, pushed as `/sbin/init`.
     pub worker: Arc<Vec<u8>>,
 }
@@ -150,6 +152,12 @@ pub trait BackupHost: Send + Sync + 'static {
         &self,
         name: &RestoreTargetName,
         job: Option<JobId>,
+    ) -> impl Future<Output = Result<bool, HostError>> + Send;
+
+    /// Whether the restore target `name` exists (it is listed as a marked target).
+    fn restore_target_exists(
+        &self,
+        name: &str,
     ) -> impl Future<Output = Result<bool, HostError>> + Send;
 
     /// Stops `hx-drive.service` (crash recovery step 5).
@@ -283,14 +291,16 @@ impl<T: Transport + Clone + 'static> BackupHost for IncusHost<T> {
                         .await?
                         .ok_or_else(|| HostError::Precondition("the desktop is gone".into()))?;
                     let name = RestoreTargetName::new(target)?;
-                    let spec = RestoreTargetSpec::from_desktop(
-                        &desktop,
-                        name.clone(),
-                        plan.job,
-                        &self.naming,
-                    )?;
-                    c.create_restore_target(&spec, Duration::from_secs(300))
-                        .await?;
+                    if !plan.reuse_target {
+                        let spec = RestoreTargetSpec::from_desktop(
+                            &desktop,
+                            name.clone(),
+                            plan.job,
+                            &self.naming,
+                        )?;
+                        c.create_restore_target(&spec, Duration::from_secs(300))
+                            .await?;
+                    }
                     let made = c
                         .get_instance(name.as_str())
                         .await?
@@ -333,6 +343,15 @@ impl<T: Transport + Clone + 'static> BackupHost for IncusHost<T> {
         job: Option<JobId>,
     ) -> Result<bool, HostError> {
         Ok(self.c().delete_restore_target(name, job).await?)
+    }
+
+    async fn restore_target_exists(&self, name: &str) -> Result<bool, HostError> {
+        Ok(self
+            .c()
+            .list_restore_targets()
+            .await?
+            .iter()
+            .any(|t| t.name.as_str() == name))
     }
 
     async fn stop_drive_service(&self) -> Result<(), HostError> {

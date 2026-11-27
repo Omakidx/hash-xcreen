@@ -116,12 +116,11 @@ async fn a_full_backup_round_trip() {
         "the socket is removed"
     );
     assert!(!rig.desktop_dir().join("job.json").exists());
-    assert!(
-        rig.runner.start(rig.backup_request()).await.is_ok(),
-        "the slot is free again"
-    );
+    let again = rig.runner.start(rig.backup_request()).await.unwrap();
+    rig.outcome(&again).await;
+    // No job is running: every relay slot is back, exactly 16 of them.
     rig.until("the relay slots to come back", || {
-        rig.runner.relay_slots_free() >= 14
+        rig.runner.relay_slots_free() == 16
     })
     .await;
     // Progress: privd's own text, privd's phase table, the byte counters.

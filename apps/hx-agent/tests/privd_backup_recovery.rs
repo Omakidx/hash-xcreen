@@ -202,7 +202,8 @@ async fn teardown_cancels_the_active_job_and_removes_every_target_resumable_or_n
     rig.host.add_helper(job(9));
     leave_socket(&rig.cfg.run_dir, "x.sock");
     let runner = rig.runner.clone();
-    let td = tokio::spawn(async move { runner.teardown_cleanup(&["main".to_string()]).await });
+    let td =
+        tokio::spawn(async move { runner.teardown_cleanup(&["main".to_string()], true).await });
     rig.until("the cancel", || h.status().state == JobState::Cancelling)
         .await;
     rig.advance(31_000, 31_000).await;
@@ -270,6 +271,23 @@ fn seed_leftovers(h: &Harness) {
             .snapshots
             .push("hx-backup-20261127T030000Z-ab12".into());
     });
+    // The records attribute the leftovers to the desktop: a `DestroyDesktop` deletes only what
+    // they name.
+    let dirs = BackupDirs::new(&h.daemon.cfg.state_dir);
+    dirs.ensure_desktop_dir("main").unwrap();
+    JobRecord {
+        format: FORMAT,
+        job_id: job(1).hex(),
+        kind: kind_name(JobKind::Restore).into(),
+        desktop_id: "main".into(),
+        started_unix: 1_800_000_000,
+        helper: job(1).helper_name().to_string(),
+        snapshot: None,
+        target: Some(format!("hx-restore-{}", job(2).hex())),
+        resumable: false,
+    }
+    .store(&dirs.job_path("main").unwrap())
+    .unwrap();
     let run = &h.daemon.cfg.backup_run_dir;
     std::fs::create_dir_all(run).unwrap();
     leave_socket(run, &format!("{}.sock", job(1).hex()));

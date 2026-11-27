@@ -967,3 +967,24 @@ fn a_link_the_helper_closed_itself_is_not_reported_as_a_violation() {
     while s.env.pump().is_ok() {}
     assert_eq!(s.join_without_closing(), End::Lost);
 }
+
+// ---- S-M1: a snapshot is create-only ----
+
+#[test]
+fn a_snapshot_that_exists_cannot_be_written_again() {
+    let rig = Rig::new();
+    let mut s = rig.open_session();
+    s.env.create().ok();
+    let snap = data(500, 7);
+    s.env.write(T::Snapshot, &id(0x50), &snap).ok();
+    // Written again with the same bytes (the hash matches): refused, and the object is intact.
+    assert_eq!(
+        s.env.write(T::Snapshot, &id(0x50), &snap).class(),
+        Some(EC::Permission)
+    );
+    assert_eq!(s.env.read_full(T::Snapshot, &id(0x50)), Reply::Read(snap));
+    // A different snapshot is created as usual, and a pack may still be written twice.
+    s.env.write(T::Snapshot, &id(0x51), &data(10, 1)).ok();
+    s.env.write(T::Pack, &id(0x60), &data(10, 2)).ok();
+    s.env.write(T::Pack, &id(0x60), &data(10, 2)).ok();
+}

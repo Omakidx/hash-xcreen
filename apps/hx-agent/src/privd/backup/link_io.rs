@@ -43,6 +43,16 @@ use super::clock::Monotonic;
 /// The reader waits while the other link has this many data bytes queued: two full frames.
 pub const SINK_LIMIT: usize = 2 * 1024 * 1024;
 
+/// The control queue of a link holds at most this many bytes; a peer that lets it fill by not
+/// reading is dead (ipc.md section 25).
+pub const CTL_LIMIT: usize = 256 * 1024;
+
+/// The reader of the other link waits while this many control bytes are queued.
+pub const CTL_SOFT: usize = 64 * 1024;
+
+/// Data frames queued on a link at most (the "2 frames per stream" rule, over 2 streams).
+pub const MAX_DATA_FRAMES: usize = 4;
+
 /// A write that makes no progress for this long fails the link.
 const WRITE_STALL: Duration = Duration::from_secs(120);
 
@@ -51,7 +61,7 @@ const WRITE_STALL: Duration = Duration::from_secs(120);
 #[allow(clippy::large_enum_variant)] // one per frame; boxing would only add an allocation
 pub enum LinkEvent {
     /// A decoded, validated frame, and the relay slot it holds.
-    Frame(Incoming, OwnedSemaphorePermit),
+    Frame(Incoming, Option<OwnedSemaphorePermit>),
     /// The stream ended at a frame boundary.
     Eof,
     /// The stream ended inside a frame.
@@ -88,7 +98,28 @@ struct QueueInner {
     ctl: VecDeque<Out>,
     data: VecDeque<Out>,
     data_bytes: usize,
+    ctl_bytes: usize,
+    pong: Option<Vec<u8>>,
     closed: bool,
+    /// Bumped by `reopen`: a writer thread of an earlier generation stops.
+    generation: u64,
+}
+
+/// Why a push to a queue failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushError {
+    /// The queue is closed.
+    Closed,
+    /// The control queue is over its cap: the peer is not reading.
+    Overflow,
+}
+
+fn ctl_len(o: &Out) -> usize {
+    match o {
+        Out::Msg(b) => b.len(),
+        Out::Secret(b) => b.len(),
+        _ => 0,
+    }
 }
 
 /// The outgoing queue of a link: control frames go first, data frames wait behind them.
@@ -108,15 +139,32 @@ impl OutQueue {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Queues a control item; `false` when the queue is closed.
-    pub fn push_ctl(&self, out: Out) -> bool {
+    /// Queues a control item. At most [`CTL_LIMIT`] bytes are held: past that the peer is not
+    /// reading and the push is refused.
+    pub fn push_ctl(&self, out: Out) -> Result<(), PushError> {
         let mut g = self.lock();
         if g.closed {
-            return false;
+            return Err(PushError::Closed);
         }
+        let n = ctl_len(&out);
+        if g.ctl_bytes + n > CTL_LIMIT {
+            return Err(PushError::Overflow);
+        }
+        g.ctl_bytes += n;
         g.ctl.push_back(out);
         self.cv.notify_all();
-        true
+        Ok(())
+    }
+
+    /// Queues a `Pong`: at most one is ever pending, a newer one replaces it.
+    pub fn set_pong(&self, bytes: Vec<u8>) -> Result<(), PushError> {
+        let mut g = self.lock();
+        if g.closed {
+            return Err(PushError::Closed);
+        }
+        g.pong = Some(bytes);
+        self.cv.notify_all();
+        Ok(())
     }
 
     /// Queues a data frame of `len` payload bytes; `false` when the queue is closed.
@@ -132,13 +180,18 @@ impl OutQueue {
     }
 
     /// The next item, blocking; `None` once the queue is closed (what is still queued is dropped).
-    pub fn pop(&self) -> Option<(Out, usize)> {
+    pub fn pop(&self, generation: u64) -> Option<(Out, usize)> {
         let mut g = self.lock();
         loop {
-            if g.closed {
+            if g.closed || g.generation != generation {
                 return None;
             }
+            if let Some(b) = g.pong.take() {
+                return Some((Out::Msg(b), 0));
+            }
             if let Some(o) = g.ctl.pop_front() {
+                g.ctl_bytes = g.ctl_bytes.saturating_sub(ctl_len(&o));
+                self.cv.notify_all();
                 return Some((o, 0));
             }
             if let Some(o) = g.data.pop_front() {
@@ -164,15 +217,48 @@ impl OutQueue {
         self.lock().data_bytes
     }
 
-    /// Waits up to `timeout` for fewer than `limit` queued data bytes. `true` when below the
-    /// limit or closed.
+    /// Control bytes queued and not yet written.
+    pub fn ctl_bytes(&self) -> usize {
+        self.lock().ctl_bytes
+    }
+
+    /// Data frames queued and not yet written (`written` is called per frame).
+    pub fn data_frames(&self) -> usize {
+        self.lock().data.len()
+    }
+
+    /// Waits up to `timeout` until the queue is below `limit` data bytes, below
+    /// [`MAX_DATA_FRAMES`] data frames and below [`CTL_SOFT`] control bytes. `true` when it is
+    /// (or the queue is closed).
     pub fn wait_below(&self, limit: usize, timeout: Duration) -> bool {
+        let full = |q: &QueueInner| {
+            q.data_bytes >= limit || q.data.len() >= MAX_DATA_FRAMES || q.ctl_bytes >= CTL_SOFT
+        };
         let g = self.lock();
         let (g, _) = self
             .cv
-            .wait_timeout_while(g, timeout, |q| !q.closed && q.data_bytes >= limit)
+            .wait_timeout_while(g, timeout, |q| !q.closed && full(q))
             .unwrap_or_else(|e| e.into_inner());
-        g.closed || g.data_bytes < limit
+        g.closed || !full(&g)
+    }
+
+    /// The generation a writer thread belongs to.
+    pub fn generation(&self) -> u64 {
+        self.lock().generation
+    }
+
+    /// Opens a closed queue again (a reconnect of the worker link reuses it). The writer thread
+    /// of the link that was closed belongs to the old generation and stops.
+    pub fn reopen(&self) {
+        let mut g = self.lock();
+        g.closed = false;
+        g.generation += 1;
+        g.ctl.clear();
+        g.data.clear();
+        g.data_bytes = 0;
+        g.ctl_bytes = 0;
+        g.pong = None;
+        self.cv.notify_all();
     }
 
     /// Closes the queue: the writer stops and what is queued is dropped.
@@ -182,6 +268,8 @@ impl OutQueue {
         g.ctl.clear();
         g.data.clear();
         g.data_bytes = 0;
+        g.ctl_bytes = 0;
+        g.pong = None;
         self.cv.notify_all();
     }
 
@@ -224,8 +312,26 @@ fn run_reader(
         while !sink.wait_below(SINK_LIMIT, Duration::from_millis(100)) {
             last_rx.store(mono.now_ms(), Ordering::SeqCst);
         }
-        let Ok(permit) = handle.block_on(budget.clone().acquire_owned()) else {
-            return;
+        // A reader that waits for a slot is not blocked by its peer: it keeps its link's
+        // silence clock fresh (ipc.md section 25).
+        let permit = loop {
+            if let Ok(p) = budget.clone().try_acquire_owned() {
+                break p;
+            }
+            let acquired = handle.block_on(async {
+                tokio::time::timeout(Duration::from_millis(100), budget.clone().acquire_owned())
+                    .await
+            });
+            match acquired {
+                Ok(Ok(p)) => break p,
+                Ok(Err(_)) => return,
+                Err(_) => {
+                    last_rx.store(mono.now_ms(), Ordering::SeqCst);
+                    if tx.is_closed() {
+                        return;
+                    }
+                }
+            }
         };
         let mut r = Stamping {
             inner: NoCmsgReader(&stream),
@@ -234,7 +340,11 @@ fn run_reader(
         };
         let event = match dec.read_from(&mut r) {
             Ok(Some(raw)) => match repo::decode(raw, endpoint) {
-                Ok(incoming) => LinkEvent::Frame(incoming, permit),
+                // A kind-1 frame is at most 64 KiB and the channel holds a few: it gives its slot
+                // back at once. Only a data frame (up to 1 MiB, relayed without copying) holds
+                // its slot until it has been written to the other link.
+                Ok(incoming @ Incoming::Data(_)) => LinkEvent::Frame(incoming, Some(permit)),
+                Ok(incoming) => LinkEvent::Frame(incoming, None),
                 Err(e) => LinkEvent::Violation(e.to_string().chars().take(100).collect()),
             },
             Ok(None) => LinkEvent::Eof,
@@ -251,7 +361,8 @@ fn run_reader(
 
 fn run_writer(mut stream: UnixStream, q: Arc<OutQueue>, tx: mpsc::Sender<LinkEvent>) {
     let _ = stream.set_write_timeout(Some(WRITE_STALL));
-    while let Some((item, data_len)) = q.pop() {
+    let generation = q.generation();
+    while let Some((item, data_len)) = q.pop(generation) {
         let r = match &item {
             Out::Msg(b) => stream.write_all(b),
             Out::Secret(b) => stream.write_all(b),
@@ -287,6 +398,17 @@ pub enum SendError {
     Rule(&'static str),
     /// The queue is closed.
     Closed,
+    /// The control queue is over its cap: the peer is not reading.
+    Overflow,
+}
+
+impl From<PushError> for SendError {
+    fn from(e: PushError) -> Self {
+        match e {
+            PushError::Closed => Self::Closed,
+            PushError::Overflow => Self::Overflow,
+        }
+    }
 }
 
 /// One link as the job loop sees it.
@@ -334,7 +456,7 @@ impl Link {
         other_q: Arc<OutQueue>,
         parts: &LinkParts,
     ) -> io::Result<Self> {
-        let (tx, rx) = mpsc::channel(1);
+        let (tx, rx) = mpsc::channel(16);
         let last_rx = Arc::new(AtomicU64::new(parts.mono.now_ms()));
         let rstream = stream.try_clone()?;
         let wstream = stream.try_clone()?;
@@ -380,11 +502,12 @@ impl Link {
             .sent_message(frame)
             .map_err(|e| SendError::Rule(e.0))?;
         let bytes = encode_message(frame, self.peer).map_err(|_| SendError::Rule("encode"))?;
-        if self.q.push_ctl(Out::Msg(bytes)) {
-            Ok(())
+        let r = if matches!(frame.frame, Some(pb::repo_frame::Frame::Pong(_))) {
+            self.q.set_pong(bytes)
         } else {
-            Err(SendError::Closed)
-        }
+            self.q.push_ctl(Out::Msg(bytes))
+        };
+        r.map_err(SendError::from)
     }
 
     /// Sends one data frame.
@@ -418,11 +541,9 @@ impl Link {
             .sent_secret(0, slot, secret.len())
             .map_err(|e| SendError::Rule(e.0))?;
         let framed = encode_secret(0, slot, secret).map_err(|_| SendError::Rule("encode"))?;
-        if self.q.push_ctl(Out::Secret(framed)) {
-            Ok(())
-        } else {
-            Err(SendError::Closed)
-        }
+        self.q
+            .push_ctl(Out::Secret(framed))
+            .map_err(SendError::from)
     }
 
     /// `Ping` with a fresh nonce.
@@ -448,7 +569,7 @@ impl Link {
         self.open = false;
         if bye && self.state.is_open() {
             let _ = self.send(&frame(pb::repo_frame::Frame::Bye(pb::Bye {})));
-            if self.q.push_ctl(Out::Close) {
+            if self.q.push_ctl(Out::Close).is_ok() {
                 return;
             }
         }
@@ -510,15 +631,15 @@ mod tests {
             },
             3,
         );
-        q.push_ctl(Out::Msg(vec![1]));
+        q.push_ctl(Out::Msg(vec![1])).unwrap();
         assert_eq!(q.data_bytes(), 3);
-        assert!(matches!(q.pop(), Some((Out::Msg(_), 0))));
-        assert!(matches!(q.pop(), Some((Out::Data { .. }, 3))));
+        assert!(matches!(q.pop(q.generation()), Some((Out::Msg(_), 0))));
+        assert!(matches!(q.pop(q.generation()), Some((Out::Data { .. }, 3))));
         q.written(3);
         assert_eq!(q.data_bytes(), 0);
         q.close();
-        assert!(q.pop().is_none());
-        assert!(!q.push_ctl(Out::Msg(vec![2])));
+        assert!(q.pop(q.generation()).is_none());
+        assert_eq!(q.push_ctl(Out::Msg(vec![2])), Err(PushError::Closed));
     }
 
     #[test]
@@ -536,5 +657,53 @@ mod tests {
         assert!(!q.wait_below(10, Duration::from_millis(5)));
         q.written(20);
         assert!(q.wait_below(10, Duration::from_millis(5)));
+    }
+
+    #[test]
+    fn the_control_queue_is_capped_and_a_pong_flood_costs_one_slot() {
+        let q = OutQueue::new();
+        // A Ping flood: a million pongs, one pending.
+        for _ in 0..1_000_000 {
+            q.set_pong(vec![0; 12]).unwrap();
+        }
+        assert_eq!(
+            q.ctl_bytes(),
+            0,
+            "pongs are not queued, they replace each other"
+        );
+        assert!(matches!(q.pop(q.generation()), Some((Out::Msg(b), 0)) if b.len() == 12));
+        // Requests and answers are bounded in bytes.
+        let mut pushed = 0;
+        loop {
+            match q.push_ctl(Out::Msg(vec![0; 1000])) {
+                Ok(()) => pushed += 1,
+                Err(e) => {
+                    assert_eq!(e, PushError::Overflow);
+                    break;
+                }
+            }
+            assert!(pushed < 10_000, "unbounded");
+        }
+        assert!(q.ctl_bytes() <= CTL_LIMIT);
+        assert_eq!(pushed, CTL_LIMIT / 1000);
+        // Control bytes hold the reader of the other link back.
+        assert!(!q.wait_below(SINK_LIMIT, Duration::from_millis(5)));
+    }
+
+    #[test]
+    fn data_frames_are_bounded_by_count_as_well_as_bytes() {
+        let q = OutQueue::new();
+        for _ in 0..MAX_DATA_FRAMES {
+            q.push_data(
+                Out::Data {
+                    header: [0; DATA_FRAME_HEADER_LEN],
+                    payload: Bytes::from_static(b"x"),
+                    _permit: None,
+                },
+                1,
+            );
+        }
+        assert!(!q.wait_below(SINK_LIMIT, Duration::from_millis(5)));
+        assert_eq!(q.data_frames(), MAX_DATA_FRAMES);
     }
 }

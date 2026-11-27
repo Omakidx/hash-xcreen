@@ -231,11 +231,16 @@ pub fn forget_list(record: &CompletedRecord, retention: &Retention) -> Vec<[u8; 
         .collect()
 }
 
+/// The most ids one `FORGET_PRUNE` names, so that its `Job` fits the 64 KiB frame (ipc.md
+/// section 26): the oldest go first and a later prune takes the rest.
+pub const MAX_FORGET_PER_JOB: usize = 1_800;
+
 /// The `FORGET_PRUNE` spec of ipc.md section 28, with `forget` taken from the record only.
 pub fn forget_prune_spec(record: &CompletedRecord, retention: &Retention) -> pb::ForgetPruneSpec {
     pb::ForgetPruneSpec {
         forget: forget_list(record, retention)
             .into_iter()
+            .take(MAX_FORGET_PER_JOB)
             .map(|id| Bytes::copy_from_slice(&id))
             .collect(),
         instant: true,

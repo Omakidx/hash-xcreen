@@ -71,6 +71,10 @@ pub use progress::JobProgress;
 /// The relay buffer cap across jobs: 16 frame slots of 1 MiB (ipc.md section 25).
 pub const RELAY_FRAME_SLOTS: usize = 16;
 
+/// The slots a job reserves when it starts (two readers, a frame being read and one in the
+/// channel each): at most `RELAY_FRAME_SLOTS / JOB_FRAME_SLOTS` jobs run at once.
+pub const JOB_FRAME_SLOTS: usize = 4;
+
 /// A job runs on a monotonic clock with these timers (ipc.md section 32); the values are the
 /// contract, and tests change only `tick` and `connect_retry` (the pace at which the loop looks
 /// at the clock), never a limit.
@@ -284,6 +288,9 @@ pub struct JobOutcome {
     pub desktop_id: String,
     /// What it produced, or why it failed.
     pub result: Result<JobSuccess, Failure>,
+    /// How many `PERMISSION` answers of the Drive helper privd relayed in the job (the first is
+    /// audited when it happens, the count is in the job's last audit line).
+    pub permission_answers: u32,
 }
 
 /// Where a job is.

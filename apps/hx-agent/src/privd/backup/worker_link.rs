@@ -28,48 +28,58 @@ pub async fn open<E: BackupEnv>(
     let window = u64::try_from(s.timing.worker_connect_window.as_millis()).unwrap_or(u64::MAX);
     let retry = s.timing.connect_retry;
     let mono = s.mono.clone();
-    let stream = s
-        .service(connect_unix(socket, window, retry, mono.as_ref()))
-        .await
-        .map_err(|_| Failure::HelperFailed("the worker's socket cannot be reached".into()))?;
-    if let Some(f) = s.abort_reason() {
-        return Err(f);
-    }
-    let link = Link::spawn(
-        "worker",
-        stream,
-        Endpoint::PrivdWorkerLink,
-        s.worker_q.clone(),
-        s.drive_q.clone(),
-        &s.parts,
-    )
-    .map_err(|_| Failure::HelperFailed("cannot start the worker link".into()))?;
-    s.worker = Some(link);
-    let hello = frame(pb::repo_frame::Frame::Hello(pb::Hello {
-        major: repo::VERSION_MAJOR,
-        minor: repo::VERSION_MINOR,
-        job_id: job.job_id.clone(),
-    }));
-    if !s.send_worker(&hello) {
-        return Err(Failure::HelperFailed(
-            "the worker link closed at once".into(),
-        ));
-    }
-    // `HelloAck` within 30 s of the start of the helper.
+    // `HelloAck` within 30 s of the start of the helper. The Incus proxy accepts before the
+    // worker listens and then closes: such a connection is dropped and tried again.
     let ack_by = helper_started_ms + u64::try_from(s.timing.ack_timeout.as_millis()).unwrap_or(0);
-    s.pump_until(|s| {
-        s.worker.as_ref().is_some_and(|l| l.state.is_open()) || s.mono.now_ms() >= ack_by
-    })
-    .await;
-    if let Some(f) = s.abort_reason() {
-        return Err(f);
-    }
-    if !s.worker.as_ref().is_some_and(|l| l.state.is_open()) {
-        return Err(if s.worker.as_ref().is_some_and(|l| !l.open) {
-            Failure::HelperFailed("the worker link ended before HelloAck".into())
+    loop {
+        let stream = s
+            .service(connect_unix(socket, window, retry, mono.as_ref()))
+            .await
+            .map_err(|_| Failure::HelperFailed("the worker's socket cannot be reached".into()))?;
+        if let Some(f) = s.abort_reason() {
+            return Err(f);
+        }
+        let link = Link::spawn(
+            "worker",
+            stream,
+            Endpoint::PrivdWorkerLink,
+            s.worker_q.clone(),
+            s.drive_q.clone(),
+            &s.parts,
+        )
+        .map_err(|_| Failure::HelperFailed("cannot start the worker link".into()))?;
+        s.worker = Some(link);
+        let hello = frame(pb::repo_frame::Frame::Hello(pb::Hello {
+            major: repo::VERSION_MAJOR,
+            minor: repo::VERSION_MINOR,
+            job_id: job.job_id.clone(),
+        }));
+        if !s.send_worker(&hello) {
+            return Err(Failure::HelperFailed(
+                "the worker link closed at once".into(),
+            ));
+        }
+        s.pump_until(|s| {
+            s.worker.as_ref().is_some_and(|l| l.state.is_open()) || s.mono.now_ms() >= ack_by
+        })
+        .await;
+        if let Some(f) = s.abort_reason() {
+            return Err(f);
+        }
+        if s.worker.as_ref().is_some_and(|l| l.state.is_open()) {
+            break;
+        }
+        let ended = s.worker.as_ref().is_some_and(|l| !l.open);
+        if ended && s.mono.now_ms() < ack_by {
+            s.reset_worker();
+            tokio::time::sleep(retry).await;
+            continue;
+        }
+        return Err(Failure::HelperFailed(if ended {
+            "the worker link ended before HelloAck".into()
         } else {
-            Failure::HelperFailed("no HelloAck within 30 s of the start".into())
-        });
+            "no HelloAck within 30 s of the start".into()
+        }));
     }
     // The worker has been heard from now: the silence clock starts here, not at the connection.
     if let Some(l) = s.worker.as_ref() {

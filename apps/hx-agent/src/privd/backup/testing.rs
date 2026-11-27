@@ -36,6 +36,8 @@ pub struct FakeEnv {
     pub desktops: Mutex<Vec<String>>,
     /// Whether an uninstall has begun.
     pub uninstalling: AtomicBool,
+    /// The desktop lock is held until the job's cancel fires.
+    pub hold_lock: AtomicBool,
     /// The wall clock, Unix seconds.
     pub now: AtomicU64,
     /// How many times the desktop lock was taken.
@@ -51,6 +53,7 @@ impl FakeEnv {
             alerts: Mutex::new(Vec::new()),
             desktops: Mutex::new(desktops.iter().map(|s| (*s).to_string()).collect()),
             uninstalling: AtomicBool::new(false),
+            hold_lock: AtomicBool::new(false),
             now: AtomicU64::new(1_800_000_000),
             locks: AtomicUsize::new(0),
         })
@@ -112,10 +115,16 @@ impl BackupEnv for FakeEnv {
     fn lock_desktop<'a>(
         &'a self,
         _desktop: &'a str,
-        _cancel: &'a CancelToken,
+        cancel: &'a CancelToken,
     ) -> BoxFuture<'a, Result<LockGuard, String>> {
         self.locks.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async { Ok(Box::new(()) as LockGuard) })
+        Box::pin(async move {
+            if self.hold_lock.load(Ordering::SeqCst) {
+                cancel.cancelled().await;
+                return Err("the request was cancelled".to_string());
+            }
+            Ok(Box::new(()) as LockGuard)
+        })
     }
 }
 
@@ -139,6 +148,8 @@ struct HostState {
     unmarked_targets: BTreeSet<String>,
     log: Vec<String>,
     fail: BTreeMap<String, HostError>,
+    delete_delay_ms: u64,
+    fail_targets_once: bool,
     drive_stops: usize,
     pool: Option<(u64, u64)>,
     facts: Option<DesktopFacts>,
@@ -151,6 +162,7 @@ pub struct FakeHost {
     state: Mutex<HostState>,
     on_start: Mutex<Option<StartHook>>,
     on_kill: Mutex<Option<KillHook>>,
+    on_finish: Mutex<Option<KillHook>>,
 }
 
 impl FakeHost {
@@ -172,12 +184,18 @@ impl FakeHost {
             }),
             on_start: Mutex::new(None),
             on_kill: Mutex::new(None),
+            on_finish: Mutex::new(None),
         })
     }
 
     /// Called when the helper of a job is started: start the fake worker on `socket`.
     pub fn set_on_start(&self, f: impl Fn(StartInfo) + Send + Sync + 'static) {
         *lock(&self.on_start) = Some(Arc::new(f));
+    }
+
+    /// Called when `finish_helper` runs (a test moves the clock there).
+    pub fn set_on_finish(&self, f: impl Fn(JobId) + Send + Sync + 'static) {
+        *lock(&self.on_finish) = Some(Arc::new(f));
     }
 
     /// Called when a helper is force-deleted: stop the fake worker.
@@ -206,7 +224,19 @@ impl FakeHost {
         lock(&self.state).fail.insert(op.to_string(), e);
     }
 
+    /// Makes the next `list_restore_targets` fail, once.
+    pub fn fail_target_listing_once(&self) {
+        lock(&self.state).fail_targets_once = true;
+    }
+
+    /// Makes `delete_snapshot` take this long (so that concurrent callers interleave).
+    pub fn set_delete_delay_ms(&self, ms: u64) {
+        lock(&self.state).delete_delay_ms = ms;
+    }
+
     /// Makes `list_helpers` and `list_restore_targets` fail (Incus down).
+    ///
+    /// With `set_list_fails_once` only the next listing fails.
     pub fn set_list_fails(&self, on: bool) {
         lock(&self.state).list_fails = on;
     }
@@ -302,6 +332,10 @@ impl BackupHost for Arc<FakeHost> {
     }
 
     async fn delete_snapshot(&self, instance: &str, snapshot: &str) -> Result<(), HostError> {
+        let delay = lock(&self.state).delete_delay_ms;
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         self.step(
             format!("delete_snapshot {instance} {snapshot}"),
             "delete_snapshot",
@@ -332,16 +366,19 @@ impl BackupHost for Arc<FakeHost> {
     async fn create_helper(&self, plan: &HelperPlan) -> Result<(), HostError> {
         self.step(
             format!(
-                "create_helper {} {:?} snapshot={:?} target={:?}",
+                "create_helper {} {:?} snapshot={:?} target={:?} reuse={}",
                 plan.job.helper_name(),
                 plan.kind,
                 plan.snapshot,
-                plan.target
+                plan.target,
+                plan.reuse_target
             ),
             "create_helper",
         )?;
         let mut s = lock(&self.state);
-        if let Some(t) = &plan.target {
+        if let Some(t) = &plan.target
+            && !plan.reuse_target
+        {
             s.targets.insert(t.clone(), Some(plan.job));
         }
         s.helpers.insert(plan.job.hex(), plan.job);
@@ -368,6 +405,11 @@ impl BackupHost for Arc<FakeHost> {
             format!("finish_helper {}", job.helper_name()),
             "finish_helper",
         )?;
+        if let Some(f) = lock(&self.on_finish).clone() {
+            f(job);
+        }
+        // A moment of real time, so that a loop that waits for this call sees a few ticks.
+        tokio::time::sleep(Duration::from_millis(12)).await;
         // The fake worker ends its helper when it exits: give it a moment, then force.
         for _ in 0..40 {
             if !lock(&self.state).helpers.contains_key(&job.hex()) {
@@ -414,8 +456,8 @@ impl BackupHost for Arc<FakeHost> {
     }
 
     async fn list_restore_targets(&self) -> Result<Vec<RestoreTargetInfo>, HostError> {
-        let s = lock(&self.state);
-        if s.list_fails {
+        let mut s = lock(&self.state);
+        if s.list_fails || std::mem::take(&mut s.fail_targets_once) {
             return Err(HostError::Failed("Incus is down".into()));
         }
         Ok(s.targets
@@ -443,6 +485,10 @@ impl BackupHost for Arc<FakeHost> {
             "delete_restore_target",
         )?;
         Ok(lock(&self.state).targets.remove(name.as_str()).is_some())
+    }
+
+    async fn restore_target_exists(&self, name: &str) -> Result<bool, HostError> {
+        Ok(lock(&self.state).targets.contains_key(name))
     }
 
     async fn stop_drive_service(&self) -> Result<(), HostError> {

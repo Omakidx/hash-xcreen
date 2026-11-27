@@ -45,7 +45,14 @@ use crate::privd::cancel::CancelToken;
 use crate::privd::progress::ProgressSender;
 
 /// Called with the accepted result of a successful `BACKUP`.
-pub type BackupHook = Box<dyn Fn(&pb::JobResult) + Send + Sync>;
+///
+/// The flag is true when the job listed or read that snapshot before: it existed, so it is not
+/// the job's own and is not recorded (ipc.md section 29).
+pub type BackupHook = Box<dyn Fn(&pb::JobResult, bool) + Send + Sync>;
+
+/// The largest `PACK` or `INDEX` the Drive helper takes, and so the largest privd relays (ipc.md
+/// section 29, "Memory").
+pub const DRIVE_WRITE_CAP: u32 = 72 * 1024 * 1024;
 
 /// The id of the `OpenRepo` request, the first of the Drive session.
 pub const OPEN_REPO_ID: u64 = 1;
@@ -129,6 +136,8 @@ pub struct RunEnd {
     pub first_err: Option<ErrorClass>,
     /// The worker link ended without a `JobResult`.
     pub worker_gone: bool,
+    /// How many `PERMISSION` answers of the Drive helper privd relayed.
+    pub permission_answers: u32,
 }
 
 /// Both links of one job and everything the loop knows about them.
@@ -165,6 +174,8 @@ pub struct Session<E: BackupEnv> {
     cancel_seen: bool,
     last_tick_ms: u64,
     open_life: Option<u64>,
+    seen_snapshots: std::collections::HashSet<[u8; 32]>,
+    permission_answers: u32,
     pub(super) open_repo_answer: Option<pb::repo_response::Result>,
     on_backup_ok: Option<BackupHook>,
 }
@@ -229,6 +240,8 @@ impl<E: BackupEnv> Session<E> {
             cancel_seen: false,
             last_tick_ms: now,
             open_life: None,
+            seen_snapshots: std::collections::HashSet::new(),
+            permission_answers: 0,
             open_repo_answer: None,
             on_backup_ok: None,
         }
@@ -269,6 +282,25 @@ impl<E: BackupEnv> Session<E> {
         self.forced
             .clone()
             .or_else(|| self.drain.as_ref().map(|d| d.reason.clone()))
+    }
+
+    fn note_snapshot(&mut self, id: &[u8]) {
+        // Bounded: past 65 536 ids nothing more is remembered (a repository with that many
+        // snapshots is far beyond v1).
+        if self.seen_snapshots.len() < 65_536
+            && let Ok(id) = <[u8; 32]>::try_from(id)
+        {
+            self.seen_snapshots.insert(id);
+        }
+    }
+
+    /// Forgets the worker link (a reconnect: the proxy accepted before the worker listened and
+    /// then closed). The session goes on as if no worker had connected.
+    pub fn reset_worker(&mut self) {
+        self.worker = None;
+        self.worker_q.reopen();
+        self.over = false;
+        self.worker_gone = false;
     }
 
     /// `OpenRepo` has been sent: it is guarded like any Drive request.
@@ -365,6 +397,11 @@ impl<E: BackupEnv> Session<E> {
                 self.fatal(Failure::Internal(format!("{name} link: {r}")));
                 false
             }
+            // The control queue is full: the peer is not reading, which is what silence means.
+            Err(SendError::Overflow) => {
+                self.fatal(Failure::Silent(which));
+                false
+            }
         }
     }
 
@@ -398,6 +435,10 @@ impl<E: BackupEnv> Session<E> {
             Err(SendError::Rule(r)) => {
                 let name = link.name;
                 self.fatal(Failure::Internal(format!("{name} link data: {r}")));
+                false
+            }
+            Err(SendError::Overflow) => {
+                self.fatal(Failure::Silent(which));
                 false
             }
         }
@@ -485,6 +526,7 @@ impl<E: BackupEnv> Session<E> {
             result: self.result.clone(),
             first_err: self.first_err,
             worker_gone: self.worker_gone,
+            permission_answers: self.permission_answers,
         }
     }
 
@@ -610,7 +652,7 @@ impl<E: BackupEnv> Session<E> {
         self.over = true;
     }
 
-    fn worker_frame(&mut self, incoming: Incoming, permit: OwnedSemaphorePermit) {
+    fn worker_frame(&mut self, incoming: Incoming, permit: Option<OwnedSemaphorePermit>) {
         let Some(link) = self.worker.as_mut() else {
             return;
         };
@@ -658,7 +700,9 @@ impl<E: BackupEnv> Session<E> {
             && self.kind == JobKind::Backup
             && let Some(h) = &self.on_backup_ok
         {
-            h(&r);
+            let existed = <[u8; 32]>::try_from(r.snapshot_id.as_ref())
+                .is_ok_and(|id| self.seen_snapshots.contains(&id));
+            h(&r, existed);
         }
         self.result = Some(r);
         // Wait for `Bye` (or the end of the stream), but not for longer than the grace: a worker
@@ -682,20 +726,14 @@ impl<E: BackupEnv> Session<E> {
             self.fatal(Failure::WorkerProtocol("request: no operation".into()));
             return;
         };
-        if self.drive_dead.is_some() {
-            self.answer_error(w_id, ErrorClass::Unavailable);
-            return;
-        }
-        if self.drain.is_some() {
-            self.answer_error(w_id, ErrorClass::Cancelled);
-            return;
-        }
         let Some(job) = self.job_msg.as_ref() else {
             self.fatal(Failure::Internal(
                 "a request before the job was sent".into(),
             ));
             return;
         };
+        // The policy comes first, in every state: a forbidden request is refused, audited and
+        // backed off even while the job is being cancelled (ipc.md section 25).
         match repo::check_job_op(job, &op) {
             Verdict::Allow => {}
             Verdict::AllowIfAbsent if self.config_absent => {}
@@ -704,11 +742,51 @@ impl<E: BackupEnv> Session<E> {
                 return;
             }
         }
+        if self.drive_dead.is_some() {
+            self.answer_error(w_id, ErrorClass::Unavailable);
+            return;
+        }
+        if self.drain.is_some() {
+            self.answer_error(w_id, ErrorClass::Cancelled);
+            return;
+        }
+        if let Op::Write(w) = &op
+            && matches!(
+                ObjectType::try_from(w.object_type),
+                Ok(ObjectType::Pack | ObjectType::Index)
+            )
+            && w.size > DRIVE_WRITE_CAP
+        {
+            self.env.audit(&format!(
+                "backup job {}: a write over the size cap was refused (TOO_LARGE)",
+                self.job_hex
+            ));
+            self.answer_error(w_id, ErrorClass::TooLarge);
+            self.fatal(Failure::TooLarge);
+            return;
+        }
+        match &op {
+            Op::ReadFull(x) if x.object_type == ObjectType::Snapshot as i32 => {
+                self.note_snapshot(&x.id);
+            }
+            Op::ReadPartial(x) if x.object_type == ObjectType::Snapshot as i32 => {
+                self.note_snapshot(&x.id);
+            }
+            _ => {}
+        }
         let is_write = matches!(op, Op::Write(_));
+        let is_config_write =
+            matches!(&op, Op::Write(w) if w.object_type == ObjectType::Config as i32);
+        if !self.drive.as_ref().is_some_and(|l| l.open) {
+            // The link is gone and its end has not been read yet: the loss of the session.
+            self.answer_error(w_id, ErrorClass::Unavailable);
+            self.drive_lost(ErrorClass::Unavailable, Failure::Unavailable);
+            return;
+        }
         if !self
             .drive
             .as_ref()
-            .is_some_and(|l| l.open && l.state.can_request(is_write))
+            .is_some_and(|l| l.state.can_request(is_write))
         {
             self.fatal(Failure::Internal(
                 "the Drive link has no room for a request".into(),
@@ -754,7 +832,16 @@ impl<E: BackupEnv> Session<E> {
             op: Some(op),
         }));
         if !self.send_drive(&f) {
+            // Not forwarded: the worker is told, and nothing is tracked.
+            if self.forced.is_none() {
+                self.answer_error(w_id, ErrorClass::Unavailable);
+                self.drive_lost(ErrorClass::Unavailable, Failure::Unavailable);
+            }
             return;
+        }
+        if is_config_write {
+            // The repository is no longer known to be without a config.
+            self.config_absent = false;
         }
         let now = self.now();
         self.by_drive.insert(d_id, w_id);
@@ -771,7 +858,12 @@ impl<E: BackupEnv> Session<E> {
         );
     }
 
-    fn worker_data(&mut self, d: repo::DataFrame, permit: OwnedSemaphorePermit, discard: bool) {
+    fn worker_data(
+        &mut self,
+        d: repo::DataFrame,
+        permit: Option<OwnedSemaphorePermit>,
+        discard: bool,
+    ) {
         if discard {
             return;
         }
@@ -793,7 +885,7 @@ impl<E: BackupEnv> Session<E> {
         let len = d.payload.len() as u64;
         if !d.end {
             self.mapper.add_transfer(len);
-            self.send_data_on(LinkName::Drive, d_id, false, d.payload, Some(permit));
+            self.send_data_on(LinkName::Drive, d_id, false, d.payload, permit);
             return;
         }
         // The last frame: forward its `END` only if the body hashes to the id.
@@ -811,7 +903,7 @@ impl<E: BackupEnv> Session<E> {
         }
         w.end_forwarded = true;
         self.mapper.add_transfer(len);
-        self.send_data_on(LinkName::Drive, d_id, true, d.payload, Some(permit));
+        self.send_data_on(LinkName::Drive, d_id, true, d.payload, permit);
     }
 
     // ----- the Drive link -----------------------------------------------------------------
@@ -831,7 +923,7 @@ impl<E: BackupEnv> Session<E> {
         }
     }
 
-    fn drive_frame(&mut self, incoming: Incoming, permit: OwnedSemaphorePermit) {
+    fn drive_frame(&mut self, incoming: Incoming, permit: Option<OwnedSemaphorePermit>) {
         let Some(link) = self.drive.as_mut() else {
             return;
         };
@@ -882,10 +974,19 @@ impl<E: BackupEnv> Session<E> {
                 return;
             };
             req.life = now;
-            matches!(req.op, ReqOp::List(ObjectType::Config))
+            (
+                matches!(req.op, ReqOp::List(ObjectType::Config)),
+                matches!(req.op, ReqOp::List(ObjectType::Snapshot)),
+            )
         };
+        let (is_config_list, is_snapshot_list) = is_config_list;
         match result {
             R::ListPage(p) => {
+                if is_snapshot_list {
+                    for e in &p.entries {
+                        self.note_snapshot(&e.id);
+                    }
+                }
                 if is_config_list {
                     let total = self.list_total.entry(w_id).or_default();
                     *total += p.entries.len() as u64;
@@ -927,11 +1028,14 @@ impl<E: BackupEnv> Session<E> {
             return;
         };
         if class == ErrorClass::Permission {
-            let what = req.label.clone();
-            self.env.audit(&format!(
-                "backup job {}: the Drive helper answered PERMISSION to `{what}`",
-                self.job_hex
-            ));
+            self.permission_answers += 1;
+            if self.permission_answers == 1 {
+                let what = req.label.clone();
+                self.env.audit(&format!(
+                    "backup job {}: the Drive helper answered PERMISSION to `{what}`",
+                    self.job_hex
+                ));
+            }
         }
         if !matches!(class, ErrorClass::NotFound | ErrorClass::Cancelled)
             && self.first_err.is_none()
@@ -966,7 +1070,12 @@ impl<E: BackupEnv> Session<E> {
         self.send_worker(&f);
     }
 
-    fn drive_data(&mut self, d: repo::DataFrame, permit: OwnedSemaphorePermit, discard: bool) {
+    fn drive_data(
+        &mut self,
+        d: repo::DataFrame,
+        permit: Option<OwnedSemaphorePermit>,
+        discard: bool,
+    ) {
         if discard {
             return;
         }
@@ -978,7 +1087,7 @@ impl<E: BackupEnv> Session<E> {
             r.life = now;
         }
         self.mapper.add_transfer(d.payload.len() as u64);
-        self.send_data_on(LinkName::Worker, w_id, d.end, d.payload, Some(permit));
+        self.send_data_on(LinkName::Worker, w_id, d.end, d.payload, permit);
     }
 
     fn drive_event(&mut self, e: pb::Event) {

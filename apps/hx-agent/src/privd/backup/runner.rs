@@ -19,14 +19,14 @@ use std::time::Duration;
 use hx_backup::manifest::Manifest;
 use hx_ipc::repo::pb::{self, ErrorClass, JobKind, WorkerError};
 use hx_provision::incus::JobId;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use zeroize::Zeroizing;
 
 use super::completed::{CompletedRecord, entry_from_result};
 use super::creds::{CredError, drive_token_present, read_backup_key};
 use super::drive_link::{self, OpenParams};
 use super::host::{BackupHost, HelperPlan, HostKind};
-use super::progress::JobProgress;
+use super::progress::{JobProgress, cleanup_index};
 use super::recovery::{Recovery, RecoveryReport, check_run_dir};
 use super::relay::{Reporter, RunEnd, Session};
 use super::slot::{
@@ -36,8 +36,8 @@ use super::slot::{
 use super::spec::{BuildCtx, JobSecrets, JobSpec, SpecError, build_job};
 use super::worker_link;
 use super::{
-    Alert, AlertKind, BackupConfig, BackupEnv, Failure, JobOutcome, JobState, JobStatus,
-    JobSuccess, RELAY_FRAME_SLOTS,
+    Alert, AlertKind, BackupConfig, BackupEnv, Failure, JOB_FRAME_SLOTS, JobOutcome, JobState,
+    JobStatus, JobSuccess, RELAY_FRAME_SLOTS,
 };
 use crate::privd::cancel::{CancelReason, CancelToken};
 use crate::privd::progress::ProgressSender;
@@ -108,6 +108,10 @@ pub enum StartError {
     /// The spec or the secrets are not valid (the rule's name).
     #[error("invalid job: {0}")]
     Invalid(String),
+    /// A restore target is kept (`resume.json`): resume it with a `resumable` restore, or tear
+    /// it down first; it is never overwritten.
+    #[error("a restore target is kept; resume it or remove it first")]
+    ResumePending,
     /// A record cannot be read or written, or recovery of a leftover failed.
     #[error("{0}")]
     Record(String),
@@ -165,6 +169,7 @@ impl JobHandle {
                     kind: JobKind::Unspecified,
                     desktop_id: self.desktop_id.clone(),
                     result: Err(Failure::Internal("the job task ended".into())),
+                    permission_answers: 0,
                 });
             }
         }
@@ -172,6 +177,7 @@ impl JobHandle {
 }
 
 struct Active {
+    job_id: String,
     cancel: CancelToken,
     status: watch::Receiver<JobStatus>,
 }
@@ -256,6 +262,14 @@ pub fn classify(setup: Option<Failure>, end: Option<RunEnd>) -> Result<pb::JobRe
     let Some(end) = end else {
         return Err(Failure::Internal("no result".into()));
     };
+    // An accepted successful result wins over anything that follows it (a lost link, silence, a
+    // violation after the result) as it wins over a cancel and a deadline: the backup exists and
+    // is recorded, and the outcome says so.
+    if let Some(r) = &end.result
+        && r.ok
+    {
+        return Ok(r.clone());
+    }
     if let Some(f) = end.forced {
         return Err(f);
     }
@@ -336,18 +350,28 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
         rep
     }
 
-    /// The cleanup for `DestroyDesktop` and `Uninstall`: cancels and waits for the active jobs
-    /// (at most 60 s), then removes every helper, every restore target (resumable or not), the
-    /// job sockets and the job and resume records of `desktops`.
-    pub async fn teardown_cleanup(&self, desktops: &[String]) -> RecoveryReport {
+    /// The cleanup for `DestroyDesktop` (`all` false: the scope is `desktops`) and `Uninstall`
+    /// (`all` true: the host). Cancels and waits for the active jobs of the scope (at most
+    /// 60 s), then removes the helpers, restore targets (resumable or not) and sockets of the
+    /// scope and the job and resume records of `desktops` (ipc.md section 35).
+    pub async fn teardown_cleanup(&self, desktops: &[String], all: bool) -> RecoveryReport {
         let i = &self.inner;
-        let tokens: Vec<CancelToken> = lock(&i.active).values().map(|a| a.cancel.clone()).collect();
-        for t in &tokens {
-            t.cancel(CancelReason::Cancelled);
+        let mut jobs = Vec::new();
+        let mut scoped = Vec::new();
+        for (d, a) in lock(&i.active).iter() {
+            if all || desktops.contains(d) {
+                a.cancel.cancel(CancelReason::Cancelled);
+                jobs.push(a.job_id.clone());
+                scoped.push(d.clone());
+            }
         }
         let started = i.mono.now_ms();
         let wait = u64::try_from(i.cfg.timing.teardown_wait.as_millis()).unwrap_or(0);
-        while !lock(&i.active).is_empty() && i.mono.now_ms().saturating_sub(started) < wait {
+        while {
+            let a = lock(&i.active);
+            scoped.iter().any(|d| a.contains_key(d))
+        } && i.mono.now_ms().saturating_sub(started) < wait
+        {
             tokio::time::sleep(i.cfg.timing.tick).await;
         }
         Recovery {
@@ -356,7 +380,7 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
             cfg: &i.cfg,
             dirs: &i.dirs,
         }
-        .teardown(desktops)
+        .teardown(desktops, all, &jobs)
         .await
     }
 
@@ -421,12 +445,20 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
             return Err(StartError::UnknownDesktop);
         }
         let rec_err = |e: RecordError| StartError::Record(e.to_string());
+        // The slot first, and the relay slots of the job: everything below is checked while
+        // holding them, so that two admissions cannot clean and start at once.
+        let guard = i.slots.take(&desktop).ok_or(StartError::Busy)?;
+        let reserved = i
+            .budget
+            .clone()
+            .try_acquire_many_owned(JOB_FRAME_SLOTS as u32)
+            .map_err(|_| StartError::Busy)?;
         // A leftover record of a job whose cleanup failed: clean it before anything else.
         let jp = i
             .dirs
             .job_path(&desktop)
             .map_err(|e| StartError::Record(e.to_string()))?;
-        if !i.slots.held(&desktop) && jp.exists() {
+        if jp.exists() {
             let rep = Recovery {
                 host: &i.host,
                 env: i.env.as_ref(),
@@ -502,7 +534,35 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
                 tail[1]
             )
         });
-        let target = (kind == JobKind::Restore).then(|| format!("hx-restore-{}", job.hex()));
+        // A kept restore target is resumed by a resumable restore (the helper is built on it and
+        // the worker verifies what is there), and refuses any other restore: `resume.json` is
+        // never silently overwritten and the older target is never abandoned.
+        let mut spec = req.spec.clone();
+        let (target, reuse_target) = if kind == JobKind::Restore {
+            let kept = ResumeRecord::load(
+                &i.dirs
+                    .resume_path(&desktop)
+                    .map_err(|e| StartError::Record(e.to_string()))?,
+            )
+            .map_err(rec_err)?;
+            match (&mut spec, kept) {
+                (
+                    JobSpec::Restore {
+                        resumable: true,
+                        verify_existing,
+                        ..
+                    },
+                    Some(k),
+                ) => {
+                    *verify_existing = true;
+                    (Some(k.target), true)
+                }
+                (_, Some(_)) => return Err(StartError::ResumePending),
+                (_, None) => (Some(format!("hx-restore-{}", job.hex())), false),
+            }
+        } else {
+            (None, false)
+        };
         let instance = format!("{}{desktop}", i.cfg.instance_prefix);
         let facts = if kind == JobKind::Backup {
             Some(
@@ -515,14 +575,19 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
         } else {
             None
         };
-        let completed = CompletedRecord::load(
-            &i.dirs
-                .completed_path(&desktop)
-                .map_err(|e| StartError::Record(e.to_string()))?,
-        )
-        .map_err(rec_err)?;
+        // Only a prune needs the record, so a corrupt one does not stop a backup.
+        let completed = if matches!(spec, JobSpec::ForgetPrune { .. }) {
+            CompletedRecord::load(
+                &i.dirs
+                    .completed_path(&desktop)
+                    .map_err(|e| StartError::Record(e.to_string()))?,
+            )
+            .map_err(rec_err)?
+        } else {
+            CompletedRecord::default()
+        };
         let job_msg = build_job(
-            &req.spec,
+            &spec,
             &BuildCtx {
                 job_id: raw,
                 facts: facts.as_ref(),
@@ -537,13 +602,20 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
             SpecError::Invalid(r) => StartError::Invalid(r),
             SpecError::NoFacts => StartError::UnknownDesktop,
         })?;
+        // The encoded `Job` must fit its frame: refused here, before a snapshot or a helper.
+        hx_ipc::repo::encode_message(
+            &pb::RepoFrame {
+                frame: Some(pb::repo_frame::Frame::Job(job_msg.clone())),
+            },
+            hx_ipc::repo::Endpoint::Worker,
+        )
+        .map_err(|_| StartError::Invalid("the job does not fit its frame".into()))?;
         check_run_dir(&i.cfg.run_dir, i.cfg.expected_owner).map_err(StartError::Host)?;
         let server_id = i
             .dirs
             .server_id()
             .map_err(|e| StartError::Record(e.to_string()))?;
-        // The slot, then the record.
-        let guard = i.slots.take(&desktop).ok_or(StartError::Busy)?;
+        // The record.
         i.dirs
             .ensure_desktop_dir(&desktop)
             .map_err(|e| StartError::Record(e.to_string()))?;
@@ -557,7 +629,7 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
             snapshot: snapshot.clone(),
             target: target.clone(),
             resumable: matches!(
-                req.spec,
+                spec,
                 JobSpec::Restore {
                     resumable: true,
                     ..
@@ -580,6 +652,7 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
         lock(&i.active).insert(
             desktop.clone(),
             Active {
+                job_id: job.hex(),
                 cancel: cancel.clone(),
                 status: rx.clone(),
             },
@@ -592,11 +665,12 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
             inner: self.inner.clone(),
             job,
             raw,
-            spec: req.spec,
+            spec,
             desktop: desktop.clone(),
             instance,
             snapshot,
             target,
+            reuse_target,
             job_msg,
             secrets: JobSecrets {
                 slot0,
@@ -613,6 +687,7 @@ impl<H: BackupHost, E: BackupEnv> JobRunner<H, E> {
             tx,
             progress: req.progress.take(),
             guard,
+            reserved,
             resumable: record.resumable,
         };
         let handle = JobHandle {
@@ -635,6 +710,7 @@ struct JobTask<H: BackupHost, E: BackupEnv> {
     instance: String,
     snapshot: Option<String>,
     target: Option<String>,
+    reuse_target: bool,
     job_msg: pb::Job,
     secrets: JobSecrets,
     open: OpenParams,
@@ -643,6 +719,7 @@ struct JobTask<H: BackupHost, E: BackupEnv> {
     tx: watch::Sender<JobStatus>,
     progress: Option<ProgressSender>,
     guard: SlotGuard,
+    reserved: OwnedSemaphorePermit,
     resumable: bool,
 }
 
@@ -652,6 +729,7 @@ struct Made {
     snapshot: bool,
     helper_attempted: bool,
     target_attempted: bool,
+    reuse_target: bool,
     helper_started_ms: Option<u64>,
 }
 
@@ -679,6 +757,12 @@ impl<H: BackupHost, E: BackupEnv> JobTask<H, E> {
                 detail_of(f)
             ),
         });
+        if outcome.permission_answers > 1 {
+            i.env.audit(&format!(
+                "backup job {job_hex}: the Drive helper answered PERMISSION {} times in all",
+                outcome.permission_answers
+            ));
+        }
         let outcome = Arc::new(outcome);
         tx.send_modify(|s| {
             s.state = JobState::Finished;
@@ -686,8 +770,7 @@ impl<H: BackupHost, E: BackupEnv> JobTask<H, E> {
         });
         let final_status = tx.borrow().clone();
         lock(&i.last).insert(desktop.clone(), final_status);
-        lock(&i.active).remove(&desktop);
-        // `self.guard` (the slot) was moved into `execute` and dropped there.
+        // The `active` entry was removed, and the slot released, inside `execute`.
     }
 
     async fn execute(self) -> JobOutcome {
@@ -708,6 +791,8 @@ impl<H: BackupHost, E: BackupEnv> JobTask<H, E> {
             tx,
             progress,
             guard,
+            reserved,
+            reuse_target,
             resumable,
         } = self;
         let kind = spec.kind();
@@ -720,7 +805,7 @@ impl<H: BackupHost, E: BackupEnv> JobTask<H, E> {
             i.env.clone(),
             i.mono.clone(),
             i.cfg.timing,
-            i.budget.clone(),
+            Arc::new(Semaphore::new(JOB_FRAME_SLOTS)),
             job_hex.clone(),
             kind,
             cancel.clone(),
@@ -731,12 +816,25 @@ impl<H: BackupHost, E: BackupEnv> JobTask<H, E> {
             let dirs = i.dirs.clone();
             let env = i.env.clone();
             let (d2, j2) = (desktop.clone(), job_hex.clone());
-            s.set_backup_hook(Box::new(move |r| {
+            s.set_backup_hook(Box::new(move |r, existed| {
                 // Before cleanup, with fsync (ipc.md section 35).
                 let Ok(path) = dirs.completed_path(&d2) else {
                     return;
                 };
-                let mut rec = CompletedRecord::load(&path).unwrap_or_default();
+                if existed {
+                    env.audit(&format!(
+                        "backup job {j2}: the snapshot already existed in the repository; it is not recorded"
+                    ));
+                    return;
+                }
+                // A record that cannot be read is never rewritten from nothing.
+                let mut rec = match CompletedRecord::load(&path) {
+                    Ok(rec) => rec,
+                    Err(e) => {
+                        env.audit(&format!("backup job {j2}: cannot record the backup: {e}"));
+                        return;
+                    }
+                };
                 if let Some(e) = entry_from_result(&j2, env.now_unix(), r) {
                     rec.add(e);
                     if let Err(e) = rec.store(&path) {
@@ -745,7 +843,10 @@ impl<H: BackupHost, E: BackupEnv> JobTask<H, E> {
                 }
             }));
         }
-        let mut made = Made::default();
+        let mut made = Made {
+            reuse_target,
+            ..Made::default()
+        };
         let mut setup: Option<Failure> = None;
         let mut end: Option<RunEnd> = None;
 
@@ -769,8 +870,10 @@ impl<H: BackupHost, E: BackupEnv> JobTask<H, E> {
             && let Some(name) = &snapshot
         {
             let locked = s.service(i.env.lock_desktop(&desktop, &cancel)).await;
+            // A cancel or a deadline that arrived while the lock was awaited is the job's fate,
+            // not a failure of the snapshot.
             match locked {
-                Ok(lockg) => {
+                Ok(lockg) if s.abort_reason().is_none() => {
                     let r = s.service(i.host.create_snapshot(&instance, name)).await;
                     drop(lockg);
                     made.snapshot = true;
@@ -778,7 +881,16 @@ impl<H: BackupHost, E: BackupEnv> JobTask<H, E> {
                         setup = Some(Failure::SnapshotFailed(e.to_string()));
                     }
                 }
-                Err(e) => setup = Some(Failure::SnapshotFailed(e)),
+                Ok(_) => {}
+                Err(e) => {
+                    // The lock future may end because of the cancel that the loop has not
+                    // looked at yet: the cancel is the job's fate.
+                    let fate = s.abort_reason().or(cancel.reason().map(|r| match r {
+                        CancelReason::Deadline => Failure::Deadline,
+                        _ => Failure::Cancelled,
+                    }));
+                    setup = Some(fate.unwrap_or(Failure::SnapshotFailed(e)));
+                }
             }
             if setup.is_none() {
                 setup = s.abort_reason();
@@ -796,6 +908,7 @@ impl<H: BackupHost, E: BackupEnv> JobTask<H, E> {
                         desktop_instance: instance.clone(),
                         snapshot: snapshot.clone(),
                         target: target.clone(),
+                        reuse_target,
                         worker: Arc::new(bytes),
                     };
                     made.helper_attempted = true;
@@ -838,6 +951,9 @@ impl<H: BackupHost, E: BackupEnv> JobTask<H, E> {
         let graceful = end
             .as_ref()
             .is_some_and(|e| e.result.is_some() && e.forced.is_none());
+        let forced_failure = end.as_ref().is_some_and(|e| e.forced.is_some());
+        let first_err = end.as_ref().and_then(|e| e.first_err);
+        let permission_answers = end.as_ref().map_or(0, |e| e.permission_answers);
         let mut result = classify(setup, end);
 
         // The manifest of a `RESTORE_PLAN` is untrusted input.
@@ -856,6 +972,13 @@ impl<H: BackupHost, E: BackupEnv> JobTask<H, E> {
         // The effects on privd's state.
         if let Err(f) = &result {
             apply_effects(&i, &desktop, &job_hex, f);
+            // What the repository said counts whatever ended the job: a cancel or a deadline
+            // that came while an `AUTH_REVOKED` was already relayed does not undo it.
+            if let Some(c) = first_err
+                && *f != Failure::Repo(c)
+            {
+                apply_effects(&i, &desktop, &job_hex, &Failure::Repo(c));
+            }
         } else if let (Ok(r), JobSpec::ForgetPrune { .. }) = (&result, &spec) {
             let _ = r;
             if let Some(pb::job::Spec::ForgetPrune(fp)) = &job_msg.spec {
@@ -865,9 +988,15 @@ impl<H: BackupHost, E: BackupEnv> JobTask<H, E> {
                     .filter_map(|b| <[u8; 32]>::try_from(b.as_ref()).ok())
                     .collect();
                 if let Ok(path) = i.dirs.completed_path(&desktop) {
-                    let mut rec = CompletedRecord::load(&path).unwrap_or_default();
-                    rec.remove(&ids);
-                    let _ = rec.store(&path);
+                    match CompletedRecord::load(&path) {
+                        Ok(mut rec) => {
+                            rec.remove(&ids);
+                            let _ = rec.store(&path);
+                        }
+                        Err(e) => i.env.audit(&format!(
+                            "backup job {job_hex}: cannot update the record: {e}"
+                        )),
+                    }
                 }
             }
         }
@@ -875,6 +1004,9 @@ impl<H: BackupHost, E: BackupEnv> JobTask<H, E> {
 
         // Step 7: cleanup, whatever happened.
         tx.send_modify(|st| st.state = JobState::CleaningUp);
+        if let Some(n) = cleanup_index(kind) {
+            s.enter_phase(n);
+        }
         let kept_target = cleanup(
             &i,
             &mut s,
@@ -886,9 +1018,19 @@ impl<H: BackupHost, E: BackupEnv> JobTask<H, E> {
             target.as_deref(),
             resumable,
             graceful,
+            forced_failure,
         )
         .await;
+        // The `active` entry goes before the slot is released, and only if it is this job's: a
+        // waiter that starts the next job the moment the slot is free must find its own entry.
+        {
+            let mut a = lock(&i.active);
+            if a.get(&desktop).is_some_and(|x| x.job_id == job_hex) {
+                a.remove(&desktop);
+            }
+        }
         drop(guard);
+        drop(reserved);
         JobOutcome {
             job_id: job_hex,
             kind,
@@ -897,6 +1039,7 @@ impl<H: BackupHost, E: BackupEnv> JobTask<H, E> {
                 result: r,
                 restore_target: kept_target,
             }),
+            permission_answers,
         }
     }
 }
@@ -965,6 +1108,7 @@ async fn cleanup<H: BackupHost, E: BackupEnv>(
     target: Option<&str>,
     resumable: bool,
     graceful: bool,
+    forced_failure: bool,
 ) -> Option<String> {
     let job_hex = job.hex();
     let mut leftovers = false;
@@ -977,18 +1121,19 @@ async fn cleanup<H: BackupHost, E: BackupEnv>(
     if let Some(l) = s.worker.as_mut() {
         l.close(false);
     }
+    // `Bye` whenever the Drive session is healthy (a cancelled or failed job included), and
+    // not after a failure without grace.
     if let Some(l) = s.drive.as_mut() {
-        l.close(drive_ok && graceful);
+        l.close(drive_ok && !forced_failure);
     }
     // (b) the helper
     if made.helper_attempted {
         let r = if graceful {
-            i.host
-                .finish_helper(job, i.cfg.timing.helper_finish)
+            s.service(i.host.finish_helper(job, i.cfg.timing.helper_finish))
                 .await
                 .map(|_| ())
         } else {
-            i.host.force_delete_helper(job).await.map(|_| ())
+            s.service(i.host.force_delete_helper(job)).await.map(|_| ())
         };
         if let Err(e) = r {
             leftovers = true;
@@ -1008,14 +1153,22 @@ async fn cleanup<H: BackupHost, E: BackupEnv>(
     // (d) the snapshot
     if made.snapshot
         && let Some(name) = snapshot
-        && let Err(e) = i.host.delete_snapshot(instance, name).await
+        && let Err(e) = s.service(i.host.delete_snapshot(instance, name)).await
     {
         leftovers = true;
         note(format!("the snapshot could not be deleted: {e}"));
     }
     // (e) the restore target
     let mut kept = None;
-    if made.target_attempted
+    // Only a target that exists is kept or deleted: a precondition that failed before the
+    // target was created leaves nothing to record.
+    let target_exists = match target {
+        Some(t) if made.target_attempted => {
+            made.reuse_target || i.host.restore_target_exists(t).await.unwrap_or(true)
+        }
+        _ => false,
+    };
+    if target_exists
         && let Some(t) = target
         && let Ok(name) = hx_provision::incus::RestoreTargetName::new(t)
     {
@@ -1104,7 +1257,11 @@ mod tests {
 
     #[test]
     fn forced_failures_and_setup_failures_win_and_no_result_is_a_helper_failure() {
+        // A failure without grace that follows an accepted success does not undo it (L2).
         let mut e = end(Some(res(true, WorkerError::Unspecified)));
+        e.forced = Some(Failure::Silent(crate::privd::backup::LinkName::Drive));
+        assert!(classify(None, Some(e)).is_ok());
+        let mut e = end(Some(res(false, WorkerError::Engine)));
         e.forced = Some(Failure::Integrity);
         assert_eq!(classify(None, Some(e)), Err(Failure::Integrity));
         assert_eq!(

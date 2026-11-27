@@ -89,6 +89,16 @@ pub fn table(kind: JobKind) -> (ppb::ProgressStage, u32) {
     }
 }
 
+/// The phase privd enters when the job is over and its objects are removed: Backup 6, the
+/// repository-only kinds 3; a restore's table has none (its last phase belongs to 2C).
+pub fn cleanup_index(kind: JobKind) -> Option<u32> {
+    match kind {
+        JobKind::Backup => Some(6),
+        JobKind::Restore => None,
+        _ => Some(3),
+    }
+}
+
 /// privd's text for phase `index` (from 1) of a job of `kind`.
 pub fn step_text(kind: JobKind, index: u32) -> &'static str {
     let i = (index.max(1) - 1) as usize;

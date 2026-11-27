@@ -804,7 +804,7 @@ impl Repo {
     }
 
     /// Writes an object (a retry overwrites, so an ambiguous failure does not duplicate it).
-    /// A `CONFIG` is refused when one exists.
+    /// A `CONFIG` is refused when one exists, and so is a `SNAPSHOT` that exists.
     ///
     /// # Errors
     /// `LEASE_HELD`, `PERMISSION` (config exists), or the class of a Drive failure.
@@ -819,6 +819,14 @@ impl Repo {
         self.check_lease(Mutation::Write, cancel).await?;
         if ty == pb::ObjectType::Config
             && self.stat("config", "stat config", cancel).await?.is_some()
+        {
+            return Err(DriveError::new(EC::Permission));
+        }
+        // A snapshot is create-only (ipc.md section 29, v0.8): a worker cannot re-write one it
+        // did not make and report it as its own. The check is before the first attempt, so the
+        // retries of this request still overwrite.
+        if ty == pb::ObjectType::Snapshot
+            && self.stat(&path, "stat snapshot", cancel).await?.is_some()
         {
             return Err(DriveError::new(EC::Permission));
         }
