@@ -12,22 +12,27 @@
 //!    is recorded for [`super::retry`]; the body of an error is read (at most 64 KiB) for that and
 //!    never kept.
 //!
-//! The client has redirects off, no proxy, `https_only`, HTTP/1.1, TLS 1.3 only (`rustls`, `ring`)
-//! and a resolver that answers only the two names, with global unicast addresses only. Nothing here
-//! logs or returns a URL: OpenDAL's token request carries the refresh token in its query string.
+//! The client (`hyper-util`, on the connector of [`super::connector`]) follows no redirect, has no
+//! proxy and speaks HTTP/1.1 over TLS 1.3 only (`rustls`, `ring`) to global unicast addresses of the
+//! two names. Nothing here logs or returns a URL: OpenDAL's token request carries the refresh token
+//! in its query string.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures_util::TryStreamExt;
 use http::{Request, Response};
 use http_body::{Body, Frame, SizeHint};
+use http_body_util::BodyExt;
+use hyper::body::Incoming;
+use hyper_util::rt::{TokioExecutor, TokioTimer};
 use opendal::{Buffer, HttpBody, HttpTransport};
 
+use super::connector::Connector;
+pub use super::connector::{BuildError, HttpConfig};
 use super::rate::{CHUNK, UploadRate};
 use super::retry::{Observed, Timing, record};
 
@@ -111,76 +116,8 @@ pub fn is_global_unicast(ip: IpAddr) -> bool {
     }
 }
 
-struct Resolver;
-
-impl reqwest::dns::Resolve for Resolver {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let host = name.as_str().to_owned();
-        Box::pin(async move {
-            if host != API_HOST && host != TOKEN_HOST {
-                return Err("name is not allowed".into());
-            }
-            let found: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
-                .await?
-                .filter(|a| is_global_unicast(a.ip()))
-                .collect();
-            if found.is_empty() {
-                return Err("no global address".into());
-            }
-            let addrs: reqwest::dns::Addrs = Box::new(found.into_iter());
-            Ok(addrs)
-        })
-    }
-}
-
-/// How the client is built. Production uses [`HttpConfig::default`]; the tests of this package
-/// (feature `test-hooks`) add a root and an address override.
-#[derive(Debug, Clone, Default)]
-pub struct HttpConfig {
-    /// PEM of additional trusted roots (tests).
-    #[cfg(feature = "test-hooks")]
-    pub extra_roots_pem: Option<Vec<u8>>,
-    /// Send requests for either Google host to this `host:port` (tests); the host check runs first.
-    #[cfg(feature = "test-hooks")]
-    pub api_addr: Option<String>,
-}
-
-/// The client could not be built.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("cannot build the HTTP client: {0}")]
-pub struct BuildError(pub &'static str);
-
-fn tls_config(cfg: &HttpConfig) -> Result<rustls::ClientConfig, BuildError> {
-    let mut roots = rustls::RootCertStore::empty();
-    let native = rustls_native_certs::load_native_certs();
-    roots.add_parsable_certificates(native.certs);
-    #[cfg(feature = "test-hooks")]
-    if let Some(pem) = &cfg.extra_roots_pem {
-        use rustls::pki_types::{CertificateDer, pem::PemObject};
-        for der in CertificateDer::pem_slice_iter(pem) {
-            let der = der.map_err(|_| BuildError("test root is not PEM"))?;
-            roots
-                .add(der)
-                .map_err(|_| BuildError("test root is not a certificate"))?;
-        }
-    }
-    #[cfg(not(feature = "test-hooks"))]
-    let _ = cfg;
-    if roots.is_empty() {
-        return Err(BuildError("no trusted root certificates"));
-    }
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|_| BuildError("TLS 1.3 is unavailable"))?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok(config)
-}
-
 /// A piece of an upload body: at most [`CHUNK`] bytes, released at the shared rate.
-struct UploadBody {
+pub struct UploadBody {
     chunks: Buffer,
     current: Bytes,
     pending: Option<Bytes>,
@@ -244,10 +181,12 @@ impl Body for UploadBody {
     }
 }
 
+type Client = hyper_util::client::legacy::Client<Connector, UploadBody>;
+
 /// The transport OpenDAL runs on. Cheap to clone.
 #[derive(Clone)]
 pub struct GoogleTransport {
-    client: reqwest::Client,
+    client: Client,
     rate: Arc<UploadRate>,
     timing: Timing,
     #[cfg(feature = "test-hooks")]
@@ -325,24 +264,19 @@ impl GoogleTransport {
     /// Builds the client.
     ///
     /// # Errors
-    /// [`BuildError`] when TLS or the client cannot be set up (for example no root certificates).
+    /// [`BuildError`] when TLS cannot be set up (for example no root certificates).
     pub fn new(
         cfg: &HttpConfig,
         rate: Arc<UploadRate>,
         timing: Timing,
     ) -> Result<Self, BuildError> {
-        let client = reqwest::Client::builder()
-            .tls_backend_preconfigured(tls_config(cfg)?)
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .https_only(true)
-            .http1_only()
-            .dns_resolver(Resolver)
-            .connect_timeout(timing.attempt_base)
+        let connector = Connector::new(cfg, timing.attempt_base)?;
+        // No redirect following, no proxy and no HTTP/2: this client has none of them to turn off.
+        let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
+            .pool_timer(TokioTimer::new())
+            .pool_idle_timeout(Duration::from_secs(30))
             .pool_max_idle_per_host(2)
-            .user_agent("hx-drive")
-            .build()
-            .map_err(|_| BuildError("client"))?;
+            .build::<_, UploadBody>(connector);
         Ok(Self {
             client,
             rate,
@@ -352,17 +286,33 @@ impl GoogleTransport {
         })
     }
 
-    /// The address to connect to: the URL itself, or the test override.
-    fn target(&self, uri: &http::Uri) -> String {
+    /// The URI to connect to: the request's own, or the test override.
+    fn target(&self, uri: &http::Uri) -> Result<http::Uri, opendal::Error> {
         #[cfg(feature = "test-hooks")]
         if let Some(addr) = &self.api_addr {
             let pq = uri
                 .path_and_query()
                 .map_or("/", http::uri::PathAndQuery::as_str);
-            return format!("https://{addr}{pq}");
+            return format!("https://{addr}{pq}")
+                .parse()
+                .map_err(|_| opendal::Error::new(opendal::ErrorKind::Unexpected, "bad url"));
         }
-        uri.to_string()
+        Ok(uri.clone())
     }
+}
+
+/// Reads at most `cap` bytes of a body (the rest is read and dropped), or fails.
+async fn read_capped(mut body: Incoming, cap: usize) -> Result<Vec<u8>, ()> {
+    let mut buf = Vec::new();
+    while let Some(frame) = body.frame().await {
+        if let Ok(d) = frame.map_err(|_| ())?.into_data()
+            && buf.len() < cap
+        {
+            let room = cap - buf.len();
+            buf.extend_from_slice(&d[..d.len().min(room)]);
+        }
+    }
+    Ok(buf)
 }
 
 impl HttpTransport for GoogleTransport {
@@ -371,8 +321,7 @@ impl HttpTransport for GoogleTransport {
         let trash = is_trash_request(&req);
         let uri = req.uri().clone();
         let is_upload = uri.path().starts_with("/upload/");
-        let url = reqwest::Url::parse(&self.target(&uri))
-            .map_err(|_| opendal::Error::new(opendal::ErrorKind::Unexpected, "bad url"))?;
+        let target = self.target(&uri)?;
         let method = if trash {
             http::Method::DELETE
         } else {
@@ -380,6 +329,10 @@ impl HttpTransport for GoogleTransport {
         };
         let mut headers = std::mem::take(req.headers_mut());
         headers.remove(http::header::HOST);
+        headers.insert(
+            http::header::USER_AGENT,
+            http::HeaderValue::from_static("hx-drive"),
+        );
         let body = if trash {
             headers.remove(http::header::CONTENT_TYPE);
             headers.remove(http::header::CONTENT_LENGTH);
@@ -388,13 +341,15 @@ impl HttpTransport for GoogleTransport {
             std::mem::take(req.body_mut())
         };
         let body_len = body.len();
-        let mut builder = self.client.request(method, url).headers(headers);
-        if !body.is_empty() {
-            let rate = is_upload.then(|| self.rate.clone());
-            builder = builder.body(reqwest::Body::wrap(UploadBody::new(body, rate)));
-        }
+        let rate = (is_upload && !body.is_empty()).then(|| self.rate.clone());
+        let mut hreq = hyper::Request::builder()
+            .method(method)
+            .uri(target)
+            .body(UploadBody::new(body, rate))
+            .map_err(|_| opendal::Error::new(opendal::ErrorKind::Unexpected, "bad request"))?;
+        *hreq.headers_mut() = headers;
         let timeout = self.timing.attempt_timeout(body_len as u64);
-        let resp = match tokio::time::timeout(timeout, builder.send()).await {
+        let resp = match tokio::time::timeout(timeout, self.client.request(hreq)).await {
             Ok(Ok(r)) => r,
             Ok(Err(_)) => return Err(network_error("send failed")),
             Err(_) => return Err(network_error("no response in time")),
@@ -411,34 +366,22 @@ impl HttpTransport for GoogleTransport {
                 .map(|s| Duration::from_secs(s.min(3600))),
             ..Observed::default()
         };
+        let (parts, incoming) = resp.into_parts();
         if status.as_u16() >= 400 {
             // Read the error body (bounded) for its reason; it is rebuilt for OpenDAL, which maps
             // the status itself.
-            let headers = resp.headers().clone();
-            let version = resp.version();
-            let mut stream = resp.bytes_stream();
-            let mut buf: Vec<u8> = Vec::new();
-            loop {
-                match stream.try_next().await {
-                    Ok(Some(c)) => {
-                        if buf.len() < 64 * 1024 {
-                            let room = 64 * 1024 - buf.len();
-                            buf.extend_from_slice(&c[..c.len().min(room)]);
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(_) => return Err(network_error("error body")),
-                }
-            }
+            let Ok(buf) = read_capped(incoming, 64 * 1024).await else {
+                return Err(network_error("error body"));
+            };
             let (reason, oauth) = parse_error_body(&buf);
             obs.reason = reason;
             obs.oauth_error = oauth;
             record(obs);
             let mut out = Response::builder()
                 .status(status)
-                .version(version)
+                .version(parts.version)
                 .extension(uri);
-            *out.headers_mut().expect("builder is valid") = headers;
+            *out.headers_mut().expect("builder is valid") = parts.headers;
             return Ok(out
                 .body(single_buffer_body(Bytes::from(buf)))
                 .expect("static parts"));
@@ -452,27 +395,53 @@ impl HttpTransport for GoogleTransport {
                 .body(single_buffer_body(Bytes::from_static(b"{}")))
                 .expect("static parts"));
         }
-        let content_length = resp
-            .headers()
+        let content_length = parts
+            .headers
             .get(http::header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok());
         let mut out = Response::builder()
             .status(status)
-            .version(resp.version())
+            .version(parts.version)
             .extension(uri);
-        *out.headers_mut().expect("builder is valid") = resp.headers().clone();
-        let stream = resp
-            .bytes_stream()
-            .try_filter(|v| std::future::ready(!v.is_empty()))
-            .map_ok(Buffer::from)
-            .map_err(|_| {
-                opendal::Error::new(opendal::ErrorKind::Unexpected, "read from the response")
-                    .set_temporary()
-            });
+        *out.headers_mut().expect("builder is valid") = parts.headers;
+        // OpenDAL wants a `Sync` stream and hyper's body is not: a task relays it, two chunks
+        // ahead at most. It ends when the stream is dropped or the body ends.
+        let (tx, rx) = tokio::sync::mpsc::channel::<opendal::Result<Buffer>>(2);
+        tokio::spawn(async move {
+            let mut body = incoming;
+            while let Some(frame) = body.frame().await {
+                let item = match frame {
+                    Ok(f) => match f.into_data() {
+                        Ok(d) if !d.is_empty() => Ok(Buffer::from(d)),
+                        _ => continue,
+                    },
+                    Err(_) => Err(opendal::Error::new(
+                        opendal::ErrorKind::Unexpected,
+                        "read from the response",
+                    )
+                    .set_temporary()),
+                };
+                let failed = item.is_err();
+                if tx.send(item).await.is_err() || failed {
+                    return;
+                }
+            }
+        });
         Ok(out
-            .body(HttpBody::new(stream, content_length))
+            .body(HttpBody::new(RelayStream(rx), content_length))
             .expect("static parts"))
+    }
+}
+
+/// The receiving end of the body relay, as a `Stream`.
+struct RelayStream(tokio::sync::mpsc::Receiver<opendal::Result<Buffer>>);
+
+impl futures_util::Stream for RelayStream {
+    type Item = opendal::Result<Buffer>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.0.poll_recv(cx)
     }
 }
 

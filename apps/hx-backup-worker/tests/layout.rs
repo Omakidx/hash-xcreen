@@ -69,11 +69,19 @@ fn no_hx_agent_binary_can_contain_rustic() {
 #[test]
 fn the_drive_helpers_http_stack_is_small_and_has_no_openssl() {
     let normal = tree(&["-p", "hx-backup-worker", "-e", "normal"]).expect("cargo tree");
-    for wanted in ["opendal", "reqwest", "rustls"] {
+    for wanted in ["opendal", "hyper-util", "tokio-rustls"] {
         assert!(normal.contains(wanted), "the Drive role links {wanted}");
     }
-    // pure Rust TLS with ring: no OpenSSL, no native-tls, no aws-lc
-    for forbidden in ["openssl-sys", "native-tls", "aws-lc"] {
+    // pure Rust TLS with ring: no OpenSSL, no native-tls, no aws-lc; and not reqwest, whose rustls
+    // stack enables `tls12` and brings a certificate bundle outside the licence allowlist
+    for forbidden in [
+        "openssl-sys",
+        "native-tls",
+        "aws-lc",
+        "reqwest",
+        "hyper-rustls",
+        "webpki-root-certs",
+    ] {
         assert!(
             !normal.contains(forbidden),
             "the worker's tree contains {forbidden}:\n{normal}"
@@ -99,6 +107,8 @@ fn the_drive_helpers_http_stack_is_small_and_has_no_openssl() {
         !features.contains("opendal-service-s3") && !features.contains("opendal-service-fs"),
         "{features}"
     );
+    // TLS 1.3 only (deny.toml bans rustls's `tls12` feature)
+    assert!(!features.contains("rustls feature \"tls12\""), "{features}");
 }
 
 #[test]

@@ -7,6 +7,7 @@
 //! | Module | What it does |
 //! |---|---|
 //! | [`creds`] | The fixed OAuth client file and the `drive-token` credential. |
+//! | [`connector`] | TCP and TLS 1.3 to the two Google hosts, global unicast addresses only. |
 //! | [`transport`] | The one HTTP path: host check, permanent delete, upload pacing, what Drive answered. |
 //! | [`rate`] | The upload-rate bucket (`SetUploadRate`). |
 //! | [`retry`] | Classes of failure (§31), the retrier, the daily-limit gate, the timing. |
@@ -15,6 +16,7 @@
 //! | [`server`] | One link session. |
 //! | [`run`] | Activation, one connection at a time, `SO_PEERCRED`, the idle exit. |
 
+pub mod connector;
 pub mod creds;
 pub mod gdrive;
 pub mod lease;
