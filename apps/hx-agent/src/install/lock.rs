@@ -20,7 +20,17 @@ use super::error::InstallError;
 /// A held lock. Dropping it releases the lock.
 #[derive(Debug)]
 pub struct Lock {
-    _fd: OwnedFd,
+    fd: OwnedFd,
+}
+
+impl Drop for Lock {
+    /// Unlocks before the descriptor closes. A `flock` belongs to the open file description, not
+    /// to the descriptor: a child forked by another thread (`Command::spawn`) holds a copy of it
+    /// until it execs, `O_CLOEXEC` or not, and closing ours alone would leave the lock held until
+    /// then. `LOCK_UN` releases it for every copy at once.
+    fn drop(&mut self) {
+        let _ = rustix::fs::flock(&self.fd, FlockOperation::Unlock);
+    }
 }
 
 fn locked() -> InstallError {
@@ -51,7 +61,7 @@ pub fn acquire(path: &Path, lock_fd: Option<i32>) -> Result<Lock, InstallError> 
         }
     };
     match rustix::fs::flock(&fd, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(Lock { _fd: fd }),
+        Ok(()) => Ok(Lock { fd }),
         Err(e) => {
             // An inherited descriptor is not closed on failure (the caller's shell owns the lock).
             if adopted {
@@ -131,6 +141,58 @@ mod tests {
         assert_eq!(e.exit, 11);
         drop(first);
         assert!(acquire(&p, None).is_ok(), "released on drop");
+    }
+
+    #[test]
+    fn dropping_releases_the_lock_even_while_a_copy_of_the_descriptor_is_open() {
+        // A child forked by another thread (`Command::spawn`) holds a copy of every descriptor
+        // until it execs, `O_CLOEXEC` or not. A `dup` is the same kind of copy: one more
+        // reference to the open file description that owns the `flock`.
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("run/hx-install.lock");
+        let first = acquire(&p, None).unwrap();
+        let copy = rustix::io::dup(&first.fd).unwrap();
+        drop(first);
+        let again = acquire(&p, None).expect("released on drop although a copy is still open");
+        drop(again);
+        drop(copy);
+    }
+
+    #[test]
+    fn dropping_releases_the_lock_while_a_forked_child_has_not_exec_d_yet() {
+        use std::io::{Read, Write};
+        use std::os::unix::process::CommandExt;
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("run/hx-install.lock");
+        let first = acquire(&p, None).unwrap();
+        // The child signals over a pipe once it is between fork and exec, then waits there for a
+        // byte (not for EOF: the child holds its own copy of the write end until it execs).
+        let (mut ready_r, ready_w) = std::io::pipe().unwrap();
+        let ready_w = OwnedFd::from(ready_w);
+        let (release_r, mut release_w) = std::io::pipe().unwrap();
+        let release_r = OwnedFd::from(release_r);
+        let spawner = std::thread::spawn(move || {
+            let mut cmd = std::process::Command::new("/bin/true");
+            // SAFETY: the closure only calls the async-signal-safe `write` and `read` on
+            // descriptors it owns copies of, then returns.
+            unsafe {
+                cmd.pre_exec(move || {
+                    let _ = rustix::io::write(&ready_w, b"x");
+                    let mut b = [0u8; 1];
+                    let _ = rustix::io::read(&release_r, &mut b);
+                    Ok(())
+                });
+            }
+            cmd.status().unwrap()
+        });
+        let mut b = [0u8; 1];
+        ready_r.read_exact(&mut b).unwrap();
+        // The child now holds a copy of the lock's descriptor.
+        drop(first);
+        let again = acquire(&p, None);
+        release_w.write_all(b"x").unwrap();
+        assert!(spawner.join().unwrap().success());
+        again.expect("released on drop although a forked child still holds the descriptor");
     }
 
     #[test]
