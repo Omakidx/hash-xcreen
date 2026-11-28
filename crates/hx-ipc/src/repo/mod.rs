@@ -24,7 +24,7 @@
 //! * [`LinkState`]: the stateful rules (handshake, request ids, outstanding limits, data
 //!   streams, listing, job result), sans I/O;
 //! * [`policy`]: the per-job operation table of section 30;
-//! * [`limits`] items re-exported here: every size, count and time limit.
+//! * `limits` items re-exported here: every size, count and time limit.
 //!
 //! # Reading a link
 //!

@@ -332,6 +332,10 @@ pub async fn uninstall<T: Transport + Clone + 'static>(
         );
     }
 
+    // The active backup job is cancelled and every helper, restore target, socket and job record
+    // is removed before the desktops and the pool are touched (ipc.md 35).
+    d.backup_teardown(&ids, true).await;
+
     let mut rep = Report::default();
     let steps = steps_for(st.mode);
     for (i, step) in steps.iter().enumerate() {

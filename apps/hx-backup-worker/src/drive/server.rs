@@ -119,6 +119,23 @@ fn response(req_id: u64, result: pb::repo_response::Result) -> Out {
     })))
 }
 
+/// `Event{SESSION_FAILED, class}` (ipc.md §29, W5-2): why the helper is about to close the link.
+/// The codec refuses privd's own classes and `UNSPECIFIED` here, so those are given as `INTERNAL`
+/// (the helper never produces them; this keeps a bug from becoming a violation on privd's side).
+fn session_failed(class: EC) -> Out {
+    let class = match class {
+        EC::Unspecified | EC::PolicyDenied | EC::Integrity | EC::TooLarge | EC::Unavailable => {
+            EC::Internal
+        }
+        c => c,
+    };
+    Out::Message(frame(pb::repo_frame::Frame::Event(pb::Event {
+        kind: pb::EventKind::SessionFailed as i32,
+        until_ms: 0,
+        error_class: class as i32,
+    })))
+}
+
 fn error_response(req_id: u64, e: DriveError) -> Out {
     response(
         req_id,
@@ -335,10 +352,19 @@ impl Shared {
         while sent < size {
             let chunk = match rs.next_chunk(&go).await {
                 Ok(Some(c)) if sent + c.len() <= size => c,
-                _ => {
+                failed => {
                     eprintln!(
                         "hx-backup-worker: a download failed after ReadBegin: closing the link"
                     );
+                    // The class of the failure cannot be an answer (§25), so it goes in an
+                    // event on the control queue, ahead of the close (§29, W5-2): privd reads it
+                    // before the end of stream. A source that ended early or gave too much has
+                    // no better class than INTERNAL.
+                    let class = match failed {
+                        Err(e) => e.class,
+                        _ => EC::Internal,
+                    };
+                    let _ = self.ctl.send(session_failed(class));
                     // The writer closes the link between two frames, so privd sees a clean end.
                     let _ = self.ctl.send(Out::Close);
                     return Ok(Answer::Sent);

@@ -573,6 +573,22 @@ impl FakeIncus {
                 );
                 ok_sync(Value::Null)
             }
+            // `?recursion=1`: every instance, as the single GET shows it (the backup runner lists
+            // helpers and restore targets this way).
+            ("GET", ["1.0", "instances"]) => ok_sync(Value::Array(
+                s.instances
+                    .iter()
+                    .map(|(name, i)| {
+                        json!({
+                            "name": name, "status": i.status, "type": "container",
+                            "profiles": ["hx-desktop"], "config": i.config, "description": "",
+                            "architecture": "x86_64", "devices": i.devices,
+                            "expanded_devices": i.devices,
+                            "last_used_at": "1970-01-01T00:00:00Z",
+                        })
+                    })
+                    .collect(),
+            )),
             ("GET", ["1.0", "instances", name]) => match s.instances.get(*name) {
                 None => err_response(404, "Instance not found"),
                 Some(i) => {

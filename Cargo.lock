@@ -2872,6 +2872,7 @@ dependencies = [
  "hkdf 0.12.4",
  "hmac 0.12.1",
  "hx-agent",
+ "hx-backup",
  "hx-capture",
  "hx-crypto",
  "hx-ipc",

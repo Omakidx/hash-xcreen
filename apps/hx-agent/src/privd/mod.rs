@@ -17,10 +17,12 @@
 //! | [`cancel`], [`progress`] | cancellation and per-desktop locks, lossy progress frames |
 //! | [`update`] | self-update: manifest, keys, extraction, switch, health check (ipc.md 6.12) |
 //! | [`image`] | prebuilt desktop images: keys, `choose`, fetch, offline import, cache (ipc.md 6.5, 6.12) |
+//! | [`backup`] | the backup job runner: relay, Drive session, crash recovery (ipc.md Part 3) |
 
 pub mod activation;
 pub mod audit;
 pub mod auth;
+pub mod backup;
 pub mod cancel;
 pub mod clock;
 pub mod cmd;

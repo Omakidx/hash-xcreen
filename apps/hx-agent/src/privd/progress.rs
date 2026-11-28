@@ -94,12 +94,27 @@ impl ProgressSender {
             step: sanitize_text(step, hx_ipc::privd::MAX_PROGRESS_STEP_LEN),
             percent: if percent <= 100 { percent } else { 255 },
             ok,
+            ..Default::default()
         };
         if let Ok(mut q) = self.queue.q.lock() {
             if q.len() >= MAX_QUEUED {
                 q.pop_front();
             }
             q.push_back(p);
+        }
+        self.queue.notify.notify_one();
+    }
+
+    /// Queues a frame of a backup job (ipc.md 33): the stage, phase, text and byte counters
+    /// come from the job runner's mapper, the request id is this sender's.
+    pub fn emit_job(&self, p: &crate::privd::backup::JobProgress) {
+        let mut frame = p.to_pb(self.request_id);
+        frame.step = sanitize_text(&frame.step, hx_ipc::privd::MAX_PROGRESS_STEP_LEN);
+        if let Ok(mut q) = self.queue.q.lock() {
+            if q.len() >= MAX_QUEUED {
+                q.pop_front();
+            }
+            q.push_back(frame);
         }
         self.queue.notify.notify_one();
     }

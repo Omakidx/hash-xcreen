@@ -156,7 +156,31 @@ pub fn validate_frame(frame: &pb::RepoFrame, to: Endpoint) -> Check {
         F::Result(r) => validate_result(r),
         F::Cancel(_) | F::Ping(_) | F::Pong(_) | F::Bye(_) => Ok(()),
         F::CancelRequest(c) => require(c.req_id != 0, "cancel_request.req_id"),
-        F::Event(e) => known::<pb::EventKind>(e.kind, "event.kind"),
+        F::Event(e) => validate_event(e),
+    }
+}
+
+/// An `Event` (section 29): the kind is known, and `error_class` is set exactly for
+/// `SESSION_FAILED`, as a class the Drive helper may give (never `UNSPECIFIED` or one of privd's
+/// own verdicts).
+fn validate_event(e: &pb::Event) -> Check {
+    use pb::ErrorClass as C;
+    known::<pb::EventKind>(e.kind, "event.kind")?;
+    if e.kind == pb::EventKind::SessionFailed as i32 {
+        known::<C>(e.error_class, "event.error_class")?;
+        let class = C::try_from(e.error_class).unwrap_or(C::Unspecified);
+        require(
+            !matches!(
+                class,
+                C::Unspecified | C::PolicyDenied | C::Integrity | C::TooLarge | C::Unavailable
+            ),
+            "event.error_class: not a class of the Drive helper",
+        )
+    } else {
+        require(
+            e.error_class == 0,
+            "event.error_class: only for SESSION_FAILED",
+        )
     }
 }
 

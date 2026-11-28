@@ -156,6 +156,10 @@ message Progress {
   // 0 to 100, or 255 for unknown.
   uint32 percent = 6;
   bool ok = 7;
+  // Section 33, BACKUP and RESTORE only; 0 = unknown.
+  uint64 bytes_done = 8;
+  uint64 bytes_total = 9;
+  uint64 transfer_bytes = 10;
 }
 
 // ----- shared types (section 6) -----
@@ -195,6 +199,9 @@ enum NeedsAttention {
   NEEDS_ATTENTION_PASSWORD_LOCKED = 5;
   NEEDS_ATTENTION_UPDATE_ROLLED_BACK = 6;
   NEEDS_ATTENTION_HOST_DOCKER_FORWARDING = 7;
+  // Phase 2 (section 31): the Drive token is revoked or missing; the backup is taken over.
+  NEEDS_ATTENTION_DRIVE_RECONNECT = 8;
+  NEEDS_ATTENTION_BACKUP_TAKEN_OVER = 9;
 }
 
 enum DesktopState {

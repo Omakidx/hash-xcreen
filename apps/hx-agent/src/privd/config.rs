@@ -86,6 +86,16 @@ pub struct PrivdConfig {
     pub update: UpdateConfig,
     /// Paths and timings of the prebuilt-image path (ipc.md 6.5, 6.12).
     pub image: ImageConfig,
+    /// Where the sealed credentials live (`/etc/hx/creds`); privd only checks that the Drive
+    /// token credential exists there (ipc.md 26, "Admission").
+    pub creds_dir: PathBuf,
+    /// The directory of the repository-link sockets of backup jobs (`/run/hx/backup`, ipc.md 24).
+    pub backup_run_dir: PathBuf,
+    /// The Drive helper's socket (`/run/hx/drive.sock`, ipc.md 24).
+    pub drive_socket: PathBuf,
+    /// The owner that the backup run directory and the backup key credential must have (root in
+    /// production); `None` skips the owner checks (tests that run as an ordinary user).
+    pub backup_owner: Option<u32>,
 }
 
 impl PrivdConfig {
@@ -126,6 +136,10 @@ impl PrivdConfig {
                 std::path::Path::new(STATE_DIR),
                 std::path::Path::new("/var/lib/incus"),
             ),
+            creds_dir: "/etc/hx/creds".into(),
+            backup_run_dir: "/run/hx/backup".into(),
+            drive_socket: "/run/hx/drive.sock".into(),
+            backup_owner: Some(0),
         })
     }
 
@@ -160,6 +174,10 @@ impl PrivdConfig {
             max_desktops: 1,
             update: UpdateConfig::for_tests(dir),
             image: ImageConfig::for_tests(dir),
+            creds_dir: dir.join("creds"),
+            backup_run_dir: dir.join("run-backup"),
+            drive_socket: dir.join("drive.sock"),
+            backup_owner: None,
         }
     }
 
