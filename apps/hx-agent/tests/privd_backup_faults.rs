@@ -554,13 +554,10 @@ async fn a_write_that_does_not_hash_to_its_id_never_gets_its_end_and_raises_the_
     let out = rig.outcome(&h).await;
     assert_eq!(out.result.as_ref().unwrap_err(), &Failure::Integrity);
     assert!(rig.drive.objects(T::Pack).is_empty());
-    // The Drive helper got the data frames but never the END that would commit the object.
+    // The Drive helper never got the END that would commit the object. (Whether it got any of
+    // the data frames before is not asserted: a failure without grace closes the link and
+    // drops what is still queued, so under load none may have been written yet.)
     let seen = rig.drive.seen();
-    let data_frames: Vec<_> = seen
-        .iter()
-        .filter(|s| matches!(s, Seen::Data { .. }))
-        .collect();
-    assert!(!data_frames.is_empty(), "{seen:?}");
     assert!(
         !seen
             .iter()

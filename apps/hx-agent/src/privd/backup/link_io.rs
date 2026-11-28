@@ -99,6 +99,8 @@ pub enum Out {
 struct QueueInner {
     ctl: VecDeque<Out>,
     data: VecDeque<Out>,
+    /// The orderly end (`Bye`, then the close): written only when `ctl` and `data` are empty.
+    tail: VecDeque<Out>,
     data_bytes: usize,
     ctl_bytes: usize,
     pong: Option<Vec<u8>>,
@@ -161,6 +163,23 @@ impl OutQueue {
         Ok(())
     }
 
+    /// The orderly end of the link: `bye` (if any) and then the close, written **after
+    /// everything already queued, data frames included** (a queued `END` of an aborted upload
+    /// must not be overtaken by the `Bye`, which would otherwise go first as a control frame, or
+    /// dropped by the close; ipc.md section 25).
+    pub fn finish(&self, bye: Option<Vec<u8>>) -> Result<(), PushError> {
+        let mut g = self.lock();
+        if g.closed {
+            return Err(PushError::Closed);
+        }
+        if let Some(b) = bye {
+            g.tail.push_back(Out::Msg(b));
+        }
+        g.tail.push_back(Out::Close);
+        self.cv.notify_all();
+        Ok(())
+    }
+
     /// Queues a `Pong`: at most one is ever pending, a newer one replaces it.
     pub fn set_pong(&self, bytes: Vec<u8>) -> Result<(), PushError> {
         let mut g = self.lock();
@@ -192,7 +211,10 @@ impl OutQueue {
             if g.closed || g.generation != generation {
                 return None;
             }
-            if let Some(b) = g.pong.take() {
+            // A `Pong` after the orderly end has begun would follow the `Bye`: not sent.
+            if g.tail.is_empty()
+                && let Some(b) = g.pong.take()
+            {
                 return Some((Out::Msg(b), 0));
             }
             if let Some(o) = g.ctl.pop_front() {
@@ -206,6 +228,9 @@ impl OutQueue {
                     _ => 0,
                 };
                 return Some((o, len));
+            }
+            if let Some(o) = g.tail.pop_front() {
+                return Some((o, 0));
             }
             g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
         }
@@ -288,6 +313,7 @@ impl OutQueue {
         g.generation += 1;
         g.ctl.clear();
         g.data.clear();
+        g.tail.clear();
         g.data_bytes = 0;
         g.ctl_bytes = 0;
         g.pong = None;
@@ -305,6 +331,7 @@ impl OutQueue {
         g.closed = true;
         g.ctl.clear();
         g.data.clear();
+        g.tail.clear();
         g.data_bytes = 0;
         g.ctl_bytes = 0;
         g.pong = None;
@@ -621,8 +648,12 @@ impl Link {
         }
         self.open = false;
         if bye && self.state.is_open() {
-            let _ = self.send(&frame(pb::repo_frame::Frame::Bye(pb::Bye {})));
-            if self.q.push_ctl(Out::Close).is_ok() {
+            // Behind everything queued, data frames included (`OutQueue::finish`).
+            let f = frame(pb::repo_frame::Frame::Bye(pb::Bye {}));
+            if self.state.sent_message(&f).is_ok()
+                && let Ok(bytes) = encode_message(&f, self.peer)
+                && self.q.finish(Some(bytes)).is_ok()
+            {
                 return;
             }
         }
@@ -995,5 +1026,37 @@ mod tests {
             "the close of the old generation closed the new queue"
         );
         assert_ne!(q.generation(), old_gen);
+    }
+
+    #[test]
+    fn the_orderly_end_is_written_after_the_data_frames_that_were_queued_before_it() {
+        use std::io::Read;
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let q = OutQueue::new();
+        // An aborted upload's empty END is queued, then the link ends in order.
+        assert!(q.push_data(
+            Out::Data {
+                header: [0xD; DATA_FRAME_HEADER_LEN],
+                payload: Bytes::new(),
+                _permit: None,
+            },
+            0
+        ));
+        // A control frame queued meanwhile still goes first, a Pong is not sent after the end
+        // began.
+        q.push_ctl(Out::Msg(vec![0xC])).unwrap();
+        q.set_pong(vec![0xF]).unwrap();
+        q.finish(Some(vec![0xB, 0xB])).unwrap();
+        let (tx, _rx) = mpsc::channel(4);
+        let generation = q.generation();
+        let q2 = q.clone();
+        let w = std::thread::spawn(move || writer_loop(a, q2, tx, generation, &|| {}));
+        let mut got = Vec::new();
+        b.read_to_end(&mut got).unwrap();
+        w.join().unwrap();
+        let mut want = vec![0xC];
+        want.extend([0xD; DATA_FRAME_HEADER_LEN]);
+        want.extend([0xB, 0xB]);
+        assert_eq!(got, want, "control, then the END, then Bye, then the close");
     }
 }
