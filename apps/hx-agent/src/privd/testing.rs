@@ -1096,6 +1096,24 @@ impl RawClient {
         self.stream.write_all(&bytes).expect("write");
     }
 
+    /// Sends a frame to a daemon that may already have closed the connection. privd closes some
+    /// peers at accept, before it reads anything (a refused uid, a forbidden group, a full role),
+    /// so the write can fail with `BrokenPipe` or `ConnectionReset`; that is not a failure here.
+    /// The caller checks the close itself.
+    pub fn send_maybe_closed(&mut self, frame: F) {
+        let bytes =
+            privd::encode_message(&pb::Frame { frame: Some(frame) }, Side::Server).expect("encode");
+        match self.stream.write_all(&bytes) {
+            Ok(()) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ) => {}
+            Err(e) => panic!("write: {e:?}"),
+        }
+    }
+
     /// Sends bytes as they are (malformed frames).
     pub fn send_raw(&mut self, bytes: &[u8]) {
         self.stream.write_all(bytes).expect("write");
