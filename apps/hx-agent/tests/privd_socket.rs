@@ -84,7 +84,8 @@ async fn a_peer_that_is_not_root_or_the_gateway_is_closed_without_a_reply() {
     // Configured gateway uid is someone else's; this process is neither root nor that user.
     let h = Harness::start(me() + 1);
     let mut c = h.connect();
-    c.send(F::Hello(pb::Hello {
+    // privd may close before this write: the Hello is best effort, the close is what is tested.
+    c.send_maybe_closed(F::Hello(pb::Hello {
         major: hx_ipc::privd::VERSION_MAJOR,
         minor: 0,
         software: "x".into(),
@@ -369,7 +370,8 @@ async fn at_most_four_connections_per_role() {
         held.push(c);
     }
     let mut fifth = h.connect();
-    fifth.send(F::Hello(pb::Hello {
+    // Closed at accept, possibly before this write lands.
+    fifth.send_maybe_closed(F::Hello(pb::Hello {
         major: hx_ipc::privd::VERSION_MAJOR,
         minor: 0,
         software: "x".into(),
@@ -928,7 +930,8 @@ async fn l6_a_gateway_peer_holding_a_forbidden_group_is_refused_at_accept() {
     )
     .unwrap();
     let mut c = h.connect();
-    c.send(F::Hello(pb::Hello {
+    // Refused at accept, possibly before this write lands.
+    c.send_maybe_closed(F::Hello(pb::Hello {
         major: hx_ipc::privd::VERSION_MAJOR,
         minor: 0,
         software: "x".into(),
