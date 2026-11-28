@@ -856,16 +856,16 @@ async fn the_cleaning_up_phase_is_entered() {
         mono2.advance_ms(300);
         snapshot_result(w);
     });
-    let (ps, queue) = ProgressSender::new(1);
+    let (ps, _queue) = ProgressSender::new(1);
     let mut req = rig.backup_request();
     req.progress = Some(ps);
     let h = rig.runner.start(req).await.unwrap();
-    assert!(rig.outcome(&h).await.result.is_ok());
-    let mut steps = Vec::new();
-    while let Some(f) = queue.pop() {
-        steps.push(f.step);
-    }
-    assert!(steps.iter().any(|s| s == "Cleaning up"), "{steps:?}");
+    let out = rig.outcome(&h).await;
+    assert!(out.result.is_ok());
+    // The progress frames are throttled (at most 10 a second) and the last one may be held when
+    // the job ends, so the queue cannot prove the phase was entered. The phase history of the
+    // outcome is not throttled: snapshot (1), helper (2) and cleanup (6), in that order.
+    assert_eq!(out.phases, vec![1, 2, 6], "{:?}", out.phases);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

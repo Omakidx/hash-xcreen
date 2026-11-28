@@ -151,6 +151,9 @@ pub struct ProgressMapper {
     dirty: bool,
     last_emit_ms: Option<u64>,
     interval_ms: u64,
+    /// The phases entered, in order (starts with 1): not throttled, so what the job went
+    /// through can be told even when the throttle held the last frame.
+    history: Vec<u32>,
 }
 
 impl ProgressMapper {
@@ -169,6 +172,7 @@ impl ProgressMapper {
             dirty: true,
             last_emit_ms: None,
             interval_ms: 1000 / MAX_PER_SECOND,
+            history: vec![1],
         }
     }
 
@@ -176,12 +180,18 @@ impl ProgressMapper {
     pub fn enter(&mut self, index: u32) {
         if index != self.index {
             self.index = index;
+            self.history.push(index);
             self.files_done = 0;
             self.files_total = 0;
             self.bytes_done = 0;
             self.bytes_total = 0;
             self.dirty = true;
         }
+    }
+
+    /// The phases the job entered, in order (not throttled).
+    pub fn history(&self) -> &[u32] {
+        &self.history
     }
 
     /// The worker's latest numbers.
@@ -444,6 +454,7 @@ mod tests {
                 dirty: self.dirty,
                 last_emit_ms: self.last_emit_ms,
                 interval_ms: self.interval_ms,
+                history: self.history.clone(),
             }
         }
     }

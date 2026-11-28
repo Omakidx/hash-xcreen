@@ -177,6 +177,7 @@ impl JobHandle {
                     permission_answers: 0,
                     peak_ctl_bytes: 0,
                     transfer_bytes: 0,
+                    phases: Vec::new(),
                 });
             }
         }
@@ -1340,6 +1341,7 @@ impl<H: BackupHost, E: BackupEnv> JobTask<H, E> {
         }
         let peak_ctl_bytes = s.peak_ctl_bytes();
         let transfer_bytes = s.transfer_bytes();
+        let phases = s.phase_history();
         drop(guard);
         drop(reserved);
         JobOutcome {
@@ -1353,6 +1355,7 @@ impl<H: BackupHost, E: BackupEnv> JobTask<H, E> {
             permission_answers,
             peak_ctl_bytes,
             transfer_bytes,
+            phases,
         }
     }
 }

@@ -340,6 +340,11 @@ impl<E: BackupEnv> Session<E> {
         }
     }
 
+    /// The phases of privd's table that the job entered, in order (not throttled).
+    pub fn phase_history(&self) -> Vec<u32> {
+        self.mapper.history().to_vec()
+    }
+
     /// Object bytes relayed in both directions so far.
     pub fn transfer_bytes(&self) -> u64 {
         self.mapper.current().transfer_bytes

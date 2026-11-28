@@ -297,6 +297,9 @@ pub struct JobOutcome {
     /// Object bytes privd relayed in both directions in the job (what the progress frames
     /// report as `transfer_bytes`, final).
     pub transfer_bytes: u64,
+    /// The phases of privd's progress table that the job entered, in order. Unlike the progress
+    /// frames (at most 10 a second, the last one may be held when the job ends) it is complete.
+    pub phases: Vec<u32>,
 }
 
 /// Where a job is.
